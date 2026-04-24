@@ -1,0 +1,1122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GEMM 计算/访存比分析</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body, {
+    delimiters: [
+      {left: '$$', right: '$$', display: true},
+      {left: '\\[', right: '\\]', display: true},
+      {left: '$',  right: '$',  display: false},
+      {left: '\\(', right: '\\)', display: false}
+    ],
+    throwOnError: false
+  });"></script>
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --muted: #555;
+    --bg: #ffffff;
+    --accent: #0b6cc4;
+    --soft: #f4f6f8;
+    --border: #d9dde2;
+    --code-bg: #f1f3f5;
+    --table-alt: #fafbfc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e6e6e6;
+      --muted: #a9b1ba;
+      --bg: #121417;
+      --accent: #5fb3ff;
+      --soft: #1b1f24;
+      --border: #2a2f36;
+      --code-bg: #1b1f24;
+      --table-alt: #171a1f;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.72;
+    font-size: 16px;
+  }
+  .wrap {
+    max-width: 820px;
+    margin: 48px auto;
+    padding: 0 24px 80px;
+  }
+  h1 { font-size: 1.95rem; margin: 0 0 8px; letter-spacing: -0.01em; }
+  h2 {
+    font-size: 1.3rem;
+    margin: 2.4rem 0 0.7rem;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 { font-size: 1.08rem; margin: 1.6rem 0 0.5rem; }
+  p { margin: 0.7rem 0; }
+  .subtitle { color: var(--muted); margin-top: 0; font-size: 0.95rem; }
+  code, kbd, samp {
+    font-family: "SF Mono", Menlo, Consolas, "Courier New", monospace;
+    background: var(--code-bg);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 0.9em;
+  }
+  .highlight {
+    background: var(--soft);
+    border-left: 3px solid var(--accent);
+    padding: 12px 16px;
+    border-radius: 4px;
+    margin: 16px 0;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 14px 0;
+    font-size: 0.94rem;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 8px 12px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--soft); font-weight: 600; }
+  tbody tr:nth-child(even) { background: var(--table-alt); }
+  ul { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .eq {
+    margin: 14px 0;
+    padding: 10px 14px;
+    background: var(--soft);
+    border-radius: 6px;
+    overflow-x: auto;
+  }
+  .tag {
+    display: inline-block;
+    font-size: 0.75rem;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: var(--accent);
+    color: #fff;
+    vertical-align: middle;
+    margin-left: 6px;
+  }
+  hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
+  .meta { color: var(--muted); font-size: 0.85rem; }
+  pre.code {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 18px;
+    font-family: "SF Mono", Menlo, Consolas, "Courier New", monospace;
+    font-size: 0.86rem;
+    line-height: 1.6;
+    overflow-x: auto;
+    margin: 12px 0 18px;
+    white-space: pre;
+  }
+  pre.code .kw  { color: var(--accent); font-weight: 600; }
+  pre.code .cm  { color: var(--muted); font-style: italic; }
+  pre.code .sy  { color: var(--muted); }
+  .caption { color: var(--muted); font-size: 0.85rem; margin-top: -6px; margin-bottom: 10px; }
+  #export-md {
+    position: fixed;
+    top: 18px;
+    right: 18px;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.18);
+    z-index: 1000;
+    transition: transform 0.08s ease, filter 0.15s ease;
+  }
+  #export-md:hover { filter: brightness(1.1); }
+  #export-md:active { transform: translateY(1px); }
+  #export-md.flash { background: #3aaa55; }
+
+  /* --- 目录导航 TOC --- */
+  #toc {
+    position: fixed;
+    top: 64px;
+    left: 20px;
+    width: 240px;
+    max-height: calc(100vh - 96px);
+    overflow-y: auto;
+    background: var(--soft);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px 14px;
+    font-size: 0.82rem;
+    line-height: 1.5;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+    z-index: 900;
+  }
+  #toc.collapsed { width: 44px; padding: 10px 8px; overflow: hidden; }
+  #toc.collapsed > *:not(#toc-toggle) { display: none; }
+  #toc-toggle {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 1rem;
+    padding: 4px 6px;
+    line-height: 1;
+    border-radius: 4px;
+  }
+  #toc-toggle:hover { background: var(--border); color: var(--fg); }
+  #toc h4 {
+    margin: 0 0 10px;
+    font-size: 0.75rem;
+    color: var(--muted);
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding-right: 28px;
+  }
+  #toc ul { list-style: none; padding: 0; margin: 0; }
+  #toc li { margin: 1px 0; }
+  #toc a {
+    color: var(--fg);
+    text-decoration: none;
+    display: block;
+    padding: 3px 8px;
+    border-radius: 4px;
+    border-left: 2px solid transparent;
+    transition: all 0.12s;
+    word-break: break-word;
+  }
+  #toc a:hover { background: var(--border); }
+  #toc a.active {
+    background: var(--bg);
+    border-left-color: var(--accent);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  #toc li.lvl-3 > a {
+    padding-left: 20px;
+    font-size: 0.76rem;
+    color: var(--muted);
+  }
+  #toc li.lvl-3 > a.active { color: var(--accent); }
+
+  /* 屏幕太窄自动折叠 */
+  @media (max-width: 1180px) {
+    #toc { display: none; }
+  }
+</style>
+</head>
+<body>
+<button id="export-md" title="下载 Markdown 版本" onclick="exportMarkdown()">⬇ Markdown</button>
+
+<div class="wrap">
+
+  <h1>GEMM 计算/访存比（Arithmetic Intensity）分析</h1>
+  <p class="subtitle">方阵基线 → 零复用下界 → 分块 → 任意形状 tile 的完整推导</p>
+  <p class="meta">元素字节数记作 $b$（FP32: $b=4$；FP16/BF16: $b=2$；FP8: $b=1$）。</p>
+
+  <div class="highlight">
+    <strong>📌 建模前提</strong>：下面 <em>Section 一、二</em> 采用 <strong>单层 blocking</strong> 模型 —— 每个输出 tile 的输入 A / B 都假设从 DRAM 独立加载，不考虑相邻 C tile 之间通过 cache 产生的复用。这是为什么 $K_t$ 在渐近 AI 中"消掉"。<em>Section 三</em> 放开这个假设，用 <strong>2 级 blocking</strong>（DRAM ↔ L2 ↔ SMEM）重新审视，$K_t$ 会通过 cache 预算间接入场。
+  </div>
+
+  <hr>
+
+  <h2>一、方阵基线（$N \times N$）</h2>
+  <p>$C = A \cdot B$，三者都是 $N \times N$。总 FLOPs $= 2N^3$（每个 $C$ 元素 $N$ 次乘加）。</p>
+
+  <h3>1. 理论下界（完美复用）</h3>
+  <p>每个输入 / 输出元素只从主存进出一次，总访存 $3N^2$ 元素：</p>
+  <div class="eq">
+    $$\text{AI}_{\text{ideal}} \;=\; \frac{2N^3}{3N^2 \cdot b} \;=\; \frac{2N}{3b}\ \text{FLOP/byte}$$
+  </div>
+  <p><strong>随 $N$ 线性增长</strong>。FP32、$N = 4096$ 时 $\approx 683$ FLOP/byte——远超 H100（$\approx 7$）、B200（$\approx 20$）的平衡点，所以大 GEMM 理论上是 compute-bound。</p>
+
+  <h3>2. 完全无复用（naive 三重循环）</h3>
+  <p>假设 $C$ 在寄存器里累加，每次 FMA 只需 load $A$、load $B$ 两个元素：</p>
+  <div class="eq">
+    $$\text{AI}_{\text{no-reuse}} \;=\; \frac{2\ \text{FLOP}}{2b\ \text{byte}} \;=\; \frac{1}{b}\ \text{FLOP/byte}$$
+  </div>
+  <p><strong>与 $N$ 无关的常数。</strong>FP32 下仅 $0.25$ FLOP/byte——彻底 memory-bound，H100 只能发挥不到 4% 峰值。</p>
+
+  <p class="caption">朴素三重循环伪代码：</p>
+<pre class="code"><span class="cm"># Naive GEMM: C = A · B, 三者均为 N×N</span>
+<span class="kw">for</span> i <span class="kw">in</span> 0..N:
+    <span class="kw">for</span> j <span class="kw">in</span> 0..N:
+        acc = 0
+        <span class="kw">for</span> k <span class="kw">in</span> 0..N:
+            acc += A[i, k] * B[k, j]      <span class="cm"># 每次迭代 2 loads + 2 FLOPs</span>
+        C[i, j] = acc                       <span class="cm"># C 全程留在寄存器</span></pre>
+  <p>内层每次 FMA 都从 DRAM 拉 <code>A[i,k]</code> 和 <code>B[k,j]</code>，没有任何跨迭代复用，故 $\text{AI} = 1/b$。</p>
+
+  <h3>3. 分块（块大小 $T \times T$，cache 零延迟）</h3>
+  <p>一个 $T \times T$ 的 $C$ 块沿 $k$ 方向扫过 $N/T$ 次：</p>
+  <ul>
+    <li>FLOPs: $(N/T) \cdot 2T^3 = 2NT^2$</li>
+    <li>主存访问：$A$ tiles $(N/T)\cdot T^2 = NT$，$B$ tiles $NT$，$C$ 写回 $T^2$（一次，大 $N$ 可忽略）</li>
+  </ul>
+  <div class="eq">
+    $$\text{AI}_{\text{blocked}} \;=\; \frac{2NT^2}{2NT \cdot b} \;=\; \frac{T}{b}\ \text{FLOP/byte}$$
+  </div>
+  <p>总访存 $= 2N^3/T$，正是 Hong–Kung 下界 $\Omega(N^3/\sqrt{M})$ 的具象形式。</p>
+
+  <p class="caption">分块 GEMM 伪代码（方形 tile，$T \times T$）：</p>
+<pre class="code"><span class="cm"># Blocked GEMM, 假设 3·T² 元素能同时放进 cache</span>
+<span class="kw">for</span> i0 <span class="kw">in</span> 0..N <span class="kw">step</span> T:              <span class="cm"># 遍历 C 的行块</span>
+    <span class="kw">for</span> j0 <span class="kw">in</span> 0..N <span class="kw">step</span> T:          <span class="cm"># 遍历 C 的列块</span>
+        C_tile = 0                       <span class="cm"># T×T 累加器（寄存器 / shared mem）</span>
+        <span class="kw">for</span> k0 <span class="kw">in</span> 0..N <span class="kw">step</span> T:      <span class="cm"># 沿 K 方向扫块</span>
+            <span class="cm"># —— 一次性把两个输入 tile 搬进 fast storage ——</span>
+            A_tile = A[i0:i0+T, k0:k0+T]
+            B_tile = B[k0:k0+T, j0:j0+T]
+            <span class="cm"># —— tile 内做稠密小 GEMM（在 cache 里，零 DRAM 访问）——</span>
+            <span class="kw">for</span> i <span class="kw">in</span> 0..T:
+                <span class="kw">for</span> j <span class="kw">in</span> 0..T:
+                    <span class="kw">for</span> k <span class="kw">in</span> 0..T:
+                        C_tile[i, j] += A_tile[i, k] * B_tile[k, j]
+        C[i0:i0+T, j0:j0+T] = C_tile     <span class="cm"># 一次写回</span></pre>
+  <p>关键差异：每对 <code>A_tile</code>、<code>B_tile</code> 只从 DRAM 加载 <strong>一次</strong>，在 tile 内被复用 $T$ 次——AI 从 $1/b$ 放大到 $T/b$。</p>
+
+  <h3>4. cache 容量约束</h3>
+  <p>三个 tile 同时在 cache：$3T^2 b \le M$，故</p>
+  <div class="eq">
+    $$T_{\max} \;=\; \sqrt{\frac{M}{3b}}, \qquad \text{AI}_{\max} \;=\; \sqrt{\frac{M}{3b^{3}}}$$
+  </div>
+  <p><strong>要 AI 翻倍，cache 必须变 4 倍。</strong></p>
+
+  <hr>
+
+  <h2>二、任意形状 tile <span class="tag">generalized</span></h2>
+
+  <p>一般 GEMM：$C\,(M{\times}N)\mathrel{+}= A\,(M{\times}K)\cdot B\,(K{\times}N)$，tile 尺寸 $M_t \times N_t$（$C$ 块）、$M_t \times K_t$（$A$ 块）、$K_t \times N_t$（$B$ 块）。</p>
+
+  <h3>1. 核心公式</h3>
+  <p>算一个 $M_t \times N_t$ 的 $C$ tile：</p>
+  <table>
+    <thead><tr><th>项</th><th>量（元素）</th></tr></thead>
+    <tbody>
+      <tr><td>FLOPs</td><td>$2\, M_t N_t K$</td></tr>
+      <tr><td>读 $A$</td><td>$(K/K_t)\cdot M_t K_t = M_t K$</td></tr>
+      <tr><td>读 $B$</td><td>$(K/K_t)\cdot K_t N_t = K N_t$</td></tr>
+      <tr><td>写 $C$</td><td>$M_t N_t$（一次，大 $K$ 可忽略）</td></tr>
+    </tbody>
+  </table>
+  <div class="eq">
+    $$\boxed{\;\text{AI} \;=\; \frac{2 M_t N_t K}{(M_t + N_t)\, K \cdot b} \;=\; \frac{2}{b} \cdot \frac{M_t N_t}{M_t + N_t} \;=\; \frac{H(M_t, N_t)}{b}\;}$$
+  </div>
+  <p>其中 $H(M_t, N_t) \;=\; \dfrac{2 M_t N_t}{M_t + N_t}$ 是 <strong>调和平均</strong>。</p>
+
+  <h3>2. Takeaway 1：AI 由较短边主导</h3>
+  <p>调和平均性质——被短板拉死。直观理解：$A$ 每个元素复用 $N_t$ 次，$B$ 每个元素复用 $M_t$ 次。</p>
+  <table>
+    <thead><tr><th>$M_t \times N_t$</th><th>$H(M_t, N_t)$</th><th>解释</th></tr></thead>
+    <tbody>
+      <tr><td>$128 \times 128$</td><td><strong>128</strong></td><td>方阵基准</td></tr>
+      <tr><td>$256 \times 64$</td><td>$102$</td><td>元素个数 $\times 1$，AI 降到 80%</td></tr>
+      <tr><td>$512 \times 32$</td><td>$60$</td><td>元素个数 $\times 1$，AI 只剩 47%</td></tr>
+      <tr><td>$1024 \times 16$</td><td>$31.5$</td><td>接近 $2 N_t$</td></tr>
+      <tr><td>$M_t \to \infty,\; N_t$ 固定</td><td>$2 N_t$</td><td>极限等于短边两倍</td></tr>
+      <tr><td>$1 \times N_t$（GEMV）</td><td>$\approx 2$</td><td>常数，算力发挥不出</td></tr>
+    </tbody>
+  </table>
+  <div class="highlight">
+    这就是 <strong>GEMV、skinny GEMM、LLM decode 阶段 $Q\cdot K^\top$</strong>（当一侧很小）变 memory-bound 的根源。
+  </div>
+
+  <h3>3. Takeaway 2：$K_t$ 在渐近 AI 中消掉（仅限单层 blocking）</h3>
+  <ul>
+    <li>$K_t$ 只是 $K$ 循环的切片，不改变 $A$、$B$ 的复用倍数（仍是 $N_t$、$M_t$）。</li>
+    <li>$K_t$ 实际影响：working set $= M_t K_t + K_t N_t + M_t N_t$，流水线深度，accumulator 初始化摊销。</li>
+    <li>工程选型：够 Tensor Core 指令宽度（HMMA $k{=}16$、WGMMA $k{=}16/32$）加一点流水化即可，不追求大。</li>
+    <li><strong>注意</strong>：放开"tile 间无复用"假设后，$K_t$ 会通过 cache 预算间接影响 AI —— 详见 <em>Section 三</em>。</li>
+  </ul>
+
+  <h3>4. cache 预算下的最优形状</h3>
+  <p>固定 $K_t$，约束 $M_t N_t + K_t (M_t + N_t) \le M/b$，最大化 $H(M_t, N_t)$：</p>
+  <div class="eq">
+    $$\arg\max_{M_t,\,N_t} H(M_t, N_t)\ \Longrightarrow\ M_t = N_t,\quad M_t \approx \sqrt{M/b} - K_t$$
+  </div>
+  <p><strong>在容量预算内，越接近正方形 AI 越高。</strong>这也是用方阵推导就能说明问题的根因。</p>
+
+  <h3>5. 两种退化极端：行条 / 列条 tile</h3>
+  <p>$M_t$ 或 $N_t$ 退化到 1 的两种边界——对应 $H(1, N) \to 2$ 和 $H(M, 1) \to 2$，AI 都落到 $2/b$。它们是 Berkeley slide 里 "naive" 给出 $q \approx 2$ 的本质——隐式把 tile 设成了行条或列条，比 $1{\times}1$ 多了一维复用。</p>
+
+  <p class="caption">$M_t = 1,\ N_t = N$（行条）：A 的第 $i$ 行加载一次、被 $N$ 次复用：</p>
+<pre class="code"><span class="cm"># 行条 tile: 一次扫完 C 的一整行, A 行在 cache 里被复用 N 次</span>
+<span class="kw">for</span> i <span class="kw">in</span> 0..M:
+    <span class="cm"># 把 A[i, :] (K 个元素) 搬进 fast storage, 整个 j 循环都用它</span>
+    <span class="kw">for</span> j <span class="kw">in</span> 0..N:                     <span class="cm"># 扫 C 的整行</span>
+        acc = 0                             <span class="cm"># C[i, j] 在寄存器</span>
+        <span class="kw">for</span> k <span class="kw">in</span> 0..K:
+            acc += A[i, k] * B[k, j]        <span class="cm"># A[i,k] 从 cache, B[k,j] 从 DRAM</span>
+        C[i, j] = acc</pre>
+  <p>访存：读 A 用 $M K$（每行一次），读 B 用 $M N K$（跨 $i$ 无复用），FLOPs $2 M N K$：</p>
+  <div class="eq">
+    $$\text{AI}_{\text{row-strip}} \;=\; \frac{2 M N K}{(M K + M N K)\, b} \;\xrightarrow{N \to \infty}\; \frac{2}{b}$$
+  </div>
+
+  <p class="caption">$M_t = M,\ N_t = 1$（列条）：对称情形，B 的第 $j$ 列被 $M$ 次复用：</p>
+<pre class="code"><span class="cm"># 列条 tile: 一次扫完 C 的一整列, B 列在 cache 里被复用 M 次</span>
+<span class="kw">for</span> j <span class="kw">in</span> 0..N:
+    <span class="cm"># 把 B[:, j] (K 个元素) 搬进 fast storage, 整个 i 循环都用它</span>
+    <span class="kw">for</span> i <span class="kw">in</span> 0..M:                     <span class="cm"># 扫 C 的整列</span>
+        acc = 0
+        <span class="kw">for</span> k <span class="kw">in</span> 0..K:
+            acc += A[i, k] * B[k, j]        <span class="cm"># B[k,j] 从 cache, A[i,k] 从 DRAM</span>
+        C[i, j] = acc</pre>
+  <p>访存对称：读 B 用 $N K$，读 A 用 $M N K$，FLOPs $2 M N K$：</p>
+  <div class="eq">
+    $$\text{AI}_{\text{col-strip}} \;=\; \frac{2 M N K}{(N K + M N K)\, b} \;\xrightarrow{M \to \infty}\; \frac{2}{b}$$
+  </div>
+
+  <p>要把 AI 从 $2/b$ 再往上推，就必须 <strong>同时</strong> 复用 $A$ 和 $B$ —— 即 $M_t, N_t$ 都大于 1 的方形 tile，这就回到了 Section 1.3 的分块 GEMM，AI 可以放大到 $T/b$。</p>
+
+  <hr>
+
+  <h2>三、2 级 blocking 与跨 tile 复用</h2>
+
+  <p>Section 一、二 只看了"一个 tile 独立从 DRAM 取数据"的最保守情形。真实硬件是多级 cache（HBM ↔ L2 ↔ SMEM ↔ 寄存器），相邻 C tile 之间会自动跨级复用。放开"tile 间无复用"假设后，$K_t$ 会通过 cache 预算间接回到 AI 公式里。</p>
+
+  <h3>1. 跨 tile 的可复用数据总量 —— 与 $K_t$ 无关</h3>
+  <p>处理 $C[0, j_1]$ 和 $C[0, j_2]$ 时，都需要 $A$ 的第 0 行块全部 $K$ 列 —— 即 $M_t \times K$ 个元素。切成 $K/K_t$ 个 $M_t \times K_t$ 小块还是整条一次加载，<strong>共享量始终是 $M_t K$</strong>。$K_t$ 只决定分块粒度，不决定复用潜力。B 端对称：$C[i_1, 0]$ 和 $C[i_2, 0]$ 共享 $N_t K$ 元素。</p>
+
+  <h3>2. 两层 tile 结构</h3>
+  <table>
+    <thead><tr><th>层级</th><th>tile</th><th>容量</th><th>带宽</th><th>决定什么</th></tr></thead>
+    <tbody>
+      <tr><td>外层（DRAM ↔ L2）</td><td>$M_o \times N_o \times K$</td><td>$M_{L2}$（~几十 MB）</td><td>$BW_{\text{DRAM}}$</td><td>DRAM 流量、跨 CTA 复用</td></tr>
+      <tr><td>内层（L2 ↔ SMEM / 寄存器）</td><td>$M_t \times N_t \times K_t$</td><td>SMEM（~200 KB）+ 寄存器</td><td>$BW_{L2}$</td><td>CTA 内部复用、L2 流量</td></tr>
+    </tbody>
+  </table>
+  <p>每一层各自有 $H$ 型的 AI：</p>
+  <div class="eq">
+    $$\text{AI}_{\text{outer}} = \frac{H(M_o, N_o)}{b}, \qquad \text{AI}_{\text{inner}} = \frac{H(M_t, N_t)}{b}$$
+  </div>
+
+  <h3>3. 多级 Roofline：有效吞吐由最慢一层决定</h3>
+  <p>算力峰值 $P$ 要同时被两层 cache 的带宽喂饱：</p>
+  <div class="eq">
+    $$\text{Throughput}_{\text{eff}} = \min\!\left(P,\; BW_{\text{DRAM}} \cdot \text{AI}_{\text{outer}},\; BW_{L2} \cdot \text{AI}_{\text{inner}}\right)$$
+  </div>
+  <p>想让算力不被任何一层卡死，需要</p>
+  <div class="eq">
+    $$\text{AI}_{\text{outer}} \;\ge\; \frac{P}{BW_{\text{DRAM}}}, \qquad \text{AI}_{\text{inner}} \;\ge\; \frac{P}{BW_{L2}}$$
+  </div>
+  <p>两个不等式各自决定该层 tile 至少多大。</p>
+
+  <h3>4. 两种带宽比例下的 tile 选型</h3>
+
+  <p><strong>Case A：$BW_{L2} \approx BW_{\text{DRAM}}$</strong>（L2 近乎没用，或内外层带宽接近）</p>
+  <p>两层对 AI 的要求一样大：$H(M_t, N_t) \approx H(M_o, N_o)$，也就是 <strong>$M_t$ 必须和 $M_o$ 同量级</strong>。内层 tile 已经要做到和外层一样大，2 级 blocking <em>退化</em> 成单层——分两层没带宽收益。</p>
+
+  <p><strong>Case B：$BW_{L2} = 10 \times BW_{\text{DRAM}}$</strong>（典型 GPU：Hopper L2 对 HBM 约 $5\times\!\sim\!20\times$）</p>
+  <p>内层只需满足</p>
+  <div class="eq">
+    $$\text{AI}_{\text{inner}} \;\ge\; \frac{P}{BW_{L2}} \;=\; \frac{1}{10}\cdot\frac{P}{BW_{\text{DRAM}}}$$
+  </div>
+  <p>即 $H(M_t, N_t) \gtrsim \tfrac{1}{10} H(M_o, N_o)$。方形近似下 <strong>$M_t \approx M_o / 10$</strong> 就够了。</p>
+  <p>这正是 GPU CTA tile（$128\times 128$）+ cluster / pipeline stage 级别大 panel 这种配置的根据：内外两层带宽差拉开后，内层 tile 可以缩小很多，换来更高 occupancy 和更灵活的调度，而不牺牲整机算力。</p>
+
+  <p>数值对比（$P = 1000$ TFLOPS，FP16 $b=2$，方形最优）：</p>
+  <table>
+    <thead><tr><th>情形</th><th>$BW_{\text{DRAM}}$</th><th>$BW_{L2}$</th><th>所需 $M_o$</th><th>所需 $M_t$</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td>Case A（同速）</td><td>3 TB/s</td><td>3 TB/s</td><td>$\gtrsim 333$</td><td>$\gtrsim 333$</td><td>分两层无意义</td></tr>
+      <tr><td>Case B（L2 10×）</td><td>3 TB/s</td><td>30 TB/s</td><td>$\gtrsim 333$</td><td>$\gtrsim 33$</td><td>内层可缩 10 倍</td></tr>
+    </tbody>
+  </table>
+  <p><strong>L2 越快，内层 tile 可以越小，2 级 blocking 才有收益</strong>。这是为什么 CPU 上多级 cache 能帮到 GEMM（L1 可能 30–50× DRAM）、而移动端或弱 cache 层级的架构常常只做单层就够了。</p>
+
+  <h3>5. $K_t$ 通过 cache 预算间接影响 $M_o \cdot N_o$</h3>
+  <p>外层 tile 的 working set 占 L2：</p>
+  <div class="eq">
+    $$\underbrace{M_o K_t}_{\text{A slab}} + \underbrace{K_t N_o}_{\text{B slab}} + \underbrace{M_o N_o}_{\text{C accum}} \;\le\; M_{L2}$$
+  </div>
+  <p>固定 $M_{L2}$，$K_t$ 越大，留给 $M_o N_o$ 的预算越小。在 $M_o = N_o$ 的最优下：</p>
+  <div class="eq">
+    $$M_o \;\approx\; \sqrt{M_{L2}} - K_t, \qquad \text{AI}_{\text{DRAM}} \;\approx\; \frac{\sqrt{M_{L2}} - K_t}{b}$$
+  </div>
+  <p>所以 <strong>$K_t$ 小 → 外层 tile 可以做大 → 跨 tile 复用更多 → DRAM AI 更高</strong>。</p>
+
+  <h3>6. 数值直观（FP16，$M_{L2} = 40\text{M elem}$）</h3>
+  <table>
+    <thead><tr><th>$K_t$</th><th>$M_o = N_o$ 上限</th><th>$\text{AI}_{\text{DRAM}}$</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>16</td><td>~6300</td><td>~3150</td><td>$K_t$ 占 cache 可忽略</td></tr>
+      <tr><td>256</td><td>~6000</td><td>~3000</td><td>几乎无影响</td></tr>
+      <tr><td>4096</td><td>~2000</td><td>~1000</td><td>$K_t$ 吃掉半个 L2</td></tr>
+      <tr><td>40000</td><td>~0</td><td>—</td><td>塞不下</td></tr>
+    </tbody>
+  </table>
+
+  <h3>7. 什么时候 $K_t$ 真的影响 AI</h3>
+  <table>
+    <thead><tr><th>场景</th><th>$K_t$ 影响 AI？</th></tr></thead>
+    <tbody>
+      <tr><td>单层 blocking（只看 SMEM），无跨 tile 复用</td><td>❌ 不影响（Section 二的结论）</td></tr>
+      <tr><td>2 级 blocking，$K_t \ll \sqrt{M_{L2}}$</td><td>❌ 几乎不影响</td></tr>
+      <tr><td>2 级 blocking，$K_t$ 占 cache 显著比例</td><td>✅ 压缩外层 tile，降低 DRAM AI</td></tr>
+      <tr><td>Split-K（$K$ 拆给多 CTA 再规约）</td><td>✅ 引入 $O(K_t M_t N_t)$ 额外 C 写回 + 规约读</td></tr>
+      <tr><td>$K_t$ 小于 Tensor Core 指令宽度（如 $<16$）</td><td>✅ 指令稀疏，实际带宽打折</td></tr>
+    </tbody>
+  </table>
+  <p><strong>修正 Section 2.3 的说法</strong>："$K_t$ 在渐近 AI 中消掉"严格只对单层 blocking 成立。2 级 blocking 下，$K_t$ 不改变"可复用数据总量"（$M_o K$），但改变"这些数据能否真的留在 cache 里被复用"。</p>
+
+  <hr>
+
+  <h2>四、实战中非方形的典型情形</h2>
+  <table>
+    <thead><tr><th>场景</th><th>常见 $M_t \times N_t$</th><th>为什么不方</th></tr></thead>
+    <tbody>
+      <tr><td>Tensor Core 原子</td><td>$16{\times}8$, $32{\times}8$, $16{\times}16$</td><td>硬件指令强制，上层再拼方</td></tr>
+      <tr><td>CUTLASS warp tile</td><td>$64{\times}64$, $128{\times}64$</td><td>寄存器 + MMA 排布约束</td></tr>
+      <tr><td>CUTLASS CTA tile</td><td>$128{\times}128$, $256{\times}128$</td><td>shared mem 预算 + occupancy</td></tr>
+      <tr><td>Batched GEMM / MoE</td><td>$M_t$ 被 batch 锁死</td><td>单 matmul 的 $M$ 天生小</td></tr>
+      <tr><td>LLM decode（GEMV）</td><td>$M_t = 1{\sim}4$</td><td>必然 memory-bound，需 FlashDecoding 拼 $M$</td></tr>
+      <tr><td>Flash-Attention</td><td>$B_r \times B_c$</td><td>同样要方形化才能兼顾带宽与算力</td></tr>
+    </tbody>
+  </table>
+
+  <hr>
+
+  <h2>五、数值对照（FP16，$b = 2$）</h2>
+  <table>
+    <thead>
+      <tr><th>$M_t \times N_t \times K_t$</th><th>工作集</th><th>AI (FLOP/byte)</th><th>相对方阵</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>$128 \times 128 \times 16$</td><td>$\sim 41$ KB</td><td><strong>64</strong></td><td>100%</td></tr>
+      <tr><td>$256 \times 64 \times 16$</td><td>$\sim 42$ KB</td><td>$51$</td><td>80%</td></tr>
+      <tr><td>$64 \times 64 \times 16$</td><td>$\sim 12$ KB</td><td>$32$</td><td>50%</td></tr>
+      <tr><td>$64 \times 64 \times 64$</td><td>$\sim 24$ KB</td><td>$32$</td><td>50%（$K_t$ 加倍 AI 不变）</td></tr>
+      <tr><td>$1 \times 128 \times 16$</td><td>$\sim 4$ KB</td><td>$\approx 2$</td><td>3%（GEMV）</td></tr>
+    </tbody>
+  </table>
+
+  <hr>
+
+  <h2>六、调度算法与 tile 选型（工程实务）</h2>
+
+  <p>前面讨论的都是 "tile 的形状如何影响 AI"；现在讨论"<strong>怎么把 CTA 铺到这些 tile 上</strong>"，以及 $K_t$ 和 L2 在工程里实际怎么处理。</p>
+
+  <h3>1. 调度：把 CTA 铺到工作上</h3>
+
+  <p>核心矛盾：当 $M \cdot N$ 小到 tile 数 $\lt$ SM 数时，默认的 Data-Parallel 调度会让大量 SM 闲置。下表按递进思路排列：</p>
+
+  <table>
+    <thead><tr><th>算法</th><th>核心思想</th><th>适用</th><th>代价</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Data-Parallel</strong></td><td>1 CTA = 1 C tile，$K$ 在 CTA 内串起累加</td><td>$MN$ 大，tile 数 $\ge$ SM 数</td><td>无</td></tr>
+      <tr><td><strong>Split-K</strong></td><td>$K$ 切 $S$ 段，$S$ 个 CTA 并行算同一 C tile 的部分和；atomic 或 workspace 规约</td><td>$MN$ 小 / $K$ 大（GEMV、skinny）</td><td>$2 S M_t N_t$ 额外 C 流量</td></tr>
+      <tr><td><strong>Stream-K</strong></td><td>把总计算 $2MNK$ 按 SM 数均分，每 CTA 处理连续"输出 work"，可跨 C tile 边界；fix-up 合并边界部分和</td><td>任意形状，尤其 tile 数不是 SM 数整数倍时</td><td>边界 fix-up（比 Split-K 少）</td></tr>
+      <tr><td><strong>Persistent kernel</strong></td><td>launch 数 $=$ SM 数的 CTA，每个从 work queue 拉 tile</td><td>batched / MoE、多个小 GEMM</td><td>调度复杂度</td></tr>
+      <tr><td><strong>Threadblock Swizzle</strong></td><td>改 C tile $\to$ CTA 映射顺序（group raster / Hilbert）让相邻 CTA 共享 L2 面板</td><td>任何 GEMM，组合使用</td><td>免费</td></tr>
+      <tr><td><strong>Cluster + TMA</strong></td><td>$n$ 个 CTA 组成 cluster，通过 DSMEM 共享 tile；TMA 从 L2 直接到 SMEM</td><td>Hopper+</td><td>需 SM_90+</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>Stream-K</strong>（Osama et al., CUTLASS 2023）是"取代 Split-K"的现代方案——Split-K 仍保留 tile 边界、切法手选 $S$；Stream-K 完全按 SM 数均分计算量。当前 CUTLASS / cuBLAS 的主力组合是 <strong>Stream-K + Persistent + Cluster</strong>。</p>
+
+  <p class="caption">选型决策树：</p>
+<pre class="code">tile 数 (M/Mt)·(N/Nt) &gt;= SM 数?
+├─ 是 → Data-Parallel + Swizzle (+ Cluster TMA 更快)
+└─ 否 → tile 数不足以填满 GPU
+    ├─ K 大 → Split-K (简单) 或 <span class="kw">Stream-K</span> (推荐)
+    ├─ 多个小 GEMM 串 → Persistent + work queue (grouped GEMM)
+    └─ batch 维可拼 → batched GEMM / FlashDecoding 把 M 撑起来</pre>
+
+  <h3>2. $K_t$ 在实战里是怎么定的</h3>
+
+  <p>$K_t$ 受三层约束夹紧，按由硬到软的顺序：</p>
+
+  <table>
+    <thead><tr><th>约束</th><th>典型值</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>(a) Tensor Core 原子宽度</td><td>FP16: $k{=}16$、FP8: $k{=}32$</td><td>$K_t$ 必须是原子宽度的整数倍，否则 MMA 指令发不出去</td></tr>
+      <tr><td>(b) Pipeline stages（多缓冲）</td><td>3–6 stages</td><td>隐藏 global $\to$ shared 的 async load 延迟；$K_t \approx \text{atom} \times \text{stages}$</td></tr>
+      <tr><td>(c) SMEM 预算</td><td>Ampere 164 KB、Hopper 228 KB per SM</td><td>$\text{stages} \cdot (M_t + N_t) \cdot K_t \cdot b \le \text{SMEM}$</td></tr>
+      <tr><td>(d) 寄存器预算</td><td>~64 KB per SM</td><td>累加器 $M_t N_t$ 为主，反过来约束 $M_t N_t$</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>CUTLASS / cuBLAS 的典型落点</strong>：</p>
+
+  <table>
+    <thead><tr><th>架构</th><th>数据类型</th><th>CTA tile $M_t \times N_t \times K_t$</th><th>stages</th></tr></thead>
+    <tbody>
+      <tr><td>Ampere (SM_80)</td><td>FP16 / BF16</td><td>$128 \times 128 \times 32$</td><td>3–4</td></tr>
+      <tr><td>Hopper (SM_90)</td><td>FP16 / BF16</td><td>$128 \times 128 \times 64$ 或 $128 \times 256 \times 64$</td><td>4–6</td></tr>
+      <tr><td>Hopper</td><td>FP8</td><td>$128 \times 128 \times 128$</td><td>4–6</td></tr>
+      <tr><td>Blackwell (SM_100)</td><td>FP16 / FP8</td><td>$128 \times 256 \times 64$（常配 2-CTA cluster）</td><td>6+</td></tr>
+    </tbody>
+  </table>
+
+  <p>"甜点"经验：<strong>$K_t$ 要够塞满 MMA 流水线（atom × stages），又不至于把 SMEM 挤到放不下多 stage</strong>。Hopper 上 FP16 的 $K_t{=}64$、FP8 的 $K_t{=}128$ 是绝大多数 kernel 的起点。</p>
+
+  <h3>3. L2 cache 在实战里是怎么考虑的</h3>
+
+  <p>真实 GEMM 库不把 L2 当黑盒；三个层面的优化让 L2 中的 A/B 面板最大限度被跨 CTA 复用。</p>
+
+  <h4 style="margin-top: 1rem; font-size: 1rem; color: var(--muted);">(a) Threadblock Swizzling——L2 的首要优化手段</h4>
+
+  <p>默认 row-major 的 CTA 编号会让"调度上相邻的 CTA"跨得很远（典型 $\Delta_i{=}0, \Delta_j{=}1$，两个 CTA 共享一条 A 行但要求完全不同的 B 列）。<strong>改成以 $g \times g$ 小方块为调度单位（group raster）</strong>：$g^2$ 个 CTA 共享同一条 A 的 $g$ 行 + 同一条 B 的 $g$ 列，L2 中的 A/B 块能被 $g$ 次复用。</p>
+
+  <p>CUTLASS 的 <code>ThreadblockSwizzle</code> 选项：</p>
+  <ul>
+    <li><code>IdentitySwizzle</code>：row-major，无 L2 优化</li>
+    <li><code>GemmIdentityThreadblockSwizzle&lt;log_tile&gt;</code>：group raster，$g = 2^{\text{log\_tile}}$，典型 $g{=}4$ 或 $8$</li>
+    <li>Hilbert / Morton swizzle：更精细的空间局部性，实测比 group raster 只高一两个百分点，很少用</li>
+  </ul>
+
+  <p>实测：$g = 8$ group raster 能把 L2 对 A/B 的命中率从 ~50% 拉到 ~90%，对应 DRAM 带宽压力减半。</p>
+
+  <h4 style="margin-top: 1rem; font-size: 1rem; color: var(--muted);">(b) 硬件级 L2 控制</h4>
+
+  <ul>
+    <li><strong>Ampere+ persisting access</strong>：<code>cudaAccessPolicyWindow</code> 把某段地址标为 persisting，提高 L2 留存优先级（典型用于 weights）</li>
+    <li><strong>Hopper TMA</strong>：Tensor Memory Accelerator 从 L2 直接搬 2D/3D tile 到 SMEM，路径绕开 L1，释放 L1 带宽给其他 kernel 用</li>
+    <li><strong>Hopper Cluster + DSMEM</strong>：$n$ 个 CTA 组成 cluster 通过 DSMEM 共享同一份 A 或 B 面板 —— 把"L2 跨 CTA 复用"升级成"cluster 内 SMEM 多播"，少一级 cache</li>
+  </ul>
+
+  <h4 style="margin-top: 1rem; font-size: 1rem; color: var(--muted);">(c) 选 $M_o, N_o$（swizzle group 大小）时拟合 L2</h4>
+
+  <p>经验法则：外层 tile 的 A + B 面板占 L2 约半，剩下给 C accumulator、驱逐缓冲和其他 kernel 碎数据：</p>
+  <div class="eq">
+    $$K \cdot (M_o + N_o) \cdot b \;\lesssim\; 0.5 \cdot M_{L2}$$
+  </div>
+
+  <p>H100 的 L2 $\approx 50$ MB，FP16 $b=2$。$K = 4096$ 时 $(M_o + N_o) \lesssim 3000$，取 $M_o = N_o = 1500$，对应约 $12 \times 12$ 个 $128\times 128$ CTA tile 的 swizzle group。Stream-K 会自动调到接近这个尺寸。</p>
+
+  <h3>4. 一条汇总经验</h3>
+
+  <ul>
+    <li><strong>$K_t$</strong>：硬件指令宽度 × 几个 pipeline stage，受 SMEM 限制。实战靠穷举选最佳 = atom × {2, 3, 4, 6, 8} 里找。</li>
+    <li><strong>$M_t, N_t$</strong>：方形优先；受寄存器文件限制（$M_t N_t$ 是累加器大小）；Hopper 上 $128 \times 128$ 或 $128 \times 256$。</li>
+    <li><strong>$M_o, N_o$（outer / swizzle group）</strong>：拟合 L2 的一半容量；优先靠 group raster 或 Stream-K 自动逼近。</li>
+    <li><strong>调度</strong>：默认 DP；tile 数 $\lt$ SM 数时切 Stream-K；小 batched 走 Persistent；Hopper+ 叠 Cluster。</li>
+  </ul>
+
+  <hr>
+
+  <h2>TL;DR</h2>
+  <ul>
+    <li>方阵 tile：$\text{AI} = T / b$，随 $T$ 线性增长，受 cache 容量的平方根限制。</li>
+    <li>任意形状：$\text{AI} = H(M_t, N_t) / b$，<strong>由较小的那一维主导</strong>。</li>
+    <li>$K_t$ 不进入单层 blocking 的渐近 AI；2 级 blocking 下通过 cache 预算间接影响 $M_o \cdot N_o$。</li>
+    <li>两级 Roofline：$BW_{L2}$ 越高于 $BW_\text{DRAM}$，内层 $M_t$ 可以越小于外层 $M_o$（$10\times$ 带宽差 $\Rightarrow$ $M_t \approx M_o/10$）。</li>
+    <li>cache 预算内，<strong>越接近正方形 AI 越高</strong>。</li>
+    <li>$MN$ 小到 tile 数 $\lt$ SM 数时必须切 $K$ 维：<strong>Stream-K &gt; Split-K</strong>，辅以 Persistent / Cluster 调度。</li>
+    <li>工程选型：$K_t$ = MMA atom × 3–6 stages；$M_t \times N_t$ 方形优先受寄存器约束；$M_o \times N_o$（swizzle group）拟合 $\sim 0.5 \cdot M_{L2}$。</li>
+    <li>任何一侧被问题固有地压小（GEMV、batched MoE、LLM decode），都会从根本上变 memory-bound——这是算法层面（拼 $M$、FlashDecoding）而非 kernel 层面的问题。</li>
+  </ul>
+
+</div>
+
+<script type="text/markdown" id="md-source"># GEMM 计算/访存比（Arithmetic Intensity）分析
+
+> 方阵基线 → 零复用下界 → 分块 → 任意形状 tile → 2 级 blocking
+
+元素字节数记作 $b$（FP32: $b=4$；FP16/BF16: $b=2$；FP8: $b=1$）。
+
+> 📌 **建模前提**：Section 一、二 采用**单层 blocking** 模型——每个输出 tile 的输入 A/B 都假设从 DRAM 独立加载，不考虑相邻 C tile 之间通过 cache 产生的复用。Section 三 放开这个假设，用 2 级 blocking（DRAM ↔ L2 ↔ SMEM）重新审视，$K_t$ 会通过 cache 预算间接入场。
+
+---
+
+## 一、方阵基线（$N \times N$）
+
+$C = A \cdot B$，三者都是 $N \times N$。总 FLOPs $= 2N^3$（每个 $C$ 元素 $N$ 次乘加）。
+
+### 1. 理论下界（完美复用）
+
+每个输入 / 输出元素只从主存进出一次，总访存 $3N^2$ 元素：
+
+$$\text{AI}_{\text{ideal}} = \frac{2N^3}{3N^2 \cdot b} = \frac{2N}{3b}\ \text{FLOP/byte}$$
+
+**随 $N$ 线性增长**。FP32、$N = 4096$ 时 $\approx 683$ FLOP/byte —— 远超 H100（$\approx 7$）、B200（$\approx 20$）的平衡点，所以大 GEMM 理论上是 compute-bound。
+
+### 2. 完全无复用（naive 三重循环）
+
+假设 $C$ 在寄存器里累加，每次 FMA 只需 load $A$、load $B$ 两个元素：
+
+$$\text{AI}_{\text{no-reuse}} = \frac{2\ \text{FLOP}}{2b\ \text{byte}} = \frac{1}{b}\ \text{FLOP/byte}$$
+
+**与 $N$ 无关的常数。** FP32 下仅 $0.25$ FLOP/byte —— 彻底 memory-bound，H100 只能发挥不到 4% 峰值。
+
+朴素三重循环伪代码：
+
+```text
+# Naive GEMM: C = A · B, 三者均为 N×N
+for i in 0..N:
+    for j in 0..N:
+        acc = 0
+        for k in 0..N:
+            acc += A[i, k] * B[k, j]     # 每次迭代 2 loads + 2 FLOPs
+        C[i, j] = acc                    # C 全程留在寄存器
+```
+
+内层每次 FMA 都从 DRAM 拉 `A[i,k]` 和 `B[k,j]`，没有任何跨迭代复用，故 $\text{AI} = 1/b$。
+
+### 3. 分块（块大小 $T \times T$，cache 零延迟）
+
+一个 $T \times T$ 的 $C$ 块沿 $k$ 方向扫过 $N/T$ 次：
+
+- FLOPs: $(N/T) \cdot 2T^3 = 2NT^2$
+- 主存访问：$A$ tiles $NT$，$B$ tiles $NT$，$C$ 写回 $T^2$（大 $N$ 可忽略）
+
+$$\text{AI}_{\text{blocked}} = \frac{2NT^2}{2NT \cdot b} = \frac{T}{b}\ \text{FLOP/byte}$$
+
+总访存 $= 2N^3/T$，即 Hong–Kung 下界 $\Omega(N^3/\sqrt{M})$ 的具象形式。
+
+分块 GEMM 伪代码（方形 tile，$T \times T$）：
+
+```text
+# Blocked GEMM, 假设 3·T² 元素能同时放进 cache
+for i0 in 0..N step T:              # 遍历 C 的行块
+    for j0 in 0..N step T:          # 遍历 C 的列块
+        C_tile = 0                  # T×T 累加器（寄存器 / shared mem）
+        for k0 in 0..N step T:      # 沿 K 方向扫块
+            # —— 一次性把两个输入 tile 搬进 fast storage ——
+            A_tile = A[i0:i0+T, k0:k0+T]
+            B_tile = B[k0:k0+T, j0:j0+T]
+            # —— tile 内做稠密小 GEMM（在 cache 里，零 DRAM 访问）——
+            for i in 0..T:
+                for j in 0..T:
+                    for k in 0..T:
+                        C_tile[i, j] += A_tile[i, k] * B_tile[k, j]
+        C[i0:i0+T, j0:j0+T] = C_tile  # 一次写回
+```
+
+关键差异：每对 `A_tile`、`B_tile` 只从 DRAM 加载 **一次**，在 tile 内被复用 $T$ 次 —— AI 从 $1/b$ 放大到 $T/b$。
+
+### 4. cache 容量约束
+
+三个 tile 同时在 cache：$3T^2 b \le M$，故
+
+$$T_{\max} = \sqrt{\frac{M}{3b}}, \qquad \text{AI}_{\max} = \sqrt{\frac{M}{3b^{3}}}$$
+
+**要 AI 翻倍，cache 必须变 4 倍。**
+
+---
+
+## 二、任意形状 tile
+
+一般 GEMM：$C\,(M{\times}N)\mathrel{+}= A\,(M{\times}K)\cdot B\,(K{\times}N)$，tile 尺寸 $M_t \times N_t$（$C$ 块）、$M_t \times K_t$（$A$ 块）、$K_t \times N_t$（$B$ 块）。
+
+### 1. 核心公式
+
+算一个 $M_t \times N_t$ 的 $C$ tile：
+
+| 项 | 量（元素） |
+|---|---|
+| FLOPs | $2\, M_t N_t K$ |
+| 读 $A$ | $M_t K$ |
+| 读 $B$ | $K N_t$ |
+| 写 $C$ | $M_t N_t$（一次，大 $K$ 可忽略） |
+
+$$\boxed{\;\text{AI} = \frac{2 M_t N_t K}{(M_t + N_t) K \cdot b} = \frac{2}{b} \cdot \frac{M_t N_t}{M_t + N_t} = \frac{H(M_t, N_t)}{b}\;}$$
+
+其中 $H(M_t, N_t) = \dfrac{2 M_t N_t}{M_t + N_t}$ 是**调和平均**。
+
+### 2. Takeaway 1：AI 由较短边主导
+
+$A$ 每个元素复用 $N_t$ 次，$B$ 每个元素复用 $M_t$ 次；调和平均被短板拉死。
+
+| $M_t \times N_t$ | $H(M_t, N_t)$ | 解释 |
+|---|---|---|
+| 128 × 128 | **128** | 方阵基准 |
+| 256 × 64 | 102 | 元素个数 ×1，AI 80% |
+| 512 × 32 | 60 | 元素个数 ×1，AI 47% |
+| 1024 × 16 | 31.5 | 接近 $2 N_t$ |
+| $M_t \to \infty$, $N_t$ 固定 | $2 N_t$ | 极限等于短边两倍 |
+| $1 \times N_t$（GEMV） | ≈ 2 | 常数，算力发挥不出 |
+
+> 这就是 GEMV、skinny GEMM、LLM decode 阶段 $Q \cdot K^\top$ 变 memory-bound 的根源。
+
+### 3. Takeaway 2：$K_t$ 在渐近 AI 中消掉（仅限单层 blocking）
+
+- $K_t$ 只切片 $K$ 循环，不改变 $A$、$B$ 的复用倍数（仍是 $N_t$、$M_t$）。
+- $K_t$ 实际影响：working set $= M_t K_t + K_t N_t + M_t N_t$，流水线深度，accumulator 初始化摊销。
+- 工程选型：够 Tensor Core 指令宽度（HMMA $k{=}16$、WGMMA $k{=}16/32$）+ 一点流水化即可，不追求大。
+- **注意**：放开"tile 间无复用"假设后，$K_t$ 会通过 cache 预算间接影响 AI —— 详见 Section 三。
+
+### 4. cache 预算下的最优形状
+
+固定 $K_t$，约束 $M_t N_t + K_t (M_t + N_t) \le M/b$，最大化 $H(M_t, N_t)$：
+
+$$\arg\max_{M_t, N_t} H(M_t, N_t) \Longrightarrow M_t = N_t, \quad M_t \approx \sqrt{M/b} - K_t$$
+
+**在容量预算内，越接近正方形 AI 越高。**
+
+### 5. 两种退化极端：行条 / 列条 tile
+
+$M_t$ 或 $N_t$ 退化到 1 的两种边界——对应 $H(1, N) \to 2$、$H(M, 1) \to 2$，AI 都落到 $2/b$。它们是 Berkeley slide 里 "naive" 给出 $q \approx 2$ 的本质：隐式把 tile 设成了行条或列条，比 $1 \times 1$ 多了一维复用。
+
+$M_t = 1$, $N_t = N$（行条）：A 的第 $i$ 行加载一次、被 $N$ 次复用：
+
+```text
+# 行条 tile: 一次扫完 C 的一整行, A 行在 cache 里被复用 N 次
+for i in 0..M:
+    # 把 A[i, :] (K 个元素) 搬进 fast storage, 整个 j 循环都用它
+    for j in 0..N:                     # 扫 C 的整行
+        acc = 0                        # C[i, j] 在寄存器
+        for k in 0..K:
+            acc += A[i, k] * B[k, j]   # A[i,k] 从 cache, B[k,j] 从 DRAM
+        C[i, j] = acc
+```
+
+访存：读 A 用 $MK$、读 B 用 $MNK$，FLOPs $2MNK$：
+
+$$\text{AI}_{\text{row-strip}} = \frac{2MNK}{(MK + MNK)\, b} \xrightarrow{N \to \infty} \frac{2}{b}$$
+
+$M_t = M$, $N_t = 1$（列条）：对称情形，B 的第 $j$ 列被 $M$ 次复用：
+
+```text
+# 列条 tile: 一次扫完 C 的一整列, B 列在 cache 里被复用 M 次
+for j in 0..N:
+    # 把 B[:, j] (K 个元素) 搬进 fast storage, 整个 i 循环都用它
+    for i in 0..M:                     # 扫 C 的整列
+        acc = 0
+        for k in 0..K:
+            acc += A[i, k] * B[k, j]   # B[k,j] 从 cache, A[i,k] 从 DRAM
+        C[i, j] = acc
+```
+
+$$\text{AI}_{\text{col-strip}} = \frac{2MNK}{(NK + MNK)\, b} \xrightarrow{M \to \infty} \frac{2}{b}$$
+
+要把 AI 从 $2/b$ 再往上推，就必须**同时**复用 $A$ 和 $B$——即 $M_t, N_t$ 都大于 1 的方形 tile，回到 Section 1.3 的分块 GEMM，AI 可以放大到 $T/b$。
+
+---
+
+## 三、2 级 blocking 与跨 tile 复用
+
+Section 一、二 只看了"一个 tile 独立从 DRAM 取数据"的最保守情形。真实硬件是多级 cache（HBM ↔ L2 ↔ SMEM ↔ 寄存器），相邻 C tile 之间会自动跨级复用。放开"tile 间无复用"假设后，$K_t$ 会通过 cache 预算间接回到 AI 公式里。
+
+### 1. 跨 tile 的可复用数据总量 —— 与 $K_t$ 无关
+
+处理 $C[0, j_1]$ 和 $C[0, j_2]$ 时，都需要 $A$ 的第 0 行块全部 $K$ 列——即 $M_t \times K$ 个元素。切成 $K/K_t$ 个 $M_t \times K_t$ 小块还是整条一次加载，**共享量始终是 $M_t K$**。$K_t$ 只决定分块粒度，不决定复用潜力。B 端对称：$C[i_1, 0]$ 和 $C[i_2, 0]$ 共享 $N_t K$ 元素。
+
+### 2. 两层 tile 结构
+
+| 层级 | tile | 容量 | 带宽 | 决定什么 |
+|---|---|---|---|---|
+| 外层 (DRAM ↔ L2)  | $M_o \times N_o \times K$ | $M_{L2}$（几十 MB）| $BW_{\text{DRAM}}$ | DRAM 流量、跨 CTA 复用 |
+| 内层 (L2 ↔ SMEM)   | $M_t \times N_t \times K_t$ | SMEM (~200 KB) + 寄存器 | $BW_{L2}$ | CTA 内部复用、L2 流量 |
+
+$$\text{AI}_{\text{outer}} = \frac{H(M_o, N_o)}{b}, \qquad \text{AI}_{\text{inner}} = \frac{H(M_t, N_t)}{b}$$
+
+### 3. 多级 Roofline：有效吞吐由最慢一层决定
+
+$$\text{Throughput}_{\text{eff}} = \min\!\left(P,\ BW_{\text{DRAM}} \cdot \text{AI}_{\text{outer}},\ BW_{L2} \cdot \text{AI}_{\text{inner}}\right)$$
+
+想让算力不被任何一层卡死：
+
+$$\text{AI}_{\text{outer}} \ge \frac{P}{BW_{\text{DRAM}}}, \qquad \text{AI}_{\text{inner}} \ge \frac{P}{BW_{L2}}$$
+
+### 4. 两种带宽比例下的 tile 选型
+
+**Case A：$BW_{L2} \approx BW_{\text{DRAM}}$**（L2 近乎没有带宽优势）
+
+两层对 AI 的要求一样大：$H(M_t, N_t) \approx H(M_o, N_o)$，即 **$M_t$ 必须和 $M_o$ 同量级**。2 级 blocking 退化成单层——分两层没有带宽收益。
+
+**Case B：$BW_{L2} = 10 \times BW_{\text{DRAM}}$**（典型 GPU，Hopper L2 对 HBM 约 $5\sim20\times$）
+
+内层只需满足 $\text{AI}_{\text{inner}} \ge P / BW_{L2} = 0.1 \cdot P / BW_{\text{DRAM}}$，即
+
+$$H(M_t, N_t) \gtrsim \tfrac{1}{10}\, H(M_o, N_o)$$
+
+方形近似下 **$M_t \approx M_o / 10$** 就够了。这正是 GPU 上 CTA tile $128\times 128$ + cluster / panel 外层这种配置的根据：带宽差拉开后内层可以缩得很小，换来更高 occupancy。
+
+数值对比（$P = 1000$ TFLOPS，FP16 $b=2$）：
+
+| 情形 | $BW_{\text{DRAM}}$ | $BW_{L2}$ | 所需 $M_o$ | 所需 $M_t$ | 结论 |
+|---|---|---|---|---|---|
+| Case A（同速） | 3 TB/s | 3 TB/s  | $\gtrsim 333$ | $\gtrsim 333$ | 分两层无意义 |
+| Case B（L2 10×）| 3 TB/s | 30 TB/s | $\gtrsim 333$ | $\gtrsim 33$ | 内层可缩 10 倍 |
+
+**L2 越快，内层 tile 可以越小，2 级 blocking 才有收益**。CPU 上 L1 对 DRAM 是 30–50×，所以多级 cache 对 GEMM 帮助很大；移动端或 cache 弱的架构常常只需单层。
+
+### 5. $K_t$ 通过 cache 预算间接影响 $M_o \cdot N_o$
+
+外层 tile 的 working set 占 L2：
+
+$$M_o K_t + K_t N_o + M_o N_o \;\le\; M_{L2}$$
+
+固定 $M_{L2}$，$K_t$ 越大，留给 $M_o N_o$ 的预算越小。$M_o = N_o$ 时：
+
+$$M_o \approx \sqrt{M_{L2}} - K_t, \qquad \text{AI}_{\text{DRAM}} \approx \frac{\sqrt{M_{L2}} - K_t}{b}$$
+
+**$K_t$ 小 → 外层 tile 做大 → 跨 tile 复用更多 → DRAM AI 更高**。
+
+### 6. 数值直观（FP16，$M_{L2} = 40\text{M elem}$）
+
+| $K_t$ | $M_o = N_o$ 上限 | $\text{AI}_{\text{DRAM}}$ | 说明 |
+|---|---|---|---|
+| 16    | ~6300 | ~3150 | $K_t$ 占 cache 可忽略 |
+| 256   | ~6000 | ~3000 | 几乎无影响 |
+| 4096  | ~2000 | ~1000 | $K_t$ 吃掉半个 L2 |
+| 40000 | ~0    | —     | 塞不下 |
+
+### 7. 什么时候 $K_t$ 真的影响 AI
+
+| 场景 | $K_t$ 影响 AI？ |
+|---|---|
+| 单层 blocking，无跨 tile 复用 | ❌ 不影响 |
+| 2 级 blocking，$K_t \ll \sqrt{M_{L2}}$ | ❌ 几乎不影响 |
+| 2 级 blocking，$K_t$ 占 cache 显著比例 | ✅ 压缩外层，降低 DRAM AI |
+| Split-K（$K$ 拆给多 CTA 再规约） | ✅ 引入 $O(K_t M_t N_t)$ 额外 C 写/读 |
+| $K_t$ 小于 Tensor Core 宽度（$<16$） | ✅ 指令稀疏，带宽打折 |
+
+**修正 Section 2.3 的说法**：$K_t$ 在渐近 AI 中消掉严格只对单层 blocking 成立。2 级 blocking 下它不改变"可复用数据总量" $M_o K$，但改变"这些数据能否真的留在 cache 里被复用"。
+
+---
+
+## 四、实战中非方形的典型情形
+
+| 场景 | 常见 $M_t \times N_t$ | 为什么不方 |
+|---|---|---|
+| Tensor Core 原子 | 16×8, 32×8, 16×16 | 硬件指令强制，上层再拼方 |
+| CUTLASS warp tile | 64×64, 128×64 | 寄存器 + MMA 排布约束 |
+| CUTLASS CTA tile | 128×128, 256×128 | shared mem 预算 + occupancy |
+| Batched GEMM / MoE | $M_t$ 被 batch 锁死 | 单 matmul 的 $M$ 天生小 |
+| LLM decode（GEMV） | $M_t = 1 \sim 4$ | 必然 memory-bound，需 FlashDecoding 拼 $M$ |
+| Flash-Attention | $B_r \times B_c$ | 同样要方形化才能兼顾带宽与算力 |
+
+---
+
+## 五、数值对照（FP16，$b=2$）
+
+| $M_t \times N_t \times K_t$ | 工作集 | AI (FLOP/byte) | 相对方阵 |
+|---|---|---|---|
+| 128×128×16 | ~41 KB | **64** | 100% |
+| 256×64×16  | ~42 KB | 51 | 80% |
+| 64×64×16   | ~12 KB | 32 | 50% |
+| 64×64×64   | ~24 KB | 32 | 50%（$K_t$ 加倍 AI 不变） |
+| 1×128×16   | ~4 KB  | ≈ 2 | 3%（GEMV） |
+
+---
+
+## 六、调度算法与 tile 选型（工程实务）
+
+前面讨论的都是 "tile 的形状如何影响 AI"；这里讨论**怎么把 CTA 铺到这些 tile 上**，以及 $K_t$ 和 L2 在工程里实际怎么处理。
+
+### 1. 调度：把 CTA 铺到工作上
+
+核心矛盾：当 $M \cdot N$ 小到 tile 数 < SM 数时，默认 Data-Parallel 会让大量 SM 闲置。下表按递进思路排列：
+
+| 算法 | 核心思想 | 适用 | 代价 |
+|---|---|---|---|
+| **Data-Parallel** | 1 CTA = 1 C tile，K 在 CTA 内串起累加 | $MN$ 大，tile 数 $\ge$ SM 数 | 无 |
+| **Split-K** | $K$ 切 $S$ 段，$S$ 个 CTA 并行算同一 C tile 的部分和；atomic 或 workspace 规约 | $MN$ 小 / $K$ 大（GEMV、skinny） | $2S M_t N_t$ 额外 C 流量 |
+| **Stream-K** | 总计算 $2MNK$ 按 SM 数均分，每 CTA 处理连续输出 work，可跨 C tile 边界；fix-up 合并边界部分和 | 任意形状，尤其 tile 数不是 SM 数整数倍时 | 边界 fix-up（比 Split-K 少） |
+| **Persistent kernel** | launch 数 = SM 数的 CTA，每个从 work queue 拉 tile | batched / MoE、多个小 GEMM | 调度复杂度 |
+| **Threadblock Swizzle** | 改 C tile → CTA 映射顺序让相邻 CTA 共享 L2 面板 | 任何 GEMM，组合使用 | 免费 |
+| **Cluster + TMA** | $n$ 个 CTA 组成 cluster，通过 DSMEM 共享 tile | Hopper+ | 需 SM_90+ |
+
+**Stream-K**（Osama et al., CUTLASS 2023）是"取代 Split-K"的现代方案——Split-K 仍保留 tile 边界、$S$ 手选；Stream-K 完全按 SM 数均分计算量。当前 CUTLASS / cuBLAS 主力组合是 **Stream-K + Persistent + Cluster**。
+
+选型决策树：
+
+```text
+tile 数 (M/Mt)·(N/Nt) >= SM 数?
+├─ 是 → Data-Parallel + Swizzle (+ Cluster TMA 更快)
+└─ 否 → tile 数不足以填满 GPU
+    ├─ K 大 → Split-K (简单) 或 Stream-K (推荐)
+    ├─ 多个小 GEMM 串 → Persistent + work queue (grouped GEMM)
+    └─ batch 维可拼 → batched GEMM / FlashDecoding 把 M 撑起来
+```
+
+### 2. $K_t$ 在实战里是怎么定的
+
+| 约束 | 典型值 | 说明 |
+|---|---|---|
+| (a) Tensor Core 原子宽度 | FP16: k=16，FP8: k=32 | $K_t$ 必须是整数倍 |
+| (b) Pipeline stages | 3–6 | $K_t \approx \text{atom} \times \text{stages}$ 以隐藏 async load 延迟 |
+| (c) SMEM 预算 | Ampere 164 KB / Hopper 228 KB per SM | $\text{stages} \cdot (M_t + N_t) \cdot K_t \cdot b \le \text{SMEM}$ |
+| (d) 寄存器预算 | ~64 KB per SM | 累加器 $M_t N_t$ 为主 |
+
+CUTLASS / cuBLAS 典型落点：
+
+| 架构 | dtype | CTA tile | stages |
+|---|---|---|---|
+| Ampere | FP16/BF16 | 128×128×32 | 3–4 |
+| Hopper | FP16/BF16 | 128×128×64 或 128×256×64 | 4–6 |
+| Hopper | FP8 | 128×128×128 | 4–6 |
+| Blackwell | FP16/FP8 | 128×256×64（2-CTA cluster）| 6+ |
+
+"甜点"经验：$K_t$ 要够塞满 MMA 流水线、又不至于把 SMEM 挤到放不下多 stage。Hopper FP16 取 64、FP8 取 128 是绝大多数 kernel 的起点。
+
+### 3. L2 cache 在实战里是怎么考虑的
+
+**(a) Threadblock Swizzling——L2 的首要优化手段**
+
+默认 row-major 的 CTA 编号让相邻调度的 CTA 跨得很远（共享 A 行但 B 列完全不同）。改成 $g \times g$ 小方块为调度单位（group raster），让 $g^2$ 个 CTA 共享 A 的 $g$ 行 + B 的 $g$ 列，L2 中的 A/B 块被复用 $g$ 次。
+
+CUTLASS 的 `ThreadblockSwizzle`：
+- `IdentitySwizzle`：row-major，无 L2 优化
+- `GemmIdentityThreadblockSwizzle<log_tile>`：group raster，$g = 2^{\text{log\_tile}}$，典型 4 / 8
+- Hilbert / Morton：更精细但只比 group raster 好 1–2%
+
+实测：$g = 8$ 能把 L2 对 A/B 的命中率从 ~50% 拉到 ~90%，DRAM 带宽压力减半。
+
+**(b) 硬件级 L2 控制**
+
+- **Ampere+ persisting access**：`cudaAccessPolicyWindow` 把地址标为 persisting（典型用于 weights）
+- **Hopper TMA**：Tensor Memory Accelerator 从 L2 直接搬 tile 到 SMEM，绕开 L1
+- **Hopper Cluster + DSMEM**：$n$ 个 CTA 组 cluster 通过 DSMEM 共享 A/B，把 L2 跨 CTA 复用升级成 cluster 内 SMEM 多播
+
+**(c) 选 $M_o, N_o$ 时拟合 L2**
+
+$$K \cdot (M_o + N_o) \cdot b \;\lesssim\; 0.5 \cdot M_{L2}$$
+
+H100 L2 ≈ 50 MB，FP16，$K = 4096$ 时取 $M_o = N_o = 1500$（约 $12 \times 12$ 个 $128\times 128$ CTA tile 的 swizzle group）。Stream-K 自动调到这个尺寸。
+
+### 4. 汇总经验
+
+- **$K_t$**：MMA atom × 3–6 stages，受 SMEM 约束；实战穷举找最佳
+- **$M_t, N_t$**：方形优先，受寄存器约束；Hopper 常取 128×128 或 128×256
+- **$M_o, N_o$**：swizzle group 拟合 ~0.5 × $M_{L2}$
+- **调度**：默认 DP；tile 数 < SM 切 Stream-K；batched 走 Persistent；Hopper+ 叠 Cluster
+
+---
+
+## TL;DR
+
+- 方阵 tile：$\text{AI} = T / b$，随 $T$ 线性增长，受 cache 容量的平方根限制。
+- 任意形状：$\text{AI} = H(M_t, N_t) / b$，**由较小的那一维主导**。
+- $K_t$ 不进入单层 blocking 的渐近 AI；2 级 blocking 下通过 cache 预算间接影响 $M_o \cdot N_o$。
+- 两级 Roofline：$BW_{L2}$ 越高于 $BW_\text{DRAM}$，内层 $M_t$ 可以越小于外层 $M_o$（$10\times$ 带宽差 ⇒ $M_t \approx M_o/10$）。
+- cache 预算内，**越接近正方形 AI 越高**。
+- $MN$ 小到 tile 数 < SM 数时必须切 $K$ 维：**Stream-K > Split-K**，辅以 Persistent / Cluster 调度。
+- 工程选型：$K_t$ = MMA atom × 3–6 stages；$M_t \times N_t$ 方形优先受寄存器约束；$M_o \times N_o$（swizzle group）拟合 ~0.5 · $M_{L2}$。
+- 任何一侧被问题固有压小（GEMV、batched MoE、LLM decode），都会从根本上变 memory-bound —— 这是算法层面（拼 $M$、FlashDecoding）而非 kernel 层面的问题。
+</script>
+
+<script>
+function exportMarkdown() {
+  const md = document.getElementById('md-source').textContent.trimStart();
+  const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'gemm_ai.md';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+
+  // 视觉反馈
+  const btn = document.getElementById('export-md');
+  const orig = btn.textContent;
+  btn.textContent = '✓ 已下载';
+  btn.classList.add('flash');
+  setTimeout(() => { btn.textContent = orig; btn.classList.remove('flash'); }, 1400);
+}
+
+// 键盘快捷键：⌘/Ctrl + S
+window.addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+    e.preventDefault();
+    exportMarkdown();
+  }
+});
+
+// --- 目录导航生成 ---
+(function buildTOC() {
+  const wrap = document.querySelector('.wrap');
+  if (!wrap) return;
+  const headings = wrap.querySelectorAll('h2, h3');
+  if (headings.length === 0) return;
+
+  const toc = document.createElement('nav');
+  toc.id = 'toc';
+
+  // toggle button (折叠/展开)
+  const btn = document.createElement('button');
+  btn.id = 'toc-toggle';
+  btn.title = '折叠 / 展开目录';
+  btn.textContent = '⤢';
+  btn.addEventListener('click', () => {
+    const collapsed = toc.classList.toggle('collapsed');
+    btn.textContent = collapsed ? '☰' : '⤢';
+    try { localStorage.setItem('toc-collapsed', collapsed ? '1' : '0'); } catch (_) {}
+  });
+  toc.appendChild(btn);
+
+  const title = document.createElement('h4');
+  title.textContent = '📖 目录';
+  toc.appendChild(title);
+
+  const list = document.createElement('ul');
+  toc.appendChild(list);
+
+  headings.forEach((h, i) => {
+    if (!h.id) h.id = 'sec-' + i;
+    const li = document.createElement('li');
+    li.className = 'lvl-' + h.tagName.substring(1);
+    const a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.textContent = h.textContent.trim();
+    a.dataset.target = h.id;
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      h.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      history.replaceState(null, '', '#' + h.id);
+    });
+    li.appendChild(a);
+    list.appendChild(li);
+  });
+
+  document.body.appendChild(toc);
+
+  // 恢复折叠状态
+  try {
+    if (localStorage.getItem('toc-collapsed') === '1') {
+      toc.classList.add('collapsed');
+      btn.textContent = '☰';
+    }
+  } catch (_) {}
+
+  // 当前阅读位置高亮
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (!entry.isIntersecting) return;
+      const id = entry.target.id;
+      toc.querySelectorAll('a.active').forEach(a => a.classList.remove('active'));
+      const link = toc.querySelector('a[data-target="' + id + '"]');
+      if (link) {
+        link.classList.add('active');
+        // 滚动 TOC 自己以保证当前项可见
+        const r = link.getBoundingClientRect();
+        const tr = toc.getBoundingClientRect();
+        if (r.top < tr.top || r.bottom > tr.bottom) {
+          link.scrollIntoView({ block: 'nearest' });
+        }
+      }
+    });
+  }, {
+    rootMargin: '-15% 0px -70% 0px',
+    threshold: 0,
+  });
+  headings.forEach(h => observer.observe(h));
+})();
+</script>
+
+</body>
+</html>
