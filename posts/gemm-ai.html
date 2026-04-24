@@ -4,6 +4,13 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>GEMM 计算/访存比分析</title>
+<!-- Post metadata (consumed by scripts/build-index.py) -->
+<meta name="post:title"   content="GEMM 计算/访存比分析">
+<meta name="post:slug"    content="gemm-ai">
+<meta name="post:date"    content="2026-04-24">
+<meta name="post:tags"    content="GPU, GEMM, 性能分析, CUDA">
+<meta name="post:reading" content="25 分钟">
+<meta name="post:summary" content="从方阵基线到任意形状 tile,再到 2 级 blocking 与跨 tile 复用,完整推导 arithmetic intensity；并讨论 Split-K / Stream-K / Persistent / Cluster 等调度算法,以及 Kt、L2 cache 在实战中的选型经验。">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
@@ -28,7 +35,7 @@
     --table-alt: #fafbfc;
   }
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
       --fg: #e6e6e6;
       --muted: #a9b1ba;
       --bg: #121417;
@@ -38,6 +45,16 @@
       --code-bg: #1b1f24;
       --table-alt: #171a1f;
     }
+  }
+  :root[data-theme="dark"] {
+    --fg: #e6e6e6; --muted: #a9b1ba; --bg: #121417;
+    --accent: #5fb3ff; --soft: #1b1f24; --border: #2a2f36;
+    --code-bg: #1b1f24; --table-alt: #171a1f;
+  }
+  :root[data-theme="light"] {
+    --fg: #1a1a1a; --muted: #555; --bg: #ffffff;
+    --accent: #0b6cc4; --soft: #f4f6f8; --border: #d9dde2;
+    --code-bg: #f1f3f5; --table-alt: #fafbfc;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
@@ -150,6 +167,25 @@
   #export-md:active { transform: translateY(1px); }
   #export-md.flash { background: #3aaa55; }
 
+  #theme-toggle {
+    position: fixed;
+    top: 18px;
+    right: 160px;
+    background: var(--soft);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 0.85rem;
+    font-family: inherit;
+    cursor: pointer;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.12);
+    z-index: 1000;
+    transition: transform 0.08s ease;
+  }
+  #theme-toggle:hover { border-color: var(--accent); }
+  #theme-toggle:active { transform: translateY(1px); }
+
   /* --- 目录导航 TOC --- */
   #toc {
     position: fixed;
@@ -225,6 +261,7 @@
 </style>
 </head>
 <body>
+<button id="theme-toggle" title="切换主题 (自动 → 亮 → 暗)" onclick="cycleTheme()">🌓 自动</button>
 <button id="export-md" title="下载 Markdown 版本" onclick="exportMarkdown()">⬇ Markdown</button>
 
 <div class="wrap">
@@ -615,7 +652,7 @@
 
   <hr>
 
-  <h2>TL;DR</h2>
+  <h2 id="tldr">TL;DR</h2>
   <ul>
     <li>方阵 tile：$\text{AI} = T / b$，随 $T$ 线性增长，受 cache 容量的平方根限制。</li>
     <li>任意形状：$\text{AI} = H(M_t, N_t) / b$，<strong>由较小的那一维主导</strong>。</li>
@@ -626,6 +663,28 @@
     <li>工程选型：$K_t$ = MMA atom × 3–6 stages；$M_t \times N_t$ 方形优先受寄存器约束；$M_o \times N_o$（swizzle group）拟合 $\sim 0.5 \cdot M_{L2}$。</li>
     <li>任何一侧被问题固有地压小（GEMV、batched MoE、LLM decode），都会从根本上变 memory-bound——这是算法层面（拼 $M$、FlashDecoding）而非 kernel 层面的问题。</li>
   </ul>
+
+  <hr>
+
+  <section id="comments" style="margin-top: 40px;">
+    <h2 style="border: none; font-size: 1.2rem; color: var(--muted); font-weight: 600;">💬 评论</h2>
+    <script src="https://giscus.app/client.js"
+      data-repo="JacoCheung/notes"
+      data-repo-id="R_kgDOSLhzsA"
+      data-category="Announcements"
+      data-category-id="DIC_kwDOSLhzsM4C7mnH"
+      data-mapping="pathname"
+      data-strict="0"
+      data-reactions-enabled="1"
+      data-emit-metadata="0"
+      data-input-position="bottom"
+      data-theme="preferred_color_scheme"
+      data-lang="zh-CN"
+      data-loading="lazy"
+      crossorigin="anonymous"
+      async>
+    </script>
+  </section>
 
 </div>
 
@@ -1009,6 +1068,36 @@ H100 L2 ≈ 50 MB，FP16，$K = 4096$ 时取 $M_o = N_o = 1500$（约 $12 \times
 </script>
 
 <script>
+// --- Theme toggle (auto → light → dark → auto) ---
+const THEME_LABELS = { '': '🌓 自动', light: '☀️ 亮色', dark: '🌙 暗色' };
+(function restoreTheme() {
+  try {
+    const saved = localStorage.getItem('theme');
+    if (saved === 'light' || saved === 'dark') {
+      document.documentElement.dataset.theme = saved;
+    }
+  } catch (_) {}
+})();
+function updateThemeBtn() {
+  const btn = document.getElementById('theme-toggle');
+  if (!btn) return;
+  const cur = document.documentElement.dataset.theme || '';
+  btn.textContent = THEME_LABELS[cur];
+}
+function cycleTheme() {
+  const cur = document.documentElement.dataset.theme || '';
+  const next = cur === '' ? 'light' : cur === 'light' ? 'dark' : '';
+  if (next) {
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem('theme', next); } catch (_) {}
+  } else {
+    delete document.documentElement.dataset.theme;
+    try { localStorage.removeItem('theme'); } catch (_) {}
+  }
+  updateThemeBtn();
+}
+document.addEventListener('DOMContentLoaded', updateThemeBtn);
+
 function exportMarkdown() {
   const md = document.getElementById('md-source').textContent.trimStart();
   const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
