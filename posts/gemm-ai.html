@@ -287,11 +287,17 @@
   <p><strong>随 $N$ 线性增长</strong>。FP32、$N = 4096$ 时 $\approx 683$ FLOP/byte——远超 H100（$\approx 7$）、B200（$\approx 20$）的平衡点，所以大 GEMM 理论上是 compute-bound。</p>
 
   <h3>2. 完全无复用（naive 三重循环）</h3>
-  <p>假设 $C$ 在寄存器里累加，每次 FMA 只需 load $A$、load $B$ 两个元素：</p>
+  <p>$C$ 在寄存器 <code>acc</code> 里累加，K 走完后一次写回。整个 GEMM：</p>
+  <ul>
+    <li>FLOPs：$2 N^3$</li>
+    <li>读 $A$：$N^3$（每个 $A[i,k]$ 跨 $j$ 重复加载 $N$ 次）</li>
+    <li>读 $B$：$N^3$（每个 $B[k,j]$ 跨 $i$ 重复加载 $N$ 次）</li>
+    <li>写 $C$：$N^2$（每个 $(i,j)$ 累加完写回一次）</li>
+  </ul>
   <div class="eq">
-    $$\text{AI}_{\text{no-reuse}} \;=\; \frac{2\ \text{FLOP}}{2b\ \text{byte}} \;=\; \frac{1}{b}\ \text{FLOP/byte}$$
+    $$\text{AI}_{\text{no-reuse}} \;=\; \frac{2 N^3}{(2 N^3 + N^2)\cdot b} \;\xrightarrow{N\to\infty}\; \frac{1}{b}\ \text{FLOP/byte}$$
   </div>
-  <p><strong>与 $N$ 无关的常数。</strong>FP32 下仅 $0.25$ FLOP/byte——彻底 memory-bound，H100 只能发挥不到 4% 峰值。</p>
+  <p>写 $C$ 的 $N^2$ 项被 $2 N^3$ 压住，渐近 <strong>与 $N$ 无关</strong>。FP32 下仅 $0.25$ FLOP/byte——彻底 memory-bound，H100 只能发挥不到 4% 峰值。</p>
 
   <p class="caption">朴素三重循环伪代码：</p>
 <pre class="code"><span class="cm"># Naive GEMM: C = A · B, 三者均为 N×N</span>
@@ -307,12 +313,12 @@
   <p>一个 $T \times T$ 的 $C$ 块沿 $k$ 方向扫过 $N/T$ 次：</p>
   <ul>
     <li>FLOPs: $(N/T) \cdot 2T^3 = 2NT^2$</li>
-    <li>主存访问：$A$ tiles $(N/T)\cdot T^2 = NT$，$B$ tiles $NT$，$C$ 写回 $T^2$（一次，大 $N$ 可忽略）</li>
+    <li>主存访问：$A$ tiles $(N/T)\cdot T^2 = NT$，$B$ tiles $NT$，$C$ 写回 $T^2$（K-loop 累加完一次）</li>
   </ul>
   <div class="eq">
-    $$\text{AI}_{\text{blocked}} \;=\; \frac{2NT^2}{2NT \cdot b} \;=\; \frac{T}{b}\ \text{FLOP/byte}$$
+    $$\text{AI}_{\text{blocked}} \;=\; \frac{2NT^2}{(2NT + T^2)\cdot b} \;\xrightarrow{N\to\infty}\; \frac{T}{b}\ \text{FLOP/byte}$$
   </div>
-  <p>总访存 $= 2N^3/T$，正是 Hong–Kung 下界 $\Omega(N^3/\sqrt{M})$ 的具象形式。</p>
+  <p>当 $N \gg T/2$ 时写 $C$ 可忽略，全图总访存 $\approx 2N^3/T$，正是 Hong–Kung 下界 $\Omega(N^3/\sqrt{M})$ 的具象形式。</p>
 
   <p class="caption">分块 GEMM 伪代码（方形 tile，$T \times T$）：</p>
 <pre class="code"><span class="cm"># Blocked GEMM, 假设 3·T² 元素能同时放进 cache</span>
@@ -716,11 +722,16 @@ $$\text{AI}_{\text{ideal}} = \frac{2N^3}{3N^2 \cdot b} = \frac{2N}{3b}\ \text{FL
 
 ### 2. 完全无复用（naive 三重循环）
 
-假设 $C$ 在寄存器里累加，每次 FMA 只需 load $A$、load $B$ 两个元素：
+$C$ 在寄存器 `acc` 里累加，K 走完后一次写回。整个 GEMM：
 
-$$\text{AI}_{\text{no-reuse}} = \frac{2\ \text{FLOP}}{2b\ \text{byte}} = \frac{1}{b}\ \text{FLOP/byte}$$
+- FLOPs：$2 N^3$
+- 读 $A$：$N^3$（每个 $A[i,k]$ 跨 $j$ 重复加载 $N$ 次）
+- 读 $B$：$N^3$（每个 $B[k,j]$ 跨 $i$ 重复加载 $N$ 次）
+- 写 $C$：$N^2$（每个 $(i,j)$ 累加完写回一次）
 
-**与 $N$ 无关的常数。** FP32 下仅 $0.25$ FLOP/byte —— 彻底 memory-bound，H100 只能发挥不到 4% 峰值。
+$$\text{AI}_{\text{no-reuse}} = \frac{2 N^3}{(2 N^3 + N^2)\cdot b} \xrightarrow{N\to\infty} \frac{1}{b}\ \text{FLOP/byte}$$
+
+写 $C$ 的 $N^2$ 项被 $2 N^3$ 压住，渐近**与 $N$ 无关**。FP32 下仅 $0.25$ FLOP/byte —— 彻底 memory-bound，H100 只能发挥不到 4% 峰值。
 
 朴素三重循环伪代码：
 
@@ -741,11 +752,11 @@ for i in 0..N:
 一个 $T \times T$ 的 $C$ 块沿 $k$ 方向扫过 $N/T$ 次：
 
 - FLOPs: $(N/T) \cdot 2T^3 = 2NT^2$
-- 主存访问：$A$ tiles $NT$，$B$ tiles $NT$，$C$ 写回 $T^2$（大 $N$ 可忽略）
+- 主存访问：$A$ tiles $NT$，$B$ tiles $NT$，$C$ 写回 $T^2$（K-loop 累加完一次）
 
-$$\text{AI}_{\text{blocked}} = \frac{2NT^2}{2NT \cdot b} = \frac{T}{b}\ \text{FLOP/byte}$$
+$$\text{AI}_{\text{blocked}} = \frac{2NT^2}{(2NT + T^2)\cdot b} \xrightarrow{N\to\infty} \frac{T}{b}\ \text{FLOP/byte}$$
 
-总访存 $= 2N^3/T$，即 Hong–Kung 下界 $\Omega(N^3/\sqrt{M})$ 的具象形式。
+当 $N \gg T/2$ 时写 $C$ 可忽略，全图总访存 $\approx 2N^3/T$，即 Hong–Kung 下界 $\Omega(N^3/\sqrt{M})$ 的具象形式。
 
 分块 GEMM 伪代码（方形 tile，$T \times T$）：
 
