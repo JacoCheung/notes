@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Python Import 机制笔记：绝对导入 vs 相对导入</title>
+<meta name="post:title"   content="Python Import 机制：绝对导入 vs 相对导入">
+<meta name="post:slug"    content="python-imports">
+<meta name="post:date"    content="2026-05-14">
+<meta name="post:tags"    content="Python, 模块系统, 工程实践">
+<meta name="post:reading" content="15 分钟">
+<meta name="post:summary" content="从 module / package / __init__.py / namespace package 等基础概念入手,梳理 sys.path、__name__、__package__ 在 import 解析中的角色,配合 4 个典型例子与 6 个常见报错,讲清绝对导入 vs 相对导入的选型边界。">
+<style>
+:root {
+  --sidebar-w: 320px;
+  --fg: #1f2328;
+  --muted: #57606a;
+  --bg: #ffffff;
+  --panel: #f6f8fa;
+  --border: #d0d7de;
+  --accent: #0969da;
+  --code-bg: #f6f8fa;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", Roboto, "Helvetica Neue", Arial,
+    sans-serif;
+  font-size: 16px;
+  line-height: 1.65;
+  color: var(--fg);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+.layout {
+  display: flex;
+  align-items: flex-start;
+  min-height: 100vh;
+}
+aside.toc {
+  position: sticky;
+  top: 0;
+  flex: 0 0 var(--sidebar-w);
+  width: var(--sidebar-w);
+  height: 100vh;
+  overflow-y: auto;
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+  padding: 24px 18px 32px;
+  font-size: 14px;
+}
+aside.toc .toc-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  text-transform: uppercase;
+  margin-bottom: 12px;
+}
+aside.toc ul {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 0 0;
+}
+aside.toc li { margin: 2px 0; }
+aside.toc ul ul { padding-left: 14px; border-left: 1px solid var(--border); margin-left: 4px; }
+aside.toc a {
+  display: block;
+  padding: 3px 6px;
+  color: var(--fg);
+  text-decoration: none;
+  border-radius: 4px;
+  line-height: 1.45;
+}
+aside.toc a:hover { background: #eaeef2; color: var(--accent); }
+aside.toc a.active {
+  background: #ddf4ff;
+  color: var(--accent);
+  font-weight: 600;
+}
+main.content {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 920px;
+  padding: 40px 56px 96px;
+}
+main.content h1, main.content h2, main.content h3, main.content h4 {
+  scroll-margin-top: 24px;
+}
+main.content h1 {
+  font-size: 2.1em;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3em;
+  margin-top: 0;
+}
+main.content h2 {
+  font-size: 1.55em;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.25em;
+  margin-top: 1.8em;
+}
+main.content h3 { font-size: 1.2em; margin-top: 1.5em; }
+main.content h4 { font-size: 1.0em; margin-top: 1.2em; }
+main.content a { color: var(--accent); }
+main.content a.headerlink {
+  color: var(--muted);
+  text-decoration: none;
+  margin-left: 8px;
+  opacity: 0;
+  transition: opacity 0.15s;
+  font-weight: 400;
+}
+main.content h1:hover .headerlink,
+main.content h2:hover .headerlink,
+main.content h3:hover .headerlink,
+main.content h4:hover .headerlink { opacity: 1; }
+code {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 0.88em;
+  background: rgba(175, 184, 193, 0.2);
+  padding: 0.18em 0.4em;
+  border-radius: 4px;
+}
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  line-height: 1.5;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+  font-size: 0.85em;
+}
+blockquote {
+  margin: 1em 0;
+  padding: 0.4em 1em;
+  color: var(--muted);
+  border-left: 4px solid var(--border);
+  background: var(--panel);
+}
+table {
+  border-collapse: collapse;
+  margin: 1em 0;
+  width: auto;
+  max-width: 100%;
+}
+table th, table td {
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+}
+table th { background: var(--panel); }
+hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 2em 0;
+}
+.toc-back-to-top {
+  display: block;
+  margin-top: 20px;
+  color: var(--muted);
+  font-size: 12px;
+  text-decoration: none;
+}
+.toc-back-to-top:hover { color: var(--accent); }
+@media (max-width: 900px) {
+  .layout { flex-direction: column; }
+  aside.toc {
+    position: static;
+    width: 100%;
+    height: auto;
+    max-height: 40vh;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  main.content { padding: 24px 20px 64px; max-width: 100%; }
+}
+pre { line-height: 125%; }
+td.linenos .normal { color: inherit; background-color: transparent; padding-left: 5px; padding-right: 5px; }
+span.linenos { color: inherit; background-color: transparent; padding-left: 5px; padding-right: 5px; }
+td.linenos .special { color: #000000; background-color: #ffffc0; padding-left: 5px; padding-right: 5px; }
+span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 5px; padding-right: 5px; }
+.codehilite .hll { background-color: #ffffcc }
+.codehilite { background: #f8f8f8; }
+.codehilite .c { color: #3D7B7B; font-style: italic } /* Comment */
+.codehilite .err { border: 1px solid #F00 } /* Error */
+.codehilite .k { color: #008000; font-weight: bold } /* Keyword */
+.codehilite .o { color: #666 } /* Operator */
+.codehilite .ch { color: #3D7B7B; font-style: italic } /* Comment.Hashbang */
+.codehilite .cm { color: #3D7B7B; font-style: italic } /* Comment.Multiline */
+.codehilite .cp { color: #9C6500 } /* Comment.Preproc */
+.codehilite .cpf { color: #3D7B7B; font-style: italic } /* Comment.PreprocFile */
+.codehilite .c1 { color: #3D7B7B; font-style: italic } /* Comment.Single */
+.codehilite .cs { color: #3D7B7B; font-style: italic } /* Comment.Special */
+.codehilite .gd { color: #A00000 } /* Generic.Deleted */
+.codehilite .ge { font-style: italic } /* Generic.Emph */
+.codehilite .ges { font-weight: bold; font-style: italic } /* Generic.EmphStrong */
+.codehilite .gr { color: #E40000 } /* Generic.Error */
+.codehilite .gh { color: #000080; font-weight: bold } /* Generic.Heading */
+.codehilite .gi { color: #008400 } /* Generic.Inserted */
+.codehilite .go { color: #717171 } /* Generic.Output */
+.codehilite .gp { color: #000080; font-weight: bold } /* Generic.Prompt */
+.codehilite .gs { font-weight: bold } /* Generic.Strong */
+.codehilite .gu { color: #800080; font-weight: bold } /* Generic.Subheading */
+.codehilite .gt { color: #04D } /* Generic.Traceback */
+.codehilite .kc { color: #008000; font-weight: bold } /* Keyword.Constant */
+.codehilite .kd { color: #008000; font-weight: bold } /* Keyword.Declaration */
+.codehilite .kn { color: #008000; font-weight: bold } /* Keyword.Namespace */
+.codehilite .kp { color: #008000 } /* Keyword.Pseudo */
+.codehilite .kr { color: #008000; font-weight: bold } /* Keyword.Reserved */
+.codehilite .kt { color: #B00040 } /* Keyword.Type */
+.codehilite .m { color: #666 } /* Literal.Number */
+.codehilite .s { color: #BA2121 } /* Literal.String */
+.codehilite .na { color: #687822 } /* Name.Attribute */
+.codehilite .nb { color: #008000 } /* Name.Builtin */
+.codehilite .nc { color: #00F; font-weight: bold } /* Name.Class */
+.codehilite .no { color: #800 } /* Name.Constant */
+.codehilite .nd { color: #A2F } /* Name.Decorator */
+.codehilite .ni { color: #717171; font-weight: bold } /* Name.Entity */
+.codehilite .ne { color: #CB3F38; font-weight: bold } /* Name.Exception */
+.codehilite .nf { color: #00F } /* Name.Function */
+.codehilite .nl { color: #767600 } /* Name.Label */
+.codehilite .nn { color: #00F; font-weight: bold } /* Name.Namespace */
+.codehilite .nt { color: #008000; font-weight: bold } /* Name.Tag */
+.codehilite .nv { color: #19177C } /* Name.Variable */
+.codehilite .ow { color: #A2F; font-weight: bold } /* Operator.Word */
+.codehilite .w { color: #BBB } /* Text.Whitespace */
+.codehilite .mb { color: #666 } /* Literal.Number.Bin */
+.codehilite .mf { color: #666 } /* Literal.Number.Float */
+.codehilite .mh { color: #666 } /* Literal.Number.Hex */
+.codehilite .mi { color: #666 } /* Literal.Number.Integer */
+.codehilite .mo { color: #666 } /* Literal.Number.Oct */
+.codehilite .sa { color: #BA2121 } /* Literal.String.Affix */
+.codehilite .sb { color: #BA2121 } /* Literal.String.Backtick */
+.codehilite .sc { color: #BA2121 } /* Literal.String.Char */
+.codehilite .dl { color: #BA2121 } /* Literal.String.Delimiter */
+.codehilite .sd { color: #BA2121; font-style: italic } /* Literal.String.Doc */
+.codehilite .s2 { color: #BA2121 } /* Literal.String.Double */
+.codehilite .se { color: #AA5D1F; font-weight: bold } /* Literal.String.Escape */
+.codehilite .sh { color: #BA2121 } /* Literal.String.Heredoc */
+.codehilite .si { color: #A45A77; font-weight: bold } /* Literal.String.Interpol */
+.codehilite .sx { color: #008000 } /* Literal.String.Other */
+.codehilite .sr { color: #A45A77 } /* Literal.String.Regex */
+.codehilite .s1 { color: #BA2121 } /* Literal.String.Single */
+.codehilite .ss { color: #19177C } /* Literal.String.Symbol */
+.codehilite .bp { color: #008000 } /* Name.Builtin.Pseudo */
+.codehilite .fm { color: #00F } /* Name.Function.Magic */
+.codehilite .vc { color: #19177C } /* Name.Variable.Class */
+.codehilite .vg { color: #19177C } /* Name.Variable.Global */
+.codehilite .vi { color: #19177C } /* Name.Variable.Instance */
+.codehilite .vm { color: #19177C } /* Name.Variable.Magic */
+.codehilite .il { color: #666 } /* Literal.Number.Integer.Long */
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录</div>
+    <div class="toc">
+<ul>
+<li><a href="#1">1. 基础概念</a><ul>
+<li><a href="#module">Module（模块）</a></li>
+<li><a href="#package">Package（包）</a></li>
+<li><a href="#__init__py">__init__.py 的作用</a></li>
+<li><a href="#packagetop-level-package">顶级 package（top-level package）</a></li>
+<li><a href="#namespace-packagepep-420">Namespace package（PEP 420）</a></li>
+</ul>
+</li>
+<li><a href="#2-import">2. import 是怎么工作的</a><ul>
+<li><a href="#syspath">sys.path 决定能找到什么</a></li>
+<li><a href="#__name__-__package__">__name__ 和 __package__</a></li>
+<li><a href="#vs">绝对导入 vs 相对导入</a></li>
+<li><a href="#dotted-name">dotted name 是怎么一段段解析的</a></li>
+<li><a href="#import">import 的两个隐藏副作用</a></li>
+<li><a href="#package_1">同名子模块 / 同名顶级 package 的歧义</a></li>
+</ul>
+</li>
+<li><a href="#3">3. 典型例子</a><ul>
+<li><a href="#1-module">例 1：同目录导入兄弟 module</a></li>
+<li><a href="#2-package">例 2：从兄弟 package 导入</a></li>
+<li><a href="#3-package">例 3：从兄弟 package 的下一级导入</a></li>
+<li><a href="#4">例 4：脚本入口</a></li>
+</ul>
+</li>
+<li><a href="#4_1">4. 反例（常见报错）</a><ul>
+<li><a href="#1importerror-attempted-relative-import-with-no-known-parent-package">反例 1：ImportError: attempted relative import with no known parent package</a></li>
+<li><a href="#2modulenotfounderror-no-module-named-app">反例 2：ModuleNotFoundError: No module named 'app'</a></li>
+<li><a href="#3importerror-attempted-relative-import-beyond-top-level-package">反例 3：ImportError: attempted relative import beyond top-level package</a></li>
+<li><a href="#4__init__py-import-importerror-cannot-import-name-x">反例 4：__init__.py 里循环 import → ImportError: cannot import name 'X'</a></li>
+<li><a href="#5-syspath0">反例 5：被 sys.path[0] 偷换的"假顶级"</a></li>
+<li><a href="#6-namespace-package-__init__py">反例 6：给 namespace package 补了 __init__.py</a></li>
+</ul>
+</li>
+<li><a href="#5">5. 检查清单</a></li>
+</ul>
+</div>
+
+    <a class="toc-back-to-top" href="#">↑ 回到顶部</a>
+  </aside>
+  <main class="content">
+    <h1 id="python-import-vs">Python Import 机制笔记：绝对导入 vs 相对导入<a class="headerlink" href="#python-import-vs" title="Permanent link">#</a></h1>
+<h2 id="1">1. 基础概念<a class="headerlink" href="#1" title="Permanent link">#</a></h2>
+<h3 id="module">Module（模块）<a class="headerlink" href="#module" title="Permanent link">#</a></h3>
+<p>一个 <code>.py</code> 文件就是一个 module。被 <code>import</code> 之后，会变成一个 module 对象，加进 <code>sys.modules</code> 缓存里，避免重复执行。</p>
+<h3 id="package">Package（包）<a class="headerlink" href="#package" title="Permanent link">#</a></h3>
+<p>一个 <strong>包含 <code>__init__.py</code> 的目录</strong> 就是一个 package（"regular package"）。它本身也是一个 module 对象，但额外有 <code>__path__</code> 属性，能继续装下层子 module / 子 package。</p>
+<blockquote>
+<p>PEP 420 之后还有一种 <strong>namespace package</strong>：目录里没有 <code>__init__.py</code>，可以跨多个物理目录拼接。它是真实生产场景里会踩到的坑，单独成节展开（见下面"Namespace package"小节）。</p>
+</blockquote>
+<h3 id="__init__py"><code>__init__.py</code> 的作用<a class="headerlink" href="#__init__py" title="Permanent link">#</a></h3>
+<ol>
+<li><strong>标记</strong>：让目录被当作 regular package 识别。</li>
+<li><strong>初始化代码</strong>：第一次 <code>import pkg</code> 时执行一次（即使只是 <code>from pkg.a import x</code> 也会先执行 <code>pkg/__init__.py</code>）。</li>
+<li><strong>re-export 门面</strong>：常见用法是在里面 <code>from .a import Foo</code>，让外面可以直接写 <code>from pkg import Foo</code>。</li>
+<li><strong>定义 <code>__all__</code></strong>：控制 <code>from pkg import *</code> 暴露哪些名字。</li>
+</ol>
+<h3 id="packagetop-level-package">顶级 package（top-level package）<a class="headerlink" href="#packagetop-level-package" title="Permanent link">#</a></h3>
+<p><strong><code>sys.path</code> 里某条目录的直接子项</strong> —— 如果它是个带 <code>__init__.py</code> 的目录，那它就是一个顶级 package。</p>
+<p>举例：<code>sys.path</code> 里有 <code>/home/me/proj</code>，而 <code>/home/me/proj/app/__init__.py</code> 存在，那 <code>app</code> 就是顶级 package。<code>app.pkg</code>、<code>app.pkg.sub</code> 是它的子 package，但<strong>不是</strong>顶级。</p>
+<p>判断"谁是顶级"完全取决于 <code>sys.path</code>，跟磁盘上的目录嵌套<strong>没有必然关系</strong>。</p>
+<h3 id="namespace-packagepep-420">Namespace package（PEP 420）<a class="headerlink" href="#namespace-packagepep-420" title="Permanent link">#</a></h3>
+<p>目录里<strong>没有 <code>__init__.py</code></strong>，但 Python 仍然把它当成一个 package。它和 regular package 的核心区别：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>regular package</th>
+<th>namespace package</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>__init__.py</code></td>
+<td>必须有</td>
+<td><strong>必须没有</strong></td>
+</tr>
+<tr>
+<td><code>__file__</code></td>
+<td>有</td>
+<td>没有</td>
+</tr>
+<tr>
+<td><code>__path__</code></td>
+<td>普通 list</td>
+<td><code>_NamespacePath</code>（可由多个物理目录拼成）</td>
+</tr>
+<tr>
+<td>用途</td>
+<td>单一 wheel 拥有整个 package</td>
+<td>多个 wheel <strong>拼接</strong>同一个 import 命名空间</td>
+</tr>
+</tbody>
+</table>
+<p>典型场景：<code>fbgemm_gpu/experimental/</code> 这种 hub-style 目录故意不放 <code>__init__.py</code>——这样 <code>fbgemm_gpu_experimental_hstu</code>、<code>fbgemm_gpu_experimental_gen_ai</code> 等独立 wheel 可以各自往 <code>site-packages/fbgemm_gpu/experimental/&lt;name&gt;/</code> 装自己的子 package，运行时 Python 把它们合并成同一个 <code>fbgemm_gpu.experimental</code> 命名空间。</p>
+<p><strong>关键约束</strong>：只要任何一个 wheel 在这个目录里塞进 <code>__init__.py</code>，它立刻退化成 regular package，从此别的 wheel 再往里装的子目录就<strong>不再被识别</strong>了（见反例 6）。</p>
+<hr />
+<h2 id="2-import">2. import 是怎么工作的<a class="headerlink" href="#2-import" title="Permanent link">#</a></h2>
+<h3 id="syspath"><code>sys.path</code> 决定能找到什么<a class="headerlink" href="#syspath" title="Permanent link">#</a></h3>
+<p><code>import X</code> 的本质是：解释器拿 <code>X</code> 这个点分名字，去 <code>sys.modules</code> 找；找不到就让 finder 沿 <code>sys.path</code> 找顶级 package，再顺着子 package 的 <code>__path__</code> 一层一层往下找。</p>
+<p><code>sys.path</code> 的常见来源：
+- 启动脚本所在目录（<code>python a.py</code> → <code>a.py</code> 的目录被插到 <code>sys.path[0]</code>）
+- <code>python -m pkg.mod</code> → <strong>当前工作目录</strong>被插到 <code>sys.path[0]</code>（这是 <code>-m</code> 和直接跑文件最大的区别之一）
+- <code>PYTHONPATH</code> 环境变量
+- 安装的 site-packages</p>
+<h3 id="__name__-__package__"><code>__name__</code> 和 <code>__package__</code><a class="headerlink" href="#__name__-__package__" title="Permanent link">#</a></h3>
+<p>每个 module 都有这两个属性，决定相对导入怎么解析。</p>
+<table>
+<thead>
+<tr>
+<th>启动方式</th>
+<th><code>__name__</code></th>
+<th><code>__package__</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>python app/pkg/a.py</code>（直接跑文件）</td>
+<td><code>"__main__"</code></td>
+<td><code>None</code> 或 <code>""</code></td>
+</tr>
+<tr>
+<td><code>python -m app.pkg.a</code>（按模块跑）</td>
+<td><code>"__main__"</code></td>
+<td><code>"app.pkg"</code></td>
+</tr>
+<tr>
+<td>被别处 <code>import app.pkg.a</code></td>
+<td><code>"app.pkg.a"</code></td>
+<td><code>"app.pkg"</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>相对导入（<code>from . import x</code>）只看 <code>__package__</code></strong>：以它为起点，每多一个点退一层。如果 <code>__package__</code> 是 <code>None</code>/<code>""</code>，相对导入直接失败。</p>
+<p>这就是为什么直接 <code>python a.py</code> 跑一个包里的文件，里面的 <code>from . import b</code> 会立刻报错——它根本不知道自己属于哪个 package。</p>
+<h3 id="vs">绝对导入 vs 相对导入<a class="headerlink" href="#vs" title="Permanent link">#</a></h3>
+<ul>
+<li><strong>绝对导入</strong>：<code>from app.pkg import b</code>，从 <code>sys.path</code> 根开始找完整路径。可读性好，跨 package 移动文件后基本不用改。</li>
+<li><strong>相对导入</strong>：<code>from . import b</code>、<code>from ..sib import e</code>，基于 <code>__package__</code> 算。重命名顶级 package 时不用改，但<strong>不能跨出顶级</strong>，并且不能在脚本入口里用。</li>
+</ul>
+<p>PEP 8 推荐绝对导入；相对导入用于 package <strong>内部</strong> 同辈/近亲互引。</p>
+<h3 id="dotted-name">dotted name 是怎么一段段解析的<a class="headerlink" href="#dotted-name" title="Permanent link">#</a></h3>
+<p><code>from a.b.c import d</code> 并不是一步到位，而是按 <code>.</code> 一段段走，每段独立决定它是 regular / namespace package 还是普通 module：</p>
+<ol>
+<li>找 <code>a</code>：沿 <code>sys.path</code> 找叫 <code>a</code> 的目录 / 文件，写进 <code>sys.modules['a']</code>。</li>
+<li>找 <code>a.b</code>：在 <code>a.__path__</code> 里找 <code>b</code>，再走一遍 finder。如果 <code>a</code> 是 namespace package，<code>a.__path__</code> 可能是多个物理目录的合集，<code>b</code> 可能来自其中任何一个。</li>
+<li>找 <code>a.b.c</code>：在 <code>a.b.__path__</code> 里找 <code>c</code>。</li>
+<li>从 <code>a.b.c</code> 这个 module 对象上取属性 <code>d</code>。</li>
+</ol>
+<p>每一步加载的 module 都写进 <code>sys.modules</code>，下次重复 import 直接命中缓存、不再走 finder。所以中间任何一层只要被 import 过一次，后面再换 <code>sys.path</code> 也不会让它"重新解析"。</p>
+<h3 id="import">import 的两个隐藏副作用<a class="headerlink" href="#import" title="Permanent link">#</a></h3>
+<p>这两条副作用解释了大量"为什么空的 <code>__init__.py</code> 也能这样用"的困惑。</p>
+<p><strong>(a) <code>import a.b</code> 会把 <code>b</code> 设为 <code>a</code> 的属性。</strong> 这是 import 系统在加载子模块时主动做的赋值，<strong>不是</strong> <code>__init__.py</code> 里必须写 <code>from . import b</code> 才有的效果：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">a.b</span>           <span class="c1"># 哪怕 a/__init__.py 完全为空</span>
+<span class="n">a</span><span class="o">.</span><span class="n">b</span><span class="o">.</span><span class="n">foo</span><span class="p">()</span>            <span class="c1"># 也能 work：import 系统已经把 b 绑到 a 上了</span>
+</code></pre></div>
+<p><strong>(b) <code>from a import b</code> 在 <code>a</code> 上找不到属性 <code>b</code> 时，会兜底去加载子模块 <code>a.b</code>。</strong> 这就是为什么 <code>__init__.py</code> 里没写 <code>from . import b</code>，外面仍然能 <code>from a import b</code> 拿到子模块。<strong>注意</strong>这条兜底只对单层 attribute 生效——<code>from a import b.c</code> 是语法错误。</p>
+<h3 id="package_1">同名子模块 / 同名顶级 package 的歧义<a class="headerlink" href="#package_1" title="Permanent link">#</a></h3>
+<p>import 系统<strong>只看名字</strong>，不区分"逻辑上是同一个包"。两种常见歧义：</p>
+<ul>
+<li><strong>同名顶级 package 撞车</strong>：<code>sys.path</code> 里有两条目录都包含 <code>foo/</code>，<code>import foo</code> 只会拿到 <code>sys.path</code> 中<strong>第一条</strong>命中的那个，另一个永远见不到。靠 <code>foo.__file__</code> 排查。</li>
+<li><strong>同名子模块不同含义</strong>：例如 <code>fbgemm_gpu.experimental.hstu.hstu_ops_gpu</code>（C++/CUDA 绑定）和 <code>fbgemm_gpu.experimental.hstu.hstu_blackwell.hstu_ops_gpu</code>（Triton 实现）是两个完全不同的 module，只是末尾文件名重合。靠绝对路径区分，常见做法是在调用方 <code>import ... as _sm90</code> / <code>as _sm100</code> 用别名 dispatch。</li>
+</ul>
+<hr />
+<h2 id="3">3. 典型例子<a class="headerlink" href="#3" title="Permanent link">#</a></h2>
+<p>假设项目结构（<code>sys.path</code> 里有 <code>/proj</code>，所以 <code>app</code> 是顶级 package）：</p>
+<div class="highlight"><pre><span></span><code>/proj/
+  app/                  &lt;- 顶级 package
+    __init__.py
+    main.py             &lt;- 入口：python -m app.main
+    pkg/
+      __init__.py
+      a.py
+      b.py
+      sub/
+        __init__.py
+        c.py
+    sib/
+      __init__.py
+      e.py
+      sub2/
+        __init__.py
+        f.py
+</code></pre></div>
+<h3 id="1-module">例 1：同目录导入兄弟 module<a class="headerlink" href="#1-module" title="Permanent link">#</a></h3>
+<p><code>app/pkg/a.py</code> 想用 <code>app/pkg/b.py</code> 里的 <code>foo</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 相对（推荐用于 package 内部）</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.</span><span class="w"> </span><span class="kn">import</span> <span class="n">b</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.b</span><span class="w"> </span><span class="kn">import</span> <span class="n">foo</span>
+
+<span class="c1"># 绝对（也合法）</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">app.pkg</span><span class="w"> </span><span class="kn">import</span> <span class="n">b</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">app.pkg.b</span><span class="w"> </span><span class="kn">import</span> <span class="n">foo</span>
+</code></pre></div>
+<p><code>.</code> 表示"当前 package"，也就是 <code>__package__ == "app.pkg"</code>。</p>
+<h3 id="2-package">例 2：从兄弟 package 导入<a class="headerlink" href="#2-package" title="Permanent link">#</a></h3>
+<p><code>app/pkg/a.py</code> 想用 <code>app/sib/e.py</code> 里的 <code>bar</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 相对：两个点退到 app，再进 sib</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..sib</span><span class="w"> </span><span class="kn">import</span> <span class="n">e</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..sib.e</span><span class="w"> </span><span class="kn">import</span> <span class="n">bar</span>
+
+<span class="c1"># 绝对</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">app.sib</span><span class="w"> </span><span class="kn">import</span> <span class="n">e</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">app.sib.e</span><span class="w"> </span><span class="kn">import</span> <span class="n">bar</span>
+</code></pre></div>
+<p>注意 <code>..</code> 不能越过顶级 package。这里 <code>pkg</code> 和 <code>sib</code> 都是 <code>app</code> 的子 package，<code>..</code> 退到 <code>app</code> 是合法的。如果app 下面没有__init__.py, 就是非法的.</p>
+<h3 id="3-package">例 3：从兄弟 package 的下一级导入<a class="headerlink" href="#3-package" title="Permanent link">#</a></h3>
+<p><code>app/pkg/a.py</code> 想用 <code>app/sib/sub2/f.py</code> 里的 <code>baz</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 相对</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..sib.sub2</span><span class="w"> </span><span class="kn">import</span> <span class="n">f</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..sib.sub2.f</span><span class="w"> </span><span class="kn">import</span> <span class="n">baz</span>
+
+<span class="c1"># 绝对</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">app.sib.sub2</span><span class="w"> </span><span class="kn">import</span> <span class="n">f</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">app.sib.sub2.f</span><span class="w"> </span><span class="kn">import</span> <span class="n">baz</span>
+</code></pre></div>
+<h3 id="4">例 4：脚本入口<a class="headerlink" href="#4" title="Permanent link">#</a></h3>
+<p><code>app/main.py</code> 作为入口，引用其它模块：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># main.py —— 推荐用 -m 启动：python -m app.main</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">app.pkg.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">something</span>    <span class="c1"># 绝对，最稳</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.pkg.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">something</span>       <span class="c1"># 相对，要求 __package__ == &quot;app&quot;，即用 -m 启动</span>
+</code></pre></div>
+<hr />
+<h2 id="4_1">4. 反例（常见报错）<a class="headerlink" href="#4_1" title="Permanent link">#</a></h2>
+<h3 id="1importerror-attempted-relative-import-with-no-known-parent-package">反例 1：<code>ImportError: attempted relative import with no known parent package</code><a class="headerlink" href="#1importerror-attempted-relative-import-with-no-known-parent-package" title="Permanent link">#</a></h3>
+<p><div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/proj/app/pkg
+$<span class="w"> </span>python<span class="w"> </span>a.py
+</code></pre></div>
+<code>a.py</code> 里有 <code>from . import b</code>。直接跑文件，<code>a.py</code> 的 <code>__name__ == "__main__"</code>，<code>__package__</code> 是 <code>None</code>——它压根不知道自己属于 <code>app.pkg</code>，相对导入起点丢了。</p>
+<p><strong>修法</strong>：
+- 改用 <code>python -m app.pkg.a</code>（在 <code>/proj</code> 下跑），让解释器把它当 module 加载，<code>__package__</code> 会被设成 <code>"app.pkg"</code>。
+- 或者把 <code>a.py</code> 写成纯脚本，里面只用绝对导入 <code>from app.pkg import b</code>（前提是 <code>/proj</code> 在 <code>sys.path</code> 里）。</p>
+<h3 id="2modulenotfounderror-no-module-named-app">反例 2：<code>ModuleNotFoundError: No module named 'app'</code><a class="headerlink" href="#2modulenotfounderror-no-module-named-app" title="Permanent link">#</a></h3>
+<p><div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/home/me
+$<span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>app.main
+</code></pre></div>
+当前目录是 <code>/home/me</code>，<code>sys.path[0]</code> 是 <code>/home/me</code>，里面根本没有 <code>app/</code> 目录。解释器找不到顶级 package。</p>
+<p><strong>修法</strong>：
+- <code>cd /proj &amp;&amp; python -m app.main</code>，或者
+- <code>PYTHONPATH=/proj python -m app.main</code>，或者
+- 把项目装成可编辑包（<code>pip install -e .</code> + <code>pyproject.toml</code>），让 <code>app</code> 进 site-packages。</p>
+<p>变体：<code>from app.pgk.a import x</code>（拼错 <code>pkg</code> → <code>pgk</code>）也会报同样错——错误信息只告诉你"没这个名字"，不会告诉你拼错了。</p>
+<h3 id="3importerror-attempted-relative-import-beyond-top-level-package">反例 3：<code>ImportError: attempted relative import beyond top-level package</code><a class="headerlink" href="#3importerror-attempted-relative-import-beyond-top-level-package" title="Permanent link">#</a></h3>
+<p><div class="highlight"><pre><span></span><code><span class="c1"># app/__init__.py 里写：</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..util</span><span class="w"> </span><span class="kn">import</span> <span class="n">helper</span>
+</code></pre></div>
+<code>app</code> 已经是顶级 package，<code>..</code> 想退到 <code>app</code> 的"父 package"——根本不存在。Python 不允许相对导入跨出顶级 package 的边界。</p>
+<p><strong>注意</strong>：错误信息里的 "top-level package" 指的是 <strong>相对导入起点所在的顶级 package</strong>（这里是 <code>app</code>），不是说"我已经在最外层目录了"。即使磁盘上 <code>app/</code> 外面还有别的目录，也无关——<code>sys.path</code> 决定的"顶"就是顶。</p>
+<p><strong>修法</strong>：用绝对导入 <code>from util import helper</code>（前提是 <code>util</code> 也是顶级 package），或者把 <code>util</code> 挪进 <code>app</code> 里变成 <code>app.util</code>。</p>
+<h3 id="4__init__py-import-importerror-cannot-import-name-x">反例 4：<code>__init__.py</code> 里循环 import → <code>ImportError: cannot import name 'X'</code><a class="headerlink" href="#4__init__py-import-importerror-cannot-import-name-x" title="Permanent link">#</a></h3>
+<p><div class="highlight"><pre><span></span><code><span class="c1"># app/pkg/__init__.py</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">Foo</span>
+
+<span class="c1"># app/pkg/a.py</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.</span><span class="w"> </span><span class="kn">import</span> <span class="n">b</span>           <span class="c1"># 触发 pkg/__init__.py 重入</span>
+
+<span class="c1"># app/pkg/b.py</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">Foo</span>        <span class="c1"># 此时 a 还没执行完，Foo 尚未定义</span>
+</code></pre></div>
+报错形式是 <code>ImportError: cannot import name 'Foo' from partially initialized module 'app.pkg.a'</code>。</p>
+<p><strong>修法</strong>：把交叉依赖打散（按需 <code>import</code> 到函数体内，或拆出共享底层 module），不要在 <code>__init__.py</code> 顶层就 re-export 出会引发回环的符号。</p>
+<h3 id="5-syspath0">反例 5：被 <code>sys.path[0]</code> 偷换的"假顶级"<a class="headerlink" href="#5-syspath0" title="Permanent link">#</a></h3>
+<p><div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/proj/app
+$<span class="w"> </span>python<span class="w"> </span>pkg/a.py
+</code></pre></div>
+<code>a.py</code> 里 <code>from app.pkg import b</code> 会报 <code>ModuleNotFoundError: No module named 'app'</code>。原因：<code>python pkg/a.py</code> 把 <code>/proj/app/pkg</code> 插到 <code>sys.path[0]</code>——这下 <code>pkg</code> 看起来像顶级了，但 <code>app</code> 反而不在 <code>sys.path</code> 任何一项的直接子项里。</p>
+<p><strong>修法</strong>：永远用 <code>python -m app.pkg.a</code> 在项目根目录跑，别直接 <code>python xxx.py</code> 跑包里的文件。</p>
+<h3 id="6-namespace-package-__init__py">反例 6：给 namespace package 补了 <code>__init__.py</code><a class="headerlink" href="#6-namespace-package-__init__py" title="Permanent link">#</a></h3>
+<p>某天有人觉得 <code>fbgemm_gpu/experimental/</code> 里没 <code>__init__.py</code> "看着不规范"，手贱补了一个。结果：</p>
+<ul>
+<li><code>fbgemm_gpu.experimental</code> 从 namespace 退化成 regular package。</li>
+<li>它的 <code>__path__</code> 从可拼接的 <code>_NamespacePath</code> 变成单一目录的普通 list。</li>
+<li>别的 wheel（<code>fbgemm_gpu_experimental_gen_ai</code> 等）往别处的 <code>experimental/gen_ai/</code> 装的子目录<strong>不再被识别</strong>——只有这个被"占坑"了的 <code>__init__.py</code> 所在目录下的子目录算数。</li>
+</ul>
+<p>报错形式：<code>ModuleNotFoundError: No module named 'fbgemm_gpu.experimental.gen_ai'</code>，但磁盘上 <code>gen_ai/</code> 明明存在。</p>
+<p><strong>修法</strong>：删掉那个不该存在的 <code>__init__.py</code>。判断一个目录"该不该有 <code>__init__.py</code>"的标准：<strong>这个目录是单个 wheel 拥有的，还是要给多个 wheel 拼接命名空间的？</strong> 前者必须有，后者绝对不能有。</p>
+<hr />
+<h2 id="5">5. 检查清单<a class="headerlink" href="#5" title="Permanent link">#</a></h2>
+<p>碰到 import 报错时，按顺序排查：</p>
+<ol>
+<li><code>python -c "import sys; print(sys.path)"</code> —— 顶级 package 的父目录在不在里面？</li>
+<li><code>python -c "import app; print(app.__file__)"</code> —— 找到的是不是你期望的那个 <code>app</code>？（小心同名 package 撞车）</li>
+<li>出错的文件里打 <code>print(__name__, __package__)</code> —— 相对导入的起点对不对？</li>
+<li>启动命令是 <code>python file.py</code> 还是 <code>python -m pkg.file</code>？前者几乎一定会让 <code>__package__</code> 丢失。</li>
+<li><code>__init__.py</code> 是不是在导入时就触发了循环？</li>
+</ol>
+  </main>
+</div>
+<script>
+// Highlight the current section in the sidebar as the user scrolls.
+(function () {
+  const headings = Array.from(document.querySelectorAll(
+    'main.content h2[id], main.content h3[id], main.content h4[id]'
+  ));
+  const links = new Map();
+  document.querySelectorAll('aside.toc a[href^="#"]').forEach(a => {
+    const id = decodeURIComponent(a.getAttribute('href').slice(1));
+    if (id) links.set(id, a);
+  });
+  if (!headings.length || !links.size) return;
+
+  const setActive = (id) => {
+    document.querySelectorAll('aside.toc a.active').forEach(a => a.classList.remove('active'));
+    const el = links.get(id);
+    if (el) {
+      el.classList.add('active');
+      const aside = document.querySelector('aside.toc');
+      const rect = el.getBoundingClientRect();
+      const asideRect = aside.getBoundingClientRect();
+      if (rect.top < asideRect.top || rect.bottom > asideRect.bottom) {
+        el.scrollIntoView({ block: 'nearest' });
+      }
+    }
+  };
+
+  const observer = new IntersectionObserver((entries) => {
+    const visible = entries.filter(e => e.isIntersecting)
+      .sort((a, b) => a.target.getBoundingClientRect().top - b.target.getBoundingClientRect().top);
+    if (visible.length) {
+      setActive(visible[0].target.id);
+    }
+  }, { rootMargin: '-20% 0px -70% 0px', threshold: 0 });
+
+  headings.forEach(h => observer.observe(h));
+})();
+</script>
+</body>
+</html>
