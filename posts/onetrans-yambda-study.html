@@ -1,0 +1,1305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>oneTrans+YaMBDA study</title>
+<meta name="post:title"   content="oneTrans+YaMBDA study">
+<meta name="post:slug"    content="onetrans-yambda-study">
+<meta name="post:date"    content="2026-05-18">
+<meta name="post:tags"    content="推荐系统, MLperf, TorchRec">
+<meta name="post:reading" content="20 分钟">
+<meta name="post:summary" content="Yambda 数据集与 OneTrans 数据流梳理：原始 parquet schema、sparse/sequential/dense/cross-product 训练特征清单、embedding 表总览、ScoringPair 字段索引、DataLoader 运行时派生与 candidate 生成,并配 B=2 batch 张量流示例。">
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    line-height: 1.65;
+    margin: 0;
+    padding: 0;
+    color: #24292e;
+    background: #fff;
+  }
+  .layout {
+    display: flex;
+    align-items: flex-start;
+  }
+  main.content {
+    flex: 1;
+    max-width: 1080px;
+    margin: 2em auto;
+    padding: 0 1.5em 4em;
+    min-width: 0;
+  }
+  h1 { border-bottom: 2px solid #d0d7de; padding-bottom: 0.3em; }
+  h2 { border-bottom: 1px solid #d0d7de; padding-bottom: 0.2em; margin-top: 2em; }
+  h3 { margin-top: 1.6em; }
+  h4 { margin-top: 1.2em; color: #57606a; }
+  code {
+    background: #f6f8fa;
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.92em;
+  }
+  pre {
+    background: #f6f8fa;
+    padding: 1em;
+    border-radius: 6px;
+    overflow-x: auto;
+    line-height: 1.45;
+  }
+  pre code { background: none; padding: 0; }
+  table {
+    border-collapse: collapse;
+    margin: 1em 0;
+    width: 100%;
+    font-size: 0.94em;
+  }
+  th, td {
+    border: 1px solid #d0d7de;
+    padding: 0.45em 0.7em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: #f6f8fa; font-weight: 600; }
+  tr:nth-child(even) td { background: #fafbfc; }
+  a { color: #0969da; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  blockquote {
+    border-left: 4px solid #d0d7de;
+    margin: 1em 0;
+    padding: 0.3em 1em;
+    color: #57606a;
+    background: #f6f8fa;
+  }
+  .ok    { color: #1a7f37; font-weight: 600; }
+  .warn  { color: #bf8700; font-weight: 600; }
+  .gap   { color: #cf222e; font-weight: 600; }
+  .small { font-size: 0.85em; color: #57606a; }
+  .callout {
+    border: 1px solid #d0d7de;
+    border-left: 4px solid #bf8700;
+    background: #fff8c5;
+    padding: 0.6em 1em;
+    border-radius: 4px;
+    margin: 1em 0;
+  }
+  .callout.note { border-left-color: #0969da; background: #ddf4ff; }
+  ul, ol { padding-left: 1.6em; }
+  hr { border: none; border-top: 1px solid #d0d7de; margin: 2em 0; }
+  nav.toc {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 280px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    background: #f6f8fa;
+    border-right: 1px solid #d0d7de;
+    padding: 1.2em 1em 1.5em 1.4em;
+    font-size: 0.88em;
+    box-sizing: border-box;
+    z-index: 100;
+  }
+  nav.toc strong {
+    display: block;
+    font-size: 1.05em;
+    margin-bottom: 0.6em;
+    color: #1f2328;
+    border-bottom: 1px solid #d0d7de;
+    padding-bottom: 0.4em;
+  }
+  nav.toc ul { margin: 0.2em 0; padding-left: 1em; list-style: none; }
+  nav.toc > ul { padding-left: 0; }
+  nav.toc li { margin: 0.18em 0; }
+  nav.toc a {
+    display: block;
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+    color: #424a53;
+    line-height: 1.4;
+  }
+  nav.toc a:hover {
+    background: #ddf4ff;
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.toc > ul > li > a { font-weight: 600; color: #1f2328; }
+  nav.toc ul ul a { font-size: 0.95em; color: #57606a; }
+  nav.toc code { font-size: 0.85em; background: transparent; padding: 0; }
+  /* Mobile fallback: stack nav above content instead of sidebar */
+  @media (max-width: 900px) {
+    nav.toc {
+      position: static;
+      width: auto;
+      max-height: 280px;
+      border-right: none;
+      border-bottom: 1px solid #d0d7de;
+    }
+    main.content { margin-top: 1em; }
+  }
+  /* Sidebar present → push main content right (desktop only) */
+  @media (min-width: 901px) {
+    main.content { margin-left: 300px; }
+  }
+  html { scroll-padding-top: 1em; }
+</style>
+</head>
+<body>
+
+<nav class="toc" aria-label="目录">
+<strong>目录</strong>
+<ul>
+  <li><a href="#sec1">1. 原始数据集</a>
+    <ul>
+      <li><a href="#sec1-1">1.1 来源与规模</a></li>
+      <li><a href="#sec1-2">1.2 文件清单</a></li>
+      <li><a href="#sec1-3">1.3 <code>multi_event.parquet</code> Schema</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec2">2. 训练特征清单</a>
+    <ul>
+      <li><a href="#sec2-1">2.1 Sparse Non-Sequential 特征</a></li>
+      <li><a href="#sec2-2">2.2 Sparse Sequential 特征</a></li>
+      <li><a href="#sec2-3">2.3 Dense 特征</a></li>
+      <li><a href="#sec2-4">2.4 Cross-Product Sparse 特征</a></li>
+      <li><a href="#sec2-5">2.5 Embedding 表总览</a></li>
+      <li><a href="#sec2-6">2.6 <code>ScoringPair</code> 字段索引</a></li>
+      <li><a href="#sec2-7">2.7 多任务标签</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec3">3. 预处理与数据加载</a>
+    <ul>
+      <li><a href="#sec3-1">3.1 DataLoader 运行时派生</a></li>
+      <li><a href="#sec3-2">3.2 Candidate 生成</a></li>
+      <li><a href="#sec3-3">3.3 多事件拼接为长历史序列</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec4">4. 总结</a></li>
+  <li><a href="#sec5">5. Batch 张量流(B=2 示例)</a>
+    <ul>
+      
+      <li><a href="#sec5-1">5.1 输入示例(B=2, L=4)</a></li>
+      <li><a href="#sec5-2">5.2 Collate 后的张量</a></li>
+      <li><a href="#sec5-3">5.3 每表 Lookup 次数</a></li>
+      <li><a href="#sec5-4">5.4 Lookup 到 Token 的转换</a></li>
+      <li><a href="#sec5-5">5.5 Lookup 后的张量形状</a></li>
+      <li><a href="#sec5-6">5.6 Dense 特征处理路径</a></li>
+      <li><a href="#sec5-7">5.7 全流程可视化(Raw → Attention)</a></li>
+    </ul>
+  </li>
+</ul>
+</nav>
+
+<main class="content">
+
+<h1>oneTrans+YaMBDA study</h1>
+
+<p>本文档说明 Yambda 数据集在 Primus-DLRM 仓库里被预处理、特征化、最终喂入 OneTrans 模型的完整数据流 &mdash; 从 raw input 一路到 attention 输入、再到 loss。</p>
+
+<div class="callout note">
+阅读建议:§1-§2 是<strong>静态特征清单</strong>(数据集字段、训练特征、embedding 表),§3 是<strong>预处理逻辑</strong>,§5 是<strong>动态数据流</strong>(逐张量 shape + 模型每层的 seqlen 变化)。详细结论在文末 §4。
+</div>
+
+<hr>
+
+<h2 id="sec1">1. 原始数据集</h2>
+
+<h3 id="sec1-1">1.1 来源与规模</h3>
+<ul>
+  <li><strong>Yambda</strong>(YaMBDA / Yandex Music Behavior Dataset),Yandex Music 于 <strong>2024 年</strong>通过 HuggingFace <code>yandex/yambda</code> 公开发布(Apache 2.0)</li>
+  <li>三档:<strong>50M / 500M / 5B</strong> 事件 &mdash; Primus-DLRM 默认使用 <strong>Yambda-5B</strong>(4.79B 真实事件)</li>
+  <li>5B 档全局统计:
+    <ul>
+      <li>Users: <strong>1M</strong></li>
+      <li>Items: <strong>9.39M</strong></li>
+      <li>Behavior types: 5 (<code>listen / like / dislike / unlike / undislike</code>)</li>
+      <li>Raw size: ~195 GB,~20 字节/事件</li>
+    </ul>
+  </li>
+</ul>
+
+<h3 id="sec1-2">1.2 文件清单</h3>
+<p>HuggingFace 下载,见 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/download.py#L11-L26">download.py:11-26</a>。</p>
+
+<table>
+<thead>
+<tr><th>文件</th><th>类型</th><th>内容</th></tr>
+</thead>
+<tbody>
+<tr><td><code>flat/&lt;size&gt;/multi_event.parquet</code></td><td><strong>事件流</strong></td><td>真正的训练数据,行级用户-曲目交互</td></tr>
+<tr><td><code>embeddings.parquet</code></td><td><strong>物品目录元数据</strong></td><td>每首曲目的预训练音频嵌入,128 维(~14 GB,3 档共享)</td></tr>
+<tr><td><code>artist_item_mapping.parquet</code></td><td>物品目录元数据</td><td>item_id → artist_id</td></tr>
+<tr><td><code>album_item_mapping.parquet</code></td><td>物品目录元数据</td><td>item_id → album_id</td></tr>
+</tbody>
+</table>
+
+<h3 id="sec1-3">1.3 <code>multi_event.parquet</code> Schema</h3>
+<p>来自 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py#L166-L172">preprocessing.py:166-172</a>。</p>
+
+<table>
+<thead>
+<tr><th>列</th><th>物理含义</th></tr>
+</thead>
+<tbody>
+<tr><td><code>uid</code></td><td>用户 ID</td></tr>
+<tr><td><code>item_id</code></td><td>曲目 ID</td></tr>
+<tr><td><code>timestamp</code></td><td>秒级时间戳(5 秒粒度对齐)</td></tr>
+<tr><td><code>event_type</code></td><td><code>listen / like / dislike / unlike / undislike</code></td></tr>
+<tr><td><code>is_organic</code></td><td>是否自发收听(0 = 推荐曝光触发,1 = 用户主动)</td></tr>
+<tr><td><code>played_ratio_pct</code></td><td>曲目播放完成度(0-100)</td></tr>
+<tr><td><code>track_length_seconds</code></td><td>曲目时长</td></tr>
+</tbody>
+</table>
+
+<div class="callout note">
+⚠️ 注意:<code>artist_id / album_id</code> <strong>不在事件表里</strong>,要通过 <code>artist_item_mapping / album_item_mapping</code> 用 <code>item_id</code> 现场 join。
+</div>
+
+<hr>
+
+<h2 id="sec2">2. 训练特征清单</h2>
+
+<p>仓库 schema 定义在 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/schemas/yambda.yaml">configs/schemas/yambda.yaml</a>,embedding 表与 dense 特征定义在每个 config 文件里。下面按 <em>是否序列化</em> 切开。</p>
+
+<h3 id="sec2-1">2.1 Sparse Non-Sequential 特征</h3>
+<p>来源:用户上下文 + 候选曲目本身。共 4 个 scalar feature,对应 <strong>4 张 native sparse 表</strong>。</p>
+
+<table>
+<thead>
+<tr><th>特征</th><th>含义</th><th>表</th><th>num_embeddings</th></tr>
+</thead>
+<tbody>
+<tr><td><code>uid</code></td><td>当前用户</td><td><code>uid</code></td><td>1,000,001</td></tr>
+<tr><td><code>item</code></td><td>候选曲目</td><td><code>item</code></td><td>9,390,624</td></tr>
+<tr><td><code>artist</code></td><td>候选曲目所属艺术家</td><td><code>artist</code></td><td>1,293,395</td></tr>
+<tr><td><code>album</code></td><td>候选曲目所属专辑</td><td><code>album</code></td><td>3,367,692</td></tr>
+</tbody>
+</table>
+
+<p class="small">(见 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/bench_onetrans_large_5b.yaml#L46-L50">bench_onetrans_large_5b.yaml:46-50</a>)</p>
+
+<h3 id="sec2-2">2.2 Sparse Sequential 特征</h3>
+
+<p>OneTrans 的灵魂:用户历史按行为切成 <strong>3 个池子</strong>,每个池子记 3 种实体 ID,因此每样本 <strong>9 条 sequence</strong>。<code>L = history_length</code>(5B 配置 L=500 → S-token 序列长度 <code>L_S = 1500</code>)。</p>
+
+<table>
+<thead>
+<tr><th>Pool(行为池)</th><th>定义 (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L189-L191">dataset.py:189-191</a>)</th><th>3 条 sequence 名</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td><strong><code>hist_lp</code> (listen-plus)</strong></td>
+  <td><code>event_type==listen ∧ played_ratio_pct ≥ 50%</code>(正反馈)</td>
+  <td><code>hist_lp_item / hist_lp_artist / hist_lp_album</code></td>
+</tr>
+<tr>
+  <td><strong><code>hist_like</code></strong></td>
+  <td><code>event_type==like</code>(显式点赞)</td>
+  <td><code>hist_like_item / hist_like_artist / hist_like_album</code></td>
+</tr>
+<tr>
+  <td><strong><code>hist_skip</code></strong></td>
+  <td><code>event_type==listen ∧ played_ratio_pct &lt; 50%</code>(秒切,负反馈)</td>
+  <td><code>hist_skip_item / hist_skip_artist / hist_skip_album</code></td>
+</tr>
+</tbody>
+</table>
+
+<div class="callout note">
+注意:这 9 条序列<strong>没有独立的嵌入表</strong> &mdash; 它们和对应的 non-sequential scalar 共用同一张表(item/artist/album 各一张):
+<pre><code>- { name: item, features: [item, hist_lp_item, hist_like_item, hist_skip_item], ... }</code></pre>
+即候选曲目和历史曲目共享同一个 9.39M 行的 item 表 &mdash; 4 个 native sparse features 各对应一张表。
+</div>
+
+<h3 id="sec2-3">2.3 Dense 特征</h3>
+<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/bench_onetrans_large_5b.yaml#L58-L62">bench_onetrans_large_5b.yaml:58-62</a>:</p>
+
+<table>
+<thead>
+<tr><th>特征</th><th>维度</th><th>来源</th></tr>
+</thead>
+<tbody>
+<tr><td><code>audio_embed</code></td><td><strong>128</strong></td><td>候选曲目的预训练音频嵌入(来自 <code>embeddings.parquet</code>)</td></tr>
+<tr><td><code>user_counters</code></td><td><strong>6</strong></td><td>用户在 [7d, 30d] 窗口内的 [listen+, like, skip] 计数(2 窗 × 3 行为)</td></tr>
+<tr><td><code>item_counters</code></td><td><strong>6</strong></td><td>物品在 [7d, 30d] 窗口内的 [曝光, listen+, like] 计数</td></tr>
+<tr><td><code>cross_counters</code></td><td><strong>18</strong></td><td>user × item 在 [7d, 30d] 窗口内的多组交叉计数</td></tr>
+</tbody>
+</table>
+
+<p>计数器特征由 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/counters.py">primus_dlrm/data/counters.py</a> 在预处理时用 Numba 滑动窗口算出。</p>
+
+<h3 id="sec2-4">2.4 Cross-Product Sparse 特征</h3>
+<p>只有 <code>bench_onetrans_large_5b_cross_feat_shampoo.yaml</code> 开启。这 7 张 cross 表(<code>user_x_artist</code> / <code>user_x_album</code> / <code>user_x_hour</code> / <code>item_x_hour</code> / <code>artist_x_hour</code> / <code>user_x_is_organic</code> / <code>user_x_artist_x_hour</code>)是把 embedding footprint 显著放大的关键设计。</p>
+
+<h3 id="sec2-5">2.5 Embedding 表总览</h3>
+
+<p>所有 sparse 特征最终都要打到下面 11 张表里的某一张:</p>
+
+<table>
+<thead>
+<tr><th>#</th><th>表名</th><th>行数</th><th>类型</th><th>哪些 KJT feature 来 lookup 这张表</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td><code>item</code></td><td>9.39M</td><td>native</td><td><code>item</code>(候选)+ <code>hist_lp_item</code> / <code>hist_like_item</code> / <code>hist_skip_item</code>(3 条历史序列)</td></tr>
+<tr><td>2</td><td><code>artist</code></td><td>1.29M</td><td>native</td><td><code>artist</code> + <code>hist_lp_artist</code> / <code>hist_like_artist</code> / <code>hist_skip_artist</code></td></tr>
+<tr><td>3</td><td><code>album</code></td><td>3.37M</td><td>native</td><td><code>album</code> + <code>hist_lp_album</code> / <code>hist_like_album</code> / <code>hist_skip_album</code></td></tr>
+<tr><td>4</td><td><code>uid</code></td><td>1M</td><td>native</td><td><code>uid</code></td></tr>
+<tr><td>5</td><td><code>user_x_artist</code></td><td>100M</td><td>cross (hashed)</td><td><code>user_x_artist</code></td></tr>
+<tr><td>6</td><td><code>user_x_album</code></td><td>40M</td><td>cross (hashed)</td><td><code>user_x_album</code></td></tr>
+<tr><td>7</td><td><code>user_x_hour</code></td><td>24M</td><td>cross (unique)</td><td><code>user_x_hour</code></td></tr>
+<tr><td>8</td><td><code>item_x_hour</code></td><td>40M</td><td>cross (hashed)</td><td><code>item_x_hour</code></td></tr>
+<tr><td>9</td><td><code>artist_x_hour</code></td><td>32M</td><td>cross (unique)</td><td><code>artist_x_hour</code></td></tr>
+<tr><td>10</td><td><code>user_x_is_organic</code></td><td>2M</td><td>cross (unique)</td><td><code>user_x_is_organic</code></td></tr>
+<tr><td>11</td><td><code>user_x_artist_x_hour</code></td><td>40M</td><td>cross (hashed 3-way)</td><td><code>user_x_artist_x_hour</code></td></tr>
+</tbody>
+</table>
+
+<div class="callout note">
+<strong>关键映射规则</strong>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/pipeline_batch.py">pipeline_batch.py</a>):每个 batch 里的每个 sparse 张量,通过 <code>schema.batch_to_feature</code> 把"batch 里的字段名"映射到"KJT feature 名",再通过 <code>embedding_tables[*].features</code> 找到对应的表。<strong>4 张 native 表被 13 个 KJT feature 共享</strong>(候选 + 9 条历史序列,共享 item/artist/album/uid),<strong>7 张 cross 表各占 1 个 KJT feature</strong>。
+</div>
+
+<h3 id="sec2-6">2.6 <code>ScoringPair</code> 字段索引</h3>
+
+<p>每条训练样本(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L110-L143">dataset.py:110-143</a> 定义)对应一次 <code>(user, candidate_item, target_event)</code> 评分,按字段族分组:</p>
+
+<table>
+<thead>
+<tr><th>字段族</th><th>个数</th><th>形状</th><th>关联小节</th></tr>
+</thead>
+<tbody>
+<tr><td>sparse non-sequential scalar</td><td>4</td><td><code>[B]</code> 各</td><td><a href="#sec2-1">§2.1</a></td></tr>
+<tr><td>sparse sequential</td><td>9(3 pool × 3 entity)</td><td><code>[B, L]</code> 各</td><td><a href="#sec2-2">§2.2</a></td></tr>
+<tr><td>sparse cross-product(可选)</td><td>7</td><td><code>[B]</code> 各</td><td><a href="#sec2-4">§2.4</a></td></tr>
+<tr><td>dense</td><td>4</td><td><code>[B, 128] / [B, 6] × 2 / [B, 18]</code></td><td><a href="#sec2-3">§2.3</a></td></tr>
+<tr><td>labels</td><td>4(多任务)</td><td><code>[B]</code> 各</td><td><a href="#sec2-7">§2.7</a></td></tr>
+</tbody>
+</table>
+
+<p>具体字段名称、含义、padding 行为见上面各小节;一个 <code>B=2</code> 实际样本(含每个字段的具体 ID/值)展开见 <a href="#sec5-1">§5.1</a>。</p>
+
+<h3 id="sec2-7">2.7 多任务标签</h3>
+<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L558-L561">dataset.py:558-561</a>:</p>
+
+<table>
+<thead>
+<tr><th>任务</th><th>损失</th><th>派生公式</th></tr>
+</thead>
+<tbody>
+<tr><td><code>listen_plus</code></td><td>BCE</td><td><code>(event_type==listen) ∧ (played_ratio_pct ≥ 50)</code></td></tr>
+<tr><td><code>like</code></td><td>BCE</td><td><code>event_type==like</code></td></tr>
+<tr><td><code>dislike</code></td><td>BCE</td><td><code>event_type==dislike</code></td></tr>
+<tr><td><code>played_ratio</code></td><td>MSE</td><td><code>played_ratio_pct / 100</code></td></tr>
+</tbody>
+</table>
+
+<p>5B 配置默认只开 <code>listen_plus: 1.0</code>。</p>
+
+<hr>
+
+<h2 id="sec3">3. 预处理与数据加载</h2>
+
+<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py">primus_dlrm/data/preprocessing.py</a> 的 <code>preprocess()</code> 一站式做完:</p>
+
+<pre><code>Raw parquet (4.79B 行, ~195 GB)
+   ↓ ① 流式加载                                          _load_chunked
+事件 DataFrame (event_type 文本 → uint8 编码)
+   ↓ ② Global Temporal Split (300 天 train + 30 min gap + 1 天 test)
+   │                                                     _compute_split_boundaries
+   ↓ ③ 30 分钟会话切分                                    _build_sessions
+   ↓
+   ├──→ train_sessions.parquet         (按 uid/session_id 聚合)
+   ├──→ session_index.parquet          ④ per-user 累积长度,O(1) 定位历史
+   ├──→ item_popularity.npy            ⑤ 全训练集物品频次(流行度基线+负采样)
+   └──→ data/shared_metadata/          ⑥ embeddings/artist/album mapping 三档共享
+</code></pre>
+
+<p class="small">关键代码:<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py#L123-L132">_compute_split_boundaries</a> · <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py#L150-L176">_build_sessions</a> · <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py#L218-L287">_load_and_save_metadata</a>。<code>event_type</code> 编码:<code>listen=0, like=1, dislike=2, unlike=3, undislike=4</code>。test 用户必须在 train 出现过,否则丢弃。</p>
+
+<h3 id="sec3-1">3.1 DataLoader 运行时派生</h3>
+<p>见 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py">primus_dlrm/data/dataset.py</a>:</p>
+
+<ol>
+  <li>把会话事件 flatten 成 <code>(uid, item, ts, event_type, played_ratio_pct, is_organic, ...)</code> 的 NumPy 数组,以 <strong>MAP_SHARED + PROT_READ</strong> 的 mmap 方式加载,零虚拟内存承诺(关键 &mdash; 5B 档下 8 ranks × 700 GB cache 不会撑爆 overcommit)</li>
+  <li>派生掩码:<code>flat_is_listen_plus / flat_is_like / flat_is_skip</code>(三个布尔数组)</li>
+  <li>抽样 <code>(user, target_event)</code> 后,<strong>回扫该用户在 target 时刻之前的事件</strong>,按三个掩码切片得到 9 条历史序列(裁剪到 <code>history_length</code>)</li>
+  <li>现场算 <code>hour_of_day = (ts // 3600) % 24</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L588">dataset.py:588</a>)、读 <code>is_organic</code>,用于 cross-feature 哈希</li>
+  <li><strong>xxhash64 现算 cross-feature ID</strong>(不落盘,见 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/hashing.py">hashing.py</a>)→ 喂给 KeyedJaggedTensor</li>
+</ol>
+
+<h3 id="sec3-2">3.2 Candidate 生成</h3>
+
+<p>仓库<strong>没有显式负采样</strong> &mdash; 每条训练样本的 candidate 直接就是用户 timeline 上某个真实事件的 item,label 来自那个事件的 <code>event_type</code> 和 <code>played_ratio</code>。</p>
+
+<h4>(a) 样本位置的枚举(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L458-L500"><code>_build_sample_positions</code></a>)</h4>
+
+<pre><code>for uid in users:
+    user_event_count = user_end[uid] - user_start[uid]
+    n_samples_for_this_user = max(user_event_count - L, 0)   # 跳过前 L 个(历史不够)
+    valid_positions += [user_start[uid] + L, user_start[uid] + L + 1, ..., user_end[uid] - 1]
+</code></pre>
+
+<p>用户 timeline 上<strong>第 (L+1) 个事件起的每一个事件位置都是一个训练样本</strong>。1M 用户 × 平均数千事件 → 数十亿个训练样本。</p>
+
+<h4>(b) 取样本时的 candidate 派生(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L505-L564"><code>YambdaTrainDataset.__getitem__</code></a>)</h4>
+
+<pre><code>flat_pos      = self._positions[idx]                          # 选一个事件位置
+uid           = self.store.flat_uid[flat_pos]
+target_item   = self.store.flat_item_ids[flat_pos]            # ← candidate item
+event_type    = self.store.flat_event_types[flat_pos]         # ← 决定 label
+played_ratio  = self.store.flat_played_ratio[flat_pos]
+target_artist = self.item_to_artist[target_item]              # 现场 join mapping
+target_album  = self.item_to_album[target_item]
+audio         = self.audio_embeddings[target_item]            # 预训练音频 128 维
+</code></pre>
+
+<h4>(c) Label 派生</h4>
+
+<table>
+<thead>
+<tr><th>该事件 event_type</th><th>listen+</th><th>like</th><th>dislike</th><th>played_ratio</th></tr>
+</thead>
+<tbody>
+<tr><td>listen,played_ratio ≥ 50%</td><td><strong>1</strong></td><td>0</td><td>0</td><td>0.5-1.0</td></tr>
+<tr><td>listen,played_ratio &lt; 50%</td><td>0(隐式负样本)</td><td>0</td><td>0</td><td>0.0-0.5</td></tr>
+<tr><td>like</td><td>0</td><td><strong>1</strong></td><td>0</td><td>0</td></tr>
+<tr><td>dislike</td><td>0</td><td>0</td><td><strong>1</strong></td><td>0</td></tr>
+<tr><td>unlike / undislike</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
+</tbody>
+</table>
+
+<p>每个事件最多只有一个 label 为 1。这是典型的 <strong>implicit-feedback multi-task ranking</strong>:listen+ 的负样本来自"听了但没听完"的真实事件,like / dislike 的负样本来自"做了别的动作"的真实事件,完全靠真实行为分布提供训练信号 &mdash; <strong>不需要从全体 9.39M item 里采样负例</strong>。</p>
+
+<p class="small">注:仓库的 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/negatives.py">data/negatives.py</a> 提供 in-batch BPR 负采样,但默认 <code>contrastive_weight=0</code>,这条路径不参与默认训练。</p>
+
+<h3 id="sec3-3">3.3 多事件拼接为长历史序列</h3>
+
+<p>关键认识:<strong>"把同一用户的多个 interaction 拼成一条按时间排序的长序列"这件事不是 DataLoader 在 <code>__getitem__</code> 里现做的,而是在 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L146-L206"><code>FlatEventStore.__init__</code></a> 一次性做完</strong>。每个 <code>__getitem__</code> 只是在已经拼好的长数组里切一段窗口。</p>
+
+<h4>(a) 一次性的 flatten(预处理 + Store 构建阶段)</h4>
+
+<pre><code># preprocess() 输出
+train_sessions.parquet  # 每行 = 一个 session: (uid, session_id, [item_ids list], [timestamps list], ...)
+
+# FlatEventStore.__init__ 加载时做的事:
+sorted_sessions = sessions_df.sort(["uid", "session_id"])    # ① 先按 uid 排,user 内按 session_id 排
+exploded = sorted_sessions.explode([                          # ② 把每行的 list 列拆成多行
+    "item_ids", "timestamps", "event_types",
+    "is_organic", "played_ratio_pct", "track_length_seconds",
+])
+# 现在每一行 = 一个 event,行序 = (uid 升序, 同 uid 内按 session_id 升序, 同 session 内按 list 内顺序)
+# 又因为 _build_sessions 时已经在 session 内按时间排序了,所以整体按时间因果有序
+
+self.flat_uid          = exploded["uid"].to_numpy()           # int64 [N_total]
+self.flat_item_ids     = exploded["item_ids"].to_numpy()       # int64 [N_total]
+self.flat_timestamps   = exploded["timestamps"].to_numpy()     # int64 [N_total]
+self.flat_event_types  = exploded["event_types"].to_numpy()    # int64 [N_total]
+self.flat_played_ratio = exploded["played_ratio_pct"].to_numpy() # f32 [N_total]
+self.flat_is_organic   = exploded["is_organic"].to_numpy()     # int8 [N_total]
+</code></pre>
+
+<p>5B 档下 <code>N_total ≈ 4.79B</code>。这些 flat 数组通过 <code>np.save</code> 落盘 + mmap 加载,8 个 rank 共享同一份只读数据。</p>
+
+<h4>(b) Per-user 范围索引(O(1) 找用户切片)</h4>
+
+<pre><code>uid_changes   = np.where(np.diff(flat_uid) != 0)[0] + 1     # 用户分界点
+starts        = np.concatenate([[0], uid_changes])
+ends          = np.concatenate([uid_changes, [N_total]])
+self.user_start = np.full(max_uid, -1)
+self.user_end   = np.full(max_uid, -1)
+self.user_start[uid_vals] = starts
+self.user_end[uid_vals]   = ends
+</code></pre>
+
+<p>对任意 <code>uid</code>,该用户的完整按时间排序的 event 历史 = <code>flat_*[user_start[uid] : user_end[uid]]</code> 这一连续切片 &mdash; <strong>session 之间是无缝拼接的</strong>,序列里不保留 session 边界。</p>
+
+<h4>(c) 取样本时的"窗口扫描"(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L604-L636"><code>_get_split_history</code></a>)</h4>
+
+<pre><code>L          = config.data.history_length                       # 5B 配置 = 500
+scan_end   = flat_pos                                           # 当前事件位置(不含)
+scan_start = max(user_start[uid], flat_pos - 500)              # 回扫窗口,封顶 500 个 event
+
+item_ids = self.store.flat_item_ids[scan_start:scan_end]
+is_lp    = self.store.flat_is_listen_plus[scan_start:scan_end]   # 预先算好的布尔掩码
+is_like  = self.store.flat_is_like[scan_start:scan_end]
+is_skip  = self.store.flat_is_skip[scan_start:scan_end]
+
+lp_items   = item_ids[is_lp][-L:]      # ← 按 pool 过滤 + 取最近 L 个
+like_items = item_ids[is_like][-L:]
+skip_items = item_ids[is_skip][-L:]
+
+# pad/lookup:不足 L 在前面补 0(右对齐,最近事件在 [L-1])
+padded = np.zeros(L, dtype=np.int64)
+padded[L - n:] = items
+</code></pre>
+
+<h4>(d) 一图总结</h4>
+
+<pre><code>FlatEventStore (一次性,所有 user 共享):
+
+  flat_uid          [...0 0 0 0 ... 0 | 1 1 1 1 1 ... 1 | 2 2 2 ... 2 | ...]
+  flat_item_ids     [..............................                       ...]
+  flat_timestamps   [..............................                       ...]
+  ...
+                     └─uid=0 段─┘└──uid=1 段──┘└─uid=2─┘
+                     ↑                          ↑      ↑
+                     user_start[0]              user_start[1]  user_start[2]
+
+每个训练 sample(__getitem__ 一次):
+  ┌─ flat_pos = self._positions[idx]
+  │
+  │ 从 user_start[uid] 到 flat_pos 之间(最多回扫 500 个) ← scan_start..scan_end
+  │       ↓ 按 is_lp / is_like / is_skip 切 3 个池子
+  │       ↓ 每池取最近 L 个,左 padding 0 到长度 L
+  │       ↓ 用 item_to_artist / item_to_album 映射得到 artist/album 序列
+  │
+  └─ ScoringPair(9 条 [L] 历史序列 + candidate scalar + dense + cross + labels)
+</code></pre>
+
+<h4>关键设计取舍</h4>
+
+<ul>
+  <li><strong>预处理时 flatten 一次,训练时 zero-copy 扫窗口</strong> &mdash; 避免 DataLoader worker 反复做"分组 / 排序 / explode"。
+  </li>
+  <li><strong>右对齐 padding + 位置嵌入 0..L-1</strong> &mdash; 最近事件总在 index <code>L-1</code> 的位置,模型看到的"最近时间"在跨用户间稳定;但 padding 占了序列前段的位置嵌入,模型需要自己学会从向量 0 区分 padding。
+  </li>
+  <li><strong>session 边界丢弃</strong> &mdash; flat 序列里两个 session 之间没有 "[SEP]" 之类的标记,模型只能从 <code>timestamps</code>(并未作为 token 输入)的间隔推断,实际上不做显式 session-aware 建模。
+  </li>
+  <li><strong>回扫窗口硬编码 500</strong> &mdash; 不论 <code>history_length</code> 设置成多少,真实有效 token 数封顶 500(三池总和)。把 L 调到 &gt; 500 会得到更多 padding 而非更多信号。
+  </li>
+</ul>
+
+<hr>
+
+<h2 id="sec4">4. 总结</h2>
+
+<ul>
+  <li><strong>原始数据</strong>:Yambda 是 Yandex Music 公开的 4.79B 真实交互事件,每行 7 个字段(<code>uid, item_id, timestamp, event_type, is_organic, played_ratio_pct, track_length_seconds</code>)+ 三个共享目录文件(audio 嵌入、item→artist、item→album)。</li>
+  <li><strong>训练时</strong>:4 个 non-sequential sparse(uid/item/artist/album)+ 9 个 sequential sparse(3 pool × 3 entity,共享 4 张原生表)+ 4 类 dense(audio_embed/user_counters/item_counters/cross_counters),外加 4 个标签(listen+/like/dislike/played_ratio)。</li>
+  <li><strong>预处理</strong>:GTS 时间切分(300d train + 30min gap + 1d test)→ 30 分钟会话切分 → listen+/like/skip 三池切分 → 多窗口计数器。</li>
+  <li><strong>Cross-product 实现</strong>:仓库实现了 7 张 cross 表(名字、cardinality、hash 行为齐备),xxhash64 跨架构可复现;当前 <code>embedding_dim=64</code>,把 embedding footprint 控制在 ~75 GB。</li>
+</ul>
+
+<hr>
+
+<h2 id="sec5">5. Batch 张量流(B=2 示例)</h2>
+
+<h3 id="sec5-1">5.1 输入示例(B=2, L=4)</h3>
+
+<p>(实际 5B 配置是 <code>B_per_gpu=2048, L=500</code>,这里把 L 缩到 4 是为了可读。)</p>
+
+<h4>样本 #0 &mdash; user 42 在评分曲目 #999</h4>
+<pre><code>uid              = 42
+item_id          = 999          # 候选
+artist_id        = 88           # 候选曲目的艺术家(从 mapping join 而来)
+album_id         = 333          # 候选曲目的专辑
+
+# 用户在 target 时刻之前的 4 条 listen+(完整听过 ≥50%)历史
+hist_lp_item_ids   = [101, 102, 103, 104]
+hist_lp_artist_ids = [ 11,  12,  11,  13]
+hist_lp_album_ids  = [201, 202, 201, 203]
+
+hist_like_item_ids   = [102, 105,   0,   0]   # 只有 2 个 like,后面 0 padding
+hist_like_artist_ids = [ 12,  14,   0,   0]
+hist_like_album_ids  = [202, 204,   0,   0]
+
+hist_skip_item_ids   = [301, 302, 303, 304]
+hist_skip_artist_ids = [ 21,  22,  21,  23]
+hist_skip_album_ids  = [401, 402, 401, 403]
+
+# Cross-product 现算 ID(假设当前事件 timestamp 对应的 hour=14, is_organic=1)
+cross_ids = {
+  "user_x_artist":         xxhash64(42, 88)        % 100_000_000 = 42_103_771,
+  "user_x_album":          xxhash64(42, 333)       %  40_000_000 = 18_204_009,
+  "user_x_hour":           xxhash64(42, 14)        %  24_000_000 =  1_008_544,
+  "item_x_hour":           xxhash64(999, 14)       %  40_000_000 = 27_113_002,
+  "artist_x_hour":         xxhash64(88, 14)        %  32_000_000 = 14_750_388,
+  "user_x_is_organic":     xxhash64(42, 1)         %   2_000_000 =     31_557,
+  "user_x_artist_x_hour":  xxhash64(42, 88, 14)    %  40_000_000 = 33_902_115,
+}
+
+# Dense
+audio_embed     = [0.12, -0.04, ..., 0.56]   # 128 floats
+user_counters   = [u7d_lp, u7d_like, u7d_skip, u30d_lp, u30d_like, u30d_skip]
+item_counters   = [i7d_expose, i7d_lp, i7d_like, i30d_expose, i30d_lp, i30d_like]
+cross_counters  = [...]                       # 18 floats
+
+# Labels
+listen_plus = 1.0   # 该用户后续确实完整听了 ≥50%
+like        = 0.0
+dislike     = 0.0
+listen_pct  = 0.85
+</code></pre>
+
+<h4>样本 #1 &mdash; user 7 在评分曲目 #2024(只列与样本 #0 不同的字段)</h4>
+<pre><code>uid=7 · item_id=2024 · artist_id=501 · album_id=1700
+
+# 同一 user 在不同 pool 的真实历史长度不同:lp=2 / like=4 / skip=2,padding 落在前面
+hist_lp_item_ids   = [555, 556,   0,   0]      # 注意 0 padding 在前(右对齐)
+hist_like_item_ids = [556, 600, 700, 800]
+hist_skip_item_ids = [901, 902,   0,   0]
+# (artist / album 同样 right-aligned padding,值略)
+
+# Cross ID 走相同的 xxhash64 流程,假设此处 hour=3, is_organic=0
+cross_ids = { "user_x_artist": xxhash64(7, 501) % 100M, ... }   # 7 个,值随上下文变
+
+# Labels:本样本是 like 而非 listen+
+listen_plus = 0.0   ·   like = 1.0   ·   dislike = 0.0   ·   listen_pct = 0.0
+</code></pre>
+
+<h3 id="sec5-2">5.2 Collate 后的张量</h3>
+
+<p>由 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/pipeline_batch.py#L103-L131"><code>collate_pipeline_batch</code></a> 把 list of samples 拼成 <code>PipelineBatch</code>:</p>
+
+<h4>(a) Dense 张量字典(<code>PipelineBatch.tensors</code>)</h4>
+<pre><code>tensors = {
+    "audio_embed":     shape [2, 128]   float32,
+    "user_counters":   shape [2,   6]   float32,
+    "item_counters":   shape [2,   6]   float32,
+    "cross_counters":  shape [2,  18]   float32,
+    "listen_plus":     shape [2]        float32,   # 标签
+    "like":            shape [2]        float32,
+    "dislike":         shape [2]        float32,
+    "listen_pct":      shape [2]        float32,
+}
+</code></pre>
+
+<h4>(b) 单一 KJT(<code>PipelineBatch.unpooled_kjt</code>)— 包含全部稀疏 ID</h4>
+
+<p>按 schema <code>kjt_feature_order</code> 串接:</p>
+
+<pre><code>keys = [
+  # 4 张 native 表的 candidate / non-sequential lookups
+  "item", "artist", "album", "uid",
+  # item 表的 3 条 sequence(共享同一张 9.39M 表)
+  "hist_lp_item", "hist_like_item", "hist_skip_item",
+  # artist 表的 3 条 sequence
+  "hist_lp_artist", "hist_like_artist", "hist_skip_artist",
+  # album 表的 3 条 sequence
+  "hist_lp_album", "hist_like_album", "hist_skip_album",
+  # 7 张 cross 表(各 1 个 scalar)
+  "user_x_artist", "user_x_album", "user_x_hour",
+  "item_x_hour",   "artist_x_hour", "user_x_is_organic",
+  "user_x_artist_x_hour",
+]
+# 共 20 个 KJT key
+
+# 每个 sample 对每个 feature 贡献的 ID 个数:
+#   scalar feature → 1
+#   sequence feature → L (= 4)
+lengths = [
+  # B=2,4 个 scalar(item/artist/album/uid)
+  1, 1,    1, 1,    1, 1,    1, 1,
+  # B=2,3 个 hist_*_item(L=4)
+  4, 4,    4, 4,    4, 4,
+  # B=2,3 个 hist_*_artist
+  4, 4,    4, 4,    4, 4,
+  # B=2,3 个 hist_*_album
+  4, 4,    4, 4,    4, 4,
+  # B=2,7 个 cross scalar
+  1, 1,    1, 1,    1, 1,    1, 1,    1, 1,    1, 1,    1, 1,
+]   # shape [B × num_keys] = [2 × 20] = 40 个 length
+
+values = torch.cat([
+  # item-table lookups (sample0_item, sample1_item, sample0_hist_lp_item[0..3], ...)
+  [999, 2024],                                        # "item"     scalar × B
+  [ 88,  501],                                        # "artist"   scalar × B
+  [333, 1700],                                        # "album"    scalar × B
+  [ 42,    7],                                        # "uid"      scalar × B
+  [101,102,103,104,  555,556,  0,  0],                # "hist_lp_item"      B×L
+  [102,105,  0,  0,  556,600,700,800],                # "hist_like_item"    B×L
+  [301,302,303,304,  901,902,  0,  0],                # "hist_skip_item"    B×L
+  [ 11, 12, 11, 13,   70, 71,  0,  0],                # "hist_lp_artist"    B×L
+  ...                                                  # 同样模式继续 (hist_like_artist, hist_skip_artist,
+                                                       #             hist_lp_album, hist_like_album, hist_skip_album)
+  # 7 张 cross 表的 scalar id(每张 B=2 个)
+  [42_103_771, ...],                                  # "user_x_artist"
+  [18_204_009, ...],                                  # "user_x_album"
+  ...
+])
+# values 总长度 = 4×B (scalar native) + 9×B×L (sequence native) + 7×B (cross)
+#               = 4×2 + 9×2×4 + 7×2
+#               = 8 + 72 + 14 = 94 个 int64 ID
+</code></pre>
+
+<h3 id="sec5-3">5.3 每表 Lookup 次数</h3>
+
+<p>11 张表的列表见 <a href="#sec2-5">§2.5</a>;这里看一个 batch 实际对每张表的 GPU TBE 查询规模:</p>
+
+<table>
+<thead>
+<tr><th>表</th><th>该 batch lookup 次数公式</th><th>B=2, L=4 例子</th><th>真实 5B 配置(B=2048, L=500)</th></tr>
+</thead>
+<tbody>
+<tr><td><code>item</code> (9.39M)</td><td>B × (1 + 3L)</td><td>2 × 13 = <strong>26</strong></td><td>2048 × 1501 = <strong>3,074,048</strong></td></tr>
+<tr><td><code>artist</code> (1.29M)</td><td>B × (1 + 3L)</td><td>26</td><td>3,074,048</td></tr>
+<tr><td><code>album</code> (3.37M)</td><td>B × (1 + 3L)</td><td>26</td><td>3,074,048</td></tr>
+<tr><td><code>uid</code> (1M)</td><td>B</td><td>2</td><td>2,048</td></tr>
+<tr><td>每张 cross 表(共 7 张)</td><td>B(各)</td><td>2(各) → 共 14</td><td>2,048(各) → 共 14,336</td></tr>
+<tr><td><strong>合计</strong></td><td><strong>3·B·(1+3L) + B + 7·B</strong></td><td><strong>94</strong></td><td><strong>9,238,528</strong></td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+<strong>观察:</strong>
+<ul>
+  <li>~<strong>99.9% 的稀疏查询</strong>集中在 3 张 native 序列表(item / artist / album)— 这就是为什么 sequence length L 直接决定 TBE 吞吐压力。</li>
+  <li>cross 表数量虽多(7 张),但每张 batch 只查 B 次,总量很少,关键瓶颈是 <strong>表本身大</strong>(<code>user_x_artist</code> 单表 100M 行 × dim=512 = 204.8 GB)和 <strong>all-to-all</strong> 通信形状。</li>
+  <li>序列 padding 用 0 也会查表行 0(占位 embedding);需要的话可以在模型侧 mask 掉。</li>
+</ul>
+</div>
+
+<h3 id="sec5-4">5.4 Lookup 到 Token 的转换</h3>
+
+<pre><code>9 条 sequence (B, L, D) → 按 pool 聚合(per-event 共享 MLP tokenizer)→ 3 × (B, L, d_model)
+                        → concat → S-tokens [B, 3L, d_model]  (5B 配置 = [B, 1500, 384])
+
+4 个 native scalar (item/artist/album/uid) + 7 个 cross scalar + 4 类 dense
+    → concat 投影 → Auto-Split tokenizer → NS-tokens [B, n_ns_tokens, d_model]
+                                              (5B 配置 = [B, 16, 384])
+
+OneTrans Stack: 前向时 S-tokens 沿层金字塔裁剪 (1500 → 16),NS-tokens 保持 16
+              ↓
+最终 [B, 16, d_model] 进多任务头 → 4 个任务的 logits/regression
+</code></pre>
+
+<h3 id="sec5-5">5.5 Lookup 后的张量形状</h3>
+
+<p>仓库默认 <code>pooling="none"</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/config.py#L108">config.py:108</a>)→ 走 <strong>unpooled <code>EmbeddingCollection</code> (EC)</strong> 而不是 EBC,序列维度被保留。<code>TorchRecEmbeddings.forward</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/embedding.py#L126-L174">embedding.py:126-174</a>)的输出规则:</p>
+
+<table>
+<thead>
+<tr><th>输入 ID 张量</th><th>Feature 类型</th><th>Lookup 后形状</th></tr>
+</thead>
+<tbody>
+<tr><td><code>[B]</code></td><td>scalar 特征(<code>scalar_feature_names</code> 集合内)</td><td><code>[B, D]</code></td></tr>
+<tr><td><code>[B, L]</code></td><td>sequence 特征</td><td><code>[B, L, D]</code></td></tr>
+</tbody>
+</table>
+
+<p>代入 5B 配置(<code>B=2048, L=500, D=embedding_dim=64</code>),lookup 完之后 20 条张量(13 个 native KJT key + 7 个 cross)的具体形状:</p>
+
+<table>
+<thead>
+<tr><th>KJT feature</th><th>来源表</th><th>类型</th><th>Lookup 后形状(B=2048, L=500, D=64)</th></tr>
+</thead>
+<tbody>
+<tr><td colspan="4"><strong>4 个 native scalar(non-sequential)</strong></td></tr>
+<tr><td><code>item</code></td><td><code>item</code> 表 (9.39M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>artist</code></td><td><code>artist</code> 表 (1.29M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>album</code></td><td><code>album</code> 表 (3.37M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>uid</code></td><td><code>uid</code> 表 (1M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td colspan="4"><strong>9 个 sequential(序列保留 L 轴)</strong></td></tr>
+<tr><td><code>hist_lp_item / hist_like_item / hist_skip_item</code></td><td><code>item</code> 表 (9.39M)</td><td>sequence</td><td>各 <code>[2048, 500, 64]</code></td></tr>
+<tr><td><code>hist_lp_artist / hist_like_artist / hist_skip_artist</code></td><td><code>artist</code> 表</td><td>sequence</td><td>各 <code>[2048, 500, 64]</code></td></tr>
+<tr><td><code>hist_lp_album / hist_like_album / hist_skip_album</code></td><td><code>album</code> 表</td><td>sequence</td><td>各 <code>[2048, 500, 64]</code></td></tr>
+<tr><td colspan="4"><strong>7 个 cross scalar(non-sequential)</strong></td></tr>
+<tr><td><code>user_x_artist</code></td><td><code>user_x_artist</code> 表 (100M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>user_x_album</code></td><td><code>user_x_album</code> (40M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>user_x_hour</code></td><td><code>user_x_hour</code> (24M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>item_x_hour</code></td><td><code>item_x_hour</code> (40M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>artist_x_hour</code></td><td><code>artist_x_hour</code> (32M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>user_x_is_organic</code></td><td><code>user_x_is_organic</code> (2M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>user_x_artist_x_hour</code></td><td><code>user_x_artist_x_hour</code> (40M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+<strong>稀疏侧总激活体积</strong>:9 × (2048×500×64) + (4+7) × (2048×64) = <strong>≈ 590M floats ≈ 2.36 GB / batch</strong>(BF16 下减半 ≈ 1.18 GB)。<br>
+<strong>9 条历史序列吃掉 99.6%</strong> — 这是为什么 OneTrans 的 S-token 序列是稀疏后端 all-to-all 通信的主要负载源。
+</div>
+
+<p class="small">小提示:<code>scalar_feature_names</code> 集合(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/embedding.py#L169-L172">embedding.py:169-172</a>)决定 reshape 走 <code>[B,D]</code> 还是 <code>[B,-1,D]</code>。这个集合由 config 的 <code>feature.scalar_features</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/bench_onetrans_large_5b.yaml#L57">bench_onetrans_large_5b.yaml:57</a>)+ 7 个 cross scalar 自动注册组成。</p>
+
+<h3 id="sec5-6">5.6 Dense 特征处理路径</h3>
+
+<p><strong>结论:用了,且是 OneTrans 的 NS-token 必不可少的输入</strong>。Dense 特征不经过 embedding lookup(已经是 float 向量),走单独通路。各 dense 的来源/语义见 <a href="#sec2-3">§2.3</a>;本节只看<strong>处理逻辑和形状变化</strong>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/bench_onetrans_large_5b.yaml#L58-L62">config 字段</a>):</p>
+
+<table>
+<thead>
+<tr><th>Dense 特征</th><th>输入(B=2048)</th><th>处理</th><th>投影后</th></tr>
+</thead>
+<tbody>
+<tr><td><code>audio_embed</code></td><td><code>[2048, 128]</code></td><td><code>project=true</code> · Linear(128→D) + GeLU</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>user_counters</code></td><td><code>[2048, 6]</code></td><td><code>project=false</code> · 原样 concat</td><td><code>[2048, 6]</code></td></tr>
+<tr><td><code>item_counters</code></td><td><code>[2048, 6]</code></td><td><code>project=false</code> · 原样 concat</td><td><code>[2048, 6]</code></td></tr>
+<tr><td><code>cross_counters</code></td><td><code>[2048, 18]</code></td><td><code>project=true</code> · Linear(18→D) + ReLU</td><td><code>[2048, 64]</code></td></tr>
+</tbody>
+</table>
+
+<p class="small">注:投影目标维度是 <code>embedding_dim = D = 64</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L341">onetrans.py:341</a>),不是 <code>d_model = 384</code> — 这样 dense 投影后和 sparse scalar embedding 同量级,方便直接 concat。</p>
+
+<h4>在 OneTrans 里的去向(代码:<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L522-L532"><code>OneTransModel._build_ns_raw</code></a>)</h4>
+
+<pre><code>NS raw vector = concat([
+  # 11 个 sparse scalar embedding(已 lookup,§5.5 上半部分)
+  item_emb,             # [B, D=64]
+  artist_emb,           # [B, D]
+  album_emb,            # [B, D]
+  uid_emb,              # [B, D]
+  user_x_artist_emb,    # [B, D]
+  ... (共 7 个 cross),  # 每个 [B, D]
+  # 4 个 dense feature
+  audio_embed_proj,     # [B, D=64]   Linear(128 → 64) + GeLU   project=true
+  user_counters,        # [B, 6]      原样 concat                 project=false
+  item_counters,        # [B, 6]      原样 concat                 project=false
+  cross_counters_proj,  # [B, D=64]   Linear(18 → 64) + ReLU     project=true
+], dim=-1)
+
+# ns_raw_dim = 11 × D + 2 × D + 2 × 6
+#           = 11 × 64 + 2 × 64 + 12
+#           = 704 + 128 + 12 = 844
+# 形状: [B, 844] = [2048, 844]
+
+↓ AutoSplitTokenizer (onetrans.py:260-276):
+    proj = Linear(844, 16 × 384) → GeLU → Linear(16 × 384, 16 × 384)
+    .view(B, 16, 384)
+
+NS-tokens = [B, n_ns_tokens, d_model] = [2048, 16, 384]
+</code></pre>
+
+<h4>会喂给 attention 吗?— <span class="ok">会,通过 NS-tokens 这条通道</span></h4>
+
+<p>NS-tokens 直接和 S-tokens 拼在一起进 Transformer 块(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L565-L582"><code>_backbone</code></a>):</p>
+
+<pre><code>s_tokens  = [B, 1500, 384]    # 3 pool × L=500 历史 → 经 SequentialTokenizer
+ns_tokens = [B,   16, 384]    # 11 sparse scalar + 4 dense → 经 AutoSplitTokenizer
+
+x = torch.cat([s_tokens, ns_tokens], dim=1)   # [B, 1516, 384]
+
+for layer in self.blocks:
+    x = block(x, mask=pyramid_mask, ...)       # MixedAttention 看到完整 x
+</code></pre>
+
+<p>在 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L85-L161"><code>MixedAttention</code></a> 里:</p>
+
+<table>
+<thead>
+<tr><th>Token 段</th><th>Q/K/V 来源</th><th>参数化</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td>S-tokens(<code>x[:, :1500]</code>)</td>
+  <td><code>s_qkv = Linear(d_model, 3·d_model)</code></td>
+  <td>所有 S-token <strong>共享</strong>一组权重</td>
+</tr>
+<tr>
+  <td>NS-tokens(<code>x[:, 1500:]</code> 含全部 dense)</td>
+  <td><code>ns_qkv_weight: [n_ns, 3·d_model, d_model]</code>,通过 <code>einsum("btn,tmn->btm")</code></td>
+  <td>每个 NS-token <strong>各自</strong>一组权重(token-specific)</td>
+</tr>
+</tbody>
+</table>
+
+<p>然后 Q/K/V 各自 concat 回 <code>[B, 1516, n_heads, d_head]</code>,跑 <strong>causal SDPA / FlashAttention / Primus-Turbo</strong>。dense feature 的信息因此:</p>
+
+<ol>
+  <li><strong>作为 Query</strong>:NS-token 可以 attend 到任何历史 S-token(回看用户历史)。</li>
+  <li><strong>作为 Key/Value</strong>:S-tokens 也能 attend 到 NS-tokens(把候选 + dense 信息融进每个历史位置),即 "<em>sequence positions attend over candidate and context tokens</em>"。</li>
+  <li><strong>金字塔裁剪只裁 S-tokens</strong>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L568-L572">onetrans.py:568-572</a>),NS-tokens(以及里面的 dense 信息)<strong>始终保留全部 16 个,贯穿所有层</strong>。</li>
+</ol>
+
+<h3 id="sec5-7">5.7 全流程可视化(Raw → Attention)</h3>
+
+<p>把数据流拆成两张图,在 <strong>Attention 输入 [B, 1516, 384]</strong> 处衔接:<strong>图 A</strong> 讲数据如何从 raw input 一路构造到 Attention 输入,<strong>图 B</strong> 讲 Attention 输入如何穿过 8 层 Transformer、split 出 NS-tokens、经 head 得到 prediction 再算 loss。5B 配置:<code>B=2048, L=500, D=64, d_model=384, n_ns_tokens=16, n_layers=8</code>。</p>
+
+<div style="overflow-x:auto; margin:1em 0;">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1100" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
+  <defs>
+    <marker id="arrA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#555"/>
+    </marker>
+    <marker id="arrA-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#cf222e"/>
+    </marker>
+  </defs>
+
+  <text x="640" y="22" font-size="14" font-weight="700" text-anchor="middle" fill="#1f2328">图 A:数据构造 — Raw Input → Attention 输入</text>
+  <text x="640" y="40" font-size="10" text-anchor="middle" fill="#57606a">bottom-up · B=2048, L=500, D=64, d_model=384, n_ns_tokens=16</text>
+
+  <!-- Attention input (top of this figure) -->
+  <g>
+    <rect x="380" y="64" width="520" height="68" rx="6" fill="#ffb3b3" stroke="#cf222e" stroke-width="2.5"/>
+    <text x="640" y="86" text-anchor="middle" font-weight="700" font-size="12">Attention 输入 x</text>
+    <text x="640" y="108" text-anchor="middle" font-family="monospace" font-size="15" font-weight="700" fill="#a01818">[B, 1516, 384]</text>
+    <text x="640" y="124" text-anchor="middle" font-size="9" fill="#57606a">S-tokens(0..1499)+ NS-tokens(1500..1515)</text>
+  </g>
+  <text x="920" y="100" font-size="10" fill="#57606a" font-style="italic">(图 B 从此向上)</text>
+
+  <line x1="640" y1="172" x2="640" y2="132" stroke="#cf222e" stroke-width="1.5" marker-end="url(#arrA-r)"/>
+  <g>
+    <rect x="540" y="172" width="200" height="30" rx="4" fill="#fff" stroke="#666"/>
+    <text x="640" y="190" text-anchor="middle" font-weight="600" font-size="11">torch.cat([S, NS], dim=1)</text>
+  </g>
+
+  <line x1="320" y1="288" x2="320" y2="186" stroke="#444" stroke-width="1.4"/>
+  <line x1="320" y1="186" x2="540" y2="186" stroke="#444" stroke-width="1.4"/>
+  <line x1="960" y1="288" x2="960" y2="186" stroke="#444" stroke-width="1.4"/>
+  <line x1="960" y1="186" x2="740" y2="186" stroke="#444" stroke-width="1.4"/>
+
+  <!-- S/NS tokens -->
+  <g>
+    <rect x="170" y="216" width="300" height="70" rx="5" fill="#fff3a0" stroke="#a08c00" stroke-width="1.5"/>
+    <text x="320" y="234" text-anchor="middle" font-weight="700">S-tokens</text>
+    <text x="320" y="256" text-anchor="middle" font-family="monospace" font-weight="700" font-size="14" fill="#7a6700">[B, 1500, 384]</text>
+    <text x="320" y="274" text-anchor="middle" font-size="9" fill="#57606a">3 pools × L = 1500 个 token</text>
+  </g>
+  <g>
+    <rect x="810" y="216" width="300" height="70" rx="5" fill="#fff3a0" stroke="#a08c00" stroke-width="1.5"/>
+    <text x="960" y="234" text-anchor="middle" font-weight="700">NS-tokens</text>
+    <text x="960" y="256" text-anchor="middle" font-family="monospace" font-weight="700" font-size="14" fill="#7a6700">[B, 16, 384]</text>
+    <text x="960" y="274" text-anchor="middle" font-size="9" fill="#57606a">n_ns_tokens = 16</text>
+  </g>
+
+  <line x1="320" y1="334" x2="320" y2="286" stroke="#444" stroke-width="1.4" marker-end="url(#arrA)"/>
+  <line x1="960" y1="334" x2="960" y2="286" stroke="#444" stroke-width="1.4" marker-end="url(#arrA)"/>
+
+  <!-- Tokenizer ops -->
+  <g>
+    <rect x="180" y="334" width="280" height="42" rx="4" fill="#fff" stroke="#666"/>
+    <text x="320" y="352" text-anchor="middle" font-weight="600" font-size="11">SequentialTokenizer × 3 + cat(dim=1)</text>
+    <text x="320" y="366" text-anchor="middle" font-size="9" fill="#57606a">Linear(192→384)+GeLU+Linear+pos_emb · per pool 独立权重</text>
+  </g>
+  <g>
+    <rect x="820" y="334" width="280" height="42" rx="4" fill="#fff" stroke="#666"/>
+    <text x="960" y="352" text-anchor="middle" font-weight="600" font-size="11">AutoSplitTokenizer</text>
+    <text x="960" y="366" text-anchor="middle" font-size="9" fill="#57606a">Linear(844→16·384)+GeLU+Linear→view</text>
+  </g>
+
+  <line x1="320" y1="416" x2="320" y2="376" stroke="#444" stroke-width="1.4" marker-end="url(#arrA)"/>
+  <line x1="960" y1="416" x2="960" y2="376" stroke="#444" stroke-width="1.4" marker-end="url(#arrA)"/>
+
+  <!-- pool_raw / ns_raw -->
+  <g>
+    <rect x="170" y="416" width="300" height="66" rx="5" fill="#fde7c5" stroke="#cf6f30" stroke-width="1.5"/>
+    <text x="320" y="434" text-anchor="middle" font-weight="700">pool_raw × 3</text>
+    <text x="320" y="454" text-anchor="middle" font-family="monospace" font-weight="700" font-size="13" fill="#9a3412">3 × [B, 500, 192]</text>
+    <text x="320" y="472" text-anchor="middle" font-size="9" fill="#57606a">3 × D = 192(item+artist+album cat'd)</text>
+  </g>
+  <g>
+    <rect x="810" y="416" width="300" height="66" rx="5" fill="#fde7c5" stroke="#cf6f30" stroke-width="1.5"/>
+    <text x="960" y="434" text-anchor="middle" font-weight="700">ns_raw</text>
+    <text x="960" y="454" text-anchor="middle" font-family="monospace" font-weight="700" font-size="13" fill="#9a3412">[B, 844]</text>
+    <text x="960" y="472" text-anchor="middle" font-size="9" fill="#57606a">11×64 + 64+6+6+64 = 844</text>
+  </g>
+
+  <line x1="320" y1="528" x2="320" y2="482" stroke="#444" stroke-width="1.4" marker-end="url(#arrA)"/>
+  <g>
+    <rect x="200" y="528" width="240" height="28" rx="4" fill="#fff" stroke="#666"/>
+    <text x="320" y="546" text-anchor="middle" font-size="10" font-weight="600">cat([item, artist, album], dim=-1)</text>
+  </g>
+  <g>
+    <rect x="820" y="528" width="280" height="28" rx="4" fill="#fff" stroke="#666"/>
+    <text x="960" y="546" text-anchor="middle" font-size="10" font-weight="600">cat(8 ctx + 3 cand + 4 dense, dim=-1)</text>
+  </g>
+
+  <!-- NS multi-source merge arrows -->
+  <line x1="460" y1="620" x2="900" y2="556" stroke="#444" stroke-width="1.1"/>
+  <line x1="700" y1="620" x2="940" y2="556" stroke="#444" stroke-width="1.1"/>
+  <line x1="1030" y1="620" x2="1020" y2="556" stroke="#444" stroke-width="1.1"/>
+
+  <line x1="200" y1="620" x2="280" y2="556" stroke="#444" stroke-width="1.4" marker-end="url(#arrA)"/>
+
+  <!-- 4 lanes of post-lookup tensors -->
+  <g>
+    <rect x="60" y="620" width="280" height="64" rx="4" fill="#bdd9f1" stroke="#3d6da8" stroke-width="1.5"/>
+    <text x="200" y="638" text-anchor="middle" font-weight="700" font-size="11">9 × history emb</text>
+    <text x="200" y="658" text-anchor="middle" font-family="monospace" font-weight="700" fill="#2a3e6e">9 × [B, 500, 64]</text>
+    <text x="200" y="676" text-anchor="middle" font-size="9" fill="#57606a">3 pool × {item, artist, album}</text>
+  </g>
+  <g>
+    <rect x="360" y="620" width="200" height="64" rx="4" fill="#f8c8d8" stroke="#c14a7e" stroke-width="1.5"/>
+    <text x="460" y="638" text-anchor="middle" font-weight="700" font-size="11">8 × contextual emb</text>
+    <text x="460" y="658" text-anchor="middle" font-family="monospace" font-weight="700" fill="#7a3e58">8 × [B, 64]</text>
+    <text x="460" y="676" text-anchor="middle" font-size="9" fill="#57606a">uid + 7 cross</text>
+  </g>
+  <g>
+    <rect x="580" y="620" width="240" height="64" rx="4" fill="#bdd9f1" stroke="#3d6da8" stroke-width="1.5" stroke-dasharray="5,3"/>
+    <text x="700" y="638" text-anchor="middle" font-weight="700" font-size="11">3 × candidate emb(tgt)</text>
+    <text x="700" y="658" text-anchor="middle" font-family="monospace" font-weight="700" fill="#2a3e6e">3 × [B, 64]</text>
+    <text x="700" y="676" text-anchor="middle" font-size="9" fill="#57606a">item / artist / album(候选)</text>
+  </g>
+  <g>
+    <rect x="840" y="620" width="380" height="64" rx="4" fill="#a8e5c8" stroke="#2a8e5b" stroke-width="1.5"/>
+    <text x="1030" y="638" text-anchor="middle" font-weight="700" font-size="11">4 dense(with optional Linear projection)</text>
+    <text x="1030" y="658" text-anchor="middle" font-family="monospace" font-weight="700" fill="#1a5e3b">audio→[B,64] · u_cnt[B,6] · i_cnt[B,6] · x_cnt→[B,64]</text>
+    <text x="1030" y="676" text-anchor="middle" font-size="9" fill="#57606a">project=true 走 Linear;false 原样</text>
+  </g>
+
+  <!-- Lookup ops -->
+  <line x1="200" y1="730" x2="200" y2="684" stroke="#444" stroke-width="1.4" marker-end="url(#arrA)"/>
+  <line x1="460" y1="730" x2="460" y2="684" stroke="#444" stroke-width="1.4" marker-end="url(#arrA)"/>
+  <line x1="700" y1="730" x2="700" y2="684" stroke="#444" stroke-width="1.4" marker-end="url(#arrA)"/>
+  <line x1="1030" y1="730" x2="1030" y2="684" stroke="#2a8e5b" stroke-width="1.4" stroke-dasharray="3,3" marker-end="url(#arrA)"/>
+
+  <g><rect x="130" y="730" width="140" height="26" rx="4" fill="#fff" stroke="#666"/>
+    <text x="200" y="748" text-anchor="middle" font-size="10">EC lookup(unpooled)</text></g>
+  <g><rect x="400" y="730" width="120" height="26" rx="4" fill="#fff" stroke="#666"/>
+    <text x="460" y="748" text-anchor="middle" font-size="10">EC lookup</text></g>
+  <g><rect x="640" y="730" width="120" height="26" rx="4" fill="#fff" stroke="#666"/>
+    <text x="700" y="748" text-anchor="middle" font-size="10">EC lookup</text></g>
+  <g><rect x="960" y="730" width="140" height="26" rx="4" fill="#fff" stroke="#666" stroke-dasharray="3,3"/>
+    <text x="1030" y="748" text-anchor="middle" font-size="10">(no lookup)</text></g>
+
+  <!-- Tables stacked -->
+  <g>
+    <rect x="80" y="790" width="240" height="80" rx="4" fill="#bdd9f1" stroke="#3d6da8"/>
+    <rect x="86" y="784" width="240" height="80" rx="4" fill="#bdd9f1" stroke="#3d6da8"/>
+    <rect x="92" y="778" width="240" height="80" rx="4" fill="#bdd9f1" stroke="#3d6da8"/>
+    <text x="212" y="798" text-anchor="middle" font-weight="700" font-size="11">3 item-side tables</text>
+    <text x="212" y="816" text-anchor="middle" font-size="10" font-family="monospace">item 9.39M × D=64</text>
+    <text x="212" y="830" text-anchor="middle" font-size="10" font-family="monospace">artist 1.29M × 64</text>
+    <text x="212" y="844" text-anchor="middle" font-size="10" font-family="monospace">album 3.37M × 64</text>
+  </g>
+
+  <g>
+    <rect x="360" y="790" width="200" height="80" rx="4" fill="#f8c8d8" stroke="#c14a7e"/>
+    <rect x="366" y="784" width="200" height="80" rx="4" fill="#f8c8d8" stroke="#c14a7e"/>
+    <rect x="372" y="778" width="200" height="80" rx="4" fill="#f8c8d8" stroke="#c14a7e"/>
+    <text x="462" y="798" text-anchor="middle" font-weight="700" font-size="11">8 contextual tables</text>
+    <text x="462" y="816" text-anchor="middle" font-size="9" font-family="monospace">uid 1M · u_x_art 100M</text>
+    <text x="462" y="830" text-anchor="middle" font-size="9" font-family="monospace">u_x_alb 40M · u_x_hr 24M</text>
+    <text x="462" y="844" text-anchor="middle" font-size="9" font-family="monospace">+ i_x_hr · a_x_hr · ...</text>
+  </g>
+
+  <g>
+    <rect x="840" y="790" width="380" height="80" rx="4" fill="#fff" stroke="#2a8e5b" stroke-dasharray="4,3"/>
+    <text x="1030" y="814" text-anchor="middle" font-weight="700" font-size="11">(no embedding table)</text>
+    <text x="1030" y="832" text-anchor="middle" font-size="9" fill="#57606a">audio_embed 来自 embeddings.parquet</text>
+    <text x="1030" y="848" text-anchor="middle" font-size="9" fill="#57606a">counters 来自预处理</text>
+  </g>
+
+  <path d="M 332 802 Q 460 730 580 678" stroke="#3d6da8" fill="none" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrA)"/>
+  <text x="500" y="754" text-anchor="middle" font-size="9" fill="#3d6da8" font-style="italic">候选 scalar 共享左边 3 张表</text>
+
+  <line x1="200" y1="910" x2="200" y2="870" stroke="#444" stroke-width="1.2" marker-end="url(#arrA)"/>
+  <line x1="460" y1="910" x2="460" y2="870" stroke="#444" stroke-width="1.2" marker-end="url(#arrA)"/>
+  <line x1="1030" y1="910" x2="1030" y2="870" stroke="#444" stroke-width="1.2" stroke-dasharray="3,3" marker-end="url(#arrA)"/>
+  <path d="M 700 910 Q 510 890 332 840" stroke="#444" fill="none" stroke-width="1.2" stroke-dasharray="3,2" marker-end="url(#arrA)"/>
+
+  <!-- Input IDs -->
+  <g>
+    <rect x="60" y="910" width="280" height="72" rx="4" fill="#e6f0fa" stroke="#3d6da8" stroke-width="1.2"/>
+    <text x="200" y="928" text-anchor="middle" font-weight="700" font-size="11">history sequence IDs</text>
+    <text x="200" y="946" text-anchor="middle" font-family="monospace" font-size="11">hist_lp_{item,artist,album} [B, L]</text>
+    <text x="200" y="962" text-anchor="middle" font-family="monospace" font-size="11">hist_like_·, hist_skip_·  [B, L]</text>
+    <text x="200" y="978" text-anchor="middle" font-size="9" fill="#57606a">9 条 · L=500</text>
+  </g>
+  <g>
+    <rect x="360" y="910" width="200" height="72" rx="4" fill="#fcecf2" stroke="#c14a7e" stroke-width="1.2"/>
+    <text x="460" y="928" text-anchor="middle" font-weight="700" font-size="11">contextual scalar IDs</text>
+    <text x="460" y="946" text-anchor="middle" font-family="monospace" font-size="11">uid [B]</text>
+    <text x="460" y="962" text-anchor="middle" font-family="monospace" font-size="11">7 × cross IDs [B]</text>
+    <text x="460" y="978" text-anchor="middle" font-size="9" fill="#57606a">8 个 int64</text>
+  </g>
+  <g>
+    <rect x="580" y="910" width="240" height="72" rx="4" fill="#e6f0fa" stroke="#3d6da8" stroke-width="1.2" stroke-dasharray="5,3"/>
+    <text x="700" y="928" text-anchor="middle" font-weight="700" font-size="11">candidate scalar IDs(tgt)</text>
+    <text x="700" y="946" text-anchor="middle" font-family="monospace" font-size="11">item_id [B]</text>
+    <text x="700" y="962" text-anchor="middle" font-family="monospace" font-size="11">artist_id / album_id [B]</text>
+    <text x="700" y="978" text-anchor="middle" font-size="9" fill="#57606a">3 个 int64</text>
+  </g>
+  <g>
+    <rect x="840" y="910" width="380" height="72" rx="4" fill="#dcf2e5" stroke="#2a8e5b" stroke-width="1.2"/>
+    <text x="1030" y="928" text-anchor="middle" font-weight="700" font-size="11">dense vectors(float32)</text>
+    <text x="1030" y="946" text-anchor="middle" font-family="monospace" font-size="11">audio_embed [B,128] · user_counters [B,6]</text>
+    <text x="1030" y="962" text-anchor="middle" font-family="monospace" font-size="11">item_counters [B,6] · cross_counters [B,18]</text>
+    <text x="1030" y="978" text-anchor="middle" font-size="9" fill="#57606a">4 个 float32 向量</text>
+  </g>
+
+  <text x="640" y="1014" text-anchor="middle" font-style="italic" font-size="10" fill="#57606a">色块 = tensor(含 shape) · 白框 = op · 虚线 = candidate / 共享映射</text>
+  <text x="640" y="1032" text-anchor="middle" font-style="italic" font-size="10" fill="#57606a">ns_raw 拆分:8 contextual emb × D = 512 · 3 candidate emb × D = 192 · 4 dense projected/passed = 140 · 共 844</text>
+</svg>
+</div>
+
+<div style="overflow-x:auto; margin:1em 0;">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1140" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
+  <defs>
+    <marker id="arrB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#555"/>
+    </marker>
+    <marker id="arrB-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#cf222e"/>
+    </marker>
+  </defs>
+
+  <text x="640" y="22" font-size="14" font-weight="700" text-anchor="middle" fill="#1f2328">图 B:模型推理 — Attention 输入 → 8 层 Transformer → Head → Loss</text>
+  <text x="640" y="40" font-size="10" text-anchor="middle" fill="#57606a">bottom-up · B=2048, d_model=384, n_ns_tokens=16, n_layers=8</text>
+
+  <!-- Loss (TOP) -->
+  <g>
+    <rect x="450" y="60" width="380" height="40" rx="4" fill="#fff" stroke="#cf222e" stroke-width="1.5"/>
+    <text x="640" y="78" text-anchor="middle" font-weight="700" fill="#cf222e">Multi-task Loss</text>
+    <text x="640" y="92" text-anchor="middle" font-size="9" fill="#57606a">BCE(listen+) + BCE(like) + BCE(dislike) + MSE(played_ratio)</text>
+  </g>
+  <line x1="640" y1="138" x2="640" y2="100" stroke="#cf222e" stroke-width="1.5" marker-end="url(#arrB-r)"/>
+
+  <!-- Predictions -->
+  <g>
+    <rect x="440" y="138" width="400" height="50" rx="4" fill="#d6c5e8" stroke="#7c4fa6" stroke-width="1.5"/>
+    <text x="640" y="158" text-anchor="middle" font-weight="700">multi-task predictions</text>
+    <text x="640" y="178" text-anchor="middle" font-family="monospace" font-size="12" font-weight="700" fill="#5a3580">4 × [B] (per-task scalar)</text>
+  </g>
+  <line x1="640" y1="220" x2="640" y2="188" stroke="#444" stroke-width="1.4" marker-end="url(#arrB)"/>
+
+  <!-- Task heads op -->
+  <g>
+    <rect x="520" y="220" width="240" height="32" rx="4" fill="#fff" stroke="#666"/>
+    <text x="640" y="240" text-anchor="middle" font-weight="600" font-size="11">4 × Linear(d_model → 1)</text>
+  </g>
+  <line x1="640" y1="280" x2="640" y2="252" stroke="#444" stroke-width="1.4" marker-end="url(#arrB)"/>
+
+  <!-- h tensor -->
+  <g>
+    <rect x="490" y="280" width="300" height="46" rx="4" fill="#d6c5e8" stroke="#7c4fa6" stroke-width="1.5"/>
+    <text x="640" y="298" text-anchor="middle" font-weight="700" font-size="11">h = head_proj(ns_out.flatten)</text>
+    <text x="640" y="316" text-anchor="middle" font-family="monospace" font-weight="700" fill="#5a3580">[B, d_model] = [B, 384]</text>
+  </g>
+  <line x1="640" y1="354" x2="640" y2="326" stroke="#444" stroke-width="1.4" marker-end="url(#arrB)"/>
+
+  <!-- head_proj op -->
+  <g>
+    <rect x="480" y="354" width="320" height="32" rx="4" fill="#fff" stroke="#666"/>
+    <text x="640" y="374" text-anchor="middle" font-weight="600" font-size="11">head_proj: Linear(6144 → 384) + GeLU + Dropout</text>
+  </g>
+  <line x1="640" y1="414" x2="640" y2="386" stroke="#444" stroke-width="1.4" marker-end="url(#arrB)"/>
+
+  <!-- ns_out main branch -->
+  <g>
+    <rect x="490" y="414" width="300" height="46" rx="4" fill="#fff3a0" stroke="#a08c00" stroke-width="1.5"/>
+    <text x="640" y="432" text-anchor="middle" font-weight="700" font-size="11">ns_out = x_final[:, -16:]</text>
+    <text x="640" y="450" text-anchor="middle" font-family="monospace" font-weight="700" fill="#7a6700">[B, 16, 384]</text>
+  </g>
+
+  <!-- s_repr left branch (contrastive optional) -->
+  <text x="220" y="406" text-anchor="middle" font-size="10" fill="#57606a" font-style="italic">仅 contrastive_weight &gt; 0 时使用</text>
+  <g opacity="0.7">
+    <rect x="80" y="414" width="280" height="46" rx="4" fill="#fff3a0" stroke="#a08c00" stroke-width="1.5" stroke-dasharray="4,3"/>
+    <text x="220" y="432" text-anchor="middle" font-weight="700" font-size="11">s_repr = x_final[:, :16].mean(1)</text>
+    <text x="220" y="450" text-anchor="middle" font-family="monospace" font-weight="700" fill="#7a6700">[B, 384]</text>
+  </g>
+
+  <!-- Split op -->
+  <line x1="220" y1="510" x2="220" y2="460" stroke="#444" stroke-width="1.4" stroke-dasharray="4,3" marker-end="url(#arrB)"/>
+  <line x1="640" y1="510" x2="640" y2="460" stroke="#444" stroke-width="1.4" marker-end="url(#arrB)"/>
+  <g>
+    <rect x="120" y="510" width="640" height="40" rx="4" fill="#fff" stroke="#666"/>
+    <text x="440" y="528" text-anchor="middle" font-weight="600" font-size="11">split:  x_final[:, :16].mean → s_repr  |  x_final[:, -16:] → ns_out</text>
+    <text x="440" y="542" text-anchor="middle" font-size="9" fill="#57606a">final_norm (RMSNorm) 应用于 x_final 全长 32 个 token</text>
+  </g>
+  <line x1="440" y1="588" x2="440" y2="550" stroke="#444" stroke-width="1.4" marker-end="url(#arrB)"/>
+
+  <!-- x_final -->
+  <g>
+    <rect x="220" y="588" width="440" height="58" rx="5" fill="#fff3a0" stroke="#a08c00" stroke-width="2"/>
+    <text x="440" y="608" text-anchor="middle" font-weight="700">x_final(after 8 layers + final_norm)</text>
+    <text x="440" y="630" text-anchor="middle" font-family="monospace" font-weight="700" font-size="13" fill="#7a6700">[B, 32, 384] = [B, 2 × n_ns_tokens, d_model]</text>
+    <text x="440" y="644" text-anchor="middle" font-size="9" fill="#57606a">前 16 = 剩余 S-tokens · 后 16 = NS-tokens</text>
+  </g>
+
+  <!-- 8 layers stack -->
+  <line x1="440" y1="700" x2="440" y2="646" stroke="#444" stroke-width="1.4" marker-end="url(#arrB)"/>
+
+  <g>
+    <rect x="100" y="700" width="1080" height="222" rx="6" fill="#fef6e3" stroke="#a08c00" stroke-width="1.5"/>
+    <text x="640" y="720" text-anchor="middle" font-weight="700" fill="#7a6700">Transformer Stack: 8 × OneTransBlock(MixedAttention + MixedFFN, pre-norm)</text>
+    <text x="640" y="736" text-anchor="middle" font-size="9" fill="#57606a">use_pyramid=True · 每层 Q 段裁到末尾 q_len 个,KV 保留全长(asymmetric Q/KV)</text>
+
+    <line x1="160" y1="752" x2="1120" y2="752" stroke="#a08c00" stroke-width="0.5"/>
+    <text x="220" y="766" font-weight="700" font-size="11">Layer</text>
+    <text x="360" y="766" font-weight="700" font-size="11">输入 x.shape</text>
+    <text x="520" y="766" font-weight="700" font-size="11">q_s(S 部分)</text>
+    <text x="680" y="766" font-weight="700" font-size="11">q_len = q_s + 16</text>
+    <text x="860" y="766" font-weight="700" font-size="11">输出 x.shape</text>
+    <text x="1020" y="766" font-weight="700" font-size="11">说明</text>
+    <line x1="160" y1="772" x2="1120" y2="772" stroke="#a08c00"/>
+
+    <text x="220" y="788" font-family="monospace">0</text>
+    <text x="360" y="788" font-family="monospace">[B, 1516, 384]</text>
+    <text x="520" y="788" font-family="monospace">1500</text>
+    <text x="680" y="788" font-family="monospace">1516</text>
+    <text x="860" y="788" font-family="monospace">[B, 1516, 384]</text>
+    <text x="1020" y="788" font-size="9" fill="#57606a">对称(无裁剪)</text>
+
+    <text x="220" y="804" font-family="monospace">1</text>
+    <text x="360" y="804" font-family="monospace">[B, 1516, 384]</text>
+    <text x="520" y="804" font-family="monospace">1288</text>
+    <text x="680" y="804" font-family="monospace">1304</text>
+    <text x="860" y="804" font-family="monospace">[B, 1304, 384]</text>
+    <text x="1020" y="804" font-size="9" fill="#57606a">drop 最早 212 个 S</text>
+
+    <text x="220" y="820" font-family="monospace">2</text>
+    <text x="360" y="820" font-family="monospace">[B, 1304, 384]</text>
+    <text x="520" y="820" font-family="monospace">1076</text>
+    <text x="680" y="820" font-family="monospace">1092</text>
+    <text x="860" y="820" font-family="monospace">[B, 1092, 384]</text>
+    <text x="1020" y="820" font-size="9" fill="#57606a">−212</text>
+
+    <text x="220" y="836" font-family="monospace">3</text>
+    <text x="360" y="836" font-family="monospace">[B, 1092, 384]</text>
+    <text x="520" y="836" font-family="monospace">864</text>
+    <text x="680" y="836" font-family="monospace">880</text>
+    <text x="860" y="836" font-family="monospace">[B, 880, 384]</text>
+    <text x="1020" y="836" font-size="9" fill="#57606a">−212</text>
+
+    <text x="220" y="852" font-family="monospace">4</text>
+    <text x="360" y="852" font-family="monospace">[B, 880, 384]</text>
+    <text x="520" y="852" font-family="monospace">652</text>
+    <text x="680" y="852" font-family="monospace">668</text>
+    <text x="860" y="852" font-family="monospace">[B, 668, 384]</text>
+    <text x="1020" y="852" font-size="9" fill="#57606a">−212</text>
+
+    <text x="220" y="868" font-family="monospace">5</text>
+    <text x="360" y="868" font-family="monospace">[B, 668, 384]</text>
+    <text x="520" y="868" font-family="monospace">440</text>
+    <text x="680" y="868" font-family="monospace">456</text>
+    <text x="860" y="868" font-family="monospace">[B, 456, 384]</text>
+    <text x="1020" y="868" font-size="9" fill="#57606a">−212</text>
+
+    <text x="220" y="884" font-family="monospace">6</text>
+    <text x="360" y="884" font-family="monospace">[B, 456, 384]</text>
+    <text x="520" y="884" font-family="monospace">228</text>
+    <text x="680" y="884" font-family="monospace">244</text>
+    <text x="860" y="884" font-family="monospace">[B, 244, 384]</text>
+    <text x="1020" y="884" font-size="9" fill="#57606a">−212</text>
+
+    <text x="220" y="904" font-family="monospace" font-weight="700">7</text>
+    <text x="360" y="904" font-family="monospace" font-weight="700">[B, 244, 384]</text>
+    <text x="520" y="904" font-family="monospace" font-weight="700">16</text>
+    <text x="680" y="904" font-family="monospace" font-weight="700">32</text>
+    <text x="860" y="904" font-family="monospace" font-weight="700" fill="#cf222e">[B, 32, 384]</text>
+    <text x="1020" y="904" font-size="9" fill="#cf222e" font-weight="600">S 压到 L_NS!</text>
+  </g>
+
+  <!-- Attention input (bottom of this figure) -->
+  <line x1="640" y1="966" x2="640" y2="922" stroke="#cf222e" stroke-width="1.8" marker-end="url(#arrB-r)"/>
+  <g>
+    <rect x="380" y="966" width="520" height="74" rx="6" fill="#ffb3b3" stroke="#cf222e" stroke-width="2.5"/>
+    <text x="640" y="990" text-anchor="middle" font-weight="700" font-size="12">Attention 输入 x</text>
+    <text x="640" y="1014" text-anchor="middle" font-family="monospace" font-size="15" font-weight="700" fill="#a01818">[B, 1516, 384]</text>
+    <text x="640" y="1032" text-anchor="middle" font-size="9" fill="#57606a">S-tokens(前 1500)+ NS-tokens(后 16)</text>
+  </g>
+  <text x="920" y="1006" font-size="10" fill="#57606a" font-style="italic">(数据如何来到这里:见图 A)</text>
+
+  <text x="640" y="1080" text-anchor="middle" font-style="italic" font-size="10" fill="#57606a">8 层金字塔从 S 段逐层裁掉 ~212 个 token,NS 段始终保留 16 个</text>
+  <text x="640" y="1098" text-anchor="middle" font-style="italic" font-size="10" fill="#57606a">最终 x_final 一分为二:前 16 给对比损失(可选)· 后 16 给多任务 head</text>
+</svg>
+</div>
+
+<div class="callout note">
+<strong>读图要点:</strong>
+<ol>
+  <li><strong>图 A pool_raw 的 192 维</strong> = 3 × D(每位置 item+artist+album 沿 feature 拼接),<strong>3 不是 token 数</strong>,L=500 个位置不变。</li>
+  <li><strong>图 A ns_raw 的 844 维</strong> = 11×64 (11 个 sparse scalar 各 64 维) + 64 + 6 + 6 + 64 (4 个 dense)。</li>
+  <li><strong>SequentialTokenizer 是 per-pool 的</strong>:3 个 pool 用 3 套独立 Linear 权重 + 3 套独立位置嵌入;同一个 item ID 出现在不同 pool 会产生不同 token。</li>
+  <li><strong>图 B 的金字塔</strong>:S 段每层裁掉 ~212 个 token(1500 → 16),NS 段始终 16 个;末层输出 <code>[B, 32, 384]</code>,前 16 是剩余 S,后 16 是 NS。</li>
+  <li>x_final <strong>只用后 16 个</strong>(NS-tokens)做 prediction;前 16 个仅在 contrastive_weight &gt; 0 时用于对比损失。</li>
+</ol>
+</div>
+
+</main>
+
+</body>
+</html>
