@@ -191,7 +191,8 @@
       <li><a href="#sec5-4">5.4 Lookup 到 Token 的转换</a></li>
       <li><a href="#sec5-5">5.5 Lookup 后的张量形状</a></li>
       <li><a href="#sec5-6">5.6 Dense 特征处理路径</a></li>
-      <li><a href="#sec5-7">5.7 全流程可视化(Raw → Attention)</a></li>
+      <li><a href="#sec5-7">5.7 Attention 输入的 token 排列(按 feature name)</a></li>
+      <li><a href="#sec5-8">5.8 全流程可视化(Raw → Attention)</a></li>
     </ul>
   </li>
 </ul>
@@ -734,15 +735,15 @@ values = torch.cat([
 
 <table>
 <thead>
-<tr><th>表</th><th>该 batch lookup 次数公式</th><th>B=2, L=4 例子</th><th>真实 5B 配置(B=2048, L=500)</th></tr>
+<tr><th>表</th><th>每用户 lookup 次数</th><th>该 batch lookup 次数公式</th><th>B=2, L=4 例子</th><th>真实 5B 配置(B=2048, L=500)</th></tr>
 </thead>
 <tbody>
-<tr><td><code>item</code> (9.39M)</td><td>B × (1 + 3L)</td><td>2 × 13 = <strong>26</strong></td><td>2048 × 1501 = <strong>3,074,048</strong></td></tr>
-<tr><td><code>artist</code> (1.29M)</td><td>B × (1 + 3L)</td><td>26</td><td>3,074,048</td></tr>
-<tr><td><code>album</code> (3.37M)</td><td>B × (1 + 3L)</td><td>26</td><td>3,074,048</td></tr>
-<tr><td><code>uid</code> (1M)</td><td>B</td><td>2</td><td>2,048</td></tr>
-<tr><td>每张 cross 表(共 7 张)</td><td>B(各)</td><td>2(各) → 共 14</td><td>2,048(各) → 共 14,336</td></tr>
-<tr><td><strong>合计</strong></td><td><strong>3·B·(1+3L) + B + 7·B</strong></td><td><strong>94</strong></td><td><strong>9,238,528</strong></td></tr>
+<tr><td><code>item</code> (9.39M)</td><td>1 + 3L</td><td>B × (1 + 3L)</td><td>2 × 13 = <strong>26</strong></td><td>2048 × 1501 = <strong>3,074,048</strong></td></tr>
+<tr><td><code>artist</code> (1.29M)</td><td>1 + 3L</td><td>B × (1 + 3L)</td><td>26</td><td>3,074,048</td></tr>
+<tr><td><code>album</code> (3.37M)</td><td>1 + 3L</td><td>B × (1 + 3L)</td><td>26</td><td>3,074,048</td></tr>
+<tr><td><code>uid</code> (1M)</td><td>1</td><td>B</td><td>2</td><td>2,048</td></tr>
+<tr><td>每张 cross 表(共 7 张)</td><td>1(各)→ 共 7</td><td>B(各)</td><td>2(各) → 共 14</td><td>2,048(各) → 共 14,336</td></tr>
+<tr><td><strong>合计</strong></td><td><strong>3·(1+3L) + 1 + 7 = 9L + 11</strong></td><td><strong>B·(9L + 11)</strong></td><td><strong>47/用户 → 94</strong></td><td><strong>4,511/用户 → 9,238,528</strong></td></tr>
 </tbody>
 </table>
 
@@ -905,7 +906,183 @@ for layer in self.blocks:
   <li><strong>金字塔裁剪只裁 S-tokens</strong>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L568-L572">onetrans.py:568-572</a>),NS-tokens(以及里面的 dense 信息)<strong>始终保留全部 16 个,贯穿所有层</strong>。</li>
 </ol>
 
-<h3 id="sec5-7">5.7 全流程可视化(Raw → Attention)</h3>
+<h3 id="sec5-7">5.7 Attention 输入的 token 排列(按 feature name)</h3>
+
+<p>§5.4 给出 token 化的概览,§5.5 给出每个 lookup 输出张量的形状。本节直接回答:<strong>送进 attention 的 <code>x: [B, 1516, 384]</code>,逐位置由哪些命名 feature 组成、按什么顺序排</strong>。</p>
+
+<h4>S-tokens(位置 0..1499):3 pool × L,每段右对齐</h4>
+
+<pre><code>position 0   .. L-1      | hist_lp pool (listen+)        ← YAML sequence_groups 字典插入顺序
+position L   .. 2L-1     | hist_like pool                 (bench_onetrans_large_5b.yaml:53-56)
+position 2L  .. 3L-1     | hist_skip pool
+
+每个 pool 块内 (positions 0..L-1):
+    index 0     ← 最旧 (若实际事件 &lt; L 则左侧补 0)
+    ...
+    index L-1   ← 最新                                    (dataset.py:615-623: padded[L-n:] = items)
+
+每个 S-token 的内容 (per pool g, per event t):
+    s_token[g, t] = SeqTokenizer_g( concat[ hist_g_item[t], hist_g_artist[t], hist_g_album[t] ] )  +  pos_emb_g[t]
+                    └── Linear(3D=192, d_model=384) + GeLU + Linear(384, 384) ──┘
+    每个 pool 各持一份 SequentialTokenizer 权重 + 各自 pos_emb,3 个 pool 不共享 (onetrans.py:243-257, 327-332)
+    Concat: pool_tokens 按字典顺序 append 后 torch.cat(..., dim=1)         (onetrans.py:554-559)
+</code></pre>
+
+<h4>NS-tokens(位置 1500..1515):无 per-token feature 对位</h4>
+
+<p><strong>关键:</strong>这 16 个 token <strong>无法逐位映射回 feature 名</strong>。<code>AutoSplitTokenizer</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L260-L276">onetrans.py:260-276</a>)是 <code>Linear(844, 16·d_model) → GeLU → Linear(...) → view(B, 16, d_model)</code> &mdash; 每个输出 channel 是全部 844 维输入的线性混合,token 位置语义由训练学出。但底层 844-d 原始向量按命名 feature 顺序拼(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L522-L532">onetrans.py:522-532</a>):</p>
+
+<table>
+<thead>
+<tr><th>channel span</th><th>dims</th><th>来源 feature</th><th>处理</th></tr>
+</thead>
+<tbody>
+<tr><td colspan="4"><strong>4 个 native scalar embedding</strong></td></tr>
+<tr><td>  0..63 </td><td>64</td><td><code>uid</code></td><td>EC scalar lookup</td></tr>
+<tr><td> 64..127</td><td>64</td><td><code>item</code></td><td>同上</td></tr>
+<tr><td>128..191</td><td>64</td><td><code>artist</code></td><td>同上</td></tr>
+<tr><td>192..255</td><td>64</td><td><code>album</code></td><td>同上</td></tr>
+<tr><td colspan="4"><strong>7 个 cross scalar embedding(YAML <code>scalar_features</code> 列表顺序)</strong></td></tr>
+<tr><td>256..319</td><td>64</td><td><code>user_x_artist</code></td><td>EC scalar lookup</td></tr>
+<tr><td>320..383</td><td>64</td><td><code>user_x_album</code></td><td>同上</td></tr>
+<tr><td>384..447</td><td>64</td><td><code>user_x_hour</code></td><td>同上</td></tr>
+<tr><td>448..511</td><td>64</td><td><code>item_x_hour</code></td><td>同上</td></tr>
+<tr><td>512..575</td><td>64</td><td><code>artist_x_hour</code></td><td>同上</td></tr>
+<tr><td>576..639</td><td>64</td><td><code>user_x_is_organic</code></td><td>同上</td></tr>
+<tr><td>640..703</td><td>64</td><td><code>user_x_artist_x_hour</code></td><td>同上</td></tr>
+<tr><td colspan="4"><strong>4 个 dense feature(<code>dense_features</code> 列表顺序)</strong></td></tr>
+<tr><td>704..767</td><td>64</td><td><code>audio_embed</code></td><td>Linear(128→64) + GeLU(<code>project=true</code>)</td></tr>
+<tr><td>768..773</td><td> 6</td><td><code>user_counters</code></td><td>原样(<code>project=false</code>)</td></tr>
+<tr><td>774..779</td><td> 6</td><td><code>item_counters</code></td><td>原样</td></tr>
+<tr><td>780..843</td><td>64</td><td><code>cross_counters</code></td><td>Linear(18→64) + ReLU(<code>project=true</code>)</td></tr>
+<tr><td><strong>合计</strong></td><td><strong>844</strong></td><td colspan="2">= 11 × 64 (sparse) + 64 + 6 + 6 + 64 (dense)</td></tr>
+</tbody>
+</table>
+
+<p>NS token 段虽然每个位置看不出对应哪个 feature,但 <code>MixedAttention</code>/<code>MixedFFN</code> 给 NS 段<strong>每个 token 位置配独立的 Q/K/V 权重</strong>(<code>ns_qkv_weight: [16, 3·d_model, d_model]</code>) &mdash; 训练后 token 位置本身就是身份编码。</p>
+
+<h4>最终 attention 输入张量布局</h4>
+
+<pre><code>x = torch.cat([s_tokens, ns_tokens], dim=1)     # [B, 1516, d_model]
+                                                  (onetrans.py:565-566)
+
+position layout (5B 配置, L=500):
+    0    ..   499  →  hist_lp    ×  L     (oldest @ 0,   newest @ 499)
+    500  ..   999  →  hist_like  ×  L     (oldest @ 500, newest @ 999)
+    1000 ..  1499  →  hist_skip  ×  L     (oldest @ 1000,newest @ 1499)
+    1500 ..  1515  →  NS tokens  × 16     (无 per-position feature label)
+
+mask:   pyramid 因果掩码,只裁 S 段;NS 段每层都保留全部 16   (onetrans.py:568-572)
+pos:    仅 S 段在 SequentialTokenizer 内加了 per-pool pos_emb;
+        NS 段无 global pos_emb,token 位置由 ns_qkv_weight 隐式编码
+</code></pre>
+
+<div style="overflow-x:auto; margin:1em 0;">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 460" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
+  <defs>
+    <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#444"/>
+    </marker>
+  </defs>
+
+  <text x="640" y="22" text-anchor="middle" font-size="13" font-weight="600">Attention 输入 x = [B, 1516, 384] — 逐位置 feature 排列 (5B config, L=500)</text>
+
+  <!-- Top: position bar -->
+  <text x="20"   y="60" font-size="10" fill="#666">position</text>
+  <line x1="20" y1="68" x2="1260" y2="68" stroke="#999" stroke-width="1"/>
+  <text x="60"   y="80" font-size="10">0</text>
+  <text x="290"  y="80" font-size="10">499</text>
+  <text x="340"  y="80" font-size="10">500</text>
+  <text x="570"  y="80" font-size="10">999</text>
+  <text x="620"  y="80" font-size="10">1000</text>
+  <text x="845"  y="80" font-size="10">1499</text>
+  <text x="900"  y="80" font-size="10">1500</text>
+  <text x="1240" y="80" font-size="10" text-anchor="end">1515</text>
+
+  <!-- S-token blocks -->
+  <g>
+    <rect x="20"  y="100" width="300" height="120" fill="#e7f0fa" stroke="#0b6cc4" stroke-width="1.4" rx="4"/>
+    <text x="170" y="122" text-anchor="middle" font-weight="600" fill="#0b6cc4">hist_lp pool</text>
+    <text x="170" y="142" text-anchor="middle" font-size="10">L = 500 tokens</text>
+    <text x="170" y="160" text-anchor="middle" font-size="10">SeqTokenizer_lp(concat[</text>
+    <text x="170" y="175" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_lp_item</tspan>,</text>
+    <text x="170" y="190" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_lp_artist</tspan>,</text>
+    <text x="170" y="205" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_lp_album</tspan>]) + pos_emb_lp</text>
+  </g>
+  <g>
+    <rect x="335" y="100" width="295" height="120" fill="#eaf3ec" stroke="#1f8a4d" stroke-width="1.4" rx="4"/>
+    <text x="482" y="122" text-anchor="middle" font-weight="600" fill="#1f8a4d">hist_like pool</text>
+    <text x="482" y="142" text-anchor="middle" font-size="10">L = 500 tokens</text>
+    <text x="482" y="160" text-anchor="middle" font-size="10">SeqTokenizer_like(concat[</text>
+    <text x="482" y="175" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_like_item</tspan>,</text>
+    <text x="482" y="190" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_like_artist</tspan>,</text>
+    <text x="482" y="205" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_like_album</tspan>]) + pos_emb_like</text>
+  </g>
+  <g>
+    <rect x="645" y="100" width="240" height="120" fill="#fbeede" stroke="#b96b1a" stroke-width="1.4" rx="4"/>
+    <text x="765" y="122" text-anchor="middle" font-weight="600" fill="#b96b1a">hist_skip pool</text>
+    <text x="765" y="142" text-anchor="middle" font-size="10">L = 500 tokens</text>
+    <text x="765" y="160" text-anchor="middle" font-size="10">SeqTokenizer_skip(concat[</text>
+    <text x="765" y="175" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_skip_item</tspan>,</text>
+    <text x="765" y="190" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_skip_artist</tspan>,</text>
+    <text x="765" y="205" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_skip_album</tspan>]) + pos_emb_skip</text>
+  </g>
+
+  <!-- NS-token block -->
+  <g>
+    <rect x="900" y="100" width="360" height="120" fill="#f3e8f5" stroke="#7a4ea0" stroke-width="1.4" rx="4"/>
+    <text x="1080" y="122" text-anchor="middle" font-weight="600" fill="#7a4ea0">NS tokens (16,无 per-token feature)</text>
+    <text x="1080" y="142" text-anchor="middle" font-size="10">AutoSplitTokenizer( 844-d raw ).view(B, 16, 384)</text>
+    <text x="1080" y="162" text-anchor="middle" font-size="10">每个 token 位置: ns_qkv_weight[i, :, :] 独立学</text>
+    <text x="1080" y="182" text-anchor="middle" font-size="10">(token 位置语义由训练隐式确定)</text>
+  </g>
+
+  <!-- Time direction arrow inside one pool (using hist_lp) -->
+  <text x="60"  y="245" font-size="9" fill="#666">oldest (idx 0, 实际事件不足 L 时为 0-pad)</text>
+  <line x1="60" y1="252" x2="280" y2="252" stroke="#444" marker-end="url(#ar2)"/>
+  <text x="280" y="245" font-size="9" fill="#666" text-anchor="end">newest (idx L-1)</text>
+
+  <!-- 844-d composition under NS block -->
+  <text x="900" y="245" font-size="10" font-weight="600" fill="#444">底层 844-d raw 向量 (送进 AutoSplitTokenizer 前):</text>
+  <g font-size="9">
+    <!-- 11 sparse × 64 -->
+    <rect x="900" y="252" width="32" height="22" fill="#e7f0fa" stroke="#0b6cc4"/>
+    <text x="916" y="267" text-anchor="middle">uid</text>
+    <rect x="932" y="252" width="32" height="22" fill="#e7f0fa" stroke="#0b6cc4"/>
+    <text x="948" y="267" text-anchor="middle">item</text>
+    <rect x="964" y="252" width="32" height="22" fill="#e7f0fa" stroke="#0b6cc4"/>
+    <text x="980" y="267" text-anchor="middle">artist</text>
+    <rect x="996" y="252" width="32" height="22" fill="#e7f0fa" stroke="#0b6cc4"/>
+    <text x="1012" y="267" text-anchor="middle">album</text>
+    <rect x="1028" y="252" width="120" height="22" fill="#fef0d8" stroke="#b96b1a"/>
+    <text x="1088" y="267" text-anchor="middle">7 × cross scalar (各 64)</text>
+    <rect x="1148" y="252" width="32" height="22" fill="#e8f5e9" stroke="#2e7d32"/>
+    <text x="1164" y="267" text-anchor="middle">audio</text>
+    <rect x="1180" y="252" width="20" height="22" fill="#fff" stroke="#888"/>
+    <text x="1190" y="267" text-anchor="middle">u_c</text>
+    <rect x="1200" y="252" width="20" height="22" fill="#fff" stroke="#888"/>
+    <text x="1210" y="267" text-anchor="middle">i_c</text>
+    <rect x="1220" y="252" width="40" height="22" fill="#e8f5e9" stroke="#2e7d32"/>
+    <text x="1240" y="267" text-anchor="middle">cross_c</text>
+    <!-- legend / dims -->
+    <text x="900"  y="290" font-size="9" fill="#666">0  4×64 = 256 (sparse native)  |  256  7×64 = 448 (sparse cross)  |  704  64 (audio_embed proj)  |  768  6 (user_counters)  |  774  6 (item_counters)  |  780  64 (cross_counters proj)  |  844</text>
+  </g>
+
+  <!-- Note callouts -->
+  <g font-size="11" fill="#444">
+    <text x="20" y="335" font-weight="600">备注</text>
+    <text x="20" y="354">• Pool 顺序 [hist_lp, hist_like, hist_skip] 来自 YAML sequence_groups 字典插入顺序 (CPython 3.7+ 保序)。</text>
+    <text x="20" y="372">• 每个 S-token 含 3 个 entity (item/artist/album) 的 concat 后 MLP — 3 个 pool 各持独立 SeqTokenizer + 独立 pos_emb,不共享。</text>
+    <text x="20" y="390">• S 段时间方向: padded[L-n:] = items 右对齐 — index L-1 必是最新,index 0 可能是 0-pad (用户事件不足 L 时)。</text>
+    <text x="20" y="408">• NS 段没有 global pos_emb;token-position 区分由 MixedAttention 的 ns_qkv_weight[16, 3·d_model, d_model] 完成。</text>
+    <text x="20" y="426">• Causal pyramid mask 只作用于 S 段 (沿层逐渐裁短),NS 段每层都保留全部 16。</text>
+  </g>
+</svg>
+</div>
+
+<hr>
+
+<h3 id="sec5-8">5.8 全流程可视化(Raw → Attention)</h3>
 
 <p>把数据流拆成两张图,在 <strong>Attention 输入 [B, 1516, 384]</strong> 处衔接:<strong>图 A</strong> 讲数据如何从 raw input 一路构造到 Attention 输入,<strong>图 B</strong> 讲 Attention 输入如何穿过 8 层 Transformer、split 出 NS-tokens、经 head 得到 prediction 再算 loss。5B 配置:<code>B=2048, L=500, D=64, d_model=384, n_ns_tokens=16, n_layers=8</code>。</p>
 
