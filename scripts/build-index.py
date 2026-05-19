@@ -43,7 +43,8 @@ def extract_metadata(html_path: Path) -> dict | None:
         return None
     # normalize
     tags = [t.strip() for t in meta.get("tags", "").split(",") if t.strip()]
-    return {
+    tags_en = [t.strip() for t in meta.get("tags_en", "").split(",") if t.strip()]
+    entry = {
         "title": meta["title"],
         "slug": meta["slug"],
         "date": meta["date"],
@@ -51,6 +52,13 @@ def extract_metadata(html_path: Path) -> dict | None:
         "reading": meta.get("reading", ""),
         "summary": meta.get("summary", ""),
     }
+    # optional English fields — only included when present
+    for k in ("title_en", "reading_en", "summary_en"):
+        if meta.get(k):
+            entry[k] = meta[k]
+    if tags_en:
+        entry["tags_en"] = tags_en
+    return entry
 
 
 def main() -> int:

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -37,10 +37,9 @@
   }
   .wrap { max-width: 760px; margin: 60px auto; padding: 0 24px 80px; }
 
-  #theme-toggle {
+  #theme-toggle, #lang-toggle {
     position: fixed;
     top: 18px;
-    right: 18px;
     background: var(--soft);
     color: var(--fg);
     border: 1px solid var(--border);
@@ -52,7 +51,9 @@
     box-shadow: 0 2px 10px rgba(0,0,0,0.12);
     z-index: 100;
   }
-  #theme-toggle:hover { border-color: var(--accent); }
+  #theme-toggle { right: 18px; }
+  #lang-toggle  { right: 110px; }
+  #theme-toggle:hover, #lang-toggle:hover { border-color: var(--accent); }
 
   header { margin-bottom: 40px; }
   h1 { font-size: 2.1rem; margin: 0 0 6px; letter-spacing: -0.01em; }
@@ -148,23 +149,24 @@
 </style>
 </head>
 <body>
-<button id="theme-toggle" title="切换主题 (自动 → 亮 → 暗)" onclick="cycleTheme()">🌓 自动</button>
+<button id="lang-toggle"  onclick="cycleLang()"></button>
+<button id="theme-toggle" onclick="cycleTheme()"></button>
 
 <div class="wrap">
 
   <header>
     <h1>Notes</h1>
-    <p class="tagline">GPU、HPC、系统性能工程的学习笔记</p>
+    <p class="tagline" id="tagline"></p>
   </header>
 
   <div class="filter-bar" id="filter-bar">
-    <span class="label">标签</span>
-    <span class="tag-chip active" data-tag="">全部</span>
+    <span class="label" id="filter-label"></span>
+    <span class="tag-chip active" data-tag=""></span>
     <!-- 其它 chip 由 JS 填充 -->
   </div>
 
   <div id="post-list">
-    <div class="empty">正在加载文章…</div>
+    <div class="empty" id="loading-msg"></div>
   </div>
 
   <footer>
@@ -176,8 +178,43 @@
 </div>
 
 <script>
+// --- i18n ---
+const I18N = {
+  en: {
+    tagline:    'Study notes on GPU, HPC, and systems performance engineering',
+    label_tags: 'Tags',
+    chip_all:   'All',
+    loading:    'Loading posts…',
+    empty:      tag => `No posts match tag "${tag}".`,
+    error:      msg => `Failed to load posts: ${msg}`,
+    theme:      { '': '🌓 Auto',  light: '☀️ Light', dark: '🌙 Dark' },
+    theme_title:'Toggle theme (auto → light → dark)',
+    lang_btn:   '🌐 中文',
+    lang_title: 'Switch to Chinese',
+    html_lang:  'en',
+  },
+  zh: {
+    tagline:    'GPU、HPC、系统性能工程的学习笔记',
+    label_tags: '标签',
+    chip_all:   '全部',
+    loading:    '正在加载文章…',
+    empty:      tag => `没有匹配标签 "${tag}" 的文章。`,
+    error:      msg => `加载文章列表失败: ${msg}`,
+    theme:      { '': '🌓 自动',  light: '☀️ 亮色',  dark: '🌙 暗色' },
+    theme_title:'切换主题 (自动 → 亮 → 暗)',
+    lang_btn:   '🌐 EN',
+    lang_title: '切换为英文',
+    html_lang:  'zh-CN',
+  },
+};
+let LANG = 'en';
+try {
+  const saved = localStorage.getItem('lang');
+  if (saved === 'en' || saved === 'zh') LANG = saved;
+} catch (_) {}
+const t = () => I18N[LANG];
+
 // --- Theme toggle (auto → light → dark → auto) ---
-const THEME_LABELS = { '': '🌓 自动', light: '☀️ 亮色', dark: '🌙 暗色' };
 (function restoreTheme() {
   try {
     const saved = localStorage.getItem('theme');
@@ -190,7 +227,8 @@ function updateThemeBtn() {
   const btn = document.getElementById('theme-toggle');
   if (!btn) return;
   const cur = document.documentElement.dataset.theme || '';
-  btn.textContent = THEME_LABELS[cur];
+  btn.textContent = t().theme[cur];
+  btn.title = t().theme_title;
 }
 function cycleTheme() {
   const cur = document.documentElement.dataset.theme || '';
@@ -204,7 +242,33 @@ function cycleTheme() {
   }
   updateThemeBtn();
 }
-document.addEventListener('DOMContentLoaded', updateThemeBtn);
+
+// --- Language toggle ---
+function applyLang() {
+  document.documentElement.lang = t().html_lang;
+  const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+  set('tagline', t().tagline);
+  set('filter-label', t().label_tags);
+  // "All" chip is the only chip with empty data-tag
+  const allChip = document.querySelector('.tag-chip[data-tag=""]');
+  if (allChip) allChip.textContent = t().chip_all;
+  const loading = document.getElementById('loading-msg');
+  if (loading) loading.textContent = t().loading;
+  const langBtn = document.getElementById('lang-toggle');
+  if (langBtn) { langBtn.textContent = t().lang_btn; langBtn.title = t().lang_title; }
+  updateThemeBtn();
+}
+function cycleLang() {
+  LANG = LANG === 'en' ? 'zh' : 'en';
+  try { localStorage.setItem('lang', LANG); } catch (_) {}
+  applyLang();
+  if (ALL_POSTS.length) {
+    rebuildTagBar(ALL_POSTS);
+    renderPosts(ALL_POSTS);
+  }
+}
+
+document.addEventListener('DOMContentLoaded', applyLang);
 
 // --- 加载 posts.json 并渲染 ---
 let ALL_POSTS = [];
@@ -214,34 +278,51 @@ fetch('posts.json?_=' + Date.now())
   .then(r => r.json())
   .then(posts => {
     ALL_POSTS = posts;
-    renderTagBar(posts);
+    rebuildTagBar(posts);
     renderPosts(posts);
   })
   .catch(err => {
     document.getElementById('post-list').innerHTML =
-      '<div class="empty">加载文章列表失败: ' + (err?.message || err) + '</div>';
+      '<div class="empty">' + escapeHtml(t().error(err?.message || err)) + '</div>';
   });
 
-function renderTagBar(posts) {
+// Build a canonical tag → display-label map for the current language.
+// Canonical tag = whatever appears in p.tags; display = parallel p.tags_en (if present).
+function buildTagLabelMap(posts) {
+  const map = {};
+  posts.forEach(p => {
+    const tags = p.tags || [];
+    const tagsEn = p.tags_en || [];
+    tags.forEach((tag, i) => {
+      if (LANG === 'en' && tagsEn[i]) map[tag] = tagsEn[i];
+      else if (!map[tag]) map[tag] = tag;
+    });
+  });
+  return map;
+}
+
+function rebuildTagBar(posts) {
   const bar = document.getElementById('filter-bar');
+  // remove existing non-static chips (keep label + "all" chip)
+  bar.querySelectorAll('.tag-chip:not([data-tag=""])').forEach(c => c.remove());
   const tagSet = new Set();
   posts.forEach(p => (p.tags || []).forEach(t => tagSet.add(t)));
-  const tags = [...tagSet].sort();
+  const labelMap = buildTagLabelMap(posts);
+  const tags = [...tagSet].sort((a, b) => (labelMap[a] || a).localeCompare(labelMap[b] || b));
   tags.forEach(tag => {
     const chip = document.createElement('span');
-    chip.className = 'tag-chip';
+    chip.className = 'tag-chip' + (tag === ACTIVE_TAG ? ' active' : '');
     chip.dataset.tag = tag;
-    chip.textContent = tag;
+    chip.textContent = labelMap[tag] || tag;
     bar.appendChild(chip);
   });
-  // click handlers
   bar.querySelectorAll('.tag-chip').forEach(chip => {
-    chip.addEventListener('click', () => {
+    chip.onclick = () => {
       bar.querySelectorAll('.tag-chip').forEach(c => c.classList.remove('active'));
       chip.classList.add('active');
       ACTIVE_TAG = chip.dataset.tag;
       renderPosts(ALL_POSTS);
-    });
+    };
   });
 }
 
@@ -251,16 +332,18 @@ function renderPosts(posts) {
     ? posts.filter(p => (p.tags || []).includes(ACTIVE_TAG))
     : posts;
   if (filtered.length === 0) {
-    list.innerHTML = '<div class="empty">没有匹配标签 "' + ACTIVE_TAG + '" 的文章。</div>';
+    list.innerHTML = '<div class="empty">' + escapeHtml(t().empty(ACTIVE_TAG)) + '</div>';
     return;
   }
+  const labelMap = buildTagLabelMap(posts);
+  const pick = (p, k) => (LANG === 'en' && p[k + '_en']) ? p[k + '_en'] : (p[k] || '');
   list.innerHTML = filtered.map(p => `
     <a class="post" href="posts/${escapeHtml(p.slug)}.html">
-      <div class="post-title">${escapeHtml(p.title)}</div>
-      <div class="post-meta">${escapeHtml(p.date)}${p.reading ? ' · ' + escapeHtml(p.reading) : ''}</div>
-      <div class="post-summary">${escapeHtml(p.summary || '')}</div>
+      <div class="post-title">${escapeHtml(pick(p, 'title'))}</div>
+      <div class="post-meta">${escapeHtml(p.date)}${pick(p, 'reading') ? ' · ' + escapeHtml(pick(p, 'reading')) : ''}</div>
+      <div class="post-summary">${escapeHtml(pick(p, 'summary'))}</div>
       <div class="post-tags">
-        ${(p.tags || []).map(t => '<span class="post-tag">' + escapeHtml(t) + '</span>').join('')}
+        ${(p.tags || []).map(tag => '<span class="post-tag">' + escapeHtml(labelMap[tag] || tag) + '</span>').join('')}
       </div>
     </a>
   `).join('');
