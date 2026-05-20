@@ -345,6 +345,374 @@ y = x @ w                                                            <span class
 
 <p>这张表就是 §2 的提纲。每行展开成一节,从最浅的"为什么 c10 不直接依赖 CPython"开始。</p>
 
+<h2 id="sec2">2. C++ → Python 的物理机制</h2>
+
+<p>本章把 1.4 节那张机制总表一行一行展开看源码。读完应该能在脑子里画出 dispatcher 看到 <code>Python</code> key 后的完整流程,包括 GIL 获取、参数转换、Python 函数查找、结果回传、防递归。所有源码路径以 PyTorch <code>main</code> 分支为准 —— 这部分代码 2024-2025 期间有过文件重组,如果你看到老博客指向 <code>c10/core/PyInterpreter.h</code> 找不到,那是因为它现在在 <code>c10/core/impl/PyInterpreter.h</code>。</p>
+
+<h3 id="sec2-1">2.1 c10 与 CPython 的零依赖矛盾</h3>
+
+<p>要理解 C++→Python 跳转的设计,先得知道一个看似不起眼但贯穿全文的约束:</p>
+
+<div class="callout">
+<strong>约束</strong>:<code>libc10.so</code>(PyTorch 的核心 C++ 库)<strong>不能</strong>直接依赖 CPython 的头文件或 <code>libpython.so</code>。<code>libtorch_python.so</code> 才能依赖 CPython。
+</div>
+
+<p>为什么?因为 <code>libtorch</code>(<code>libc10</code> 的下游)<strong>必须能在没有 Python 的进程里用</strong> —— 比如:</p>
+
+<ul>
+  <li>移动端推理:把 PyTorch 模型编译成 C++ 可执行文件,运行时没有 Python。</li>
+  <li>JIT/lite-interpreter 部署:Android / iOS 的 PyTorch 应用。</li>
+  <li>嵌入式系统:Jetson Nano 上跑模型,Python 是可选的。</li>
+  <li>纯 C++ 服务:像 Triton inference server 这种,只用 libtorch C++ API,完全不加载 Python。</li>
+</ul>
+
+<p>这就和我们想做的事产生矛盾:dispatcher 在 <code>libc10</code> 里(注册表数据结构、key 枚举、KernelFunction 都在这一层),它需要"调 Python"。但 <code>libc10</code> 不能 <code>#include &lt;Python.h&gt;</code>。</p>
+
+<p>PyTorch 用一个经典的<strong>反转控制 (IoC)</strong> 设计破解这个矛盾:</p>
+
+<ol>
+  <li><strong><code>libc10</code> 定义一个抽象接口</strong>(<code>PyInterpreterVTable</code>),里面是一堆纯虚函数 —— "我需要 Python 帮我做这些事,但我不知道怎么做"。</li>
+  <li><strong><code>libtorch_python</code>(实际加载 CPython 的层)在<strong>静态初始化</strong>时</strong>填充这个 vtable 的具体实现,把指针塞回 c10 的全局变量。</li>
+  <li><strong>运行时 c10 调用</strong> Python 相关功能,走的是 vtable 虚函数 —— 它<strong>编译期不知道 CPython 存在</strong>,链接期也不需要 <code>libpython.so</code>;但<strong>运行期</strong>如果 <code>libtorch_python</code> 被加载了,vtable 就是有效的。</li>
+  <li>没有 Python 的进程里,vtable 是个 "no-op" 版本 —— 调到这些虚函数会触发友好的 error,而不是 segfault。</li>
+</ol>
+
+<p>这个 IoC 决定了所有<strong>C++→Python</strong> 调用都<strong>必须</strong>过 vtable 这一关。下一节看 vtable 长什么样。</p>
+
+<h3 id="sec2-2">2.2 PyInterpreterVTable:抽象的桥</h3>
+
+<p>vtable 定义在 <a href="https://github.com/pytorch/pytorch/blob/main/c10/core/impl/PyInterpreter.h"><code>c10/core/impl/PyInterpreter.h</code></a> 第 75-175 行附近。完整结构(裁剪):</p>
+
+<pre class="code"><span class="cm">// c10/core/impl/PyInterpreter.h</span>
+struct C10_API PyInterpreterVTable {
+  virtual ~PyInterpreterVTable() = default;
+
+  <span class="cm">// 调试用:返回 "cpython" 或 "noop"</span>
+  virtual std::string name() const = 0;
+
+  <span class="cm">// === 引用计数管理 ===</span>
+  virtual void incref(PyObject* pyobj) const = 0;
+  virtual void decref(PyObject* pyobj) const = 0;
+  virtual bool try_incref(const c10::impl::PyObjectSlot&amp; pyobj_slot) const = 0;
+  virtual size_t refcnt(PyObject* pyobj) const = 0;
+
+  <span class="cm">// === Tensor 操作 ===</span>
+  virtual c10::intrusive_ptr&lt;TensorImpl&gt; detach(const TensorImpl* self) const = 0;
+
+  <span class="cm">// === ★ 关键的"分派到 Python"方法 ===</span>
+  virtual void dispatch(const c10::OperatorHandle&amp; op,
+                        torch::jit::Stack* stack) const = 0;
+
+  virtual void python_op_registration_trampoline(
+      const c10::OperatorHandle&amp; op, c10::DispatchKey,
+      c10::DispatchKeySet keyset, torch::jit::Stack* stack,
+      bool with_keyset, bool with_op) const = 0;
+
+  virtual void python_dispatcher(const c10::OperatorHandle&amp; op,
+      c10::DispatchKeySet, torch::jit::Stack* stack) const = 0;
+
+  <span class="cm">// === 元数据查询 ===</span>
+  virtual c10::IntArrayRef strides(const TensorImpl* self) const = 0;
+  virtual c10::Device device(const TensorImpl* self) const = 0;
+  <span class="cm">// ... 还有 sizes / numel / dim / sym_size 等十几个</span>
+};
+
+struct C10_API PyInterpreter {
+  const PyInterpreterVTable* vtable_;
+  const PyInterpreterVTable&amp; operator*() const noexcept { return *vtable_; }
+  const PyInterpreterVTable* operator->() const noexcept { return vtable_; }
+  void disarm() noexcept;             <span class="cm">// 进程退出时切换到 noop_vtable</span>
+};</pre>
+
+<p>三组虚函数,各管一类事:</p>
+
+<table>
+<thead><tr><th>组</th><th>用途</th><th>谁会调它?</th></tr></thead>
+<tbody>
+<tr><td>引用计数(<code>incref</code>/<code>decref</code>/<code>refcnt</code>)</td><td>管理 c10 持有的 Python 对象的生命周期</td><td><code>TensorImpl</code> 析构时、<code>PyObjectSlot</code> 操作时</td></tr>
+<tr><td>Dispatch(<code>dispatch</code>、<code>python_op_registration_trampoline</code>、<code>python_dispatcher</code>)</td><td>把 C++ op 调用<strong>转发到 Python</strong></td><td><code>PythonFallbackKernel</code>(2.4 节)和 <code>torch.library</code> 注册 Python 实现的 op</td></tr>
+<tr><td>元数据(<code>strides</code>/<code>sizes</code>/<code>device</code> 等)</td><td>Tensor subclass 重写 shape 信息时,C++ 通过 vtable 反查</td><td><code>TensorImpl::sym_sizes_custom()</code> 等</td></tr>
+</tbody>
+</table>
+
+<p>本文重点是<strong>第二组</strong> —— <code>dispatch</code> 那行虚函数。它的具体实现(在 <code>libtorch_python</code> 里)就是 §2.6 要展开的 <code>ConcretePyInterpreterVTable::dispatch</code>。</p>
+
+<div class="example">
+<span class="label">小例 2.2 — disarm 的存在理由</span>
+PyTorch 进程退出时,Python 解释器先析构(<code>Py_Finalize</code>),但 <code>libtorch</code> 持有的 C++ 对象可能<strong>晚于</strong> Python 析构(比如缓存的张量在 atexit 之后才被销毁)。这些对象的析构函数会调 <code>pyobj_slot.decref()</code> —— 但此时 Python 已经死了,真正调 <code>Py_DECREF</code> 会 segfault。<br><br>
+<code>disarm()</code> 在 Python 析构开始时被调用,把 vtable 指针<strong>整体替换</strong>成一个 noop 版本。后续 C++ 调 <code>decref(...)</code> 走 noop —— 安静地什么都不做。如果你看到 "<em>attempted to call dispatch on a Tensor with nontrivial PyObject after corresponding interpreter died</em>" 这种诊断信息,就是这套机制在工作。
+</div>
+
+<h3 id="sec2-3">2.3 TensorImpl::pyobj_slot:反向指针</h3>
+
+<p>vtable 解决了"c10 如何调 Python 函数"的问题。还有一个对偶问题:<strong>给定一个 C++ <code>TensorImpl</code>,怎么知道它对应的 Python 对象是哪个?</strong>这对 tensor subclass 至关重要 —— 调 <code>FakeTensor</code> 的某个方法时,dispatcher 拿到的是 C++ <code>TensorImpl*</code>,但要调的 <code>__torch_dispatch__</code> 定义在 Python 那个 <code>FakeTensor</code> 类上。</p>
+
+<p>答案是:<strong>每个 <code>TensorImpl</code> 内嵌一个 <code>PyObjectSlot</code></strong>,它就是一个原子的 <code>PyObject*</code>(指向 Python 那一侧的 <code>THPVariable</code> 对象,即 <code>torch.Tensor</code> Python 包装)。定义在 <a href="https://github.com/pytorch/pytorch/blob/main/c10/core/impl/PyObjectSlot.h"><code>c10/core/impl/PyObjectSlot.h</code></a>:</p>
+
+<pre class="code"><span class="cm">// c10/core/impl/PyObjectSlot.h (完整,约 60 行,简化)</span>
+struct C10_API PyObjectSlot {
+ public:
+  PyObjectSlot() : pyobj_(nullptr) {}
+
+  PyObject* load_pyobj() const {
+    return pyobj_.load(std::memory_order_acquire);
+  }
+  void store_pyobj(PyObject* obj) {
+    pyobj_.store(obj, std::memory_order_release);
+  }
+
+  bool has_unique_reference() const {
+    PyObject* pyobj = load_pyobj();
+    return pyobj != nullptr
+        &amp;&amp; (*getGlobalPyInterpreter())->refcnt(pyobj) == 1;
+  }
+
+  void clear() { pyobj_.store(nullptr, std::memory_order_relaxed); }
+
+  <span class="cm">// 引用计数 —— 内部通过 vtable 调到 CPython 的 Py_INCREF / Py_DECREF</span>
+  void incref() const noexcept;
+  void decref() const noexcept;
+  bool try_incref() const noexcept;
+
+ private:
+  std::atomic&lt;PyObject*&gt; pyobj_;     <span class="cm">// ← 整个反向指针机制就是这 8 字节</span>
+};</pre>
+
+<p>嵌入到 <code>TensorImpl</code> 里(<a href="https://github.com/pytorch/pytorch/blob/main/c10/core/TensorImpl.h"><code>c10/core/TensorImpl.h</code></a> 第 2974 行附近):</p>
+
+<pre class="code">class TORCH_API TensorImpl : public c10::intrusive_ptr_target {
+  ...
+  impl::PyObjectSlot pyobj_slot_;       <span class="cm">// ← 占用 8 字节(64-bit ptr)</span>
+
+ public:
+  impl::PyObjectSlot* pyobj_slot()       { return &amp;pyobj_slot_; }
+  const impl::PyObjectSlot* pyobj_slot() const { return &amp;pyobj_slot_; }
+};</pre>
+
+<p>初始状态 <code>pyobj_</code> 是 <code>nullptr</code>。两种情况会被设上:</p>
+
+<ol>
+  <li><strong>普通 <code>torch.Tensor</code> 第一次被 Python 包装时</strong>:Python C 绑定层(<code>THPVariable_Wrap</code>)创建一个新的 <code>THPVariable</code> 对象,把它指针写进 <code>pyobj_slot</code>。下次 C++ 想"包回 Python"时直接复用,而不是建新包装。</li>
+  <li><strong><code>Tensor subclass</code>(如 <code>FakeTensor</code>)被构造时</strong>:Python 端构造方法主动调 <code>store_pyobj(self)</code>,同时<strong>把 <code>DispatchKey::Python</code> 设进这个 <code>TensorImpl</code> 的 <code>key_set_</code></strong> —— 这是触发 <code>PythonFallbackKernel</code> 的关键标记。</li>
+</ol>
+
+<div class="callout">
+<strong>记住这一点</strong>:tensor subclass 的整套机制建立在<strong>两件事</strong>上:① <code>TensorImpl</code> 的 <code>key_set_</code> 里有 <code>Python</code> 位,② <code>pyobj_slot_</code> 指向对应的 Python subclass 实例。两件事都必须有,任何一个缺失这个 subclass 都不会被正确识别。
+</div>
+
+<h3 id="sec2-4">2.4 PythonFallbackKernel:正式跳过去</h3>
+
+<p>vtable 和 pyobj_slot 准备好了基础设施。现在看真正干"跳"这件事的代码。它是一个 <strong>boxed kernel</strong>,以 <code>m.fallback</code> 形式注册到 <code>Python</code> key 上(还有几个相关的 key)。文件:<a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/core/PythonFallbackKernel.cpp"><code>aten/src/ATen/core/PythonFallbackKernel.cpp</code></a>。</p>
+
+<p>注册段(第 151 行附近):</p>
+
+<pre class="code"><span class="cm">// 把 pythonFallback 这个函数注册成 Python key 的 boxed 兜底 kernel
+// 注册到下划线 namespace = "所有 namespace 都生效"</span>
+TORCH_LIBRARY_IMPL(_, Python, m) {
+  m.fallback(torch::CppFunction::makeFromBoxedFunction&lt;&amp;pythonFallback&gt;());
+}
+
+<span class="cm">// 还有三个相关的 key 也注册了类似的 fallback(细节见 §4)</span>
+TORCH_LIBRARY_IMPL(_, PythonDispatcher, m) {
+  m.fallback(torch::CppFunction::makeFromBoxedFunction&lt;&amp;pythonDispatcherFallback&gt;());
+}
+TORCH_LIBRARY_IMPL(_, PythonTLSSnapshot, m) {
+  m.fallback(torch::CppFunction::makeFromBoxedFunction&lt;&amp;pythonTLSSnapshotFallback&gt;());
+}
+TORCH_LIBRARY_IMPL(_, PreDispatch, m) {
+  m.fallback(torch::CppFunction::makeFromBoxedFunction&lt;&amp;preDispatchFallback&gt;());
+}</pre>
+
+<p>所以 dispatcher 看到位图最高位是 <code>Python</code> 时,就会调用 <code>pythonFallback</code>。函数体是这一切的"中央枢纽"(第 52 行附近,我把关键部分注释加密):</p>
+
+<pre class="code"><span class="cm">// aten/src/ATen/core/PythonFallbackKernel.cpp</span>
+void pythonFallback(const c10::OperatorHandle&amp; op,
+                    c10::DispatchKeySet dispatch_keys,
+                    torch::jit::Stack* stack) {
+
+  <span class="cm">// === ① 进 guard: 标记"我们已经在 Python fallback 里了"
+  //       + 把 Python 及以下的所有 key 加入 TLS exclude
+  //       —— 这样 Python 内部调 func(*args) 时不会再触发本 fallback,
+  //         实现 2.5 节要讲的"不递归"语义。</span>
+  at::impl::MaybeSetTLSOnEntryGuard tls_guard;
+  c10::impl::ExcludeDispatchKeyGuard exclude_guard(after_Python_keyset);
+
+  const auto&amp; schema = op.schema();
+  const auto num_arguments = schema.arguments().size();
+
+  <span class="cm">// === ② 路径 A: 模式栈(mode stack)非空 → 用栈顶的 mode 处理
+  //
+  // TorchDispatchModeTLS 是 C++ 端的一个线程局部模式栈;
+  // 每次 Python 端进 `with SomeMode():` 就 push 一个 mode 对象到这。
+  // pythonFallback 拿栈顶的 mode,调它的 pyinterpreter()->dispatch(...)。</span>
+  const auto mode_stack_len = c10::impl::TorchDispatchModeTLS::stack_len();
+  if (mode_stack_len &gt; 0) {
+    const auto&amp; cur_mode = c10::impl::TorchDispatchModeTLS::get_stack_at(mode_stack_len - 1);
+    cur_mode-&gt;pyinterpreter()-&gt;dispatch(op, stack);
+    <span class="cm">// ↑ 通过 vtable 跳到 Python,真正调 mode.__torch_dispatch__(...)</span>
+    return;
+  }
+
+  <span class="cm">// === ③ 路径 B: 没有模式,但有 tensor subclass 在输入里
+  //
+  // 走完输入参数,找:① 是否真有 tensor 带 Python key;② 任意一个有 pyobj_slot 的 tensor
+  // 用作 PyInterpreter 入口。</span>
+  bool tensors_with_python_key_present = false;
+  c10::impl::PyInterpreter* interpreter = nullptr;
+  for (const auto&amp; ivalue : torch::jit::last(*stack, num_arguments)) {
+    if (ivalue.isTensor()) {
+      auto* t = ivalue.unsafeToTensorImpl();
+      if (t-&gt;key_set().has(c10::DispatchKey::Python)) {
+        tensors_with_python_key_present = true;
+      }
+      if (!interpreter &amp;&amp; t-&gt;pyobj_slot()-&gt;load_pyobj()) {
+        interpreter = c10::impl::getGlobalPyInterpreter();
+      }
+    }
+    <span class="cm">// ... List / Optional 形式参数也走相同逻辑(略)</span>
+  }
+
+  if (interpreter) {
+    if (tensors_with_python_key_present) {
+      <span class="cm">// 真有 subclass 想拦截这次调用 → 跳 Python</span>
+      (*interpreter)-&gt;dispatch(op, stack);
+    } else {
+      <span class="cm">// 输入里有 PyInterpreter 但都不带 Python key:把 Python 位 mask 掉,
+      // 让 dispatcher 用 redispatch 继续走下一层 —— 没人想拦,正常算就行</span>
+      c10::DispatchKeySet keyset = dispatch_keys.remove(c10::DispatchKey::Python);
+      c10::impl::LocalDispatchKeySet local_keyset = c10::impl::tls_local_dispatch_key_set();
+      c10::impl::ForceDispatchKeyGuard no_python_guard(
+        local_keyset.included_.remove(c10::DispatchKey::Python),
+        local_keyset.excluded_);
+      op.redispatchBoxed(keyset, stack);
+    }
+    return;
+  }
+
+  TORCH_INTERNAL_ASSERT(0, "Hit Python dispatch key but no arguments had PyInterpreter");
+}</pre>
+
+<p>这个函数体浓缩了 <strong>"C++→Python 跳转"</strong> 的全部决策。逐段读一遍:</p>
+
+<ol>
+  <li><strong>① guard 段</strong>:进 fallback 立刻把"<code>Python</code> 及更低优先级"全部 mask 掉(<code>after_Python_keyset</code> 是预算好的常量,2.5 节展开)。这保证后续 Python 代码体内的 op 调用<strong>不会</strong>再触发自己 —— 否则就是无限递归。</li>
+  <li><strong>② 路径 A:mode stack 非空</strong>。这是 <code>FakeTensorMode</code>、<code>ProxyTorchDispatchMode</code> 这些 mode 的入口。它们在 <code>__enter__</code> 时把自己 push 进 <code>TorchDispatchModeTLS</code>,<code>__exit__</code> 时 pop。<code>pythonFallback</code> 只取栈顶 —— LIFO 优先级。</li>
+  <li><strong>③ 路径 B:输入张量带 Python key</strong>。这是 tensor subclass 路径(如 <code>FakeTensor</code> 作为参数传给某 op)。<code>tensors_with_python_key_present</code> 检查 key,<code>interpreter</code> 找一个有 pyobj_slot 的张量作为入口。两个条件都满足才真跳。</li>
+  <li><strong>路径 B 的"假阳性"分支</strong>:如果 input 有 PyInterpreter 但都不带 Python key(意味着这些 tensor 的 Python 包装存在但没人指定要拦截),就<strong>把 Python 位 mask 掉,redispatch</strong> —— 这处理 "有 Python 包装但不需要拦截"的常见情况(普通 <code>torch.Tensor</code> 都在这个分支)。</li>
+</ol>
+
+<div class="aside">
+<span class="label">边栏 2.4 — 模式栈优先级 vs 子类优先级</span>
+观察上面代码:<strong>mode stack 路径写在前面</strong>,subclass 路径写在后面。这是关键的优先级决定 —— <strong>如果同时存在 mode 和带 Python key 的 tensor 参数,mode 赢</strong>。<br><br>
+这是合理的设计选择。Mode 是"用户主动声明的全局变换"(<code>with FakeTensorMode():</code>),subclass 是"输入数据本身的属性"。当两者冲突时,主动声明的语义更强、更显式 —— 用户写 <code>with FakeTensorMode():</code> 期望<strong>所有</strong> op 都被假化,即使输入里有别的 subclass。
+</div>
+
+<h3 id="sec2-5">2.5 ExcludeDispatchKeyGuard 与 after_Python_keyset</h3>
+
+<p>2.4 节的 guard:</p>
+
+<pre class="code">c10::impl::ExcludeDispatchKeyGuard exclude_guard(after_Python_keyset);</pre>
+
+<p>这是<strong>整个机制最巧妙的设计</strong>。它防止"Python 函数体内调 op → 又回到 PythonFallback → 死循环"。</p>
+
+<p><code>after_Python_keyset</code> 在 <code>PythonFallbackKernel.cpp</code> 第 27 行附近定义:</p>
+
+<pre class="code">constexpr c10::DispatchKeySet after_Python_keyset =
+    c10::DispatchKeySet(c10::DispatchKeySet::FULL)
+    ^ (c10::DispatchKeySet(c10::DispatchKeySet::FULL_AFTER, c10::DispatchKey::Python)
+       | c10::DispatchKeySet(c10::DispatchKey::Python));</pre>
+
+<p>这个表达式比较绕,但意思是:<strong>"<code>Python</code> 这一位 + 比它优先级低的所有位</strong>"。XOR 一下,得到的就是"<code>Python</code> 这一位 + 它下面所有位"组成的 mask。</p>
+
+<p><code>ExcludeDispatchKeyGuard</code> 是个 RAII 对象(类似第一篇里讲过的 <code>AutoDispatchBelowAutograd</code>),构造时把这些位<strong>加进 TLS exclude</strong>,析构时还原。所以:</p>
+
+<p>当 Python <code>__torch_dispatch__</code> 体内调 <code>func(*args)</code>(意味着"我处理完了,让 dispatcher 继续走"),这个调用过 <code>at::*</code> API 进 <code>Dispatcher::call</code>,算位图时<strong>会自动减掉 exclude 集合</strong>,<code>Python</code> 位被清零 —— 最高位变成 <code>Autograd*</code> 或更下面的 backend key,<strong>直接落到真实实现</strong>,不会再触发 <code>pythonFallback</code>。</p>
+
+<div class="example">
+<span class="label">小例 2.5 — 一次完整的 mode 拦截 + 透传</span>
+追踪 <code>with MyMode(): z = x + y</code> 的位图:<br><br>
+1. <strong>顶层 dispatcher::call</strong>:位图 = {<code>Python</code>, <code>AutogradCUDA</code>, <code>CUDA</code>}(因为进了 mode → TLS include 里有 <code>Python</code>)。最高位 = <code>Python</code>,跳 <code>pythonFallback</code>。<br>
+2. <strong><code>pythonFallback</code> 内</strong>:<code>ExcludeDispatchKeyGuard</code> 把 <code>{Python, Autograd*, CUDA, ...}</code> 全加进 TLS exclude。然后调 mode 的 <code>__torch_dispatch__(func=aten.add.Tensor, args=(x, y))</code>。<br>
+3. <strong>Python <code>__torch_dispatch__</code> 体内</strong>:用户写 <code>return func(*args, **kwargs)</code>(意思:我啥都不做,让你继续走)。这调到 <code>at::add</code> 进顶层 <code>Dispatcher::call</code>。<br>
+4. <strong>嵌套 dispatcher::call</strong>:位图初始 = {<code>Python</code>, <code>AutogradCUDA</code>, <code>CUDA</code>}(还在 mode 里),但 <strong>TLS exclude 减掉</strong>了 <code>{Python, Autograd*, CUDA, ...}</code>。运算后:最高位 = ???<br>
+5. ★ <strong>关键:exclude 集合也包含 Autograd 和 CUDA 等位!</strong>所以剩下的位图是空的?<br><br>
+其实不是 —— 仔细看 <code>after_Python_keyset</code> 的定义:<code>FULL_AFTER, Python</code> 是 "Python <em>之后</em>" 的位(更低优先级)。XOR 出来的是 "<code>Python</code> 本身 + Python 之后" 的位,也就是 <code>Python</code> 及以下。所以 exclude 包含 <code>{Python, ADInplaceOrView, Autograd*, ..., CUDA, ...}</code>。<br>
+6. 减掉后,从 <code>{Python, AutogradCUDA, CUDA}</code> 剩下空集 —— 是不是没法 dispatch?<br><br>
+<strong>答案藏在 path B</strong>:实际场景里 <code>x</code> 和 <code>y</code> 不带 Python key(它们是普通 CUDA tensor),进 <code>pythonFallback</code> 的<strong>第二次调用</strong>会走到 "no tensor with Python key" 分支,把 Python 位 mask 掉、强制 redispatch,这次最高位变成 <code>AutogradCUDA</code> —— 链条正确继续。<br><br>
+<strong>对于 tensor subclass 路径</strong>:输入张量带 Python key,但 <code>__torch_dispatch__</code> 内通常先调 <code>unwrap(x)</code> 把张量"剥成"普通 tensor,然后再 <code>func(unwrapped_args)</code>。普通 tensor 不带 Python key,后续 redispatch 同样落到 backend。
+</div>
+
+<h3 id="sec2-6">2.6 ConcretePyInterpreterVTable::dispatch:跨越边界</h3>
+
+<p><code>pythonFallback</code> 在路径 A 调 <code>cur_mode-&gt;pyinterpreter()-&gt;dispatch(op, stack)</code>。这个 <code>dispatch</code> 就是 2.2 节那个虚函数 —— 真正实现在 <a href="https://github.com/pytorch/pytorch/blob/main/torch/csrc/PyInterpreter.cpp"><code>torch/csrc/PyInterpreter.cpp</code></a> 第 177-218 行:</p>
+
+<pre class="code"><span class="cm">// torch/csrc/PyInterpreter.cpp</span>
+void ConcretePyInterpreterVTable::dispatch(
+    const c10::OperatorHandle&amp; op, torch::jit::Stack* stack) const {
+
+  const auto&amp; schema = op.schema();
+  const auto num_arguments = schema.arguments().size();
+  auto arguments = torch::jit::pop(*stack, num_arguments);   <span class="cm">// 从 stack 弹出参数</span>
+
+  <span class="cm">// === ① 获取 GIL —— 跨界第一步</span>
+  py::gil_scoped_acquire g;
+
+  <span class="cm">// === ② 找 op 对应的 Python API 函数(例如 torch.ops.aten.add.Tensor)</span>
+  std::vector&lt;PyObject*&gt; overloaded_args;
+  py::handle torch_api_function_overload = getTorchApiFunction(op);
+
+  <span class="cm">// === ③ 扫描 IValue 参数,收集"带 Python key 的 tensor"(subclass)</span>
+  for (const auto idx : c10::irange(arguments.size())) {
+    const auto&amp; ivalue = arguments[idx];
+    if (ivalue.isTensor()) {
+      const auto&amp; tensor = ivalue.toTensor();
+      if (isPythonTensor(tensor)) {
+        append_overloaded_tensor(&amp;overloaded_args, py::cast(tensor).ptr());
+      }
+    }
+    <span class="cm">// 还处理 list / optional-list 内的 tensor(略)</span>
+  }
+
+  <span class="cm">// === ④ 把所有 IValue 转成 PyObject 形式的 (args, kwargs)</span>
+  auto args_kwargs = parseIValuesToPyArgsKwargs(op, arguments);
+  auto args = std::move(args_kwargs.first);
+  auto kwargs = std::move(args_kwargs.second);
+
+  <span class="cm">// === ⑤ 调用 Python: 找 __torch_dispatch__,带 mode stack 优先级 + types MRO</span>
+  PyObject* obj = handle_torch_function_no_python_arg_parser(
+      overloaded_args, args.ptr(), kwargs.ptr(), nullptr,
+      torch_api_function_overload.ptr(), nullptr,
+      &amp;op, &amp;arguments, TorchFunctionName::TorchDispatch);
+
+  <span class="cm">// === ⑥ 把 Python 返回值转回 IValue 并压回 stack</span>
+  pushPyOutToStack(op, stack,
+      py::reinterpret_steal&lt;py::object&gt;(obj),
+      "__torch_dispatch__");
+}</pre>
+
+<p>这是<strong>真正跨界的 6 步</strong>。逐段解释:</p>
+
+<ol>
+  <li><strong>① <code>py::gil_scoped_acquire g;</code></strong>:<strong>获取 GIL</strong>。这是把 C++ 线程拉进 Python 解释器的"门票" —— 没有 GIL,你不能安全调任何 CPython API。RAII 对象,出函数自动释放。</li>
+  <li><strong>② <code>getTorchApiFunction(op)</code></strong>:从 op 名("aten::add.Tensor")找对应的 Python 函数对象(<code>torch.ops.aten.add.Tensor</code>)。这个函数对象后续被传给 Python 端,Python 端 <code>__torch_dispatch__</code> 的 <code>func</code> 参数就是它。</li>
+  <li><strong>③ 扫描"覆盖"列表</strong>:走一遍 IValue 输入,找带 Python key 的张量,收集到 <code>overloaded_args</code>。Python 端需要这个列表才能按 MRO 顺序找哪个 subclass 的 <code>__torch_dispatch__</code> 应该被调。</li>
+  <li><strong>④ <code>parseIValuesToPyArgsKwargs</code></strong>:把所有 IValue 转成 Python 对象(args 是 tuple、kwargs 是 dict)。对 tensor 参数,<code>py::cast(tensor)</code> 会优先从 <code>pyobj_slot_</code> 取已有的 Python 包装,没有才新建 —— 这是 2.3 节那个反向指针的用武之地。</li>
+  <li><strong>⑤ <code>handle_torch_function_no_python_arg_parser</code></strong>:实际"调 Python" 的步骤。它走 <code>TorchDispatchModeTLS</code> 栈 + <code>overloaded_args</code> 的 MRO,找第一个有 <code>__torch_dispatch__</code> 的对象,把 <code>(func, types, args, kwargs)</code> 传进去。具体的调度优先级:<br>
+    &nbsp;&nbsp;&nbsp;<strong>(a)</strong> Mode stack 从顶到底依次尝试,直到一个返回非 <code>NotImplemented</code>;<br>
+    &nbsp;&nbsp;&nbsp;<strong>(b)</strong> Subclass 按 MRO 顺序尝试 <code>overloaded_args</code> 里的对象。<br>
+    具体 mode vs subclass 的优先级,见 §3.3。</li>
+  <li><strong>⑥ <code>pushPyOutToStack</code></strong>:Python 返回了一个 PyObject(可能是张量、tuple、scalar 等)。把它转回 IValue,push 到 stack 上。dispatcher 顶层从 stack 取就是最终结果。</li>
+</ol>
+
+<p>这 6 步执行一次的开销:GIL 获取 + 几十次 PyObject 创建 + 一次 Python 函数调用 + 反向转换。经验值 5-15µs(对比纯 C++ dispatch 的 50ns,慢了 100-300 倍)。这就是 §7 要讨论的"什么时候不该用 <code>__torch_dispatch__</code>"的代价。</p>
+
+<div class="callout">
+<strong>本章带走的三个心智模型</strong>:<br>
+① <strong>vtable 是 c10/Python 解耦的关键</strong>。<code>libc10</code> 不依赖 CPython,通过 vtable 把"调 Python"这件事抽象成虚函数,运行时由 <code>libtorch_python</code> 填充。<br>
+② <strong><code>pyobj_slot</code> 是反向指针</strong>。每个 <code>TensorImpl</code> 8 字节存对应 Python 包装的指针。Tensor subclass 路径靠它找到 <code>__torch_dispatch__</code>。<br>
+③ <strong><code>ExcludeDispatchKeyGuard</code> 防递归</strong>。Python 函数体内调的 op 都自动跳过 <code>Python</code> kernel,直接落到 backend —— 实现"我处理完了,你继续"的递归语义。
+</div>
+
 </main>
 </div>
 </body>
