@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PyTorch C++↔Python 双向调度:TorchDispatchMode 与反向跳转</title>
+<meta name="post:title"      content="PyTorch C++↔Python 双向调度:TorchDispatchMode 与反向跳转">
+<meta name="post:title_en"   content="PyTorch C++↔Python Bidirectional Dispatch: TorchDispatchMode and the Reverse Jump">
+<meta name="post:slug"       content="pytorch-torch-dispatch-mode">
+<meta name="post:date"       content="2026-05-20">
+<meta name="post:tags"       content="PyTorch, 系统设计, C++, Python">
+<meta name="post:tags_en"    content="PyTorch, Systems Design, C++, Python">
+<meta name="post:reading"    content="35 分钟">
+<meta name="post:reading_en" content="35 min">
+<meta name="post:summary"    content="dispatcher 那篇文章的姐妹篇 —— 从 Python DispatchKey 这一层钻进去,讲清 C++ 调用走到一半反向跳回 Python 的完整机制:PyInterpreterVTable + TensorImpl::pyobj_slot + PythonFallbackKernel + TorchDispatchMode API。配合 FakeTensorMode / make_fx + ProxyTorchDispatchMode / DTensor 三个真实用户案例,以及它在 torch.compile 流水线中的角色。">
+<meta name="post:summary_en" content="Sister article to the dispatcher deep dive. Zooms into the Python DispatchKey: how a C++ op call mid-flight reverse-jumps back into Python via PyInterpreterVTable, TensorImpl::pyobj_slot, PythonFallbackKernel, and the TorchDispatchMode protocol. Includes worked case studies on FakeTensorMode, make_fx + ProxyTorchDispatchMode, DTensor, and the mechanism's role in torch.compile's AOTAutograd pipeline.">
+<style>
+  :root {
+    --sidebar-w: 280px;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --bg: #ffffff;
+    --panel: #f6f8fa;
+    --border: #d0d7de;
+    --accent: #0969da;
+    --accent-soft: #ddf4ff;
+    --code-bg: #f6f8fa;
+    --kw: #cf222e;
+    --cm: #6e7781;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --bg: #0d1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --accent: #58a6ff;
+      --accent-soft: #1f6feb33;
+      --code-bg: #161b22;
+      --kw: #ff7b72;
+      --cm: #8b949e;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 16px; line-height: 1.7;
+    color: var(--fg); background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+  }
+  .layout { display: flex; align-items: flex-start; min-height: 100vh; }
+  aside.toc {
+    position: sticky; top: 0; align-self: flex-start;
+    flex: 0 0 var(--sidebar-w); width: var(--sidebar-w);
+    max-height: 100vh; overflow-y: auto;
+    padding: 28px 18px 28px 28px;
+    border-right: 1px solid var(--border);
+    background: var(--panel);
+    font-size: 0.88rem;
+  }
+  aside.toc strong { display: block; margin-bottom: 10px; font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+  aside.toc ul { list-style: none; padding-left: 0; margin: 0; }
+  aside.toc li { margin: 4px 0; }
+  aside.toc li ul { padding-left: 14px; margin: 4px 0; font-size: 0.84rem; }
+  aside.toc a { color: var(--fg); text-decoration: none; }
+  aside.toc a:hover { color: var(--accent); }
+
+  main.content {
+    flex: 1; min-width: 0;
+    max-width: 920px; margin: 0 auto;
+    padding: 36px 40px 80px;
+  }
+  h1 { font-size: 1.9rem; margin: 0 0 6px; letter-spacing: -0.01em; }
+  h2 { font-size: 1.4rem; margin: 36px 0 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+  h3 { font-size: 1.15rem; margin: 24px 0 8px; }
+  h4 { font-size: 1.02rem; margin: 18px 0 6px; color: var(--muted); }
+  p { margin: 10px 0; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    font-size: 0.88em;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+  pre.code, pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    line-height: 1.55;
+  }
+  pre code { background: transparent; border: 0; padding: 0; }
+  .kw { color: var(--kw); }
+  .cm { color: var(--cm); font-style: italic; }
+
+  table { border-collapse: collapse; margin: 14px 0; font-size: 0.92rem; width: 100%; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; vertical-align: top; text-align: left; }
+  th { background: var(--panel); font-weight: 600; }
+  td code { font-size: 0.85em; }
+
+  .callout {
+    background: var(--accent-soft);
+    border-left: 3px solid var(--accent);
+    padding: 12px 14px;
+    margin: 16px 0;
+    border-radius: 4px;
+    font-size: 0.94rem;
+  }
+  .callout.warn { background: #fff4e5; border-left-color: #d18616; }
+  .aside, .example, .practice {
+    margin: 18px 0; padding: 14px 16px; border-radius: 6px; font-size: 0.93rem;
+  }
+  .aside { background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--muted); }
+  .aside .label, .example .label, .practice .label {
+    display: inline-block; font-size: 0.72rem; font-weight: 700;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 6px;
+  }
+  .example  { background: #f0f7ff; border: 1px solid #cfe2f3; border-left: 4px solid #0969da; }
+  .example .label  { color: #0969da; }
+  .practice { background: #fff9e6; border: 1px solid #f3e3a0; border-left: 4px solid #d18616; }
+  .practice .label { color: #b56500; }
+  .figure-caption { font-size: 0.85rem; color: var(--muted); text-align: center; margin: 4px 0 12px; font-style: italic; }
+  @media (prefers-color-scheme: dark) {
+    .callout.warn { background: #2d2210; }
+    .example  { background: #0d2235; border-color: #214b73; }
+    .example .label { color: #58a6ff; }
+    .practice { background: #2d2210; border-color: #6b5520; }
+    .practice .label { color: #f0c674; }
+  }
+  .small { font-size: 0.85rem; color: var(--muted); }
+  .tag { background: var(--accent-soft); color: var(--accent); border-radius: 10px; padding: 1px 8px; font-size: 0.72rem; vertical-align: middle; }
+
+  @media (max-width: 900px) {
+    .layout { flex-direction: column; }
+    aside.toc { position: static; flex: none; width: 100%; max-height: none; border-right: 0; border-bottom: 1px solid var(--border); }
+    main.content { padding: 24px 18px 60px; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<aside class="toc" aria-label="目录">
+<strong>目录</strong>
+<ul>
+  <li><a href="#sec1">1. 反向跳转的需求</a>
+    <ul>
+      <li><a href="#sec1-1">1.1 我们已经知道的事</a></li>
+      <li><a href="#sec1-2">1.2 真正的痛点:在 op 调用现场拦截</a></li>
+      <li><a href="#sec1-3">1.3 三个动机场景</a></li>
+      <li><a href="#sec1-4">1.4 为什么不能在 Python 层面拦?</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec2">2. C++ → Python 的物理机制</a>
+    <ul>
+      <li><a href="#sec2-1">2.1 c10 与 CPython 的零依赖矛盾</a></li>
+      <li><a href="#sec2-2">2.2 PyInterpreterVTable:抽象的桥</a></li>
+      <li><a href="#sec2-3">2.3 TensorImpl::pyobj_slot:反向指针</a></li>
+      <li><a href="#sec2-4">2.4 PythonFallbackKernel:正式跳过去</a></li>
+      <li><a href="#sec2-5">2.5 ExcludeDispatchKeyGuard:防止无限递归</a></li>
+      <li><a href="#sec2-6">2.6 ConcretePyInterpreterVTable::dispatch</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec3">3. TorchDispatchMode 的 Python 协议</a>
+    <ul>
+      <li><a href="#sec3-1">3.1 类与 with 块</a></li>
+      <li><a href="#sec3-2">3.2 <code>__torch_dispatch__</code> 签名</a></li>
+      <li><a href="#sec3-3">3.3 mode stack vs subclass</a></li>
+      <li><a href="#sec3-4">3.4 "<code>return func(*args)</code>" 是怎么递归的</a></li>
+      <li><a href="#sec3-5">3.5 vs <code>__torch_function__</code></a></li>
+    </ul>
+  </li>
+  <li><a href="#sec4">4. Python 一族四个 DispatchKey</a>
+    <ul>
+      <li><a href="#sec4-1">4.1 阶梯重看</a></li>
+      <li><a href="#sec4-2">4.2 PythonDispatcher / PreDispatch / Python / Snapshot</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec5">5. 三个案例</a>
+    <ul>
+      <li><a href="#sec5-1">5.1 FakeTensorMode:shape 推断不算数</a></li>
+      <li><a href="#sec5-2">5.2 ProxyTorchDispatchMode + make_fx</a></li>
+      <li><a href="#sec5-3">5.3 DTensor:分布式分片</a></li>
+      <li><a href="#sec5-4">5.4 当协议变成性能瓶颈:C++ 快路径</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec6">6. 与 torch.compile 的连接</a></li>
+  <li><a href="#sec7">7. 性能与陷阱</a></li>
+  <li><a href="#sec8">参考资料</a></li>
+</ul>
+</aside>
+
+<main class="content">
+
+<h1>PyTorch C++↔Python 双向调度:TorchDispatchMode 与反向跳转</h1>
+
+<p class="small">这是 <a href="pytorch-dispatcher.html">《PyTorch Dispatcher 全栈剖析》</a>的姐妹篇。前一篇沿"Python → CUDA"自顶向下走完一次 op 调用;本文反向 —— 钻进 dispatcher 的 <code>Python</code> 这一层,讲清"C++ 调用走到一半,怎么跳回 Python 让用户代码拦截每个 op"的完整机制。所有 PyTorch 源码以 <code>pytorch/pytorch</code> <code>main</code> 分支为准(May 2026)。</p>
+
+<h2 id="sec1">1. 反向跳转的需求</h2>
+
+<p>本章建立动机。前一篇文章把 dispatcher 描述成一条"自顶向下"的链:Python 调用 → autograd 包装 → backend kernel → 真正算数值。但对很多 PyTorch 的现代功能(<code>torch.compile</code>、shape inference、分布式张量),这条链是<strong>不够的</strong> —— 必须在 C++ 中途"反向跳"回 Python,让用户/框架代码<strong>在 op 调用现场</strong>插一脚。本章解释:为什么需要这种反向跳,什么时候发生,以及它和前一篇讲的 dispatcher 是什么关系。读完你应该能在脑子里画出"正向跳"(前文)和"反向跳"(本文)的完整闭环。</p>
+
+<h3 id="sec1-1">1.1 我们已经知道的事</h3>
+
+<p>先快速回顾前一篇的关键结论。如果你完全没读过那篇,这一节会让你跟上节奏;读过的话,这是个对齐起点。</p>
+
+<p>PyTorch 的 dispatcher 是一张<strong>按 <code>DispatchKey</code> 索引的函数表</strong>。每个 ATen 算子(<code>aten::add</code>、<code>aten::matmul</code> 等)拥有自己的一张表,表里每一行对应一个"行为层":CUDA 后端、CPU 后端、Autograd 包装、Autocast 包装等。一次调用做四件事:</p>
+
+<ol>
+  <li>从输入张量的属性和 TLS 状态算出一个 <strong>64 位位图</strong>(<code>DispatchKeySet</code>),表示当前激活了哪些 key。</li>
+  <li>取位图中<strong>最高优先级</strong>的 key。</li>
+  <li>跳到该 key 对应的函数指针。</li>
+  <li>该函数体可选择性地把"自己"从位图里 mask 掉再 redispatch,让控制权落到下一层 —— 比如 Autograd kernel 在建好反向图节点后,redispatch 到 CUDA kernel 真的算数值。</li>
+</ol>
+
+<p>优先级阶梯从高到低大致是:模式层(Python / Functionalize / Autocast 等)→ Autograd 层 → Backend 层(CPU / CUDA / MPS 等)。这种排序让"先记反向图再算数值"、"先降精度再 autograd"这些层级约束自动得到保证。</p>
+
+<div class="callout">
+<strong>关键句</strong>:dispatcher 不是一次跳转,而是一条 redispatch 驱动的链。每层做完自己的事,把自己 mask 掉,让下一层成为新的最高位。
+</div>
+
+<h3 id="sec1-2">1.2 真正的痛点:在 op 调用现场拦截</h3>
+
+<p>知道这套机制,我们可以问一个看似无害的问题:</p>
+
+<p class="small" style="text-align:center; font-style:italic;">"我想<strong>拦截 PyTorch 的每一次 ATen op 调用</strong>,看看输入是什么、把它们改一改、或者根本不让真的去算,而是返回一个我自己定的结果。"</p>
+
+<p>这听起来很抽象,但<strong>这正是下面几个核心功能的本质</strong>:</p>
+
+<table>
+<thead>
+<tr><th>功能</th><th>它要拦截每个 op 来做什么</th></tr>
+</thead>
+<tbody>
+<tr><td><code>torch.compile</code> 的 graph capture</td><td>用户写 <code>def f(x, y): return (x + y).relu()</code>,编译器要把这函数变成一张 <code>fx.Graph</code>。怎么知道里头有哪些 op?答案是<strong>真的跑一次</strong>,但每次 ATen op 都被截下,记到 graph 里。</td></tr>
+<tr><td>FakeTensorMode (shape inference)</td><td>调 <code>x @ y</code> 但不希望真的分配显存 + 算 matmul,只想知道"输出会是什么 shape/dtype/device"。每个 op 调用要被截下,跑一个"假"实现 —— 只算 meta,不算数值。</td></tr>
+<tr><td>DTensor (分布式)</td><td>张量在多 GPU 上分片(shard)了。一个 <code>add</code> 操作要变成:① 检查输入分片方式;② 必要时插 all-reduce;③ 每个 rank 局部算 add;④ 包装回 DTensor。这些决策必须在 op 调用现场做。</td></tr>
+<tr><td>调试 / 日志</td><td>"我想 print 出整个模型每个 op 的输入 shape" —— 简单需求,但要在 op 调用<strong>每次</strong>触发。</td></tr>
+</tbody>
+</table>
+
+<p>这些需求都有同一个形状:<strong>"在 op 调用现场,插入一段我自己的逻辑"</strong>。而且这段逻辑必须是 <strong>Python</strong>(因为用户、研究员、第三方框架都写 Python,不可能要求每个新工具都用 C++ 重新实现 ATen)。</p>
+
+<p>但 dispatcher 是 C++ 的!它存的是 C++ 函数指针,跳的也是 C++ 函数。我们怎么让一个<strong>Python 函数</strong>成为 dispatcher 表里的"一行"?</p>
+
+<h3 id="sec1-3">1.3 三个动机场景</h3>
+
+<p>抽象解释完了,看三个真实代码段感受一下。这三个就是后面 §5 要展开讲的三个用户。</p>
+
+<h4>(a) FakeTensorMode</h4>
+
+<pre class="code">import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+
+with FakeTensorMode():
+    x = torch.randn(1024, 1024, device="cuda")     <span class="cm"># 不分配显存</span>
+    y = torch.randn(1024, 512,  device="cuda")
+    z = x @ y                                       <span class="cm"># 不跑 matmul</span>
+    print(z.shape, z.dtype, z.device)
+    <span class="cm"># 输出: torch.Size([1024, 512]) torch.float32 cuda:0</span></pre>
+
+<p>这<strong>没有</strong>真的占 4 MB 显存,<strong>没有</strong>真的算 matmul。但 PyTorch 知道:如果你<strong>真</strong>跑这一段,输出会是 <code>[1024, 512]</code> 的 fp32 CUDA 张量。这个推断怎么做出来的?<code>FakeTensorMode</code> 在 dispatch 链中拦下了 <code>torch.randn</code> 和 <code>@</code>(<code>aten::matmul</code>)的<strong>每次调用</strong>,跑一个"假"实现 —— 只算 shape 不算数值。</p>
+
+<h4>(b) make_fx / ProxyTorchDispatchMode</h4>
+
+<pre class="code">import torch
+from torch.fx.experimental.proxy_tensor import make_fx
+
+def f(x, y):
+    return (x + y).relu()
+
+gm = make_fx(f, tracing_mode="fake")(torch.randn(3, 4), torch.randn(3, 4))
+gm.graph.print_tabular()
+<span class="cm"># opcode         name    target              args        kwargs
+# placeholder    x       x                   ()          {}
+# placeholder    y       y                   ()          {}
+# call_function  add     aten.add.Tensor     (x, y)      {}
+# call_function  relu    aten.relu.default   (add,)      {}
+# output         output  output              ((relu,),)  {}</span></pre>
+
+<p>这把一个 Python 函数<strong>编译成了一张图</strong>。怎么做到的?跑一次 <code>f(x, y)</code>,但用 <code>ProxyTorchDispatchMode</code> 拦下每个 ATen op,把它<strong>记录</strong>到 <code>fx.Graph</code> 上而不光算结果。这是 <code>torch.compile</code> 内部 AOTAutograd 模块的核心机制。</p>
+
+<h4>(c) DTensor</h4>
+
+<pre class="code">import torch
+from torch.distributed.tensor import DTensor, DeviceMesh, Shard, Replicate, distribute_tensor
+
+mesh = DeviceMesh("cuda", torch.arange(4))                          <span class="cm"># 4 GPU 网格</span>
+x = distribute_tensor(torch.randn(1024, 1024), mesh, [Shard(0)])    <span class="cm"># 行分片</span>
+w = distribute_tensor(torch.randn(1024, 512),  mesh, [Replicate()]) <span class="cm"># 复制</span>
+y = x @ w                                                            <span class="cm"># 自动决定通信 + 局部算</span>
+<span class="cm"># y 是 DTensor,placement=[Shard(0)],每个 rank 持有 256x512 的本地结果</span></pre>
+
+<p>表面上就是个 <code>@</code> 操作,但内部:dispatcher 在算 <code>aten::matmul</code> 时被拦下,DTensor 的代码决定"输入分片方式 + 输出分片方式 + 是否需要 collective communication + 本地算什么",然后才真的让每个 rank 调底层 matmul kernel。</p>
+
+<div class="callout">
+<strong>共同的形状</strong>:这三个用户都注册了一个 Python 端的"<strong>mode</strong>"(或者 tensor subclass),激活后 ATen op 调用<strong>每次都先经过他们的 Python 代码</strong>。我们要搞清楚:dispatcher 怎么把控制权从 C++ 交给 Python?Python 代码怎么决定"我处理完了"还是"让 dispatcher 继续走"?这就是本文的全部任务。
+</div>
+
+<h3 id="sec1-4">1.4 为什么不能在 Python 层面拦?</h3>
+
+<p>你可能会想:"我重写 <code>torch.add</code>、<code>torch.matmul</code> 不就行了?Python 函数我自己掌控,加个钩子嘛。"</p>
+
+<p>这种思路对应的旧机制叫 <code>__torch_function__</code> 协议,确实存在。但它只能拦截<strong>用户直接调的</strong> <code>torch.*</code> API。看不到下面这些情况:</p>
+
+<ul>
+  <li><strong>Autograd 内部产生的 op</strong>。<code>z = x + y</code> 反向时,engine 调 <code>AddBackward0::apply</code>,体内调 <code>at::add</code> / <code>at::mul</code> —— 这些不经过 <code>torch.add</code>,直接在 C++ 里跑,<code>__torch_function__</code> 看不到。</li>
+  <li><strong>Decomposition 产生的子 op</strong>。<code>torch.softmax</code> 在某些 backend 上被分解成 <code>exp + sum + div</code> 三个底层 op,这些子 op 也是在 C++ 里直接调,跳过用户 Python 层。</li>
+  <li><strong>第三方算子调用其它算子</strong>。某个自定义算子内部调 <code>at::clamp_min</code>,这也是 C++ → C++ 直接跳。</li>
+</ul>
+
+<p>简言之:<strong>op 的"真实调用次数"远大于"用户写出来的次数"</strong>。<code>torch.compile</code> / <code>FakeTensorMode</code> 这些工具要见到<strong>每一次</strong>真实调用,必须在 dispatcher 内部拦,而不是在 Python 用户层拦。</p>
+
+<p>那解决方案就是:<strong>在 dispatcher 内部留一个"跳回 Python"的通道</strong>。具体实现要回答几个工程问题:</p>
+
+<ul>
+  <li>C++ 的 dispatcher 怎么知道"现在该跳 Python"了?</li>
+  <li>跳过去之后,怎么找到要调用的具体 Python 函数?(可能是 mode 的 <code>__torch_dispatch__</code>,也可能是 tensor subclass 的)</li>
+  <li>Python 函数处理完之后,怎么把结果送回 C++ 的调用方?</li>
+  <li>如果 Python 函数体内又调了一个 op,怎么不让它再递归回到自己?</li>
+</ul>
+
+<p>下一章拆开这些机制。先剧透一下回答的形状:</p>
+
+<table>
+<thead><tr><th>问题</th><th>答案</th></tr></thead>
+<tbody>
+<tr><td>怎么知道该跳 Python?</td><td>位图里有 <code>DispatchKey::Python</code>(由 mode 上下文 push 或 tensor subclass 自带)</td></tr>
+<tr><td>跳哪里?</td><td><code>PythonFallbackKernel</code> —— 注册到 <code>Python</code> key 的 boxed kernel</td></tr>
+<tr><td>怎么找到 Python 函数?</td><td>① TLS 模式栈 → 拿 mode 对象的 <code>__torch_dispatch__</code>;② 输入张量的 <code>pyobj_slot</code> → 拿 subclass 的 <code>__torch_dispatch__</code></td></tr>
+<tr><td>怎么调到 Python?</td><td>过 <code>PyInterpreterVTable</code> 的虚函数,acquire GIL,把 IValue 参数转 PyObject,Python 调函数,结果反向转</td></tr>
+<tr><td>怎么不递归?</td><td><code>ExcludeDispatchKeyGuard</code> 把 <code>Python</code> 及"以下"的位 mask 掉 —— Python 内调的 op 会跳过 Python kernel</td></tr>
+</tbody>
+</table>
+
+<p>这张表就是 §2 的提纲。每行展开成一节,从最浅的"为什么 c10 不直接依赖 CPython"开始。</p>
+
+</main>
+</div>
+</body>
+</html>
