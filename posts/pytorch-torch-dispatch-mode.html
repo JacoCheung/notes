@@ -995,6 +995,315 @@ TD: ...(还有十几个 backward 调的子 op)
 <code>__torch_function__</code> 看到<strong>1 次</strong> "<code>torch.softmax</code>"。<code>__torch_dispatch__</code> 看到<strong>十几次</strong> ATen op,包括反向过程内调的所有子 op。<strong>这就是为什么 graph capture 必须用 <code>__torch_dispatch__</code></strong> —— 否则反向图根本看不见。
 </div>
 
+<h2 id="sec4">4. Python 一族四个 DispatchKey</h2>
+
+<p>前一篇文章里我提到优先级阶梯最顶部有 <code>Python</code> 和 <code>PythonTLSSnapshot</code>。其实<strong>Python 相关的 key 有四个</strong>,各管一类细分需求。本章把它们放在一起对照,补全前篇的留白。</p>
+
+<h3 id="sec4-1">4.1 阶梯重看</h3>
+
+<p>把 dispatcher 优先级阶梯顶部局部放大:</p>
+
+<div style="overflow-x:auto; margin:1em 0;">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 380" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
+  <text x="450" y="22" text-anchor="middle" font-size="14" font-weight="700">Python 一族 4 个 DispatchKey 的优先级位置</text>
+  <text x="450" y="40" text-anchor="middle" font-size="10" fill="#57606a">从上到下:bit 编号最大 → 最小</text>
+
+  <g font-size="11">
+    <rect x="120" y="60" width="600" height="36" fill="#f3e8f5" stroke="#7a4ea0" stroke-width="1.6"/>
+    <text x="420" y="78" text-anchor="middle" font-weight="700" fill="#7a4ea0">PythonDispatcher</text>
+    <text x="420" y="92" text-anchor="middle" font-size="9">"<em>用 Python 完全接管 dispatcher</em>" —— 替换整个查表过程</text>
+
+    <rect x="120" y="100" width="600" height="36" fill="#f3e8f5" stroke="#7a4ea0" stroke-width="1.6"/>
+    <text x="420" y="118" text-anchor="middle" font-weight="700" fill="#7a4ea0">PreDispatch</text>
+    <text x="420" y="132" text-anchor="middle" font-size="9">"<em>在 autograd 之上的 trace 入口</em>" — make_fx(pre_dispatch=True) 用</text>
+
+    <rect x="120" y="140" width="600" height="36" fill="#f3e8f5" stroke="#7a4ea0" stroke-width="1.6"/>
+    <text x="420" y="158" text-anchor="middle" font-weight="700" fill="#7a4ea0">PythonTLSSnapshot</text>
+    <text x="420" y="172" text-anchor="middle" font-size="9">"<em>记下 TLS 入口快照</em>" —— 跨 Python 调用时恢复 TLS 状态</text>
+
+    <rect x="120" y="180" width="600" height="32" fill="#e7f0fa" stroke="#0b6cc4" stroke-width="1.4"/>
+    <text x="420" y="200" text-anchor="middle" font-size="10">Functionalize · Named · Conjugate · Negative · ZeroTensor</text>
+
+    <rect x="120" y="216" width="600" height="32" fill="#fef0d8" stroke="#b96b1a" stroke-width="1.4"/>
+    <text x="420" y="236" text-anchor="middle" font-size="10">ADInplaceOrView</text>
+
+    <rect x="120" y="252" width="600" height="36" fill="#fbe5e5" stroke="#cf222e" stroke-width="1.6"/>
+    <text x="420" y="270" text-anchor="middle" font-weight="700" fill="#cf222e">AutogradFunctionality (→ AutogradCPU/CUDA/...)</text>
+    <text x="420" y="284" text-anchor="middle" font-size="9">建 grad_fn 反向节点</text>
+
+    <rect x="120" y="292" width="600" height="36" fill="#f3e8f5" stroke="#7a4ea0" stroke-width="1.6"/>
+    <text x="420" y="310" text-anchor="middle" font-weight="700" fill="#7a4ea0">Python</text>
+    <text x="420" y="324" text-anchor="middle" font-size="9">"<em>TorchDispatchMode + tensor subclass</em>" —— 本文的主角</text>
+
+    <rect x="120" y="332" width="600" height="32" fill="#eaf3ec" stroke="#1f8a4d" stroke-width="1.6"/>
+    <text x="420" y="352" text-anchor="middle" font-weight="700" fill="#1f8a4d">CPU · CUDA · MPS · ... (backend)</text>
+  </g>
+
+  <text x="40" y="80" font-size="9" fill="#444">★ 在 Autograd <strong>之上</strong></text>
+  <text x="40" y="118" font-size="9" fill="#444">★ 在 Autograd <strong>之上</strong></text>
+  <text x="40" y="158" font-size="9" fill="#444">★ 在 Autograd <strong>之上</strong></text>
+  <text x="40" y="310" font-size="9" fill="#444">★ 在 Autograd <strong>之下</strong></text>
+</svg>
+</div>
+
+<p>看出来了:<strong>Python 一族被拆成 4 个 key,有的在 Autograd 之上,有的在之下</strong>。这是关键洞察 —— 它们不是冗余,而是支持不同的"拦截时机"。</p>
+
+<h3 id="sec4-2">4.2 PythonDispatcher / PreDispatch / Python / Snapshot 各自做什么</h3>
+
+<table>
+<thead><tr><th>Key</th><th>位置</th><th>语义</th><th>谁用?</th></tr></thead>
+<tbody>
+<tr><td><code>PythonDispatcher</code></td><td>最高</td><td>"<strong>整个 dispatcher 让 Python 接管</strong>" —— 让 Python 全权决定该走哪个 kernel。注释:"<em>This is a bypass that allows you to skip running the C++ dispatcher entirely.</em>"</td><td><code>torch._library.SimpleOperatorRegistry</code>、PT2 内部 meta-meta-dispatcher</td></tr>
+<tr><td><code>PreDispatch</code></td><td>第二高</td><td>"<strong>在 Autograd <strong>之前</strong>拦截</strong>"。捕获到的图保留 in-place op、不分解 composite。<code>ProxyTorchDispatchMode(pre_dispatch=True)</code> 用这个 key 而不是普通 <code>Python</code>。</td><td><code>make_fx(pre_dispatch=True)</code>;<code>torch.compile</code> 的 AOTAutograd pre-dispatch tracing 阶段</td></tr>
+<tr><td><code>PythonTLSSnapshot</code></td><td>第三</td><td>"<strong>记录 TLS 状态快照</strong>"。当 dispatcher 第一次进入(从最高优先级 key 下来),把当前 included/excluded 状态存到 <code>tls_on_entry</code> 全局变量。Python 端调 C++ API 时,需要"恢复进入前的 TLS 状态" —— 这一层保证了快照可用。</td><td><code>pythonFallback</code> 内部 RAII guard;Python ↔ C++ 嵌套调用的 TLS 一致性保证</td></tr>
+<tr><td><code>Python</code></td><td>在 Autograd <strong>之下</strong></td><td>"<strong>普通模式与 subclass 入口</strong>"。最常见的 mode/subclass 都注册在这里 —— 本文 §2-§3 讲的都是这一层。</td><td><code>FakeTensorMode</code>、<code>LoggingMode</code> 等;所有非 PreDispatch 模式</td></tr>
+</tbody>
+</table>
+
+<div class="example">
+<span class="label">小例 4.2 — PreDispatch vs Python 的差别</span>
+对同一段代码,两种 mode 看到的<strong>不一样</strong>:
+<pre class="code">def f(x):
+    return torch.relu(x + 1)
+
+<span class="cm"># (a) 普通 Python key:在 autograd 之下 → 看到的是 "core ATen" 形态</span>
+gm = make_fx(f, tracing_mode="real")(torch.randn(3))
+<span class="cm"># 图大致:add(x, 1) → clamp_min(., 0) ← relu 被分解(decomposition)</span>
+
+<span class="cm"># (b) PreDispatch:在 autograd 之上 → 看到的是用户级 ATen op</span>
+gm = make_fx(f, tracing_mode="real", pre_dispatch=True)(torch.randn(3))
+<span class="cm"># 图大致:add(x, 1) → relu(.) ← relu 保留为单个 op</span></pre>
+<strong>原因</strong>:<code>relu</code> 这种 composite op 在 Autograd 层(或 <code>CompositeImplicitAutograd</code>)被分解成 <code>clamp_min</code>。<code>Python</code> 在 Autograd 之下意味着"分解已经发生",看到的是分解后形态。<code>PreDispatch</code> 在 Autograd 之上,看到的是分解前形态。<br><br>
+对 <code>torch.compile</code> 这个差别<strong>巨大</strong>:它需要 PreDispatch 抓到尽可能"高层"的 op,留给 inductor 后续做更激进的融合(因为分解后的细粒度 op 可能丢失语义信息,影响后续优化)。
+</div>
+
+<div class="aside">
+<span class="label">边栏 4.2 — 四个 key 的注册</span>
+四个 key 的 fallback 都在 <code>aten/src/ATen/core/PythonFallbackKernel.cpp</code> 注册(2.4 节见过):
+<pre class="code">TORCH_LIBRARY_IMPL(_, PythonDispatcher,    m) { m.fallback(... pythonDispatcherFallback ...); }
+TORCH_LIBRARY_IMPL(_, PreDispatch,         m) { m.fallback(... preDispatchFallback ...);     }
+TORCH_LIBRARY_IMPL(_, PythonTLSSnapshot,   m) { m.fallback(... pythonTLSSnapshotFallback ...); }
+TORCH_LIBRARY_IMPL(_, Python,              m) { m.fallback(... pythonFallback ...);          }</pre>
+四个 fallback 都遵守"通过 PyInterpreter vtable 跳到 Python"的同一模式,只是分发到不同的<strong>模式栈</strong>(Python key 用 <code>TorchDispatchModeTLS</code>,PreDispatch 用专门的 <code>pre_dispatch_mode_stack</code> 等)。
+</div>
+
+<h2 id="sec5">5. 三个案例</h2>
+
+<p>前 4 章是机制。本章是<strong>用户</strong>——三个真实的 PyTorch 子系统都建立在 <code>__torch_dispatch__</code> 之上。看完这三个,你应该能感受到这套机制的<strong>泛用性</strong>:同一个协议支撑了 shape 推断、图捕获、分布式张量三个完全不同的功能。</p>
+
+<h3 id="sec5-1">5.1 FakeTensorMode:shape 推断不算数</h3>
+
+<p>需求:跑一段模型代码<strong>不真的占显存、不真的算 kernel</strong>,只想知道 "如果我真跑这段,每个 op 的输出形状/dtype/device 会是什么"。</p>
+
+<p>用途:</p>
+<ul>
+  <li><strong><code>torch.compile</code> 编译时</strong>:Inductor 要给 graph 里每个 op 算输出 shape 才能 codegen,但又不想真跑 model —— fake 一遍。</li>
+  <li><strong>OOM 预估</strong>:模型上线前在小机器跑一次 fake forward,统计显存占用,验证是否能跑在目标 GPU 上。</li>
+  <li><strong>动态形状(symbolic shapes)</strong>:input shape 是符号,跑一次 fake 推断每个中间 tensor 的符号 shape 表达式。</li>
+</ul>
+
+<p>实现位置:<a href="https://github.com/pytorch/pytorch/blob/main/torch/_subclasses/fake_tensor.py"><code>torch/_subclasses/fake_tensor.py</code></a>。两个核心类:</p>
+
+<table>
+<thead><tr><th>类</th><th>角色</th></tr></thead>
+<tbody>
+<tr><td><code>FakeTensor</code></td><td>张量子类。物理上的 storage 在"meta"设备(meta 设备的张量只有 shape/dtype/stride 元信息,<strong>没有 data</strong>),但对外报 <code>device = "cuda"</code> 或用户指定的设备。</td></tr>
+<tr><td><code>FakeTensorMode</code></td><td>Mode 类。激活后所有 op 都被截下,跑"meta"实现而不是真实现。</td></tr>
+</tbody>
+</table>
+
+<p><code>FakeTensorMode.__torch_dispatch__</code> 大致(<a href="https://github.com/pytorch/pytorch/blob/main/torch/_subclasses/fake_tensor.py"><code>fake_tensor.py</code></a> 第 1474 行附近):</p>
+
+<pre class="code">def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+    <span class="cm"># FakeTensorMode 不应该在自己内部又被设置</span>
+    if torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.FAKE) is not None:
+        raise AssertionError(f"FakeTensorMode should not be set when dispatching {func}")
+    try:
+        return self.dispatch(func, types, args, kwargs)
+    except TypeError:
+        log.exception("fake tensor raised TypeError")
+        raise
+
+def dispatch(self, func, types, args=(), kwargs=None):
+    kwargs = kwargs or {}
+    if func in _DISPATCH_META_HANDLERS:
+        return _DISPATCH_META_HANDLERS[func](args)         <span class="cm"># 特殊 op:size/stride/device 等</span>
+    if func in _DISPATCH_HANDLE_DIRECTLY:
+        with in_kernel_invocation_manager(self):
+            return func(*args, **kwargs)                   <span class="cm"># 直接调,但在 meta 设备上</span>
+    if self.cache_enabled:
+        return self._cached_dispatch_impl(func, types, args, kwargs)
+    return self._dispatch_impl(func, types, args, kwargs)</pre>
+
+<p><code>_dispatch_impl</code> 内部的"假"逻辑:</p>
+<ol>
+  <li>把所有 <code>FakeTensor</code> 参数<strong>映射成 meta 张量</strong>(只有 shape/dtype/stride,无 storage)。</li>
+  <li>用 meta tensor 真的调一次 op —— 这会跑 op 的 meta kernel(每个 ATen op 都有一个"meta" 实现,只算输出 shape,不算数值)。</li>
+  <li>把输出 meta tensor 包成 <code>FakeTensor</code>,带上原 fake mode 引用 + 用户期望的 fake device。</li>
+</ol>
+
+<p>所以"假 matmul"内部其实是:fake_x → meta_x → 真调 <code>aten::matmul</code> on meta → 输出 meta tensor → 包成 <code>FakeTensor(device=cuda)</code> 返回。<strong>结果对外看起来在 CUDA 上,但实际无任何 CUDA kernel 启动</strong>。</p>
+
+<h4>Factory op 的特殊处理</h4>
+
+<p>用户写 <code>torch.randn(1024, 1024, device="cuda")</code> 时,这个 <code>aten::randn</code> 输入里<strong>没有任何 tensor</strong>。靠 subclass 路径拦不住(没 tensor 没 Python key)。但有 mode 路径在,<code>FakeTensorMode</code> 的 <code>__torch_dispatch__</code> 仍然被触发,在体内<strong>转发到 meta 设备的 randn</strong>(meta 上的 <code>randn</code> 不分配也不随机,只生成形状描述),再包成 <code>FakeTensor</code>。</p>
+
+<div class="callout warn">
+<strong>FakeTensorMode 一次只能有一个</strong>。<code>TorchDispatchModeTLS</code> 内部的 <code>infra_modes_</code> 数组(2.3 节提到)给 FakeTensorMode 留了一个固定槽位 —— 第二次 push 会被 no-op。这是因为"假"语义不嵌套(双层 FakeTensorMode 没意义)。对比之下,<code>ProxyTorchDispatchMode</code> 可以多个嵌套(支持嵌套 trace)。
+</div>
+
+<h3 id="sec5-2">5.2 ProxyTorchDispatchMode + make_fx:图捕获</h3>
+
+<p>需求:把一个 Python 函数<strong>变成一张 <code>fx.Graph</code></strong>(PyTorch 的 IR)。这张图后续可以被分析、修改、re-execute(用 inductor 编译成 fused kernel,或者导出成 ONNX 等)。</p>
+
+<p>实现位置:<a href="https://github.com/pytorch/pytorch/blob/main/torch/fx/experimental/proxy_tensor.py"><code>torch/fx/experimental/proxy_tensor.py</code></a>。两个核心类:</p>
+
+<table>
+<thead><tr><th>类</th><th>角色</th></tr></thead>
+<tbody>
+<tr><td><code>ProxyTorchDispatchMode</code></td><td>Mode 类。每次 op 调用时,把这次调用<strong>记录到 fx.Graph</strong> 作为一个 <code>call_function</code> 节点。</td></tr>
+<tr><td><code>_MakefxTracer</code></td><td>顶层入口,管理 fx.Tracer + (可选) FakeTensorMode + ProxyTorchDispatchMode 的组合。</td></tr>
+</tbody>
+</table>
+
+<p><code>make_fx</code> 函数体大致:</p>
+
+<pre class="code">def make_fx(f, decomposition_table=None, tracing_mode="real",
+            *, pre_dispatch=False, ...) -&gt; Callable[..., GraphModule]:
+    if tracing_mode not in ["real", "fake", "symbolic"]:
+        raise AssertionError(...)
+    make_fx_tracer = _MakefxTracer(decomposition_table, tracing_mode,
+                                   _allow_non_fake_inputs, pre_dispatch, ...)
+    @functools.wraps(f)
+    def wrapped(*args):
+        return make_fx_tracer.trace(f, *args)
+    return wrapped</pre>
+
+<p><code>_MakefxTracer.trace</code> 内部:</p>
+<ol>
+  <li>创建一个 <code>fx.Tracer</code>(空 graph + 空 placeholder)。</li>
+  <li>把输入 args 转成 <code>FakeTensor</code>(如果 <code>tracing_mode="fake"</code>),并创建对应的 <code>placeholder</code> 节点。</li>
+  <li>构造 <code>ProxyTorchDispatchMode(tracer, ...)</code>,如果 <code>pre_dispatch=True</code> 则带 <code>_dispatch_key=PreDispatch</code>。</li>
+  <li>把 mode push 上去,跑 <code>f(*fake_args)</code>。</li>
+  <li>跑的过程中,每次 ATen op 调用 → <code>__torch_dispatch__</code> → <code>proxy_call</code> → 往 graph 添加 <code>call_function</code> 节点 + 实际算 op 拿结果。</li>
+  <li>跑完拿到 <code>output</code>,添加 <code>output</code> 节点。</li>
+  <li>返回 <code>GraphModule</code>。</li>
+</ol>
+
+<p>关键的 <code>__torch_dispatch__</code>(<code>proxy_tensor.py</code> 第 1973 行附近):</p>
+
+<pre class="code">@count
+def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+    with set_original_aten_op(func):
+        kwargs = kwargs or {}
+        if func == prim.device.default:
+            return func(*args, **kwargs)
+        return proxy_call(self, func, self.pre_dispatch, args, kwargs)</pre>
+
+<p><code>proxy_call</code> 体内做的两件事(第 1131 行附近):</p>
+
+<pre class="code">def proxy_call(proxy_mode, func, pre_dispatch, args, kwargs):
+    <span class="cm"># ① 把所有参数(包括 tensor)转成 proxy 对象 —— "代理"用来记录这次调用</span>
+    proxy_args = pytree.tree_map(unwrap_proxy, args)
+    proxy_kwargs = pytree.tree_map(unwrap_proxy, kwargs)
+
+    <span class="cm"># ② 在 graph 上添加一个节点:call_function(func, proxy_args)</span>
+    proxy_out = proxy_mode.tracer.create_proxy(
+        "call_function", func, proxy_args, proxy_kwargs,
+        name=func.overloadpacket.__name__,
+    )
+
+    <span class="cm"># ③ 真的算这个 op(在 fake 或 real mode 下),拿到具体输出</span>
+    with _enable_thunkify(proxy_mode.tracer):
+        out = func(*args, **kwargs)
+
+    <span class="cm"># ④ 把 proxy_out 绑定到具体输出 → 后续 ops 用这个 tensor 时能找到它的 proxy</span>
+    return wrap_proxy(out, proxy_out, ...)</pre>
+
+<p>这个 "记录 + 执行" 的模式正是 graph capture 的核心:<strong>跑一遍真实代码,同时在每一步记下"我刚做了什么"</strong>。</p>
+
+<div class="example">
+<span class="label">小例 5.2 — 跟踪一个 trace</span>
+<pre class="code">def f(x, y):
+    return (x + y).relu()
+
+gm = make_fx(f, tracing_mode="fake", pre_dispatch=True)(
+    torch.randn(3, 4), torch.randn(3, 4))
+gm.graph.print_tabular()
+<span class="cm">
+opcode         name    target              args            kwargs
+placeholder    x       x                   ()              {}
+placeholder    y       y                   ()              {}
+call_function  add     aten.add.Tensor     (x, y)          {}
+call_function  relu    aten.relu.default   (add,)          {}
+output         output  output              ((relu,),)      {}
+</span></pre>
+<strong>注意 <code>pre_dispatch=True</code></strong> —— relu 保留为单个 op。如果是普通 <code>Python</code> key,会看到 <code>clamp_min</code>(relu 的分解)。
+</div>
+
+<h3 id="sec5-3">5.3 DTensor:分布式张量</h3>
+
+<p>需求:把 PyTorch 张量"自动"分布到多 GPU/多节点。用户写 <code>x @ w</code>,框架自动决定:</p>
+<ol>
+  <li>输入 <code>x</code> 在 rank 0/1/2/3 上各自持有第 0 维的 1/4(行分片);</li>
+  <li>权重 <code>w</code> 在所有 rank 上都有完整一份(replicated);</li>
+  <li>那 <code>x @ w</code> 该怎么算?<strong>每个 rank 局部 matmul + 不用 collective</strong> —— 因为输出自然也是行分片的;</li>
+  <li>但如果换成 <code>x.T @ x</code>,输出是 <strong>partial sum</strong>,需要插一个 <code>all-reduce</code> 才能 materialize 出真值。</li>
+</ol>
+
+<p>这种"<strong>每个 op 决定自己的通信模式</strong>"靠 <code>DTensor.__torch_dispatch__</code> 实现。实现:<a href="https://github.com/pytorch/pytorch/blob/main/torch/distributed/tensor/_api.py"><code>torch/distributed/tensor/_api.py</code></a>(第 238 行 <code>DTensor</code> 类)+ <code>torch/distributed/tensor/_dispatch.py</code>(实际 sharding 逻辑)。</p>
+
+<p>简化的 <code>DTensor.__torch_dispatch__</code> 流程:</p>
+
+<ol>
+  <li>从 <code>func</code> 看是什么 op,在 <code>OpDispatcher.sharding_propagator</code> 里查"这个 op 的 sharding 传播规则"。例如 <code>aten::mm</code> 的规则:<code>Shard(0) @ Replicate → Shard(0)</code>。</li>
+  <li>检查输入张量的实际 placement 是否符合规则需要。如果不符合,插入<strong>collective 通信</strong>(<code>all_gather</code> / <code>reduce_scatter</code> / <code>all_reduce</code> / <code>all_to_all</code>)做 redistribute。</li>
+  <li>每个 rank 调底层 <code>aten::mm</code> 跑<strong>局部 matmul</strong>。</li>
+  <li>把输出包成新的 <code>DTensor</code>,带 sharding spec。</li>
+</ol>
+
+<div class="aside">
+<span class="label">边栏 5.3 — DTensor 是数据驱动的协议</span>
+有意思的是,DTensor 的逻辑里<strong>没有 "with DTensorMode():" 这种 mode 入口</strong>。所有触发都靠张量本身是 <code>DTensor</code> subclass。这是因为 DTensor 是"<em>语义跟着数据走</em>"的典型 —— 一旦你的张量是分布式的,所有用它的 op 都必须考虑分布式;不存在"我想暂时不当分布式"的需求。这种"用 subclass 而不是 mode"的设计选择和 <code>FakeTensorMode</code> 形成对比 —— 后者是"<em>语义跟着代码走</em>"的典型。
+</div>
+
+<h3 id="sec5-4">5.4 当协议变成性能瓶颈:C++ 快路径</h3>
+
+<p>2025 年下半年的 PR <a href="https://github.com/pytorch/pytorch/pull/167051">#167051</a> 给 DTensor 的核心路径做了一次大重构:把<strong>常见 op 的 sharding 决策从 Python 移到 C++</strong>。这是 <code>__torch_dispatch__</code> 协议本身从"Python 实现"变成"C++ 实现 + Python fallback"的一个有趣案例。</p>
+
+<p>动机:DTensor 的 <code>__torch_dispatch__</code> 每次 op 都要付 §2.6 那 5-15µs 的跨界开销。对训练循环每次迭代调几千个 op 来说,累计几十毫秒,占整个 step 时间的 5-10%。</p>
+
+<p>解决方案:在 C++ 里实现一个 <strong>"DTensor fast path"</strong>:</p>
+
+<ol>
+  <li>在 <code>pythonFallback</code>(或一个专门的更高优先级 fallback)里增加一个分支:<strong>如果输入所有 DTensor 的 sharding spec 都满足某个"快路径"模板,直接在 C++ 里查规则、组合输出 spec,不调 Python</strong>。</li>
+  <li>仅 fallback 到 Python 的 <code>__torch_dispatch__</code>:复杂 op、自定义 op、需要 redistribute 通信的场景。</li>
+</ol>
+
+<p>当前 DTensor Python <code>__torch_dispatch__</code> 退化成了 <strong>fallback handler</strong> 而非主路径:</p>
+
+<pre class="code">class DTensor(torch.Tensor):
+    _op_dispatcher: op_dispatch.OpDispatcher = op_dispatch.OpDispatcher()
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        <span class="cm"># 基础 DTensor 走 C++ fast path,不到这里
+        # 这个方法只在 subclass 退化场景下被调
+        # 把 subclass 实例解包成基础 DTensor,让 C++ fast path 接管</span>
+        def unwrap(t):
+            if isinstance(t, DTensor) and type(t) is not DTensor:
+                return DTensor(t._local_tensor, t._spec, requires_grad=t.requires_grad)
+            return t
+        args = torch.utils._pytree.tree_map(unwrap, args)
+        kwargs = torch.utils._pytree.tree_map(unwrap, kwargs or {})
+        return func(*args, **kwargs)</pre>
+
+<div class="callout">
+<strong>这个 PR 的哲学价值大于性能价值</strong>:它证明 <code>__torch_dispatch__</code> 是<strong>一个协议</strong>,而不是"一个 Python 实现机制"。<strong>一旦你定义清楚了"op-level 拦截 + 决定 sharding"的语义,把它放到 C++ 实现就是一个性能优化</strong>,不是颠覆。所有<strong>调用方</strong>(用户、框架内其他模块)仍然把 DTensor 看作 "<code>__torch_dispatch__</code> 拦截器",API 不变。
+</div>
+
+<p>类似的 C++ fast path 模式很可能将来扩展到 FakeTensor / Functionalization 等其他"性能敏感"的协议实现。<strong>协议层稳定,实现层可以从 Python → C++ 迁移</strong>—— 这是 PyTorch 设计的成熟之处。</p>
+
 </main>
 </div>
 </body>
