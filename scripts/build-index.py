@@ -58,6 +58,17 @@ def extract_metadata(html_path: Path) -> dict | None:
             entry[k] = meta[k]
     if tags_en:
         entry["tags_en"] = tags_en
+    # optional series fields
+    if meta.get("series"):
+        entry["series"] = meta["series"]
+        if meta.get("series_title"):
+            entry["series_title"] = meta["series_title"]
+        if meta.get("series_title_en"):
+            entry["series_title_en"] = meta["series_title_en"]
+        try:
+            entry["series_order"] = int(meta.get("series_order", "0"))
+        except ValueError:
+            entry["series_order"] = 0
     return entry
 
 

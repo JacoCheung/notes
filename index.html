@@ -130,6 +130,40 @@
     font-size: 0.72rem;
   }
 
+  /* Series grouping */
+  .series-group {
+    margin: 18px 0 22px;
+    padding: 14px 18px 16px;
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent);
+    border-radius: 8px;
+    background: var(--soft);
+  }
+  .series-header {
+    display: flex; align-items: baseline; justify-content: space-between;
+    margin-bottom: 6px;
+  }
+  .series-title {
+    font-size: 1.0rem; font-weight: 700; color: var(--accent);
+    letter-spacing: -0.005em;
+  }
+  .series-count {
+    font-size: 0.78rem; color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+  .series-group .post { margin: 8px 0; background: var(--bg); }
+  .series-badge {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 8px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.7rem;
+    font-weight: 600;
+    margin-right: 6px;
+    vertical-align: middle;
+    font-variant-numeric: tabular-nums;
+  }
+
   .empty {
     color: var(--muted);
     text-align: center;
@@ -337,16 +371,67 @@ function renderPosts(posts) {
   }
   const labelMap = buildTagLabelMap(posts);
   const pick = (p, k) => (LANG === 'en' && p[k + '_en']) ? p[k + '_en'] : (p[k] || '');
-  list.innerHTML = filtered.map(p => `
+
+  // Build "render units": a series (group of posts) or a standalone post.
+  // Each unit gets a sort_date (= max date among its posts) so series are
+  // ordered alongside standalone posts by recency.
+  const seriesMap = {};      // series_key → { title, title_en, posts: [] }
+  const standalone = [];
+  filtered.forEach(p => {
+    if (p.series) {
+      if (!seriesMap[p.series]) {
+        seriesMap[p.series] = {
+          key: p.series,
+          title: p.series_title || p.series,
+          title_en: p.series_title_en || p.series_title || p.series,
+          posts: [],
+        };
+      }
+      seriesMap[p.series].posts.push(p);
+    } else {
+      standalone.push(p);
+    }
+  });
+
+  const units = [];
+  Object.values(seriesMap).forEach(s => {
+    s.posts.sort((a, b) => (a.series_order || 0) - (b.series_order || 0));
+    const maxDate = s.posts.reduce((d, p) => p.date > d ? p.date : d, '');
+    units.push({ type: 'series', sort_date: maxDate, series: s });
+  });
+  standalone.forEach(p => units.push({ type: 'post', sort_date: p.date, post: p }));
+  units.sort((a, b) => a.sort_date > b.sort_date ? -1 : a.sort_date < b.sort_date ? 1 : 0);
+
+  const renderPost = (p, badge) => `
     <a class="post" href="posts/${escapeHtml(p.slug)}.html">
-      <div class="post-title">${escapeHtml(pick(p, 'title'))}</div>
+      <div class="post-title">${badge}${escapeHtml(pick(p, 'title'))}</div>
       <div class="post-meta">${escapeHtml(p.date)}${pick(p, 'reading') ? ' · ' + escapeHtml(pick(p, 'reading')) : ''}</div>
       <div class="post-summary">${escapeHtml(pick(p, 'summary'))}</div>
       <div class="post-tags">
         ${(p.tags || []).map(tag => '<span class="post-tag">' + escapeHtml(labelMap[tag] || tag) + '</span>').join('')}
       </div>
     </a>
-  `).join('');
+  `;
+
+  list.innerHTML = units.map(u => {
+    if (u.type === 'post') return renderPost(u.post, '');
+    const s = u.series;
+    const totalParts = s.posts.length;
+    const title = LANG === 'en' ? s.title_en : s.title;
+    const partsLabel = LANG === 'en' ? 'parts' : '篇';
+    return `
+      <div class="series-group">
+        <div class="series-header">
+          <span class="series-title">📚 ${escapeHtml(title)}</span>
+          <span class="series-count">${totalParts} ${partsLabel}</span>
+        </div>
+        ${s.posts.map(p => {
+          const badge = `<span class="series-badge">Part ${p.series_order} / ${totalParts}</span>`;
+          return renderPost(p, badge);
+        }).join('')}
+      </div>
+    `;
+  }).join('');
 }
 
 function escapeHtml(s) {
