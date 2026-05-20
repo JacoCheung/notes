@@ -1390,295 +1390,113 @@ TORCH_LIBRARY_IMPL(myops, CompositeImplicitAutograd, m) {
 就一个 .cpp 文件,前面三个 IMPL 块全部不需要 —— 因为里头的 <code>at::clamp_min</code> 自己会走一遍 dispatcher,获得 backend 路由 + autograd 双重便利。<strong>对于"用现成 op 拼出来"的算子,这是首选写法。</strong>只有当你的实现是真正"原生"的(直接写 CUDA kernel、不是 at::* 组合),才需要 3.8 节那种分四个文件的全套写法。
 </div>
 
+<h2 id="sec4">4. 构建期自动化:torchgen</h2>
 
+<p>第 3 章我们看到自定义算子要写四个 .cpp:一个 schema、一个 CPU kernel、一个 CUDA kernel、一个 autograd wrapper。<strong>对 ATen 命名空间的 ~2000 个 in-tree 算子,如果都这么手写,会有几万行重复的胶水代码。</strong></p>
 
-<pre class="code"><span class="cm">// torch/library.h:551-553</span>
-enum Kind { DEF, IMPL, FRAGMENT };</pre>
+<p>PyTorch 的解决方案是 <strong>构建期 codegen</strong>:你只需要在两个 yaml 文件里写"声明"(schema + dispatch 表 + 反向公式),构建系统跑一个 Python 程序 <code>torchgen/gen.py</code>,它会<strong>自动生成几十种 C++ / 头文件产物</strong>,所有 <code>TORCH_LIBRARY_FRAGMENT</code> 和 <code>TORCH_LIBRARY_IMPL</code> 注册都被它写好。本章看 torchgen 吃什么、吐什么。</p>
 
-<table>
-<thead>
-<tr><th>Kind</th><th>语义</th><th>触发宏</th></tr>
-</thead>
-<tbody>
-<tr><td><code>DEF</code></td><td>给某个 namespace <strong>开一个"主"库</strong> —— 全局 namespace 名只允许一个 <code>DEF</code>,重复链接立即 abort。这是大多数自定义 op 用的口子。</td><td><code>TORCH_LIBRARY</code></td></tr>
-<tr><td><code>FRAGMENT</code></td><td>给同一个 namespace 追加 <strong>一片"片段"</strong> —— 同名 fragment 可以来自任意多个 TU,拼到一起算一个库。<code>aten</code> 全靠 fragment 拼,因为代码量太大要拆成几十个 codegen 文件。</td><td><code>TORCH_LIBRARY_FRAGMENT</code></td></tr>
-<tr><td><code>IMPL</code></td><td>给"<strong>已存在</strong>的某个 op"挂某个 DispatchKey 上的 kernel —— 不定义 schema,只能 <code>m.impl(...)</code>。多个 backend 各自的 kernel 通常来自不同 TU 的多个 IMPL 块。</td><td><code>TORCH_LIBRARY_IMPL</code></td></tr>
-</tbody>
-</table>
+<h3 id="sec4-1">4.1 输入:三份 yaml</h3>
 
-<h3 id="sec3-2">3.2 TORCH_LIBRARY:开新命名空间</h3>
-
-<pre class="code"><span class="cm">// torch/library.h:982-991</span>
-#define TORCH_LIBRARY(ns, m)                                                   \
-  static void TORCH_LIBRARY_init_##ns(torch::Library&amp;);                        \
-  static const torch::detail::TorchLibraryInit TORCH_LIBRARY_static_init_##ns( \
-      torch::Library::DEF,                                                     \
-      &amp;TORCH_LIBRARY_init_##ns,                                                \
-      C10_STRINGIZE(ns), std::nullopt,                                         \
-      __FILE__, __LINE__);                                                     \
-  void TORCH_LIBRARY_init_##ns(torch::Library&amp; m)</pre>
-
-<p>展开后是一个文件级 static 对象,它的构造函数构造一个 <code>Library(DEF, "ns", nullopt, __FILE__, __LINE__)</code>,然后调用你提供的 lambda 体(里面写 <code>m.def(...)</code>)。Static 初始化顺序保证它在 <code>main()</code> 之前就把 schema 塞进 dispatcher。</p>
-
-<p>用法 —— 给自定义 namespace 开口子:</p>
-
-<pre class="code"><span class="cm">// myops_register.cpp — 给一个新 namespace 注册两个 op 的 schema</span>
-TORCH_LIBRARY(myops, m) {
-  m.def("custom_add(Tensor self, Tensor other) -&gt; Tensor");
-  m.def("custom_relu(Tensor self) -&gt; Tensor");
-}</pre>
-
-<p>注意:<strong>同一个 namespace 在整个进程里只能出现一个 <code>TORCH_LIBRARY(ns, ...)</code></strong>。再写一个会触发运行时 abort。如果你需要把同 namespace 的注册拆到多个 .cpp,请用 <code>TORCH_LIBRARY_FRAGMENT</code>。</p>
-
-<h3 id="sec3-3">3.3 TORCH_LIBRARY_FRAGMENT:拼接片段</h3>
-
-<pre class="code"><span class="cm">// torch/library.h:1001-1023 (简化)</span>
-#define TORCH_LIBRARY_FRAGMENT(ns, m) _TORCH_LIBRARY_FRAGMENT(ns, m, C10_UID)
-#define _TORCH_LIBRARY_FRAGMENT(ns, m, uid)                                \
-  static void C10_CONCATENATE(TORCH_LIBRARY_FRAGMENT_init_##ns##_, uid)(  \
-      torch::Library&amp;);                                                   \
-  static const torch::detail::TorchLibraryInit                            \
-      C10_CONCATENATE(TORCH_LIBRARY_FRAGMENT_static_init_##ns##_, uid)(    \
-          torch::Library::FRAGMENT, ...,                                   \
-          C10_STRINGIZE(ns), std::nullopt, ...);                           \
-  void C10_CONCATENATE(...)(torch::Library&amp; m)</pre>
-
-<p>和 <code>TORCH_LIBRARY</code> 只有两点不同:</p>
-
-<ul>
-  <li><code>Kind</code> 从 <code>DEF</code> 改成 <code>FRAGMENT</code> —— 不抢"唯一所有权"。</li>
-  <li>符号名用 <code>C10_UID</code> 唯一化,允许同 namespace 在<strong>同一个 TU</strong> 里出现多次。</li>
-</ul>
-
-<p><strong>codegen 对 <code>aten</code> namespace 强制走 FRAGMENT</strong>(<a href="https://github.com/pytorch/pytorch/blob/main/torchgen/gen.py"><code>torchgen/gen.py</code> ~第 1761-1776 行</a>):</p>
-
-<pre class="code">if namespace == "aten":
-    aten_schema_registrations = schema_registrations_body
-else:
-    torch_library_macro = (
-        "TORCH_LIBRARY_FRAGMENT"
-        if namespace in FRAGMENT_NAMESPACES
-        else "TORCH_LIBRARY"
-    )</pre>
-
-<p>原因很现实:<code>aten</code> 命名空间下有 ~2000+ 个 op,每个 codegen 出来的 <code>RegisterSchema*.cpp</code> 文件都要贡献几十个 schema —— 不可能塞进单个 <code>TORCH_LIBRARY</code> 块。</p>
-
-<h3 id="sec3-4">3.4 TORCH_LIBRARY_IMPL:给某 DispatchKey 注册实现</h3>
-
-<pre class="code"><span class="cm">// torch/library.h:1064-1084 (简化)</span>
-#define TORCH_LIBRARY_IMPL(ns, k, m) _TORCH_LIBRARY_IMPL(ns, k, m, C10_UID)
-#define _TORCH_LIBRARY_IMPL(ns, k, m, uid)                          \
-  static void C10_CONCATENATE(TORCH_LIBRARY_IMPL_init_##ns##_##k##_, uid)(  \
-      torch::Library&amp;);                                                    \
-  static const torch::detail::TorchLibraryInit                             \
-      C10_CONCATENATE(TORCH_LIBRARY_IMPL_static_init_##ns##_##k##_, uid)(   \
-          torch::Library::IMPL,                                              \
-          ...,                                                               \
-          C10_STRINGIZE(ns),                                                 \
-          c10::make_optional(c10::DispatchKey::k),                          \
-          ...);                                                              \
-  void C10_CONCATENATE(...)(torch::Library&amp; m)</pre>
-
-<p>构造函数现在带一个 <code>DispatchKey::k</code> 参数。块内的每一次 <code>m.impl("op_name", kernel)</code> 都会被附加到 op 在 <strong>该 key</strong> 下的 dispatch 表项里。</p>
-
-<p>典型用法:</p>
-
-<pre class="code"><span class="cm">// myops_cpu.cpp</span>
-TORCH_LIBRARY_IMPL(myops, CPU, m) {
-  m.impl("custom_add",  &amp;my_add_cpu);
-  m.impl("custom_relu", &amp;my_relu_cpu);
-}
-
-<span class="cm">// myops_cuda.cu</span>
-TORCH_LIBRARY_IMPL(myops, CUDA, m) {
-  m.impl("custom_add",  &amp;my_add_cuda);
-  m.impl("custom_relu", &amp;my_relu_cuda);
-}
-
-<span class="cm">// myops_autograd.cpp — 单独一个 autograd kernel,用来挂 grad_fn</span>
-TORCH_LIBRARY_IMPL(myops, Autograd, m) {
-  m.impl("custom_add", &amp;my_add_autograd);
-}</pre>
-
-<p><strong>特殊形式 <code>TORCH_LIBRARY_IMPL(_, KEY, m)</code></strong>:第一个参数下划线表示"<em>所有 namespace 都套用</em>",通常配合 <code>m.fallback(...)</code> 给某个 DispatchKey 注册<strong>全局兜底 kernel</strong>。<code>aten/src/ATen/core/VariableFallbackKernel.cpp</code> 就这么干:给 <code>AutogradCUDA</code> 等所有 autograd key 注册一个"如果某个 op 没有显式 autograd kernel,就当作 differentiable through composition 处理"的 fallback。</p>
-
-<h3 id="sec3-5">3.5 m.def vs m.impl</h3>
+<p>torchgen 的主程序 <a href="https://github.com/pytorch/pytorch/blob/main/torchgen/gen.py"><code>torchgen/gen.py</code></a> 在 PyTorch 编译期作为 <code>python setup.py build</code> 的子步骤跑,吃<strong>三份 yaml</strong>:</p>
 
 <table>
 <thead>
-<tr><th></th><th><code>m.def</code></th><th><code>m.impl</code></th></tr>
+<tr><th>输入文件</th><th>给的信息</th><th>第几章讨论</th></tr>
 </thead>
 <tbody>
-<tr><td>在哪用</td><td>仅 <code>TORCH_LIBRARY</code> / <code>TORCH_LIBRARY_FRAGMENT</code> 块内</td><td>仅 <code>TORCH_LIBRARY_IMPL</code> 块内(或带 explicit key 的 def)</td></tr>
-<tr><td>作用</td><td>声明 schema(给一个新的 op-name 注册类型签名),可选附带一个"无 key" kernel</td><td>给已声明的 op,在<strong>当前块的 DispatchKey</strong> 上挂一个具体 kernel</td></tr>
-<tr><td>schema 校验</td><td>第一次 <code>def</code> 就锁定签名;后续不能改</td><td>kernel 签名必须和 schema 解析后的类型兼容(否则注册时 abort)</td></tr>
+<tr><td><a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/native_functions.yaml"><code>native_functions.yaml</code></a></td><td>每个 op 的 schema、dispatch 表、structured / ufunc 标记、tags</td><td>2.3</td></tr>
+<tr><td><a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/tags.yaml"><code>tags.yaml</code></a></td><td>tag 集合的定义(供 <code>tags:</code> 字段引用,比如 <code>pointwise</code>、<code>core</code>)</td><td>2.3 关键字段表</td></tr>
+<tr><td><a href="https://github.com/pytorch/pytorch/blob/main/tools/autograd/derivatives.yaml"><code>derivatives.yaml</code></a></td><td>每个 differentiable op 的反向 + 前向模式(jvp)公式</td><td>2.4</td></tr>
 </tbody>
 </table>
 
-<p>两种 <code>m.impl</code> 的写法:</p>
+<p>对每个 op,torchgen 把这三份信息 join 起来:schema 来自第一份,反向公式来自第三份,tags 走第二份。然后开始<strong>展开</strong> —— 一个 yaml 条目对应几十个生成产物。</p>
 
-<pre class="code">m.impl("op_name", &amp;cpu_kernel);                    <span class="cm">// raw fn ptr,框架推断签名</span>
-m.impl("op_name", TORCH_FN(cpu_kernel));            <span class="cm">// 把函数指针包成 compile-time 类型,</span>
-                                                    <span class="cm">// 启用更快的 unboxed 调用路径</span>
-m.impl("op_name", torch::CppFunction::makeFromBoxedFunction&lt;&amp;boxed_fn&gt;()); <span class="cm">// 强制走 boxed</span></pre>
+<h3 id="sec4-2">4.2 产物清单与对应宏</h3>
 
-<h3 id="sec3-6">3.6 boxed vs unboxed kernel</h3>
+<p>所有生成文件都落到 <code>build/aten/src/ATen/</code> 和 <code>build/.../torch/csrc/autograd/generated/</code> 这两个目录(具体路径取决于你的 build dir)。按用途分组:</p>
 
-<p>每个 kernel 在 dispatcher 内部都用 <code>KernelFunction</code> 表示。它可能存两份函数指针:</p>
+<h4>(a) C++ API 层 —— 用户和 kernel 内部都会调</h4>
 
-<ul>
-  <li><strong>Unboxed</strong>:原生 C++ 签名 <code>Tensor (*)(const Tensor&amp;, const Tensor&amp;, Scalar)</code>。Dispatcher 用模板直接把参数推进去,零拷贝、无类型擦除。<strong>所有热路径 op 都走这条</strong>。</li>
-  <li><strong>Boxed</strong>:统一签名 <code>void (*)(const OperatorHandle&amp;, DispatchKeySet, Stack*)</code>。参数被打包成 <code>IValue</code> 压在 <code>Stack</code> 上。慢一点,但<strong>不依赖具体类型</strong> —— functorch interpreter、JIT runtime、profiling hook、fallback kernel 都必须走 boxed。</li>
-</ul>
+<table>
+<thead><tr><th>产物</th><th>内容</th></tr></thead>
+<tbody>
+<tr><td><code>Operators.h</code> / <code>.cpp</code></td><td>每个 overload 一个 <code>at::_ops::add_Tensor::call(...)</code> 类型句柄,内部做"取 <code>TypedOperatorHandle</code> + <code>Dispatcher::call</code>"</td></tr>
+<tr><td><code>Functions.h</code> / <code>.cpp</code></td><td>用户友好的 <code>at::add(self, other, alpha)</code> 入口,inline 转给 <code>_ops::add_Tensor::call</code> —— 这是你写 C++ 代码时调用的形态</td></tr>
+<tr><td><code>RedispatchFunctions.h</code></td><td><code>at::redispatch::add(currentKeySet, ...)</code>,kernel 内部 redispatch 时用(1.7 节那个 <code>at::redispatch::add</code> 就是它)</td></tr>
+<tr><td><code>TensorBody.h</code></td><td><code>Tensor::add(...)</code> 方法形态(<code>x.add(y)</code> 用)</td></tr>
+<tr><td><code>NativeFunctions.h</code></td><td>所有手写 <code>at::native::*</code> 函数(算子作者写在 <code>aten/src/ATen/native/</code> 的)的声明</td></tr>
+</tbody>
+</table>
 
-<p><code>TORCH_FN(fn)</code> 的作用是用模板提取 <code>fn</code> 的字面类型签名,从而让 dispatcher<strong>同时</strong>保留 unboxed 调用路径 —— 默认 <code>m.impl("name", &amp;fn)</code> 也能走 unboxed,但 <code>TORCH_FN</code> 写法更明确、能让编译器在签名错的时候立刻报错。</p>
+<h4>(b) Dispatcher 注册 —— 关键产物,把 schema 和 kernel 喂给 dispatcher</h4>
 
-<p><code>m.impl_UNBOXED</code> 是已删除的老 API,只允许 boxed 调用 —— 现在用 <code>m.impl(..., torch::CppFunction::makeFromBoxedFunction&lt;...&gt;())</code> 表达同样语义。</p>
+<table>
+<thead><tr><th>产物</th><th>用什么宏</th><th>注册了什么</th></tr></thead>
+<tbody>
+<tr><td><code>RegisterSchema.cpp</code></td><td><code>TORCH_LIBRARY_FRAGMENT(aten, m)</code></td><td>每个 op 一行 <code>m.def("add.Tensor(...) -&gt; Tensor", {at::Tag::core, at::Tag::pointwise});</code></td></tr>
+<tr><td><code>RegisterCPU.cpp</code></td><td><code>TORCH_LIBRARY_IMPL(aten, CPU, m)</code></td><td><code>m.impl("add.out", TORCH_FN(wrapper_CPU_add_out));</code> —— wrapper 内部处理 device guard、调 <code>at::native::*</code></td></tr>
+<tr><td><code>RegisterCUDA.cpp</code></td><td><code>TORCH_LIBRARY_IMPL(aten, CUDA, m)</code></td><td>同上,绑 CUDA 后端</td></tr>
+<tr><td><code>RegisterMPS.cpp</code>, <code>RegisterXPU.cpp</code>, ...</td><td><code>TORCH_LIBRARY_IMPL(aten, MPS/XPU, m)</code></td><td>每个 backend 一份</td></tr>
+<tr><td><code>RegisterCompositeImplicitAutograd.cpp</code></td><td><code>TORCH_LIBRARY_IMPL(aten, CompositeImplicitAutograd, m)</code></td><td>注册到 alias 的"composite 实现"(可被 autograd 自动求导)</td></tr>
+<tr><td><code>RegisterBackendSelect.cpp</code></td><td><code>TORCH_LIBRARY_IMPL(aten, BackendSelect, m)</code></td><td>给 <code>at::randn</code> 这类 factory function 的 backend 路由 kernel</td></tr>
+<tr><td><code>RegisterMeta.cpp</code> / <code>RegisterZeroTensor.cpp</code> / ...</td><td><code>TORCH_LIBRARY_IMPL(aten, Meta/ZeroTensor, m)</code></td><td>各种非 backend functionality 的 kernel</td></tr>
+</tbody>
+</table>
 
-<h3 id="sec3-7">3.7 fallback / fallthrough</h3>
+<h4>(c) Structured kernel / ufunc 真实数学</h4>
 
-<p><code>m.fallback(...)</code> 给当前 IMPL 块的整个 DispatchKey 注册一个 <strong>op-agnostic 的 kernel</strong>,在该 key 下"没单独 impl 的 op"都走它。常见两种:</p>
+<table>
+<thead><tr><th>产物</th><th>内容</th></tr></thead>
+<tbody>
+<tr><td><code>UfuncCPU_add.cpp</code></td><td>structured + ufunc 的 CPU loop 代码,<code>AT_DISPATCH_*</code> 按 dtype 实例化 lambda,内部调 <code>at::native::ufunc::add</code></td></tr>
+<tr><td><code>UfuncCUDA_add.cu</code></td><td>同上,但是 CUDA <code>gpu_kernel</code> 形式</td></tr>
+</tbody>
+</table>
 
-<pre class="code">m.fallback(torch::CppFunction::makeFallthrough());
-    <span class="cm">// "我这层不做事,把我的 bit 从位图清掉再走下一层"</span>
-    <span class="cm">// O(1) 实现:dispatcher 看到这是 fallthrough,直接在 fallthrough_mask 里把这个 key 清零</span>
+<h4>(d) Autograd —— 反向相关</h4>
 
-m.fallback(torch::CppFunction::makeFromBoxedFunction&lt;&amp;my_boxed_fallback&gt;());
-    <span class="cm">// 真的写个 boxed kernel 兜底,比如 functorch 的 vmap interpreter</span></pre>
+<table>
+<thead><tr><th>产物</th><th>用什么宏</th><th>内容</th></tr></thead>
+<tbody>
+<tr><td><code>VariableType_N.cpp</code>(分片)</td><td><code>TORCH_LIBRARY_IMPL(aten, AutogradCPU/CUDA/..., m)</code></td><td>autograd kernel wrapper:建 <code>AddBackward0</code> → 进 <code>AutoDispatchBelowADInplaceOrView</code> guard → 调 <code>at::redispatch::add(...)</code> 落到 backend → 把 <code>grad_fn</code> 挂到输出</td></tr>
+<tr><td><code>generated/Functions.h</code> / <code>.cpp</code></td><td>无宏(纯类定义)</td><td><code>AddBackward0</code>、<code>ReluBackward0</code> 等 <code>Node</code> 子类。<code>apply()</code> 方法体由 <code>derivatives.yaml</code> 生成</td></tr>
+<tr><td><code>ADInplaceOrViewType_N.cpp</code></td><td><code>TORCH_LIBRARY_IMPL(aten, ADInplaceOrView, m)</code></td><td>给 view 和 in-place op 注册 wrapper:为输出张量设置 <code>DifferentiableViewMeta</code>;对 in-place 升 version counter</td></tr>
+<tr><td><code>TraceType_N.cpp</code></td><td><code>TORCH_LIBRARY_IMPL(aten, Tracer, m)</code></td><td>JIT trace 时记录调用(老 JIT 流程)</td></tr>
+</tbody>
+</table>
 
-<p>典型 fallthrough 用户:<code>BackendSelect</code>(只在 factory function 上有 kernel,别的 op 自动跳过)、<code>Named</code>(没开 named tensor 时全跳过)、<code>Conjugate</code>(没用复数共轭标记时全跳过)。这是 dispatcher 能"零开销支持几十个 functionality"的关键。</p>
+<h4>(e) Python 绑定层</h4>
 
-<h3 id="sec3-8">3.8 完整自定义 op 模板</h3>
+<table>
+<thead><tr><th>产物</th><th>内容</th></tr></thead>
+<tbody>
+<tr><td><code>python_torch_functions_*.cpp</code></td><td>从 schema 生成的 Python C 绑定函数(如 <code>THPVariable_add</code>):用 <code>PythonArgParser</code> 解析 Python 参数 → 拆 <code>THPVariable</code> 拿 <code>at::Tensor</code> → 调 <code>at::add</code></td></tr>
+<tr><td><code>python_variable_methods.cpp</code></td><td><code>Tensor.method</code> 形态的绑定</td></tr>
+<tr><td><code>python_functions_*.h</code></td><td>Python 端 <code>torch._C._FunctionBase</code> 子类的注册表</td></tr>
+</tbody>
+</table>
 
-<p>把上面的零件拼起来 —— 一个最小但功能完整的自定义 op,在三个 .cpp 文件里:</p>
-
-<pre class="code"><span class="cm">// ============ myops_schema.cpp ============</span>
-<span class="cm">// 1) 给 namespace `myops` 开 DEF,声明 schema 一次。</span>
-#include &lt;torch/library.h&gt;
-
-TORCH_LIBRARY(myops, m) {
-  m.def("custom_relu(Tensor self) -&gt; Tensor");
-}
-
-<span class="cm">// ============ myops_cpu.cpp ============</span>
-<span class="cm">// 2) CPU 实现 + 注册到 (myops, CPU)</span>
-#include &lt;ATen/ATen.h&gt;
-#include &lt;torch/library.h&gt;
-
-at::Tensor custom_relu_cpu(const at::Tensor&amp; self) {
-  return at::clamp_min(self, 0);   <span class="cm">// 借用现成 aten op 实现</span>
-}
-
-TORCH_LIBRARY_IMPL(myops, CPU, m) {
-  m.impl("custom_relu", TORCH_FN(custom_relu_cpu));
-}
-
-<span class="cm">// ============ myops_cuda.cu ============</span>
-<span class="cm">// 3) CUDA 实现 + 注册到 (myops, CUDA)</span>
-at::Tensor custom_relu_cuda(const at::Tensor&amp; self) {
-  return at::clamp_min(self, 0);
-}
-
-TORCH_LIBRARY_IMPL(myops, CUDA, m) {
-  m.impl("custom_relu", TORCH_FN(custom_relu_cuda));
-}
-
-<span class="cm">// ============ myops_autograd.cpp ============</span>
-<span class="cm">// 4) Autograd 实现:接住 forward, 建 grad_fn, 把 forward 数学透传到 backend kernel</span>
-#include &lt;torch/autograd.h&gt;
-#include &lt;torch/library.h&gt;
-
-class CustomReluFn : public torch::autograd::Function&lt;CustomReluFn&gt; {
- public:
-  static at::Tensor forward(torch::autograd::AutogradContext* ctx,
-                            const at::Tensor&amp; self) {
-    <span class="cm">// 进 forward 时手动排除"AutogradXxx + ADInplaceOrView" —— 否则下面 dispatcher 调用</span>
-    <span class="cm">// 会再次落回到本 Function,死循环。</span>
-    at::AutoDispatchBelowADInplaceOrView guard;
-    <span class="cm">// 直接调注册到 myops::custom_relu 的 dispatcher 入口 —— guard 在生效期内</span>
-    <span class="cm">// AutogradCUDA 已被剔除,会落到 CUDA / CPU 那两个 IMPL 之一(由 self.device() 决定)。</span>
-    static auto op = c10::Dispatcher::singleton()
-        .findSchemaOrThrow("myops::custom_relu", "")
-        .typed&lt;at::Tensor(const at::Tensor&amp;)&gt;();
-    auto result = op.call(self);
-    ctx-&gt;save_for_backward({result});
-    return result;
-  }
-  static torch::autograd::variable_list backward(
-      torch::autograd::AutogradContext* ctx,
-      torch::autograd::variable_list grad_outputs) {
-    auto saved = ctx-&gt;get_saved_variables();
-    auto&amp; result = saved[0];
-    <span class="cm">// d/dx relu(x) = (x &gt; 0)</span>
-    return { grad_outputs[0] * (result &gt; 0).to(grad_outputs[0].dtype()) };
-  }
-};
-
-at::Tensor custom_relu_autograd(const at::Tensor&amp; self) {
-  return CustomReluFn::apply(self);
-}
-
-TORCH_LIBRARY_IMPL(myops, Autograd, m) {
-  m.impl("custom_relu", &amp;custom_relu_autograd);
-}</pre>
-
-<p>Python 端:</p>
-
-<pre class="code">>>> import torch, my_extension
->>> x = torch.randn(3, requires_grad=True, device='cuda')
->>> y = torch.ops.myops.custom_relu(x)         <span class="cm"># 自动找到 AutogradCUDA → CUDA</span>
->>> y.sum().backward()                          <span class="cm"># 自动调 CustomReluFn::backward</span></pre>
-
-<div class="callout">
-<strong>更省事的做法</strong>:如果你的实现完全是 <code>at::*</code> op 的组合(像上面 <code>clamp_min</code> 那样),可以直接注册到 <code>CompositeImplicitAutograd</code> alias:<code>TORCH_LIBRARY_IMPL(myops, CompositeImplicitAutograd, m)</code> —— 一次注册同时覆盖<strong>所有 backend、所有 autograd</strong>,因为里头的 sub-op 自己会再走一遍 dispatcher,正确性 + autograd 全免费。
+<div class="example">
+<span class="label">小例 4.2 — 一个 yaml 条目的"扩展系数"</span>
+看 <code>add.Tensor</code> 这一个 yaml 条目(2.3 节列过),展开后<strong>同时</strong>影响:<br>
+<strong>① C++ API</strong>:<code>at::add(...)</code>、<code>x.add(y)</code> 在 <code>Functions.h</code> + <code>TensorBody.h</code> 各加一行<br>
+<strong>② Operators.h</strong>:增加 <code>at::_ops::add_Tensor</code> 这个类型句柄<br>
+<strong>③ Schema 注册</strong>:<code>RegisterSchema.cpp</code> 里 <code>TORCH_LIBRARY_FRAGMENT(aten,m){m.def("add.Tensor(...) -&gt; Tensor", ...);}</code> 多一行<br>
+<strong>④ CPU/CUDA wrapper</strong>:<code>RegisterCPU.cpp</code> + <code>RegisterCUDA.cpp</code> 各加一个 <code>m.impl("add.Tensor", TORCH_FN(wrapper_*_add_Tensor))</code><br>
+<strong>⑤ ufunc 实现</strong>:<code>UfuncCPU_add.cpp</code> + <code>UfuncCUDA_add.cu</code> 自动生成 loop 代码<br>
+<strong>⑥ autograd wrapper</strong>:<code>VariableType_N.cpp</code> 加一个 <code>m.impl("add.Tensor", TORCH_FN(VariableType::add_Tensor))</code><br>
+<strong>⑦ AddBackward0 类</strong>:<code>generated/Functions.h</code> 加 <code>class AddBackward0</code>,从 <code>derivatives.yaml</code> 翻译出 <code>apply()</code> 实现<br>
+<strong>⑧ Python 绑定</strong>:<code>python_torch_functions_*.cpp</code> 加 <code>THPVariable_add</code>,Python 调 <code>torch.add</code> 落到这里<br><br>
+一行 yaml → <strong>8 处生成代码</strong>。对 ~2000 个算子,这就是几万行 C++ 自动生成的胶水代码。
 </div>
 
-<h2 id="sec4">4. Codegen 流水线 (torchgen)</h2>
+<div class="callout">
+<strong>所以 3 章学的注册宏,99% 的"使用者"是 torchgen 自己。</strong>普通工程师写自定义算子时手动用 <code>TORCH_LIBRARY_IMPL</code>;PyTorch 自家算子全靠 torchgen 自动生成同样形式的 <code>TORCH_LIBRARY_FRAGMENT</code> / <code>TORCH_LIBRARY_IMPL</code> 调用 —— 两条路径走同一组宏、同一套 dispatcher。这意味着第 3 章理解的注册机制<strong>对内部和外部用户完全一致</strong>。
+</div>
 
-<h3 id="sec4-1">4.1 输入文件</h3>
-
-<p><a href="https://github.com/pytorch/pytorch/blob/main/torchgen/gen.py"><code>torchgen/gen.py</code></a> 是 PyTorch 构建期跑的 codegen 主程序。它吃三份输入:</p>
-
-<table>
-<thead>
-<tr><th>输入</th><th>给的信息</th></tr>
-</thead>
-<tbody>
-<tr><td><code>aten/src/ATen/native/native_functions.yaml</code></td><td>每个 op 的 schema + dispatch 表 + structured/ufunc 标记</td></tr>
-<tr><td><code>aten/src/ATen/native/tags.yaml</code></td><td>tag 集合的定义(供 <code>tags:</code> 字段引用)</td></tr>
-<tr><td><code>tools/autograd/derivatives.yaml</code></td><td>每个 differentiable op 的反向公式</td></tr>
-</tbody>
-</table>
-
-<h3 id="sec4-2">4.2 生成的产物</h3>
-
-<p>输出按文件分组(全部落到 <code>build/aten/src/ATen/</code> 和 <code>build/.../torch/csrc/autograd/generated/</code>):</p>
-
-<table>
-<thead>
-<tr><th>产物</th><th>内容</th><th>对应宏</th></tr>
-</thead>
-<tbody>
-<tr><td><code>Operators.h</code> / <code>.cpp</code></td><td>每个 overload 一个 <code>at::_ops::add_Tensor::call(...)</code> 类型句柄,做"取 TypedOperatorHandle + Dispatcher::call"</td><td>(C++ 静态对象,不走宏)</td></tr>
-<tr><td><code>Functions.h</code> / <code>.cpp</code></td><td>友好的 <code>at::add(self, other, alpha)</code> 入口,inline 转给 <code>_ops::add_Tensor::call</code></td><td></td></tr>
-<tr><td><code>RedispatchFunctions.h</code></td><td><code>at::redispatch::add(currentKeySet, ...)</code>,kernel 内部用</td><td></td></tr>
-<tr><td><code>TensorBody.h</code></td><td><code>Tensor::add(...)</code> 方法形态</td><td></td></tr>
-<tr><td><code>NativeFunctions.h</code></td><td>所有手写 <code>at::native::*</code> 函数的声明</td><td></td></tr>
-<tr><td><strong><code>RegisterSchema.cpp</code></strong></td><td>每个 op 一行 <code>m.def("add.Tensor(...) -&gt; Tensor", {at::Tag::core, at::Tag::pointwise});</code></td><td><code>TORCH_LIBRARY_FRAGMENT(aten, m)</code></td></tr>
-<tr><td><strong><code>RegisterCPU.cpp</code></strong></td><td><code>m.impl("add.out", TORCH_FN(wrapper_CPU_add_out));</code> 之类,wrapper 内部 device-guard + 调 <code>at::native::*</code></td><td><code>TORCH_LIBRARY_IMPL(aten, CPU, m)</code></td></tr>
-<tr><td><strong><code>RegisterCUDA.cpp</code></strong></td><td>同上,绑 CUDA 后端</td><td><code>TORCH_LIBRARY_IMPL(aten, CUDA, m)</code></td></tr>
-<tr><td><code>RegisterCompositeImplicitAutograd.cpp</code></td><td>注册到 <code>CompositeImplicitAutograd</code> alias 的 kernel</td><td><code>TORCH_LIBRARY_IMPL(aten, CompositeImplicitAutograd, m)</code></td></tr>
-<tr><td><code>RegisterBackendSelect.cpp</code></td><td>给 <code>at::randn</code> 这类 factory function 的 backend 路由 kernel</td><td><code>TORCH_LIBRARY_IMPL(aten, BackendSelect, m)</code></td></tr>
-<tr><td><code>UfuncCPU_add.cpp</code> / <code>UfuncCUDA_add.cu</code></td><td>structured + ufunc 的实际循环代码,内部调 <code>at::native::ufunc::add</code></td><td>(structured 模板)</td></tr>
-<tr><td><strong><code>VariableType_N.cpp</code></strong> (分片)</td><td><strong>autograd kernel</strong>:wrapper 里建 <code>AddBackward0</code>,然后 <code>at::redispatch::add(...)</code></td><td><code>TORCH_LIBRARY_IMPL(aten, AutogradCPU/CUDA/..., m)</code></td></tr>
-<tr><td><code>Functions.h</code> / <code>.cpp</code> (autograd)</td><td><code>AddBackward0</code> 等 <code>Node</code> 子类,<code>apply()</code> 体由 derivatives.yaml 生成</td><td></td></tr>
-<tr><td><code>ADInplaceOrViewType_N.cpp</code></td><td>view/in-place 的 version-bump 包装</td><td><code>TORCH_LIBRARY_IMPL(aten, ADInplaceOrView, m)</code></td></tr>
-<tr><td><code>TraceType_N.cpp</code></td><td>JIT trace 记录</td><td><code>TORCH_LIBRARY_IMPL(aten, Tracer, m)</code></td></tr>
-<tr><td><code>python_torch_functions_*.cpp</code></td><td>从 schema 生成的 Python C 绑定(<code>THPVariable_add</code> 等)</td><td>CPython API</td></tr>
-</tbody>
-</table>
-
-<p>这一坨生成产物加起来,把"一行 yaml 入口"摊开成一棵从 Python 函数一直延伸到 CUDA elementwise kernel 的代码森林。下一节会以 <code>aten::add</code> 为例把整条树枝沿着实际调用路径走一遍。</p>
+<p>下一章把这一坨生成产物沿着 <code>aten::add</code> 的实际调用路径走一遍,看每一份生成代码<strong>在什么时候</strong>被命中。</p>
 
 <h2 id="sec5">5. aten::add 全栈追踪</h2>
 
