@@ -1304,6 +1304,159 @@ output         output  output              ((relu,),)      {}
 
 <p>类似的 C++ fast path 模式很可能将来扩展到 FakeTensor / Functionalization 等其他"性能敏感"的协议实现。<strong>协议层稳定,实现层可以从 Python → C++ 迁移</strong>—— 这是 PyTorch 设计的成熟之处。</p>
 
+<h2 id="sec6">6. 与 torch.compile 的连接</h2>
+
+<p><code>torch.compile</code> 是 PyTorch 2 的核心特性 —— 把 Python 模型编译成高效 GPU kernel。它的图捕获机制<strong>完全依赖</strong>本文讲的 <code>__torch_dispatch__</code>。本章说清这个连接,不展开 Inductor 的编译细节(那是另一个大话题)。</p>
+
+<h3>6.1 Dynamo 和 AOTAutograd:两个阶段</h3>
+
+<p><code>torch.compile</code> 的图捕获分两步:</p>
+
+<table>
+<thead><tr><th>阶段</th><th>输入</th><th>输出</th><th>用什么机制</th></tr></thead>
+<tbody>
+<tr><td><strong>Dynamo</strong></td><td>用户写的 Python 函数</td><td><code>fx.Graph</code>,节点是 <code>torch.*</code> 用户级 API 调用</td><td>Python <strong>字节码</strong>分析(frame eval API)。<strong>不</strong>用 <code>__torch_dispatch__</code>。</td></tr>
+<tr><td><strong>AOTAutograd</strong></td><td>Dynamo 输出的 graph</td><td>更细粒度的 <code>fx.Graph</code>,节点是 <code>aten::*</code> op,<strong>包含 forward + backward</strong></td><td><strong>用 <code>__torch_dispatch__</code></strong>(<code>FakeTensorMode</code> + <code>ProxyTorchDispatchMode(pre_dispatch=True)</code>)</td></tr>
+</tbody>
+</table>
+
+<p>简言之:<strong>Dynamo 操作在 dispatcher 之上,AOTAutograd 操作在 dispatcher 之内</strong>。后者要看到反向产生的 op、看到 decomposition 的 sub-op,所以非走 <code>__torch_dispatch__</code> 不可。</p>
+
+<h3>6.2 AOTAutograd 怎么用 mode 抓 forward + backward</h3>
+
+<p>AOTAutograd 的流程(简化):</p>
+
+<pre class="code"><span class="cm"># 1. 接收 Dynamo 输出的 GraphModule (其中 inputs 是用户的真张量)</span>
+gm: GraphModule = dynamo_result
+
+<span class="cm"># 2. 把 inputs 包成 FakeTensor (避免真分配)</span>
+with FakeTensorMode():
+    fake_inputs = [fake_tensor_mode.from_tensor(t) for t in real_inputs]
+
+    <span class="cm"># 3. 同时激活 ProxyTorchDispatchMode (pre_dispatch=True)</span>
+    with ProxyTorchDispatchMode(tracer, pre_dispatch=True):
+        <span class="cm"># 4. 在 mode 中跑 forward —— 每个 op 调用都被 proxy_call 记到 graph</span>
+        fake_outputs = gm(*fake_inputs)
+
+        <span class="cm"># 5. ★ 关键:对 outputs 调 backward(),让 autograd engine 在<strong>同一个 mode 内</strong>跑反向
+        #    autograd 内部调的每个 backward op (像 AddBackward0::apply 调 at::add)
+        #    都过 ProxyTorchDispatchMode,被记到<strong>同一张 graph</strong></span>
+        loss = fake_outputs.sum()
+        loss.backward()
+
+<span class="cm"># 6. tracer.graph 现在包含完整的 forward + backward,交给 inductor</span></pre>
+
+<p>这就是 AOTAutograd 名字的由来 ——"<strong>Ahead-Of-Time</strong> Autograd":提前把<strong>反向图</strong>抓出来,而不是运行时才建。<code>__torch_dispatch__</code> 是实现这一点的<strong>唯一</strong>机制 —— 没有它,反向过程内调的 op 看不见,捕获就失败。</p>
+
+<h3>6.3 PreDispatch 在 PT2 流水线里的角色</h3>
+
+<p>4.2 节看到 <code>PreDispatch</code> 在 Autograd <strong>之上</strong>。AOTAutograd 用 <code>pre_dispatch=True</code> 是因为它需要看到<strong>用户级</strong>的 op(比如 <code>relu</code>),而不是分解后的 core op(<code>clamp_min</code>)。原因:</p>
+
+<ul>
+  <li><strong>语义保留</strong>:Inductor 后续可能对 <code>relu</code> 做 fuse pattern(比如 <code>conv2d_relu</code>)。如果 relu 已经被分解,fuse pattern 没法匹配。</li>
+  <li><strong>调试体验</strong>:用户看 graph 时希望看到自己写的 op,不是底层细节。</li>
+  <li><strong>导出</strong>:<code>torch.export</code> 要导出"和用户代码同构"的图,留给目标平台(ONNX、TensorRT 等)自己做分解。</li>
+</ul>
+
+<div class="callout">
+<strong>所以 PreDispatch 的存在,是为了支持 <code>torch.compile</code> 的"高层"图捕获</strong>。Python 的"低层"图捕获(配合 <code>tracing_mode="real"</code>)仍然有用,只是大多数用户场景不需要。
+</div>
+
+<h2 id="sec7">7. 性能与陷阱</h2>
+
+<h3>7.1 C++→Python 一次跨界的成本明细</h3>
+
+<p>2.6 节我们看到 <code>ConcretePyInterpreterVTable::dispatch</code> 的 6 个步骤。每一步都<strong>不便宜</strong>:</p>
+
+<table>
+<thead><tr><th>步骤</th><th>典型成本</th><th>原因</th></tr></thead>
+<tbody>
+<tr><td>① GIL 获取</td><td>~50ns(无竞争) → ~µs(竞争)</td><td>原子操作。多线程推理服务下严重 serializer。</td></tr>
+<tr><td>② 找 Torch API 函数</td><td>~100ns</td><td>Hash table lookup</td></tr>
+<tr><td>③ 扫描 overloaded_args</td><td>O(N) × ~10ns 每个</td><td>遍历 args,检查 Python key</td></tr>
+<tr><td>④ IValue → PyObject 转换</td><td>O(N) × ~50-100ns</td><td>每个 IValue 都创建新 PyObject(或 py::cast 复用);tensor 走 pyobj_slot 优化</td></tr>
+<tr><td>⑤ 找 + 调用 Python <code>__torch_dispatch__</code></td><td>~1-5µs</td><td>Python frame setup + bytecode 解释。<strong>大头</strong>。</td></tr>
+<tr><td>⑥ PyObject → IValue 转换 + 压回 stack</td><td>O(N) × ~50-100ns</td><td>反向转</td></tr>
+<tr><td><strong>总计</strong></td><td><strong>5-15 µs</strong></td><td></td></tr>
+</tbody>
+</table>
+
+<p>对比纯 C++ dispatch 的 <strong>~50ns</strong>,慢了<strong>100-300 倍</strong>。</p>
+
+<p>实际影响:一个典型 train step 有 <strong>5000-10000 个 op</strong> 调用。用 <code>__torch_dispatch__</code> 加 ~5µs / op,累计 25-50ms / step。对秒级 step 不算重(<5% 开销),对毫秒级 step(GPU 利用率高的训练)就是<strong>重大瓶颈</strong>。<br>这就是 §5.4 PR #167051 把 DTensor 移到 C++ fast path 的现实动机。</p>
+
+<h3>7.2 什么时候用、什么时候不用</h3>
+
+<table>
+<thead><tr><th>✅ 适合用 <code>__torch_dispatch__</code></th><th>❌ 不适合</th></tr></thead>
+<tbody>
+<tr><td>Graph capture(<code>make_fx</code>、AOTAutograd) —— 单次 trace,开销可摊销到后续多次 execute</td><td>Per-step transforms(每个训练 step 都跑)。用 <code>torch.compile</code> 或 functorch transforms 编译后再用</td></tr>
+<tr><td>Shape inference(<code>FakeTensorMode</code>) —— 比真跑 kernel 快得多</td><td>替换某个 C++ kernel 为 Python 版"图方便"—— 在每次调用都付边界开销</td></tr>
+<tr><td>调试/日志(临时的拦截脚本) —— 开发期跑一次,看清楚行为</td><td>Production inference fast path —— 5µs × 几千 op = 不可接受</td></tr>
+<tr><td>实验性张量子类(quantized、complex、sparse 新表示) —— 协议清晰,实现快</td><td>性能极敏感场景(latency-critical 推理) —— 需要 C++ fast path</td></tr>
+</tbody>
+</table>
+
+<h3>7.3 常见陷阱</h3>
+
+<h4>陷阱 1:引用循环 <code>TensorImpl ↔ PyObject ↔ Mode</code></h4>
+
+<p><code>pyobj_slot_</code> 持有 <code>PyObject*</code>(incref'd),Python wrapper 持有 <code>intrusive_ptr&lt;TensorImpl&gt;</code>(refcount)—— 这构成<strong>循环引用</strong>。PyTorch 用标签指针(tagged pointer)机制大部分时候能正确打破环,但<strong>如果你在 mode 的 self 字段里 stash 一个张量</strong>,引用就会留住,直到 <code>mode.__exit__</code> 调用。如果 mode 长期活着,这些张量就泄露。<strong>解决</strong>:用 <code>weakref</code> 包裹存到 mode 里的张量,或在 <code>__exit__</code> 显式清掉。</p>
+
+<h4>陷阱 2:嵌套 mode 的 LIFO 困惑</h4>
+
+<p><code>pythonFallback</code> 只取栈顶 mode。如果你想"<strong>多个 mode 链式生效</strong>",必须在自己的 <code>__torch_dispatch__</code> 体内显式调下一个 —— 通过 <code>return func(*args)</code> 让 dispatcher 继续(<strong>不</strong>会回到栈中下一个 mode,而是落到 backend),或者主动 <code>super().__torch_dispatch__(...)</code>(走 Python 端继承链)。<strong>记住</strong>:return func 不等于 "调下一个 mode",它跳过<strong>整个</strong> Python 层。</p>
+
+<h4>陷阱 3:<code>_DISPATCH_HANDLE_DIRECTLY</code> 陷阱</h4>
+
+<p>FakeTensor 的某些查询 op(<code>size</code>、<code>stride</code>、<code>device</code>、<code>dim</code>)在 <code>__torch_dispatch__</code> <strong>之前</strong>就被路由处理 —— 通过 <code>_DISPATCH_HANDLE_DIRECTLY</code> 集合 + <code>in_kernel_invocation_manager</code>。如果你写一个 mode 期望<strong>每个</strong> op 都过你的 <code>__torch_dispatch__</code>,会遗漏这些。<strong>解决</strong>:阅读 <code>fake_tensor.py</code> 的相关代码理解哪些 op 走特殊路径,在你的 mode 里也处理它们;或者用 <code>__torch_function__</code> 补一道防线(代价是只能看到用户级调用)。</p>
+
+<h4>陷阱 4:<code>tls_on_entry</code> 不变量</h4>
+
+<p><code>PythonFallbackKernel.cpp</code> 第 17-23 行的注释:</p>
+
+<pre class="code"><span class="cm">// This TLS is used to track the state of the dispatcher to be able to restore
+// it when calling back into python.  It has the following invariant:
+//  - It must be empty while python code is executed.
+//  - It should only be set once even for multiple dispatcher calls that do not come back to python.</span>
+thread_local std::optional&lt;c10::impl::LocalDispatchKeySet&gt; tls_on_entry;</pre>
+
+<p>违反这个不变量(比如在 mode 内手动调 <code>op.redispatchBoxed(...)</code> 而不通过 <code>func(*args)</code>)会触发 "Accessing torch dispatch state outside of __torch_dispatch__ is not allowed" 错误。<strong>正确做法</strong>:在 mode 内永远通过 <code>func(*args, **kwargs)</code> 触发下一步 dispatch。</p>
+
+<h4>陷阱 5:Python 退出时的 disarm</h4>
+
+<p>2.2 节边栏提到 Python 析构时 vtable 被 disarm。如果你的 C++ 代码缓存了带 <code>pyobj_slot</code> 的 <code>TensorImpl</code>(比如某个 static 容器),且这个 cache 在 atexit 之后才被释放,就会触发 "<em>attempted to call dispatch on a Tensor with nontrivial PyObject after corresponding interpreter died</em>" 断言。<strong>解决</strong>:在 atexit 之前显式清空 cache,或在持有的对象析构里 <code>pyobj_slot.clear()</code>。</p>
+
+<h4>陷阱 6:FakeTensorMode 单例</h4>
+
+<p>2.3 节边栏提到 <code>infra_modes_</code> 给 FakeTensorMode 留了固定槽位 —— 第二次 push 是 no-op。如果你想嵌套 fake mode(<code>with FakeTensorMode(): with FakeTensorMode():</code>),内层不会真生效,所有 op 仍走外层。这是<strong>有意</strong>的设计(嵌套 fake 没有合理语义),但容易写错。<strong>解决</strong>:别嵌套 FakeTensorMode;如果需要"在 fake 内做局部 real 操作",用 <code>FakeTensorMode.disable()</code> 暂时关掉。</p>
+
+<h2 id="sec8">参考资料</h2>
+
+<ul>
+  <li>姐妹篇:<a href="pytorch-dispatcher.html">PyTorch Dispatcher 全栈剖析</a></li>
+  <li><a href="https://dev-discuss.pytorch.org/t/what-and-why-of-torch-dispatch/557">"What and Why of <code>__torch_dispatch__</code>" — Chillee et al., PyTorch dev-discuss 2022</a></li>
+  <li><a href="https://github.com/albanD/subclass_zoo">albanD/subclass_zoo</a> — 一组小型 <code>__torch_dispatch__</code> 示例(LoggingTensor、NegativeTensor 等)</li>
+  <li><a href="https://github.com/pytorch/pytorch/pull/167051">PyTorch PR #167051 — DTensor C++ fast path</a></li>
+  <li>源码:
+    <ul>
+      <li><a href="https://github.com/pytorch/pytorch/blob/main/c10/core/impl/PyInterpreter.h">c10/core/impl/PyInterpreter.h</a></li>
+      <li><a href="https://github.com/pytorch/pytorch/blob/main/c10/core/impl/PyObjectSlot.h">c10/core/impl/PyObjectSlot.h</a></li>
+      <li><a href="https://github.com/pytorch/pytorch/blob/main/c10/core/impl/TorchDispatchModeTLS.h">c10/core/impl/TorchDispatchModeTLS.h</a></li>
+      <li><a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/core/PythonFallbackKernel.cpp">aten/src/ATen/core/PythonFallbackKernel.cpp</a></li>
+      <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/csrc/PyInterpreter.cpp">torch/csrc/PyInterpreter.cpp</a></li>
+      <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/utils/_python_dispatch.py">torch/utils/_python_dispatch.py</a></li>
+    </ul>
+  </li>
+  <li>典型用户:
+    <ul>
+      <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/_subclasses/fake_tensor.py">torch/_subclasses/fake_tensor.py</a> (FakeTensorMode)</li>
+      <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/fx/experimental/proxy_tensor.py">torch/fx/experimental/proxy_tensor.py</a> (ProxyTorchDispatchMode + make_fx)</li>
+      <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/distributed/tensor/_api.py">torch/distributed/tensor/_api.py</a> (DTensor)</li>
+    </ul>
+  </li>
+</ul>
+
 </main>
 </div>
 </body>
