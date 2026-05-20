@@ -1498,129 +1498,185 @@ TORCH_LIBRARY_IMPL(myops, CompositeImplicitAutograd, m) {
 
 <p>下一章把这一坨生成产物沿着 <code>aten::add</code> 的实际调用路径走一遍,看每一份生成代码<strong>在什么时候</strong>被命中。</p>
 
-<h2 id="sec5">5. aten::add 全栈追踪</h2>
+<h2 id="sec5">5. 端到端追踪:<code>aten::add</code> on CUDA</h2>
 
-<p>设定:<code>x, y</code> 是两个 CUDA tensor,<code>requires_grad=True</code>,我们跑 <code>z = torch.add(x, y)</code>。完整调用栈从 Python 进入,经 autograd、CUDA 后端、ufunc 循环,反向时再回到 autograd engine。下面逐层。</p>
+<p>前四章我们建立了 dispatcher 的概念模型(§1)、schema 的接口契约(§2)、注册宏(§3)、构建期 codegen(§4)。本章把这些拼起来,选<strong>一个具体场景</strong>把整条调用链走完:</p>
 
-<h3 id="sec5-1">5.1 yaml 入口</h3>
+<div class="callout">
+<strong>设定:</strong>两个 CUDA 张量 <code>x, y</code>,都 <code>requires_grad=True</code>。用户写:
+<pre class="code">z = torch.add(x, y)
+z.sum().backward()</pre>
+我们要回答:这两行 Python 代码,内部到底跑过哪些 C++ / CUDA 函数?
+</div>
 
-<p>schema(<code>native_functions.yaml</code>):</p>
+<p>调用链从 Python 进入,沿 dispatcher 优先级阶梯一层层下落,落到 CUDA elementwise kernel;反向时再回到 autograd engine 调 <code>AddBackward0::apply</code>。下面九小节按顺序拆开,每节锁定一层,讲清"这一层在做什么、对应哪个生成产物、哪段代码、注意事项是什么"。</p>
 
-<pre class="code">- func: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -&gt; Tensor
+<h3 id="sec5-1">5.1 起点:yaml 中的两行声明 + 反向公式</h3>
+
+<p>整条调用链的<strong>源头</strong>就是两份 yaml 里的几行声明。它们决定了后续生成产物长什么样。我们把这几行抄一遍,后面每一节都能回头对照。</p>
+
+<p><code>native_functions.yaml</code> 里的 <code>add.Tensor</code>(functional 变体)和 <code>add.out</code>(structured 锚点)条目(简化):</p>
+
+<pre class="code"><span class="cm"># native_functions.yaml</span>
+- func: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -&gt; Tensor
   device_check: NoCheck
-  structured_delegate: add.out      <span class="cm"># functional 走 out 委托</span>
-  variants: function, method
+  structured_delegate: add.out      <span class="cm"># 自己不实现,委托给 add.out (5.6 节会用到)</span>
+  variants: function, method        <span class="cm"># 生成 at::add 和 Tensor::add 两种入口</span>
   ...
+
 - func: add.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -&gt; Tensor(a!)
-  structured: True                  <span class="cm"># 出口</span>
+  structured: True                  <span class="cm"># 这是 structured kernel 的"出口"(5.7 节会用到)</span>
   structured_inherits: TensorIteratorBase
-  ufunc_inner_loop:                 <span class="cm"># 触发 ufunc codegen</span>
+  ufunc_inner_loop:                 <span class="cm"># 触发 ufunc codegen(5.7 节会用到)</span>
     Generic: add (AllAndComplex, BFloat16, Half, ComplexHalf)
     ScalarOnly: add (Bool)</pre>
 
-<p>反向(<code>derivatives.yaml</code>):</p>
+<p><code>derivatives.yaml</code> 里 <code>add.Tensor</code> 的反向公式(5.5 和 5.8 节会用到):</p>
 
-<pre class="code">- name: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -&gt; Tensor
+<pre class="code"><span class="cm"># tools/autograd/derivatives.yaml</span>
+- name: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -&gt; Tensor
   self:  handle_r_to_c(self.scalar_type(),  grad)
   other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))</pre>
 
-<h3 id="sec5-2">5.2 Python → C 绑定</h3>
+<p>就这么几行 yaml,加上 <code>aten/src/ATen/native/ufunc/add.h</code> 里一行真正的数学定义 —— 就构成了 <code>aten::add</code> 的<strong>全部"原始资料"</strong>。后面所有 C++ 函数都是 torchgen 根据这些行生成的。</p>
 
-<p><code>torch.add(x, y)</code> 在 Python 解析后跳到 <code>THPVariable_add</code>(生成在 <code>build/.../torch/csrc/autograd/generated/python_torch_functions_2.cpp</code>)。它的工作:</p>
+<h3 id="sec5-2">5.2 Python → C 绑定层</h3>
+
+<p>用户写 <code>torch.add(x, y)</code>。CPython 解释器查到 <code>torch.add</code> 是一个 C 函数指针,跳到 <code>THPVariable_add</code>(注意 "THP" 前缀:<strong>T</strong>orch <strong>HP</strong>ython,PyTorch 给所有 Python C 绑定的命名约定)。它的源码生成在:</p>
+
+<pre class="code">build/.../torch/csrc/autograd/generated/python_torch_functions_2.cpp</pre>
+
+<p><code>_2</code> 是分片号(整个文件太大,torchgen 把它拆成几片)。<code>THPVariable_add</code> 体大概干这四件事:</p>
 
 <ol>
-  <li>用 <code>PythonArgParser</code> 按 schema 解析参数 → 拿到 <code>Tensor self</code>、<code>Tensor other</code>、<code>Scalar alpha</code></li>
-  <li>从 <code>THPVariable</code> Python wrapper 中拆出底下的 <code>at::Tensor</code></li>
-  <li>调 C++ API:<code>at::add(self, other, alpha)</code></li>
-  <li>把返回的 <code>at::Tensor</code> 包成 <code>THPVariable</code> 还给 Python</li>
+  <li><strong>解析 Python 参数。</strong>用 <code>PythonArgParser</code> 按 schema(2.1 节那个字符串)解析,识别出第一个张量是 <code>self</code>、第二个是 <code>other</code>、可选 kw <code>alpha</code> 默认 1。</li>
+  <li><strong>拆 Python 包装。</strong>用户的 <code>x</code> 实际是 Python 端的 <code>THPVariable</code> 对象(<code>torch.Tensor</code>),内部持有一个 <code>at::Tensor</code>(C++ 张量)。<code>THPVariable_unpack</code> 把 C++ 张量取出来。</li>
+  <li><strong>调 C++ API。</strong>有了纯 C++ 张量,调 <code>at::add(self, other, alpha)</code>。控制权离开 Python,进入纯 C++ 世界。</li>
+  <li><strong>把返回值包回 Python。</strong>C++ 返回的 <code>at::Tensor</code> 被 <code>THPVariable_Wrap</code> 包成新的 <code>torch.Tensor</code> 返还给 Python。</li>
 </ol>
 
-<h3 id="sec5-3">5.3 C++ API → Dispatcher::call</h3>
+<div class="aside">
+<span class="label">边栏 5.2 — 为什么需要这一层"包装/拆包"</span>
+你可能会问:既然 <code>torch.Tensor</code> 和 <code>at::Tensor</code> 本质是同一个对象,为什么不直接传?<br><br>
+两个原因:<br>
+<strong>① Python 引用计数 vs C++ 智能指针</strong>。Python 的 <code>torch.Tensor</code> 用 CPython 引用计数(<code>Py_INCREF</code>/<code>Py_DECREF</code>),C++ 的 <code>at::Tensor</code> 用 <code>intrusive_ptr</code>。两套生命周期管理必须在边界精确转换,否则会 use-after-free。<br>
+<strong>② 解析 Python 多态参数</strong>。Python 用户可以传 <code>(Tensor, Tensor)</code> 也可以传 <code>(Tensor, Scalar)</code> 给同一个 <code>torch.add</code> —— 选择哪个 overload(<code>add.Tensor</code> vs <code>add.Scalar</code>)是<strong>这一层</strong>决定的。C++ 函数本身只接受静态类型签名,需要 Python 端先做 overload resolution。
+</div>
 
-<p><code>at::add</code> 是 codegen 进 <code>Functions.h</code> 的 inline 转发(签名见 <code>Functions.h</code> ~第 700 行):</p>
+<h3 id="sec5-3">5.3 C++ API 与 Dispatcher::call</h3>
+
+<p>进入 C++ 世界,第一个落点是 <code>at::add</code>(生成在 <code>build/aten/src/ATen/Functions.h</code>):</p>
 
 <pre class="code"><span class="cm">// build/aten/src/ATen/Functions.h</span>
 inline at::Tensor add(const at::Tensor&amp; self, const at::Tensor&amp; other, const at::Scalar&amp; alpha) {
   return at::_ops::add_Tensor::call(self, other, alpha);
 }</pre>
 
-<p><code>_ops::add_Tensor::call</code> 在 <code>Operators.cpp</code>(~第 612 行):</p>
+<p>这只是个 <strong>inline 转发</strong>,把调用甩给 <code>at::_ops::add_Tensor::call</code>(在 <code>Operators.cpp</code> ~第 612 行):</p>
 
-<pre class="code">at::Tensor _ops::add_Tensor::call(const at::Tensor&amp; self, const at::Tensor&amp; other, const at::Scalar&amp; alpha) {
-  static auto op = create_add_Tensor_typed_handle();       <span class="cm">// 进程内缓存 TypedOperatorHandle</span>
-  return op.call(self, other, alpha);
+<pre class="code"><span class="cm">// build/aten/src/ATen/Operators.cpp</span>
+at::Tensor _ops::add_Tensor::call(const at::Tensor&amp; self, const at::Tensor&amp; other, const at::Scalar&amp; alpha) {
+  static auto op = create_add_Tensor_typed_handle();   <span class="cm">// 进程内只算一次的 TypedOperatorHandle</span>
+  return op.call(self, other, alpha);                  <span class="cm">// 转给 Dispatcher::call</span>
 }</pre>
 
-<p><code>op.call</code> 最终调到 <code>Dispatcher::call</code>。</p>
+<p>这一层做的是<strong>"找到 op 的 TypedOperatorHandle"</strong>。<code>TypedOperatorHandle</code> 是 dispatcher 内部的"句柄" —— 它指向 <code>aten::add.Tensor</code> 这个 op 在 dispatcher 表里的<strong>那一行</strong>。<code>static</code> 保证这个查表只在第一次调用时跑一次,之后都是缓存。</p>
 
-<h3 id="sec5-4">5.4 DispatchKeySet 计算</h3>
+<p><code>op.call</code> 最终调到 <code>c10::Dispatcher::call</code>(<a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/core/dispatch/Dispatcher.h"><code>Dispatcher.h:774-828</code></a>)—— 这就是 1.4 节里讲的 dispatcher 入口。从这一刻起,我们正式踏入 dispatcher 的位图魔法。</p>
 
-<pre class="code"><span class="cm">// Dispatcher.h:774-828 — Dispatcher::call (核心两步)</span>
+<div class="example">
+<span class="label">小例 5.3 — 这一层为什么需要单独存在</span>
+你可能会问:既然 <code>at::add</code> 只是个转发,为什么不直接让 <code>THPVariable_add</code> 调 <code>Dispatcher::call</code>?<br><br>
+两个原因:<br>
+<strong>① 它给了用户友好的 C++ API。</strong>第三方 C++ 代码不想知道 dispatcher 内部细节,只想写 <code>at::add(x, y)</code>。<br>
+<strong>② 它隐藏了 schema lookup 的缓存。</strong><code>at::_ops::add_Tensor::call</code> 在第一次调用时找 schema(<code>create_add_Tensor_typed_handle()</code>),之后缓存。如果每次都 <code>Dispatcher::call</code> 都要先查 schema,性能会差很多。
+</div>
+
+<h3 id="sec5-4">5.4 DispatchKeySet 的现场计算</h3>
+
+<p>进入 <code>Dispatcher::call</code>(<a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/core/dispatch/Dispatcher.h"><code>Dispatcher.h:774-828</code></a>),核心两行:</p>
+
+<pre class="code"><span class="cm">// Dispatcher::call 核心</span>
 auto dispatchKeySet =
     op.operatorDef_-&gt;op.dispatchKeyExtractor()
         .template getDispatchKeySetUnboxed&lt;Args...&gt;(args...);
 const KernelFunction&amp; kernel = op.operatorDef_-&gt;op.lookup(dispatchKeySet);
 return kernel.template call&lt;Return, Args...&gt;(op, dispatchKeySet, ...);</pre>
 
-<p>对我们的场景:</p>
+<p>第一行算<strong>位图</strong>(1.5 节那个 <code>DispatchKeySet</code>),第二行<strong>查表</strong>取最高位的 kernel,第三行<strong>跳过去</strong>。对我们这次调用,具体发生:</p>
 
 <ol>
-  <li>每个输入 tensor 的 <code>TensorImpl::key_set_</code> = <code>{AutogradCUDA, CUDA}</code> —— 两个 tensor or 起来还是 <code>{AutogradCUDA, CUDA}</code>。</li>
-  <li>TLS local 默认空(没开 autocast、没在 functorch 里)。</li>
-  <li>fallthrough mask 把 <code>BackendSelect</code>、<code>Named</code>、<code>Conjugate</code> 等位清零。</li>
-  <li><code>highestPriorityTypeId()</code> 取 <code>AutogradCUDA</code> —— 因为 functionality 位里 autograd 排在 Dense 上面。</li>
+  <li><strong>位图初始值</strong>:每个输入张量 <code>self</code>、<code>other</code> 的 <code>TensorImpl::key_set_</code>。它们都是 CUDA 张量、都 require grad,所以 <code>key_set_ = {AutogradFunctionality, Dense, CUDABit}</code>(用 1.4 的二维拆分写法)。两个张量 or 起来,位图还是这三个位为 1。运行时翻译就是 <code>{AutogradCUDA, CUDA}</code>。</li>
+  <li><strong>TLS local include</strong>:没开 autocast、没在 functorch 里,所以 include 为空。</li>
+  <li><strong>TLS local exclude</strong>:第一次进 dispatcher,exclude 也是空。</li>
+  <li><strong>Fallthrough mask</strong>:每个 op 的 dispatch table 在注册期预算了 fallthrough_mask。对 <code>add</code>,<code>BackendSelect</code>、<code>Named</code>、<code>Conjugate</code> 等位都被 mask 清掉。位图维持 <code>{AutogradCUDA, CUDA}</code>。</li>
+  <li><strong>highestPriorityTypeId()</strong>:在剩下的位里找最高 functionality 位 —— 是 <code>AutogradFunctionality</code>(对应运行时 <code>AutogradCUDA</code>),因为它在 enum 里排在 <code>Dense</code> 后面(更高位)。</li>
 </ol>
 
-<p><code>lookup</code> 返回 <code>AutogradCUDA</code> 槽位下的 kernel。</p>
+<p><code>lookup</code> 返回 <code>aten::add.Tensor</code> 在 <code>AutogradCUDA</code> 槽位下的 kernel 函数指针。这个 kernel 是<strong>谁注册的</strong>?codegen 自动注册的:</p>
 
-<h3 id="sec5-5">5.5 AutogradCUDA kernel:建 grad_fn,redispatch</h3>
-
-<p>kernel 注册在 <code>torch/csrc/autograd/generated/VariableType_2.cpp</code>(具体分片号会随版本变):</p>
-
-<pre class="code">TORCH_LIBRARY_IMPL(aten, AutogradCUDA, m) {
+<pre class="code"><span class="cm">// build/.../VariableType_2.cpp(分片号会变)</span>
+TORCH_LIBRARY_IMPL(aten, AutogradCUDA, m) {
   ...
   m.impl("add.Tensor", TORCH_FN(VariableType::add_Tensor));
   ...
 }</pre>
 
-<p>kernel 体是 codegen 出来的,典型骨架:</p>
+<p>跳过去,进入 <code>VariableType::add_Tensor</code>。</p>
+
+<h3 id="sec5-5">5.5 AutogradCUDA kernel:建图与 redispatch</h3>
+
+<p><code>VariableType::add_Tensor</code> 的函数体是 codegen 出来的(根据 <code>derivatives.yaml</code> 里 <code>add.Tensor</code> 那条反向公式 + 标准模板)。简化骨架:</p>
 
 <pre class="code">at::Tensor VariableType::add_Tensor(
     c10::DispatchKeySet ks,
     const at::Tensor&amp; self, const at::Tensor&amp; other, const at::Scalar&amp; alpha) {
-  <span class="cm">// === 1) 若任何输入 requires_grad,准备一个新的 grad_fn 节点 ===</span>
+
+  <span class="cm">// === 步骤 1)若任何输入 requires_grad,准备一个新的 grad_fn 反向节点 ===</span>
   std::shared_ptr&lt;AddBackward0&gt; grad_fn;
   if (compute_requires_grad(self, other)) {
     grad_fn = std::shared_ptr&lt;AddBackward0&gt;(new AddBackward0(), deleteNode);
-    grad_fn-&gt;set_next_edges(collect_next_edges(self, other));
-    grad_fn-&gt;alpha = alpha;
+    grad_fn-&gt;set_next_edges(collect_next_edges(self, other));   <span class="cm">// 反向边</span>
+    grad_fn-&gt;alpha = alpha;                                      <span class="cm">// 存反向公式要用的</span>
     grad_fn-&gt;other_scalar_type = other.scalar_type();
     grad_fn-&gt;self_scalar_type  = self.scalar_type();
   }
 
-  <span class="cm">// === 2) 把"AutogradCUDA + ADInplaceOrView"从位图剔掉,redispatch ===</span>
+  <span class="cm">// === 步骤 2)把"AutogradCUDA + ADInplaceOrView"从位图剔掉,redispatch ===</span>
   auto _tmp = ([&amp;]() {
-    at::AutoDispatchBelowADInplaceOrView guard;
+    at::AutoDispatchBelowADInplaceOrView guard;     <span class="cm">// RAII:进 guard = TLS exclude 加 autograd + ADInplaceOrView</span>
     return at::redispatch::add(
-        ks &amp; c10::after_autograd_keyset,    <span class="cm">// 留下 CUDA 等更低位</span>
+        ks &amp; c10::after_autograd_keyset,             <span class="cm">// 显式 mask 当前层及以上</span>
         self, other, alpha);
   })();
   auto result = std::move(_tmp);
 
-  <span class="cm">// === 3) 把新算出的 result 挂到 grad_fn,加进 history ===</span>
+  <span class="cm">// === 步骤 3)把新算出的 result 挂到 grad_fn,加进 autograd 历史 ===</span>
   if (grad_fn) {
-    set_history(flatten_tensor_args(result), grad_fn);
+    set_history(flatten_tensor_args(result), grad_fn);   <span class="cm">// result.grad_fn = grad_fn</span>
   }
   return result;
 }</pre>
 
-<p>三步:<strong>建节点 → 排除自己 + redispatch 到下一层 → 把输出绑到节点</strong>。<code>AddBackward0</code> 是 codegen 出来的 <code>Node</code> 子类,定义在 <code>torch/csrc/autograd/generated/Functions.h</code>,5.8 节会看 <code>apply()</code> 体。</p>
+<p>逐行解读:</p>
 
-<h3 id="sec5-6">5.6 redispatch 到 CUDA backend</h3>
+<ol>
+  <li><strong><code>compute_requires_grad(self, other)</code></strong>:看任何一个输入张量是不是 require grad、且不在 <code>torch.no_grad()</code> 上下文里。我们的场景两个输入都 require grad → true。</li>
+  <li><strong>建 <code>AddBackward0</code> 节点</strong>:这是 codegen 生成的 <code>Node</code> 子类(5.8 节看它的 <code>apply()</code>)。<code>set_next_edges</code> 把 <code>self.grad_fn</code> 和 <code>other.grad_fn</code> 设为 <code>AddBackward0</code> 的<strong>下游边</strong> —— 反向时梯度按这两条边传出去。<code>alpha</code>、<code>self_scalar_type</code>、<code>other_scalar_type</code> 是反向公式里要用的"上下文",保存到节点里。</li>
+  <li><strong><code>at::AutoDispatchBelowADInplaceOrView guard;</code></strong>:RAII 对象,构造时<strong>修改 TLS</strong> —— 把所有 autograd functionality 位 + <code>ADInplaceOrView</code> 位 push 进 exclude 集合。从这一行到 guard 析构,所有 dispatcher 调用都不会再走 autograd 层。</li>
+  <li><strong><code>at::redispatch::add(ks &amp; c10::after_autograd_keyset, ...)</code></strong>:<code>at::redispatch::add</code> 是另一份 codegen 生成的入口(在 <code>RedispatchFunctions.h</code>),它和 <code>at::add</code> 区别只在于多带一个 <code>DispatchKeySet</code> 参数透传给 <code>Dispatcher::redispatch</code>。<code>after_autograd_keyset</code> 是预先编译好的常量掩码,作用是"清掉所有 autograd 及以上的位"。这等于<strong>显式告诉 dispatcher:接下来跳 backend</strong>。</li>
+  <li><strong><code>set_history(result, grad_fn)</code></strong>:把刚算出的 <code>result</code> 张量的 <code>.grad_fn</code> 字段设为我们建的 <code>AddBackward0</code> 节点。这样 <code>result.backward()</code> 时,autograd engine 找得到这个节点。</li>
+</ol>
 
-<p><code>at::redispatch::add</code> 在 <code>RedispatchFunctions.h</code>(codegen),做的事和 <code>at::add</code> 几乎一样,只是多带一个 <code>DispatchKeySet</code> 参数透传给 <code>Dispatcher::redispatch</code>。这次位图里 <code>AutogradCUDA</code> 已经清掉,<code>highestPriorityTypeId</code> 返回 <code>CUDA</code>。</p>
+<div class="callout">
+<strong>这一节最关键的概念</strong>:autograd kernel <strong>不做任何数值计算</strong>。它只做三件事:① 准备反向节点;② 把控制权交给 backend kernel(借助 guard + redispatch);③ 把结果挂到反向图。所有<strong>数值算术</strong>由下游的 CUDA kernel 完成。这种"包装层"模式让 autograd 完全和具体 backend 解耦 —— 同一个 autograd wrapper 适用于 CPU、CUDA、MPS 等所有 backend。
+</div>
 
-<p>CUDA 槽位上注册的 kernel 在 <code>build/.../RegisterCUDA.cpp</code>:</p>
+<h3 id="sec5-6">5.6 CUDA 后端 wrapper</h3>
+
+<p><code>at::redispatch::add</code> 把控制权交给 <code>Dispatcher::redispatch</code>。这次位图里 <code>AutogradCUDA</code> 已经清掉(被 <code>guard</code> 和 <code>after_autograd_keyset</code> 双重保险),<code>highestPriorityTypeId()</code> 返回 <code>CUDA</code>。</p>
+
+<p>CUDA 槽位的 kernel 注册在 <code>build/.../RegisterCUDA.cpp</code>:</p>
 
 <pre class="code">TORCH_LIBRARY_IMPL(aten, CUDA, m) {
   ...
@@ -1629,81 +1685,152 @@ return kernel.template call&lt;Return, Args...&gt;(op, dispatchKeySet, ...);</pr
   ...
 }</pre>
 
-<p><code>wrapper_CUDA_add_Tensor</code> 是 functional → out 的转发(因为 yaml 里 <code>structured_delegate: add.out</code>):</p>
+<p>跳到 <code>wrapper_CUDA_add_Tensor</code>(注意:还<strong>不是</strong>真正算数值的 CUDA kernel,只是 functional → out 的转发,因为 yaml 里 <code>structured_delegate: add.out</code>):</p>
 
 <pre class="code">at::Tensor wrapper_CUDA_add_Tensor(
     const at::Tensor&amp; self, const at::Tensor&amp; other, const at::Scalar&amp; alpha) {
-  <span class="cm">// 1) 分配输出</span>
+  <span class="cm">// 1) 分配一个新的输出张量(在 CUDA 上,common dtype 自动 promote)</span>
   auto common_dtype = at::native::result_type(self, other);
   auto out = at::detail::empty_cuda({0}, common_dtype, self.device());
-  <span class="cm">// 2) 转给 out 变体</span>
+  <span class="cm">// 2) 转给 out 变体真正算</span>
   return wrapper_CUDA_add_out_out(self, other, alpha, out);
 }</pre>
 
-<h3 id="sec5-7">5.7 structured kernel + ufunc</h3>
+<p>所以 <code>add.Tensor</code>(functional)的实现 = "分配 out + 调 <code>add.out</code>"。这是 <code>structured_delegate: add.out</code> 在 codegen 端的具体落地 —— 三种变体共享同一份数学,只有内存分配策略不同。</p>
 
-<p><code>wrapper_CUDA_add_out_out</code> 实例化 structured kernel base(继承 <code>TensorIteratorBase</code>):</p>
+<div class="example">
+<span class="label">小例 5.6 — 对比 in-place 变体的实现</span>
+对 <code>add_.Tensor</code>(in-place),codegen 会生成类似的 wrapper,但<strong>不分配新 out</strong>,而是把 <code>self</code> 当成 out 传给 <code>add.out</code>:
+<pre class="code">at::Tensor&amp; wrapper_CUDA_add__Tensor(
+    at::Tensor&amp; self, const at::Tensor&amp; other, const at::Scalar&amp; alpha) {
+  return wrapper_CUDA_add_out_out(self, other, alpha, self);   <span class="cm">// self 当 out</span>
+}</pre>
+三种变体三套 wrapper,但<strong>真正算数值的只有 <code>add.out</code> 这一份 impl</strong>。这是 structured kernel 的核心收益。
+</div>
+
+<h3 id="sec5-7">5.7 Structured kernel 与 ufunc</h3>
+
+<p><code>wrapper_CUDA_add_out_out</code> 是真正"开始算"的地方。它的体也是 codegen 生成的:</p>
 
 <pre class="code">at::Tensor&amp; wrapper_CUDA_add_out_out(
     const at::Tensor&amp; self, const at::Tensor&amp; other, const at::Scalar&amp; alpha,
     at::Tensor&amp; out) {
-  structured_add_out_out op(out);
-  op.meta(self, other, alpha);   <span class="cm">// 算输出 shape/dtype, 设 TensorIterator</span>
-  op.impl(self, other, alpha, op.maybe_get_output(0));   <span class="cm">// 真的算</span>
+  structured_add_out_out op(out);            <span class="cm">// 实例化 structured kernel 类</span>
+  op.meta(self, other, alpha);               <span class="cm">// 阶段 1: meta —— 算输出 shape/dtype,设 TensorIterator</span>
+  op.impl(self, other, alpha, op.maybe_get_output(0));   <span class="cm">// 阶段 2: impl —— 真的算</span>
   return out;
 }</pre>
 
-<p><code>impl</code> 体由 <code>UfuncCUDA_add.cu</code> 生成 —— ufunc 模板的标准形态:</p>
+<p><strong>structured kernel 把"算法"拆成两个标准化阶段</strong>:</p>
 
-<pre class="code"><span class="cm">// build/.../UfuncCUDA_add.cu (示意)</span>
+<ol>
+  <li><strong><code>meta()</code></strong>:广播 shape、确定 dtype、初始化 <code>TensorIterator</code>。调用方提供输出 tensor(可能是空的或已分配的),meta 根据输入决定输出该是什么形状,必要时 resize。</li>
+  <li><strong><code>impl()</code></strong>:数值计算。读 <code>TensorIterator</code> 拿到逐元素迭代器,跑实际的算法。</li>
+</ol>
+
+<p><code>structured_add_out_out::impl</code> 的体由 <code>UfuncCUDA_add.cu</code> 生成(这就是 4.2 节"structured + ufunc"产物):</p>
+
+<pre class="code"><span class="cm">// build/.../UfuncCUDA_add.cu (简化)</span>
 void structured_add_out_out::impl(
     const Tensor&amp; self, const Tensor&amp; other, const Scalar&amp; alpha, const Tensor&amp; out) {
   AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4(
-      kBFloat16, kHalf, kComplexHalf, kBool,
-      iter.common_dtype(), "add_cuda",
-      [&amp;] {
+      kBFloat16, kHalf, kComplexHalf, kBool,                      <span class="cm">// 支持的 dtype 集合</span>
+      iter.common_dtype(), "add_cuda",                            <span class="cm">// 当前 dtype + 标签</span>
+      [&amp;] {                                                      <span class="cm">// per-dtype 实例化的 lambda</span>
         scalar_t alpha_val = alpha.to&lt;scalar_t&gt;();
         gpu_kernel(iter, [alpha_val] GPU_LAMBDA (scalar_t a, scalar_t b) -&gt; scalar_t {
-          return at::native::ufunc::add(a, b, alpha_val);
+          return at::native::ufunc::add(a, b, alpha_val);         <span class="cm">// 真的数学</span>
         });
       });
 }</pre>
 
-<p><code>AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4</code>(<code>aten/src/ATen/Dispatch.h</code>) 展开成一个 <code>switch (scalar_type)</code>,对每个 dtype 实例化 lambda;<code>gpu_kernel</code> 接 <code>TensorIterator</code> + lambda,展开成 <code>vectorized_elementwise_kernel&lt;...&gt;&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(...)</code>(<code>aten/src/ATen/native/cuda/CUDALoops.cuh</code>)。</p>
+<p>这里有<strong>两层 dispatch</strong>:</p>
 
-<p>真正的标量数学只有一行,在 <a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/ufunc/add.h"><code>ATen/native/ufunc/add.h</code></a>:</p>
+<ol>
+  <li><strong><code>AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4</code></strong>:这是<strong>编译期 dispatch</strong>(<code>aten/src/ATen/Dispatch.h</code>),按 <code>iter.common_dtype()</code> 展开成 <code>switch (scalar_type)</code>,对每个 dtype(<code>float</code>、<code>double</code>、<code>int8</code>、<code>kHalf</code> 等)实例化 lambda 一次。<strong>这一层不进 dispatcher 表</strong> —— dtype 不是 DispatchKey,它只是 C++ 模板参数。</li>
+  <li><strong><code>gpu_kernel(iter, lambda)</code></strong>:这是<strong>启动 CUDA kernel</strong>(<code>aten/src/ATen/native/cuda/CUDALoops.cuh</code>)。它接 <code>TensorIterator</code>(描述逐元素遍历计划)+ 用户 lambda,展开成 <code>vectorized_elementwise_kernel&lt;...&gt;&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(...)</code>。每个 CUDA 线程跑用户 lambda 一次。</li>
+</ol>
 
-<pre class="code">template &lt;typename T&gt;
+<p>那"用户 lambda"做什么?调 <strong><code>at::native::ufunc::add</code></strong>。这是真正的数学函数,定义在 <a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/ufunc/add.h"><code>ATen/native/ufunc/add.h</code></a>,<strong>只有四行</strong>:</p>
+
+<pre class="code"><span class="cm">// aten/src/ATen/native/ufunc/add.h</span>
+template &lt;typename T&gt;
 C10_HOST_DEVICE C10_ALWAYS_INLINE T add(T self, T other, T alpha) {
   return self + alpha * other;
 }</pre>
 
-<p>所以 <strong>CPU 和 CUDA 共享同一个 <code>ufunc::add</code> 标量函数</strong>,只是各自的循环 wrapper 不同(CPU 是 SIMD 矢量化的 <code>vectorized_loop2d</code>,CUDA 是 launch 的 kernel)。</p>
+<div class="callout">
+<strong>沿调用栈所有这么多代码层,真正的"算 add"就是这一行 <code>self + alpha * other</code></strong>。其他所有层都是为了"让这一行能在<strong>正确的 dtype、正确的 backend、记好反向、可叠加 autocast/vmap 等模式</strong>下被正确调用"。这就是 PyTorch 工程量的本质。
+</div>
 
-<h3 id="sec5-8">5.8 backward:AddBackward0</h3>
+<div class="example">
+<span class="label">小例 5.7 — 为什么 CPU 和 CUDA 共享同一个 <code>ufunc::add</code></span>
+<code>ufunc/add.h</code> 用 <code>C10_HOST_DEVICE</code> 注解,这是 PyTorch 包装 CUDA <code>__host__ __device__</code> 的宏,告诉 nvcc:"这个函数同时编译成 CPU 版和 GPU 版"。<br><br>
+CPU 端的 <code>UfuncCPU_add.cpp</code> 也 include 这同一个 <code>ufunc/add.h</code>,然后用 SIMD 矢量化的 <code>vectorized_loop2d</code> 而不是 <code>gpu_kernel</code> 来调它。<strong>数学定义只写一次,CPU/CUDA 用同一份。</strong> 加一个新后端(比如 MPS)只需要写新的"循环驱动"(怎么跑 lambda),数学函数不动。
+</div>
 
-<p>反向阶段:用户调 <code>z.sum().backward()</code>,autograd engine(<code>torch/csrc/autograd/engine.cpp</code>)从 loss 拓扑排序整张图,对每个 <code>Node</code> 调 <code>apply(grads)</code>。<code>AddBackward0::apply</code>(codegen 出在 <code>generated/Functions.cpp</code>)体大致是:</p>
+<p>到这里,前向计算完成。控制权层层返回:CUDA kernel 返回 → <code>impl</code> 返回 → <code>wrapper_CUDA_add_out_out</code> 返回 <code>out</code> → <code>wrapper_CUDA_add_Tensor</code> 返回 → <code>Dispatcher::redispatch</code> 返回 → <code>at::redispatch::add</code> 返回到 <code>VariableType::add_Tensor</code>。然后:</p>
+
+<ol>
+  <li><code>guard</code> 析构,TLS exclude 还原(后续顶层调用又干净了)。</li>
+  <li><code>set_history(result, grad_fn)</code> 把反向节点挂到结果。</li>
+  <li>返回到顶层 <code>Dispatcher::call</code>,再返回到 <code>at::_ops::add_Tensor::call</code>,再返回到 <code>at::add</code>,再返回到 <code>THPVariable_add</code>,再包装成 Python <code>torch.Tensor</code> 返回给用户。</li>
+</ol>
+
+<p>前向<strong>结束</strong>。<code>z</code> 拿到手,它的 <code>.grad_fn</code> 是 <code>AddBackward0</code>。</p>
+
+<h3 id="sec5-8">5.8 反向:<code>AddBackward0::apply</code></h3>
+
+<p>用户接着调 <code>z.sum().backward()</code>。<code>backward()</code> 触发 autograd engine(<a href="https://github.com/pytorch/pytorch/blob/main/torch/csrc/autograd/engine.cpp"><code>torch/csrc/autograd/engine.cpp</code></a>):</p>
+
+<ol>
+  <li>从 loss(<code>z.sum()</code> 那个标量)的 <code>.grad_fn</code> 开始,拓扑排序<strong>整张反向图</strong>。</li>
+  <li>逆拓扑序遍历,对每个 <code>Node</code> 调它的 <code>apply(grads)</code> 方法。</li>
+  <li><code>apply</code> 返回的梯度通过 <code>next_edges</code> 传给上游节点继续累加。</li>
+</ol>
+
+<p>对我们的 <code>AddBackward0::apply</code>,codegen 生成的代码(在 <code>build/.../generated/Functions.cpp</code>)长这样:</p>
 
 <pre class="code">variable_list AddBackward0::apply(variable_list&amp;&amp; grads) {
-  auto&amp; grad = grads[0];
-  variable_list grad_inputs(2);
-  if (should_compute_output(0)) {
+  auto&amp; grad = grads[0];                                          <span class="cm">// 上游传下来的 dz</span>
+  variable_list grad_inputs(2);                                    <span class="cm">// 两个输入,两个梯度</span>
+
+  if (should_compute_output(0)) {                                  <span class="cm">// self 需要梯度?</span>
     grad_inputs[0] = handle_r_to_c(self_scalar_type, grad);
+    <span class="cm">// 翻译自 derivatives.yaml:  self: handle_r_to_c(self.scalar_type(), grad)</span>
   }
-  if (should_compute_output(1)) {
-    grad_inputs[1] = handle_r_to_c(other_scalar_type, maybe_multiply(grad, alpha.conj()));
+
+  if (should_compute_output(1)) {                                  <span class="cm">// other 需要梯度?</span>
+    grad_inputs[1] = handle_r_to_c(other_scalar_type,
+                                   maybe_multiply(grad, alpha.conj()));
+    <span class="cm">// 翻译自 derivatives.yaml:  other: handle_r_to_c(other.scalar_type(),
+    //                                     maybe_multiply(grad, alpha.conj()))</span>
   }
+
   return grad_inputs;
 }</pre>
 
-<p>对照 <code>derivatives.yaml</code>:</p>
+<p>对照 5.1 节抄的反向公式:</p>
 
 <pre class="code">self:  handle_r_to_c(self.scalar_type(),  grad)
 other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))</pre>
 
-<p>一字不差地翻译。返回的 <code>grad_inputs</code> 通过 <code>next_edges</code> 继续传递给上游节点。<code>maybe_multiply</code> 是个小优化:<code>alpha == 1</code> 时直接返回 <code>grad</code>,跳过乘法。</p>
+<p><strong>这是一字不差的翻译。</strong>codegen 把 yaml 里的表达式直接转成 C++ 代码 —— 这就是为什么 PyTorch 团队让"反向公式 DSL"是受限的:它必须能机械地翻成 C++。</p>
 
-<h3 id="sec5-9">5.9 调用栈全图</h3>
+<p>注意几个细节:</p>
+
+<ul>
+  <li><strong><code>should_compute_output(i)</code></strong>:autograd engine 知道<strong>哪些</strong>叶子张量真的 require grad。如果 <code>other</code> 是个常量(不 require grad),那 <code>grad_inputs[1]</code> 根本不算 —— 性能优化。</li>
+  <li><strong><code>maybe_multiply(grad, alpha.conj())</code></strong>:<code>maybe_multiply</code> 是个小优化:<code>alpha == 1</code> 时直接返回 <code>grad</code>,跳过浮点乘法。这是 codegen 自动加的"啄木鸟"。</li>
+  <li><strong><code>handle_r_to_c</code></strong>:处理"实数 tensor → 复数 grad"的边界情况(数值实部投影),实数运算下基本是 no-op。</li>
+  <li><strong>没有 <code>at::redispatch</code></strong>:反向公式里的子运算(像 <code>maybe_multiply</code> 内部的 <code>at::mul</code>)直接走<strong>顶层 <code>at::*</code> API</strong> —— 它们自己会走完整 dispatcher,获得"在 CUDA 上跑、记到反向图"的能力。这意味着<strong>反向自动支持高阶导</strong>:对 <code>AddBackward0::apply</code> 求二阶导,内部的 <code>at::mul</code> 又会建一个 <code>MulBackward0</code>。</li>
+</ul>
+
+<p>返回 <code>grad_inputs</code> 后,engine 把它们沿 <code>next_edges</code> 传给上游(<code>x.grad_fn</code> 和 <code>y.grad_fn</code>,如果有的话)。如果 <code>x</code>、<code>y</code> 是 leaf tensor(没有 <code>grad_fn</code>),梯度直接累加到 <code>x.grad</code>、<code>y.grad</code>。反向结束。</p>
+
+<h3 id="sec5-9">5.9 完整调用栈一图概览</h3>
+
+<p>把 5.1-5.8 串起来,这张图是这一切的"上帝视角"。左侧前向(蓝→橙→红→绿),右侧反向(红):</p>
 
 <div style="overflow-x:auto; margin:1em 0;">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
