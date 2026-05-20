@@ -713,6 +713,288 @@ void ConcretePyInterpreterVTable::dispatch(
 ③ <strong><code>ExcludeDispatchKeyGuard</code> 防递归</strong>。Python 函数体内调的 op 都自动跳过 <code>Python</code> kernel,直接落到 backend —— 实现"我处理完了,你继续"的递归语义。
 </div>
 
+<h2 id="sec3">3. TorchDispatchMode 的 Python 协议</h2>
+
+<p>第 2 章告诉了我们 C++ 怎么"过桥"到 Python。本章看桥的<strong>另一端</strong>:Python 用户/框架代码怎么写一个 mode 或 subclass 接住这次调用、怎么用约定俗成的协议告诉 dispatcher "我处理完了,你继续走" 或 "我拦截这次调用,返回这个结果"。读完应该能自己写一个简单的 <code>TorchDispatchMode</code> 子类完成任意拦截逻辑。</p>
+
+<h3 id="sec3-1">3.1 类与 with 块</h3>
+
+<p><code>TorchDispatchMode</code> 基类定义在 <a href="https://github.com/pytorch/pytorch/blob/main/torch/utils/_python_dispatch.py"><code>torch/utils/_python_dispatch.py</code></a> 第 72 行附近。简化:</p>
+
+<pre class="code"><span class="cm"># torch/utils/_python_dispatch.py</span>
+class TorchDispatchMode:
+    """A ``TorchDispatchMode`` allows you to override the meaning of all
+    ``__torch_dispatch__`` overridable functions within a dynamic scope ...
+    Independent subclasses of TorchDispatchMode are compositional: modes can
+    be pushed onto a stack using ``with MyMode():``. When you call functions
+    in the PyTorch API inside your ``__torch_dispatch__`` implementation,
+    by default, they will forward on to the next mode on the mode stack."""
+
+    supports_higher_order_operators = False
+
+    def __init__(self, _dispatch_key=None):
+        if _dispatch_key is not None:
+            self.__dict__["_dispatch_key"] = _dispatch_key   <span class="cm"># e.g. PreDispatch</span>
+        self.old_dispatch_mode_flags: deque[bool] = deque()
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        raise NotImplementedError                            <span class="cm"># 子类必须实现</span>
+
+    def __enter__(self):
+        global _is_in_torch_dispatch_mode
+        self._lazy_init_old_dispatch_mode_flags()
+        self.old_dispatch_mode_flags.append(_is_in_torch_dispatch_mode)
+        _is_in_torch_dispatch_mode = True
+        _push_mode(self)                                     <span class="cm"># ★ 把自己 push 到 TLS 模式栈</span>
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        mb_dk_or_mode_key = self.__dict__.get("_dispatch_key", None) \
+                            or self.__dict__.get("_mode_key", None)
+        global _is_in_torch_dispatch_mode
+        _is_in_torch_dispatch_mode = self.old_dispatch_mode_flags.pop()
+        _pop_mode(mb_dk_or_mode_key)                          <span class="cm"># ★ pop</span></pre>
+
+<p>关键看 <code>__enter__</code> 和 <code>__exit__</code>:</p>
+
+<ul>
+  <li><code>__enter__</code> 调 <code>_push_mode(self)</code>,这是 Python ↔ C++ 桥的核心。它通过 CPython 绑定调到 <code>c10::impl::TorchDispatchModeTLS::push(mode)</code> —— mode 进入 C++ 的<strong>线程局部模式栈</strong>。同时它会调 <code>c10::impl::tls_set_dispatch_key_included(DispatchKey::Python, true)</code> 把 <code>Python</code> 位塞进 TLS include 集合。下一次 dispatcher 算位图,<code>Python</code> 位就会是 1。</li>
+  <li><code>__exit__</code> 反向 pop —— 模式离开 C++ 栈,如果栈空,<code>Python</code> 位从 TLS include 移除。</li>
+</ul>
+
+<p>所以一个 <code>with MyMode():</code> 语句的实际效果链:</p>
+
+<pre class="code">Python:  with MyMode():
+            <span class="cm"># 内部 __enter__ → _push_mode(mode)</span>
+C++:     TorchDispatchModeTLS::push(mode_pyobj)
+            <span class="cm"># mode 进 C++ 栈,Python key 进 TLS include</span>
+Python:    <span class="cm"># 用户代码 ...</span>
+            z = x + y   <span class="cm"># aten::add 触发 dispatcher</span>
+C++:        Dispatcher::call(aten::add)
+              <span class="cm"># 算位图:tensor key_set 没 Python 位,但 TLS include 有!</span>
+              <span class="cm"># 最终位图 = {Python, AutogradCUDA, CUDA}</span>
+              <span class="cm"># 最高位 = Python → pythonFallback</span>
+            pythonFallback(...)
+              <span class="cm"># mode_stack_len &gt; 0 → 走 mode 路径</span>
+              <span class="cm"># 调 mode.pyinterpreter->dispatch(...)</span>
+Python:       mode.__torch_dispatch__(func=aten.add.Tensor, types=(Tensor,Tensor), args=(x,y))
+              <span class="cm"># 用户的拦截逻辑 ...</span>
+              return func(*args, **kwargs)   <span class="cm"># "我啥都没做,你继续走"</span>
+C++:          <span class="cm"># 嵌套 dispatcher::call,exclude 集合现在已加 after_Python_keyset
+              # → Python 位被剔除,最高位变 AutogradCUDA</span>
+              ...一路下到 CUDA kernel,算完返回 z
+Python:    <span class="cm"># 拿到 z</span>
+         __exit__ → _pop_mode()
+C++:     TorchDispatchModeTLS::pop()         <span class="cm"># Python 位移出 TLS include</span></pre>
+
+<h3 id="sec3-2"><code>__torch_dispatch__</code> 签名</h3>
+
+<p>子类必须实现的 <code>__torch_dispatch__</code> 方法签名是固定的:</p>
+
+<pre class="code">def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+    <span class="cm"># 你的拦截逻辑</span>
+    ...</pre>
+
+<p>四个参数的含义:</p>
+
+<table>
+<thead><tr><th>参数</th><th>类型</th><th>含义 / 用法</th></tr></thead>
+<tbody>
+<tr><td><code>func</code></td><td><code>OpOverload</code></td><td>当前被调度的算子重载,例如 <code>torch.ops.aten.add.Tensor</code>。你可以拿它的 <code>_schema</code> 看签名;也可以直接调 <code>func(args)</code> 继续 dispatch。<strong>等价于 §2.6 第 ② 步那个 <code>torch_api_function_overload</code></strong>。</td></tr>
+<tr><td><code>types</code></td><td><code>tuple[type, ...]</code></td><td>所有输入中"带 Python key 的 subclass 类型"的元组。例如输入有 <code>FakeTensor</code> 和 <code>DTensor</code>,<code>types</code> 就是 <code>(FakeTensor, DTensor)</code>。Mode 一般不用;subclass 用它判断"我该处理还是 <code>return NotImplemented</code> 让下一个 subclass 处理"。</td></tr>
+<tr><td><code>args</code></td><td><code>tuple</code></td><td>位置参数,<strong>已经从 IValue 转成 Python 对象</strong>。Tensor 参数是 Python <code>torch.Tensor</code>(从 pyobj_slot 取的对应包装)。</td></tr>
+<tr><td><code>kwargs</code></td><td><code>dict</code> 或 <code>None</code></td><td>关键字参数。<strong>注意默认 None 而不是 {}</strong> —— 是 Python 通用习惯避免 mutable default。</td></tr>
+</tbody>
+</table>
+
+<h4>返回值的三种语义</h4>
+
+<p><code>__torch_dispatch__</code> 的返回值不是简单的"函数返回",而是<strong>有三种特殊语义</strong>:</p>
+
+<table>
+<thead><tr><th>返回</th><th>语义</th><th>触发什么</th></tr></thead>
+<tbody>
+<tr><td><code>func(*args, **kwargs)</code></td><td>"我啥都不做,让 dispatcher 继续往下走"</td><td>触发 §2.5 的 redispatch — Python 位被 exclude,最高位变 Autograd 或 backend,正常算</td></tr>
+<tr><td>任意其它值(<code>Tensor</code> / <code>tuple</code> / 字典等)</td><td>"我处理完了,这就是答案"</td><td>这个值<strong>替换</strong>真实计算结果,返回给上游</td></tr>
+<tr><td><code>NotImplemented</code>(单例)</td><td>"我不会处理这个,让下一个 mode/subclass 来"</td><td>分派到栈中下一个 mode 或 MRO 下一个 subclass</td></tr>
+</tbody>
+</table>
+
+<div class="example">
+<span class="label">小例 3.2 — 写一个 LoggingMode</span>
+最简单的 mode:打印每个 op,不改变行为。
+<pre class="code">import torch
+from torch.utils._python_dispatch import TorchDispatchMode
+
+class LoggingMode(TorchDispatchMode):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        <span class="cm"># 打印 op 名字 + 输入形状</span>
+        shapes = [a.shape if isinstance(a, torch.Tensor) else type(a).__name__ for a in args]
+        print(f"{func} : {shapes}")
+        <span class="cm"># return func(*args) 让 dispatcher 继续 → 真正算 op</span>
+        return func(*args, **kwargs)
+
+with LoggingMode():
+    x = torch.randn(3, 4)
+    y = torch.randn(3, 4)
+    z = (x + y).relu()
+<span class="cm"># 输出:
+# aten.randn.default : [Size([3,4]), ...]    ← torch.randn 也是 op
+# aten.randn.default : [Size([3,4]), ...]
+# aten.add.Tensor : [Size([3, 4]), Size([3, 4])]
+# aten.relu.default : [Size([3, 4])]</span></pre>
+不到 10 行就实现了一个完整的"算子拦截器"。注意 <code>torch.randn</code> 也被拦了 —— mode 看的是 dispatcher 层的<strong>每一次 ATen op 调用</strong>,不光是用户写的那些。
+</div>
+
+<h3 id="sec3-3">3.3 mode stack vs subclass:两条路径</h3>
+
+<p>2.4 节我们看到 <code>pythonFallback</code> 有两条路径(mode stack 优先,subclass 兜底)。本节解释这两条路径在 Python 端如何对应不同的写法,以及为什么有这种区分。</p>
+
+<h4>(A) Mode 路径:全局拦截</h4>
+
+<p>就是 3.1-3.2 节那种写法:继承 <code>TorchDispatchMode</code>,用 <code>with</code> 块激活。<strong>特点</strong>:</p>
+
+<ul>
+  <li><strong>全局生效</strong>:进了 <code>with</code> 块后,<strong>任意</strong> op 调用都过它的 <code>__torch_dispatch__</code> —— 包括<strong>factory ops</strong>(<code>torch.empty</code>、<code>torch.arange</code> 这些没 tensor 输入的)。这是 <code>FakeTensorMode</code> 能拦截 <code>torch.empty</code> 的原因 —— 普通 tensor subclass 做不到,因为 factory op 输入里没 tensor。</li>
+  <li>由 TLS include 触发 <code>Python</code> key,作用范围是<strong>整个 <code>with</code> 块的动态作用域</strong>(包括它内部调用的任何函数)。</li>
+  <li>同时多个 mode 时构成<strong>LIFO 栈</strong>,栈顶优先。</li>
+</ul>
+
+<h4>(B) Subclass 路径:只在某些张量参与时拦截</h4>
+
+<p>定义一个 <code>torch.Tensor</code> 的子类,在它的 <code>__torch_dispatch__</code> classmethod 里写拦截逻辑:</p>
+
+<pre class="code">class MyTensor(torch.Tensor):
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        <span class="cm"># 拦截逻辑 ...</span>
+        return func(*args, **kwargs)</pre>
+
+<p><strong>特点</strong>:</p>
+
+<ul>
+  <li><strong>只在 <code>MyTensor</code> 实例参与某次 op 调用时触发</strong>。普通 <code>torch.Tensor</code> 之间的 op 跟它无关。</li>
+  <li><strong>构造 <code>MyTensor</code> 时,内部要把 <code>DispatchKey::Python</code> 设进 <code>TensorImpl::key_set_</code></strong>(通过 <code>torch._C._set_python_dispatcher</code> 或 <code>torch.Tensor.__new_full__</code> 等内部 API)。否则 <code>pythonFallback</code> 的"tensors_with_python_key_present" 检查会返回 false,直接 redispatch 跳过 subclass。</li>
+  <li>看不到 factory op(没 tensor 输入,subclass 无从插入)。要拦截 factory op,需要 mode 路径。</li>
+</ul>
+
+<div class="aside">
+<span class="label">边栏 3.3 — 为什么需要两条路径</span>
+设计上,mode 和 subclass 处理不同的关切:<br><br>
+<strong>Subclass</strong> 表示"<em>这个张量自己</em>有特殊语义"。例如 <code>FakeTensor</code> 实例代表"虚假数据";它参与 op 时该 op 自然应该走 fake 逻辑。这种"语义跟着数据走"的需求,subclass 是自然表达。<br><br>
+<strong>Mode</strong> 表示"<em>这一整段代码</em>有特殊语义"。例如 <code>with FakeTensorMode():</code> 进去后,所有 op 都走 fake —— 包括 factory op(它创建 fake 张量)。这种"语义跟着代码作用域走"的需求,只能用 mode。<br><br>
+实战中两者经常配合:<code>FakeTensorMode</code> 创建出来的张量本身也是 <code>FakeTensor</code> subclass,所以即使你跳出 <code>with</code> 块后这些张量还在,后续 op 调用仍能识别它们 —— mode 创建,subclass 保留。
+</div>
+
+<h4>(C) 同时存在时的优先级</h4>
+
+<p>2.4 节看到 <code>pythonFallback</code> <strong>先</strong>查 mode stack,<strong>再</strong>查 subclass:</p>
+
+<pre class="code">if mode_stack_len &gt; 0 {
+    cur_mode-&gt;pyinterpreter()-&gt;dispatch(...);
+    return;
+}
+<span class="cm">// 没 mode,才考虑 subclass</span>
+if interpreter &amp;&amp; tensors_with_python_key_present {
+    (*interpreter)-&gt;dispatch(...);
+}</pre>
+
+<p>即:<strong>mode 永远赢</strong>。<code>with FakeTensorMode():</code> 里的代码即使输入是 <code>DTensor</code>,先经过 FakeTensorMode 处理。</p>
+
+<p>但 <code>__torch_dispatch__</code> 内部可以选择 "我把控制权让给 subclass":在 mode 的 <code>__torch_dispatch__</code> 里检查 <code>types</code>,如果含其它 subclass,可以调它们的 classmethod 或 <code>return func(*args)</code> 让 dispatcher 继续(会落到 subclass 的拦截)。</p>
+
+<h3 id="sec3-4">3.4 "<code>return func(*args)</code>" 是怎么递归的</h3>
+
+<p>这一行是 <code>__torch_dispatch__</code> 里出现频率最高的代码,但它的语义不平凡:它<strong>不是普通的函数调用</strong>,而是<strong>触发了一次嵌套的 dispatcher</strong>。让我们慢动作看一遍:</p>
+
+<pre class="code">def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+    kwargs = kwargs or {}
+    <span class="cm"># 可能做一些拦截逻辑 ...</span>
+    return func(*args, **kwargs)         <span class="cm"># ← 这一行</span></pre>
+
+<p><code>func</code> 是 <code>OpOverload</code>(例如 <code>torch.ops.aten.add.Tensor</code>)。调它<strong>不是普通 Python 函数调用</strong> —— <code>OpOverload.__call__</code> 内部走的是 <code>torch._C._dispatch_call_*</code>,等价于在 C++ 里调 <code>at::add(...)</code>,进入<strong>顶层 <code>Dispatcher::call</code></strong>。</p>
+
+<p>嵌套调用算位图时:</p>
+
+<ul>
+  <li>Tensor 参数 <code>args[0]</code>、<code>args[1]</code> 的 <code>key_set_</code>: 假设是 <code>{AutogradCUDA, CUDA}</code>。</li>
+  <li>TLS include:仍含 <code>Python</code>(我们还在 <code>with Mode():</code> 块里)。</li>
+  <li>TLS exclude:<strong>★ 关键</strong>—— 当前还在 <code>pythonFallback</code> 的 <code>ExcludeDispatchKeyGuard</code> 生命周期内,所以 exclude 含 <code>after_Python_keyset</code>(Python 及以下)。</li>
+  <li>位图 = <code>(key_set ∪ include) − exclude</code> = <code>{AutogradCUDA, CUDA} − {Python, Autograd*, CUDA, ...}</code>。</li>
+</ul>
+
+<p>等下,exclude 含了 <code>AutogradCUDA</code> 和 <code>CUDA</code>?那位图不就空了?</p>
+
+<p><strong>这里有个微妙的地方</strong>:<code>after_Python_keyset</code> exclude 的是<strong>所有 functionality 位 ≤ Python</strong>。但运行时 key (像 <code>AutogradCUDA</code>)是由 <strong>functionality bit + backend bit 组合</strong>而成。Backend bit 不在 exclude 里。所以 exclude 完后,<code>AutogradFunctionality</code> 位被清掉,但 <code>CUDABit</code> 还在。dispatcher 重新组合位图,最高位变成 <code>AutogradFunctionality</code> ... 等等,它被 exclude 了 ...</p>
+
+<p>实际上看代码,<code>after_Python_keyset</code> 只 exclude <strong>"Python 及更低优先级的 functionality"</strong>。<strong>Autograd 的 functionality 位排在 Python 上面</strong>(优先级更高,bit 编号更大),所以 Autograd 位<strong>不</strong>在 exclude 集合里。</p>
+
+<p>所以位图实际是:<code>(原始)− (Python 及以下功能位) = {AutogradFunctionality, CUDABit}</code> 还在。最高 functionality 位是 <code>AutogradFunctionality</code>,组合 CUDABit 得到运行时 key <code>AutogradCUDA</code> —— 跳到 Autograd 包装,然后该走的链一路下到 CUDA kernel。<strong>正确</strong>。</p>
+
+<div class="callout warn">
+<strong>容易踩的认知陷阱</strong>:我第一次看时也以为 <code>after_Python_keyset</code> 包含 Autograd,从而每次 <code>return func(*args)</code> 都跳到 backend、绕过 Autograd。实际上不是。<strong>Autograd 在 Python 之上</strong>(更高优先级);<code>after_Python_keyset</code> 只 mask Python 及以下;<code>func(*args)</code> 会正常进 Autograd 包装,该建反向图就建。<br><br>
+这意味着<strong>所有在 mode 内部触发的 op 仍然是 differentiable 的</strong>。<code>FakeTensorMode</code> 内调 <code>matmul</code>,反向图仍然记 <code>MmBackward0</code>。这是设计的一致性。
+</div>
+
+<h3 id="sec3-5">3.5 vs <code>__torch_function__</code>:拦截位置的差别</h3>
+
+<p>PyTorch 还有一个更早的协议叫 <code>__torch_function__</code>。两者名字相似容易混,但<strong>拦截位置完全不同</strong>:</p>
+
+<table>
+<thead><tr><th></th><th><code>__torch_function__</code></th><th><code>__torch_dispatch__</code></th></tr></thead>
+<tbody>
+<tr><td><strong>拦截位置</strong></td><td><strong>用户 Python API 层</strong>(<code>torch.add</code> 进入 C++ 前)</td><td><strong>Dispatcher 内部</strong>(<code>Python</code> key 这一层)</td></tr>
+<tr><td><strong>看得到 autograd 反向产生的 op?</strong></td><td>看不到</td><td>能看到</td></tr>
+<tr><td><strong>看得到 decomposition 出来的子 op?</strong></td><td>看不到</td><td>能看到</td></tr>
+<tr><td><strong>看得到 ATen 算子内部调的子 op?</strong></td><td>看不到</td><td>能看到</td></tr>
+<tr><td><strong>看得到 factory op?</strong></td><td>能看到</td><td>能看到(走 BackendSelect → ... → Python)</td></tr>
+<tr><td><strong>典型用户</strong></td><td>NumPy-style 子类(早期 <code>__torch_function__</code> 设计目标)</td><td>FakeTensor、make_fx、DTensor、AOTAutograd</td></tr>
+<tr><td><strong>性能开销</strong></td><td>较低(在 Python 层做一次类型检查)</td><td>较高(每个 op 都过桥 5-15µs)</td></tr>
+</tbody>
+</table>
+
+<p>引用 Chillee 等人 2022 年 dev-discuss 那篇 "What and Why of <code>__torch_dispatch__</code>" 里一句话:</p>
+
+<div class="callout">
+"<em><code>__torch_function__</code> merely allows you to modify what happens in Python, but if you want control over everything that's happening in PyTorch? You need to use <code>__torch_dispatch__</code>.</em>"
+</div>
+
+<p>简而言之:<code>__torch_function__</code> 是"用户调 <code>torch.*</code> API 时的钩子",<code>__torch_dispatch__</code> 是"PyTorch 真的<strong>跑</strong>这个 op 时的钩子"。前者在<strong>表面</strong>,后者在<strong>底层</strong>。</p>
+
+<div class="example">
+<span class="label">小例 3.5 — 同一个调用,两个钩子看到不同</span>
+<pre class="code">class TF:                                  <span class="cm"># torch_function 实现</span>
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        print(f"TF: {func.__name__}")
+        return func(*args, **kwargs)
+
+class TD(TorchDispatchMode):               <span class="cm"># torch_dispatch 实现</span>
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        print(f"TD: {func}")
+        return func(*args, **kwargs)
+
+x = torch.tensor([1.0, 2.0], requires_grad=True)
+
+<span class="cm"># 同时激活两个</span>
+import torch.overrides
+with torch.overrides.push_torch_function_mode(TF), TD():
+    z = torch.softmax(x, dim=0)            <span class="cm"># 用户调 softmax</span>
+    z.sum().backward()
+<span class="cm">
+TF: softmax                                  ← __torch_function__ 看到的:torch.softmax
+TD: aten.softmax.default                     ← __torch_dispatch__ 看到的:底层 op
+TD: aten.softmax.int                         ← 还有 overload 解析
+TD: aten.detach.default                      ← autograd 内部调的
+TD: aten.expand.default                      ← softmax 的反向公式分解出来的
+TD: aten.mul.Tensor                          ← ...
+TD: aten.sum.dim_IntList                     ← ...
+TD: ...(还有十几个 backward 调的子 op)
+</span></pre>
+<code>__torch_function__</code> 看到<strong>1 次</strong> "<code>torch.softmax</code>"。<code>__torch_dispatch__</code> 看到<strong>十几次</strong> ATen op,包括反向过程内调的所有子 op。<strong>这就是为什么 graph capture 必须用 <code>__torch_dispatch__</code></strong> —— 否则反向图根本看不见。
+</div>
+
 </main>
 </div>
 </body>
