@@ -703,83 +703,150 @@ Tensor VariableType::add_Tensor(
 <strong>记住这条心智模型</strong>:dispatcher 不是"一次跳转",而是"每次跳转都有可能触发下一次跳转 —— 由 kernel 决定要不要 redispatch"。模式装饰器、autograd、backend 形成一条由 redispatch 显式驱动的链。链的顺序由 functionality 在 64 位位图里的 bit 编号决定;每一层用 RAII guard 把自己擦掉,让下一层自然成为新的最高位。
 </div>
 
-<h2 id="sec2">2. Schema:op 的"类型签名"</h2>
+<h2 id="sec2">2. Schema:算子的类型签名</h2>
 
-<h3 id="sec2-1">2.1 字符串语法</h3>
+<p>第 1 章给出了 dispatcher 的运行期机制 —— 但 dispatcher 怎么知道"<code>aten::add.Tensor</code>"这个算子接受什么参数?返回什么?哪些参数会被改写?这些问题的答案叫做 <strong>schema</strong>。</p>
 
-<p>一个 op 的"类型签名"以一行 schema 字符串描述,比如:</p>
+<p>Schema 是算子的<strong>接口契约</strong>。它不光是给文档看的字符串 —— 它被 dispatcher、autograd、JIT、functionalization、Python 绑定层<strong>同时读取</strong>,每个组件都从中提取自己关心的信息:dispatcher 从中知道有几个张量参数(决定 keyset);autograd 从中知道哪些参数会被改写(决定 view 处理);Python 绑定层从中生成参数解析代码。所以 schema 写错一个字 —— 比如把 <code>Tensor(a!)</code> 写成 <code>Tensor(a)</code> —— 不是文档错误,而是<strong>正确性错误</strong>:functionalization 会以为这个参数没被改写,生成错的图。</p>
+
+<p>本章拆开 schema 的字符串文法、变体命名规则、以及它在 yaml 中的实际落地形式。</p>
+
+<h3 id="sec2-1">2.1 一个 schema 的逐字解读</h3>
+
+<p>看一个真实的 schema 字符串:</p>
 
 <pre class="code">aten::add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -&gt; Tensor</pre>
 
-<p>各部分拆解:</p>
+<p>看起来像个 Python 函数签名,但每一处标点都有<strong>独立的语义</strong>。我们从左到右一字一句拆:</p>
 
 <table>
 <thead>
-<tr><th>片段</th><th>含义</th></tr>
+<tr><th>位置</th><th>片段</th><th>语义</th></tr>
 </thead>
 <tbody>
-<tr><td><code>aten</code></td><td>命名空间(自定义 op 在自己的 namespace 下,如 <code>myops</code>)</td></tr>
-<tr><td><code>add</code></td><td>op 名</td></tr>
-<tr><td><code>.Tensor</code></td><td>overload 名(区分 <code>add.Tensor</code> vs <code>add.Scalar</code>),可省 = <code>""</code></td></tr>
-<tr><td><code>Tensor self, Tensor other</code></td><td>positional 参数</td></tr>
-<tr><td><code>*</code></td><td>分隔符,之后的都是 kw-only</td></tr>
-<tr><td><code>Scalar alpha=1</code></td><td>带默认值的 kw 参数</td></tr>
-<tr><td><code>-&gt; Tensor</code></td><td>返回值</td></tr>
+<tr><td>1</td><td><code>aten</code></td><td><strong>命名空间。</strong>PyTorch 内置算子都在 <code>aten</code> 下;自定义算子(扩展)在自己命名空间下,比如 <code>myops::foo</code>。命名空间隔离了"哪些 op 能被找到",也决定了用哪个 <code>TORCH_LIBRARY*</code> 宏注册(见 3 章)。</td></tr>
+<tr><td>2</td><td><code>::</code></td><td>命名空间分隔符,跟 C++ 一样。</td></tr>
+<tr><td>3</td><td><code>add</code></td><td><strong>op 名。</strong>同一个 op 名下可以有多个 overload(像 C++ 的函数重载)。</td></tr>
+<tr><td>4</td><td><code>.Tensor</code></td><td><strong>overload 名。</strong>这是关键 —— <code>add</code> 有 <code>add.Tensor</code>(两个张量相加)和 <code>add.Scalar</code>(张量加标量)两个 overload。可省略,等于 overload 名为 <code>""</code>(空串)。dispatcher 把"<code>aten::add.Tensor</code>"作为完整 key 来索引函数表。</td></tr>
+<tr><td>5</td><td><code>(...)</code></td><td>参数列表。</td></tr>
+<tr><td>6</td><td><code>Tensor self</code></td><td><strong>第一个 positional 参数</strong>,类型 <code>Tensor</code>,名字 <code>self</code>。约定:类似"Python 方法"中的 self —— autograd 会把它当成"主"输入。</td></tr>
+<tr><td>7</td><td><code>Tensor other</code></td><td>第二个 positional 参数,类型 <code>Tensor</code>。</td></tr>
+<tr><td>8</td><td><code>*</code></td><td><strong>关键词分隔符。</strong>从这里开始,后面的参数<strong>必须用关键字传</strong>(<code>add(x, y, alpha=2)</code>),不能位置传。和 Python 函数定义里的 <code>*</code> 完全一样。</td></tr>
+<tr><td>9</td><td><code>Scalar alpha=1</code></td><td>关键词参数,类型 <code>Scalar</code>,默认值 <code>1</code>。Python 里写 <code>torch.add(x, y, alpha=3)</code> 时,这个值落到这。</td></tr>
+<tr><td>10</td><td><code>-&gt; Tensor</code></td><td><strong>返回值类型。</strong>多个返回值用 tuple 写,比如 <code>-&gt; (Tensor, Tensor)</code>。</td></tr>
 </tbody>
 </table>
 
-<p>类型语法覆盖:<code>Tensor</code>、<code>Tensor?</code>(可空)、<code>Tensor[]</code>(list)、<code>Tensor(a)</code>(alias 标记)、<code>Tensor(a!)</code>(可变 alias)、<code>Scalar</code>、<code>int</code>、<code>int[]</code>、<code>SymInt</code>、<code>bool</code>、<code>str</code>、<code>Device</code>、<code>ScalarType</code>、<code>Layout</code>、<code>MemoryFormat</code>、<code>Generator?</code> 等。</p>
+<p>类型语法覆盖一系列原语和复合类型:</p>
 
-<p><strong>alias 注解最关键</strong>:</p>
+<table>
+<thead><tr><th>类型</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td><code>Tensor</code></td><td>张量(强制非空)</td></tr>
+<tr><td><code>Tensor?</code></td><td>可空张量(对应 C++ <code>std::optional&lt;Tensor&gt;</code>)</td></tr>
+<tr><td><code>Tensor[]</code></td><td>张量列表(<code>std::vector&lt;Tensor&gt;</code>)</td></tr>
+<tr><td><code>Tensor(a)</code></td><td><strong>alias 标记</strong>:此参数和某个名为 <code>a</code> 的"内存位"共享存储,但<strong>不写它</strong>(只读 view)</td></tr>
+<tr><td><code>Tensor(a!)</code></td><td><strong>可变 alias 标记</strong>:共享存储<strong>且会改写</strong>(in-place / out)</td></tr>
+<tr><td><code>Scalar</code></td><td>标量(任意数值类型)</td></tr>
+<tr><td><code>int</code> / <code>int[]</code></td><td>整数 / 整数列表(C++ <code>int64_t</code> / <code>IntArrayRef</code>)</td></tr>
+<tr><td><code>SymInt</code></td><td>"符号整数",支持动态 shape 编译(<code>torch.compile</code> 用)</td></tr>
+<tr><td><code>bool</code>, <code>str</code></td><td>布尔、字符串</td></tr>
+<tr><td><code>Device</code>, <code>ScalarType</code>, <code>Layout</code>, <code>MemoryFormat</code></td><td>张量属性,通常出现在 factory function 里</td></tr>
+<tr><td><code>Generator?</code></td><td>随机数发生器,通常用在 dropout / randn / multinomial 上</td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+<strong>记住这一句</strong>:alias 注解(<code>(a)</code> 和 <code>(a!)</code>)是 schema 里最重要的标记。它们告诉<strong>多个</strong>下游组件不同的事:
+<br>• functionalization 用它决定"这个 op 是否产生副作用,要不要展开成函数式形式"
+<br>• autograd 用它决定"这个 op 是否产生 view,要不要建 DifferentiableViewMeta"
+<br>• JIT 用它做 alias analysis(两个变量会不会指向同一块内存,影响死代码消除等优化)
+<br>• inductor / functorch 都依赖这套注解
+<br><br>错写一个 <code>(a)</code> 为 <code>(a!)</code>,后果是 functionalization 把一个本来 in-place 的 op 当 functional 处理,反向图错;反过来,本来 functional 的写成 in-place,可能误报 alias 冲突。
+</div>
+
+<div class="example">
+<span class="label">小例 2.1 — alias 注解的作用</span>
+看 <code>aten::transpose</code> 的 schema:
+<pre class="code">aten::transpose.int(Tensor(a) self, int dim0, int dim1) -&gt; Tensor(a)</pre>
+<code>Tensor(a)</code> 出现在 <strong>self</strong> 和返回值上 —— 它们共享同一个名为 <code>a</code> 的"内存位"。这告诉 dispatcher 下游:转置后的张量和原张量<strong>共享存储</strong>,改其中一个的元素另一个也变。<br><br>
+对比 <code>aten::clone</code>:
+<pre class="code">aten::clone(Tensor self, *, MemoryFormat? memory_format=None) -&gt; Tensor</pre>
+返回值<strong>没有</strong> alias 标记 → 它是新分配的内存,改它不影响 <code>self</code>。
+</div>
+
+<p>注册时,这个字符串会被 <code>torch::jit::parseSchema</code> 解析进一个 <code>c10::FunctionSchema</code> 结构体,记录每个参数的名字、类型、alias 信息、默认值;然后才登记到 dispatcher 的内部 op 表里。所以"schema 字符串"是源头,<code>FunctionSchema</code> 是它的 in-memory 表示。</p>
+
+<h3 id="sec2-2">2.2 三种变体:functional / in-place / out</h3>
+
+<p>很多算子有"副作用"能力(in-place 改写、写入预分配的 out 张量)。PyTorch 给这类算子<strong>同时提供三种 schema 变体</strong>,功能等价但接口不同。看 <code>add</code> 的三个变体:</p>
+
+<table>
+<thead>
+<tr><th>变体</th><th>schema</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>functional</strong></td><td><code>add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -&gt; Tensor</code></td></tr>
+<tr><td><strong>in-place</strong></td><td><code>add_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -&gt; Tensor(a!)</code></td></tr>
+<tr><td><strong>out</strong></td><td><code>add.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -&gt; Tensor(a!)</code></td></tr>
+</tbody>
+</table>
+
+<p>命名约定:</p>
+
 <ul>
-  <li><code>Tensor(a)</code> = 与某个输入共享存储但不写它(view)</li>
-  <li><code>Tensor(a!)</code> = 与某个输入共享存储<strong>且会改写</strong>(in-place / out)</li>
+  <li><strong>functional</strong>:返回新张量。Python 里写 <code>z = x.add(y)</code>。最常用,对应 schema 的"基础形态"。</li>
+  <li><strong>in-place</strong>:op 名末尾加 <code>_</code>(下划线),<code>self</code> 加 <code>(a!)</code>,返回也是 <code>(a!)</code> 表示"返回的就是改后的 self"。Python 里写 <code>x.add_(y)</code>,等价 <code>x = x + y</code> 但不分配新内存。</li>
+  <li><strong>out</strong>:overload 加 <code>.out</code>,多一个 kw-only 的 <code>Tensor(a!) out</code>。Python 里写 <code>torch.add(x, y, out=z)</code>,把结果写进预分配的 <code>z</code>。常用于复用内存的优化场景。</li>
 </ul>
 
-<p>这两条注解被 functionalization、autograd-view 追踪、JIT alias analysis 全部读取,所以错一个字直接影响正确性。</p>
+<p>为什么要写三套?有三个原因:</p>
 
-<p>注册时这个字符串被 <code>torch::jit::parseSchema</code> 解析进 <code>c10::FunctionSchema</code> 结构,然后才登记到 dispatcher 表里。</p>
+<ol>
+  <li><strong>用户写法差异。</strong>Python 用户三种写法都要支持。如果只写 functional,<code>x.add_(y)</code> 就不存在。</li>
+  <li><strong>性能。</strong>functional 总是分配新内存,in-place 和 out 可复用,对训练阶段的内存峰值差距很大。</li>
+  <li><strong>autograd 行为。</strong>三个变体的 autograd 处理完全不同:functional 直接建 grad_fn,in-place 要先升 version counter、可能拒绝(<code>RuntimeError: a leaf Variable that requires grad...</code>),out 介于两者之间。</li>
+</ol>
 
-<h3 id="sec2-2">2.2 functional / inplace / out 三件套</h3>
+<div class="example">
+<span class="label">小例 2.2 — 三个变体怎么共用实现</span>
+虽然 schema 有三套,实际数学只写一次。底层用 <strong>structured kernel</strong> 模式:
+<pre class="code">add.out      :  写入预分配的 out tensor (核心实现)
+add.Tensor   :  分配一个新 out → 调 add.out → 返回 out
+add_.Tensor  :  把 self 当成 out → 调 add.out → 返回 self</pre>
+"分配 out + 调 out 版本"这一步是 codegen 自动生成的(看 yaml 里的 <code>structured_delegate: add.out</code>),作者只需要写 out 版本的实现。
+</div>
 
-<p>有副作用能力的 op 在 <code>native_functions.yaml</code> 里通常会出现三个变体:</p>
+<div class="aside">
+<span class="label">边栏 2.2 — autogen 关键字</span>
+某些算子作者只写 functional 一份,告诉 codegen "请按规则补齐 in-place 和 out 变体":
+<pre class="code">- func: my_op(Tensor self) -&gt; Tensor
+  autogen: my_op.out, my_op_</pre>
+codegen 看到 <code>autogen:</code> 后会自动生成 <code>my_op.out</code> 和 <code>my_op_</code> 的 schema 注册以及"out 包装 functional"的实现,作者一行实现都不用写。这对纯函数式 op(没有 in-place 复杂性)非常省力。
+</div>
 
-<table>
-<thead>
-<tr><th>变体</th><th>schema 例</th><th>命名规则</th></tr>
-</thead>
-<tbody>
-<tr><td>functional</td><td><code>add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -&gt; Tensor</code></td><td>无 trailing underscore;返回新 tensor</td></tr>
-<tr><td>in-place</td><td><code>add_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -&gt; Tensor(a!)</code></td><td>op 名末尾 <code>_</code>;<code>self</code> 标 <code>(a!)</code>;返回 <code>(a!)</code></td></tr>
-<tr><td>out</td><td><code>add.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -&gt; Tensor(a!)</code></td><td>overload 名 <code>.out</code>;kw-only <code>Tensor(a!) out</code></td></tr>
-</tbody>
-</table>
+<h3 id="sec2-3">2.3 native_functions.yaml:批量声明</h3>
 
-<p>这三个一旦写齐,torchgen 还能用 <code>autogen:</code> 给你自动补齐缺的变体。它们三个底层通常共用同一个 structured kernel —— functional 和 inplace 分别分配/复用一个 out tensor,然后 delegate 到 <code>add.out</code>。</p>
+<p>PyTorch 内置的 ~2000 个算子,它们的 schema 全部声明在一个文件里:<a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/native_functions.yaml"><code>aten/src/ATen/native/native_functions.yaml</code></a>。这是 in-tree op 的"出生证"。每个 yaml 条目除了 schema,还带了一堆元数据,告诉构建期 codegen 该生成什么:</p>
 
-<h3 id="sec2-3">2.3 native_functions.yaml 入口</h3>
-
-<p>所有 in-tree op 的"出生证"在 <a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/native_functions.yaml"><code>aten/src/ATen/native/native_functions.yaml</code></a>。<code>add</code> 的两个核心条目(第 555 / 578 行附近,版本会漂):</p>
-
-<pre class="code"><span class="cm"># native_functions.yaml — add.Tensor (functional)</span>
+<pre class="code"><span class="cm"># native_functions.yaml — add 的完整声明(简化)</span>
 - func: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -&gt; Tensor
-  device_check: NoCheck   <span class="cm"># TensorIterator</span>
-  structured_delegate: add.out
-  variants: function, method
-  dispatch:
-    SparseCPU, SparseCUDA, SparseMPS, SparseMeta: add_sparse
-    SparseCsrCPU, SparseCsrCUDA, SparseCsrMeta: add_sparse_csr
+  device_check: NoCheck             <span class="cm"># 不强制要求所有输入同设备(TensorIterator 自处理)</span>
+  structured_delegate: add.out      <span class="cm"># 转给 out 变体实现</span>
+  variants: function, method        <span class="cm"># 生成 at::add(...) 和 self.add(...)</span>
+  dispatch:                         <span class="cm"># 对于"特殊后端",指定专门的 kernel</span>
+    SparseCPU, SparseCUDA: add_sparse
+    SparseCsrCPU, SparseCsrCUDA: add_sparse_csr
     MkldnnCPU: mkldnn_add
     ZeroTensor: add_zerotensor
-    NestedTensorCPU, NestedTensorHPU, NestedTensorCUDA: NestedTensor_add_Tensor
-  tags: [core, pointwise]
+    NestedTensorCPU, NestedTensorCUDA: NestedTensor_add_Tensor
+  tags: [core, pointwise]           <span class="cm"># 给编译期 pass 用的标签</span>
 
-<span class="cm"># native_functions.yaml — add.out (structured 锚点)</span>
 - func: add.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -&gt; Tensor(a!)
   device_check: NoCheck
-  structured: True
+  structured: True                  <span class="cm"># ★ 这是 structured kernel 的锚点</span>
   structured_inherits: TensorIteratorBase
-  ufunc_inner_loop:
+  ufunc_inner_loop:                 <span class="cm"># ★ 用 elementwise 通用流水线</span>
     Generic: add (AllAndComplex, BFloat16, Half, ComplexHalf)
     ScalarOnly: add (Bool)
   dispatch:
@@ -788,36 +855,51 @@ Tensor VariableType::add_Tensor(
     MPS: add_out_mps
     MTIA: add_out_mtia
     <span class="cm"># 注意:这里没有 CPU / CUDA 条目 ——
-    #       Dense × {CPU, CUDA} 的实现完全由 ufunc_inner_loop 自动 codegen 出来</span></pre>
+    #       Dense × {CPU, CUDA} 的实现完全由 ufunc_inner_loop 自动 codegen 出来,
+    #       数学函数本身只需要在 ATen/native/ufunc/add.h 里写一份。</span></pre>
 
-<p>关键字段:</p>
+<p>关键字段逐个解释(后面章节会用):</p>
 
-<ul>
-  <li><code>variants: function, method</code>:同时生成 <code>at::add(self, other)</code> 和 <code>self.add(other)</code> 两套绑定。</li>
-  <li><code>structured: True</code>:声明这是一个 <strong>structured kernel</strong> —— 它有标准 <code>meta()</code> 阶段(算输出 shape/dtype)和 <code>impl()</code> 阶段(算数值),框架自动处理输出分配和广播。</li>
-  <li><code>structured_delegate: add.out</code>:functional 变体本身不写实现,直接转给 out 变体(由 codegen 生成分配输出 + 调用 out)。</li>
-  <li><code>ufunc_inner_loop</code>:声明可以走通用 elementwise 流水线(<code>TensorIterator</code> + 模板化的 GPU/CPU 循环),只需在 <code>ATen/native/ufunc/add.h</code> 里给一个 <code>scalar_t</code>-模板化的标量函数。</li>
-  <li><code>dispatch</code>:把<strong>非 Dense × {CPU, CUDA} 之外</strong>的特殊后端实现单独列出。</li>
-  <li><code>tags</code>:供编译期 pass 识别(<code>pointwise</code>、<code>core</code>、<code>nondeterministic_seeded</code> ...)。</li>
-</ul>
+<table>
+<thead><tr><th>字段</th><th>作用</th><th>示例值</th></tr></thead>
+<tbody>
+<tr><td><code>func</code></td><td>schema 字符串(本节 2.1 的语法)</td><td><code>add.Tensor(...)  -&gt; Tensor</code></td></tr>
+<tr><td><code>variants</code></td><td>codegen 生成哪些绑定形态</td><td><code>function, method</code>(生成 <code>at::add(x,y)</code> 和 <code>x.add(y)</code>)</td></tr>
+<tr><td><code>structured: True</code></td><td>声明这是 structured kernel(标准化的 meta + impl 两阶段实现)。仅出现在 <code>.out</code> 变体上</td><td>True / False</td></tr>
+<tr><td><code>structured_delegate</code></td><td>把本变体的实现委托给另一个 structured 变体。出现在 functional / inplace 上</td><td><code>add.out</code></td></tr>
+<tr><td><code>structured_inherits</code></td><td>structured kernel 继承自哪个基类(决定输出分配和广播行为)</td><td><code>TensorIteratorBase</code></td></tr>
+<tr><td><code>ufunc_inner_loop</code></td><td>声明走通用 elementwise 流水线 —— 只需要在头文件给一个 <code>scalar_t</code> 模板的数学函数,CPU 和 CUDA loop 都自动生成</td><td>见上</td></tr>
+<tr><td><code>dispatch</code></td><td>给特定后端注册不同的实现函数。<strong>不写 CPU/CUDA</strong> 意味着 ufunc 自动 codegen</td><td><code>SparseCUDA: add_sparse_cuda</code></td></tr>
+<tr><td><code>tags</code></td><td>给编译期 pass 用的标记,例如 <code>pointwise</code>(可以融合)、<code>nondeterministic_seeded</code>(给 RNG 检测用)</td><td><code>[core, pointwise]</code></td></tr>
+<tr><td><code>device_check</code></td><td>是否在调用现场检查所有张量同设备。<code>NoCheck</code> 适合 TensorIterator 类 op(它自己处理跨设备的"meta 算子"情况)</td><td><code>NoCheck</code> / <code>ExactSame</code></td></tr>
+<tr><td><code>autogen</code></td><td>请 codegen 自动补齐这些变体(见 2.2 边栏)</td><td><code>my_op.out, my_op_</code></td></tr>
+</tbody>
+</table>
 
-<p>非 structured 的简单 op 例子(<code>relu</code>,第 5228 行附近):</p>
+<p>对比一个<strong>非 structured</strong> 的简单 op —— <code>relu</code>:</p>
 
-<pre class="code">- func: relu(Tensor self) -&gt; Tensor
+<pre class="code"><span class="cm"># native_functions.yaml — relu (非 structured,直接 dispatch)</span>
+- func: relu(Tensor self) -&gt; Tensor
   device_check: NoCheck
   variants: function, method
   dispatch:
-    CPU, CUDA: relu       <span class="cm"># 直接指向 at::native::relu 的两个 overload</span>
+    CPU, CUDA: relu                 <span class="cm"># 同一个函数名,绑到两个后端</span>
     MPS: relu_mps
     MkldnnCPU: mkldnn_relu
     QuantizedCPU: relu_quantized_cpu
   tags: [core, pointwise]</pre>
 
-<p>这里 <code>dispatch: CPU, CUDA: relu</code> 把同一个名字 <code>at::native::relu</code> 同时绑到 <code>(Dense, CPU)</code> 和 <code>(Dense, CUDA)</code>。具体实现可能是同一个文件里的两个 overload(<code>aten/src/ATen/native/Activation.cpp</code> 和 <code>aten/src/ATen/native/cuda/Activation.cu</code>),靠 link 时按 device 决定。</p>
+<p>这里 <code>dispatch: CPU, CUDA: relu</code> 把同一个名字 <code>at::native::relu</code> 同时绑到 <code>(Dense, CPU)</code> 和 <code>(Dense, CUDA)</code>。具体实现是两个文件里的两个 overload(<code>aten/src/ATen/native/Activation.cpp</code> 给 CPU,<code>aten/src/ATen/native/cuda/Activation.cu</code> 给 CUDA),靠 link 时按 device 决定。这种<strong>非 structured</strong> 写法适合简单算子;但失去了 ufunc 自动生成的便利。</p>
 
-<h3 id="sec2-4">2.4 derivatives.yaml 反向公式</h3>
+<div class="aside">
+<span class="label">边栏 2.3 — 为什么有 structured 这一层</span>
+PyTorch 早年(2018 之前)每个算子的 functional / inplace / out 三套实现都得作者手写,大量代码长这样:<code>add</code> 的 functional 分配输出 → 调 add_kernel;<code>add_</code> 把 self 当输出 → 调 add_kernel;<code>add_out</code> 检查 out shape → 调 add_kernel。这种重复代码每个算子要写 3 遍,每次 add 一个新算子都要写 ~100 行胶水。<br><br>
+2020 后引入的 <strong>structured kernel</strong> 模式标准化了这套胶水:作者只在 <code>.out</code> 变体上写实际数学(<code>impl()</code>),meta 阶段(算输出 shape/dtype)写在 <code>meta()</code>。codegen 自动生成 functional 和 inplace 变体作为 out 的包装。新算子只需要 ~10 行 yaml + 一份 impl,代码量降到原来的 1/5。
+</div>
 
-<p>autograd 不在 native_functions.yaml 里写。每个 differentiable op 在 <a href="https://github.com/pytorch/pytorch/blob/main/tools/autograd/derivatives.yaml"><code>tools/autograd/derivatives.yaml</code></a> 里给反向公式:</p>
+<h3 id="sec2-4">2.4 derivatives.yaml:反向公式</h3>
+
+<p>到目前为止 schema 只描述了"前向行为"。<strong>反向(autograd)信息在另一个文件里</strong>:<a href="https://github.com/pytorch/pytorch/blob/main/tools/autograd/derivatives.yaml"><code>tools/autograd/derivatives.yaml</code></a>。每个 differentiable op 在这里给一段反向公式:</p>
 
 <pre class="code">- name: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -&gt; Tensor
   self:  handle_r_to_c(self.scalar_type(),  grad)
@@ -828,7 +910,44 @@ Tensor VariableType::add_Tensor(
   self: threshold_backward(grad, result, 0)
   result: auto_element_wise</pre>
 
-<p>这些行被 codegen 读进 <code>AddBackward0</code> / <code>ReluBackward0</code> 这种 <code>Node</code> 子类的 <code>apply()</code> 方法体里。下游 5.8 节会看实际生成的代码长啥样。</p>
+<p>逐字解读:</p>
+
+<ul>
+  <li><code>name:</code> 必须和 <code>native_functions.yaml</code> 里的 schema 完全一致 —— 这是匹配两边的"主键"。</li>
+  <li><code>self:</code>、<code>other:</code> 是<strong>输入参数名</strong>,值是一段表达式,描述"如果这个输入要算梯度,梯度 = 什么"。例如 <code>add</code> 的 <code>other</code> 输入梯度 = <code>grad * alpha.conj()</code>(用 <code>maybe_multiply</code> 包了一层,<code>alpha == 1</code> 时跳过乘法优化)。<code>grad</code> 是个魔法变量,代表"这次 backward 传入的上游梯度"。</li>
+  <li><code>result:</code> 是<strong>前向模式(jvp / tangent)</strong>的公式,用于 <code>torch.func.jvp</code>。<code>self_t</code>、<code>other_t</code> 也是魔法变量,代表"输入 self 的切向量"。如果不需要支持 jvp,这一行可以省。</li>
+  <li><code>auto_element_wise</code> 是个特殊标记,告诉 codegen "这是个 elementwise op,jvp 公式按规则自动推导"。</li>
+</ul>
+
+<p>这些公式不是 Python,而是 codegen 用的<strong>受限 DSL</strong> —— 它支持调用其他 <code>at::*</code> op(如 <code>threshold_backward</code>)、访问输入的属性(如 <code>self.scalar_type()</code>)、用 <code>grad</code>/<code>result</code>/<code>self_t</code> 这样的预定义变量。</p>
+
+<p>codegen 怎么用它?对每个 differentiable op,生成两个东西:</p>
+
+<ol>
+  <li>一个 <strong>autograd Node 子类</strong>(例如 <code>AddBackward0</code>、<code>ReluBackward0</code>),它的 <code>apply()</code> 方法体就是公式翻译成的 C++ 代码。</li>
+  <li>一个 <strong>autograd kernel wrapper</strong>(注册到 <code>AutogradCPU</code>/<code>AutogradCUDA</code> 等 key),在前向时建这个 Node、挂 <code>next_edges</code>、redispatch 到 backend(就是 1.7 节那段骨架代码)。</li>
+</ol>
+
+<div class="example">
+<span class="label">小例 2.4 — derivatives.yaml 与生成代码的对应</span>
+<code>derivatives.yaml</code> 里 <code>add</code> 的反向公式:
+<pre class="code">other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))</pre>
+被 codegen 翻译成 <code>AddBackward0::apply()</code> 里的:
+<pre class="code">if (should_compute_output(1)) {
+  grad_inputs[1] = handle_r_to_c(other_scalar_type,
+                                 maybe_multiply(grad, alpha.conj()));
+}</pre>
+几乎是一比一翻译(只多了"要不要算这个梯度"的判断,因为某些下游可能不需要 <code>other</code> 的梯度,跳过能省计算)。
+</div>
+
+<p>5.8 节会展开看 <code>AddBackward0::apply()</code> 的完整生成代码,以及 autograd engine 在 <code>loss.backward()</code> 时怎么调用它。</p>
+
+<div class="callout">
+<strong>本章带走的三个心智模型</strong>:<br>
+① Schema 是<strong>多方共读</strong>的契约 —— dispatcher、autograd、JIT、functionalization、Python 绑定都从同一字符串里抽不同信息。<br>
+② <code>(a!)</code> alias 注解是 schema 里"最危险"的标记 —— 写错直接影响 functionalization、autograd、alias analysis 三个正确性。<br>
+③ <code>native_functions.yaml</code> + <code>derivatives.yaml</code> 是<strong>一切 codegen 的输入源</strong>,后面所有生成的 C++ 文件(包括 dispatcher 注册、autograd wrapper、Python 绑定)都从这两个文件长出来。
+</div>
 
 <h2 id="sec3">3. C++ 注册宏全家桶</h2>
 
