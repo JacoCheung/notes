@@ -1946,25 +1946,13 @@ other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))</p
 </svg>
 </div>
 
-<h2 id="sec6">6. 调试 &amp; 探索</h2>
+<h2 id="sec6">6. 调试与验证</h2>
 
-<p>几个实用的"看清 dispatcher 在做什么"的工具:</p>
+<p>读到这里你已经在脑子里把 dispatcher 重建了一遍。本章给几个工具,让你能在自己机器上<strong>实地验证</strong>每一层的存在 —— 既能当调试手段,也能当学习手段:第一次看到 <code>TORCH_SHOW_DISPATCH_TRACE</code> 的输出会发现"原来真的走了这么多层"。</p>
 
-<table>
-<thead>
-<tr><th>工具</th><th>用途</th></tr>
-</thead>
-<tbody>
-<tr><td><code>TORCH_SHOW_DISPATCH_TRACE=1</code></td><td>环境变量,把每次 dispatch 打印到 stderr:op name + 最终命中的 key + kernel 地址。看一次 forward 就知道走了哪些 keys。</td></tr>
-<tr><td><code>torch._C._dispatch_dump("aten::add.Tensor")</code></td><td>打印某个 op 在 dispatcher 表里的所有注册条目(每个 key 对应哪个 kernel)。验证你的扩展确实被注册到了想要的 key 上。</td></tr>
-<tr><td><code>torch._C._dispatch_print_registrations_for_dispatch_key("CUDA")</code></td><td>反向 dump:某个 key 下有哪些 op 被注册。</td></tr>
-<tr><td><code>torch._dispatch.python_dispatcher</code></td><td>Python 端的 dispatcher 模拟器,可以单步走 dispatch 流程,便于教学和调试。</td></tr>
-<tr><td><code>gdb</code> 设断点</td><td>常用断点位置:<code>c10::Dispatcher::callBoxed</code> / <code>callImpl</code>、具体 kernel(如 <code>at::native::add_kernel_cuda</code>)、<code>AddBackward0::apply</code>。</td></tr>
-<tr><td><code>torch.library</code></td><td>Python 端的 op 注册 API:<code>torch.library.Library("myops", "DEF")</code> + <code>lib.define(...)</code> + <code>lib.impl(...)</code>。和 C++ 宏的语义完全等价,适合写测试 / 教学。</td></tr>
-</tbody>
-</table>
+<h3>6.1 看清 dispatch 链:<code>TORCH_SHOW_DISPATCH_TRACE</code></h3>
 
-<p>一个迅速看清 dispatch 链的小实验:</p>
+<p>设这个环境变量,PyTorch 在每次 dispatch 时往 stderr 打印一行:</p>
 
 <pre class="code">>>> import torch
 >>> import os; os.environ["TORCH_SHOW_DISPATCH_TRACE"] = "1"
@@ -1972,26 +1960,106 @@ other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))</p
 >>> y = torch.randn(3, device="cuda", requires_grad=True)
 >>> z = x + y
 [call] aten::add.Tensor -- AutogradCUDA
-[call] aten::add.Tensor -- ADInplaceOrView   <span class="cm"># 实际未做事,fallthrough/skip</span>
-[call] aten::add.Tensor -- CUDA
-[call] aten::empty.memory_format -- BackendSelect
+[call] aten::add.Tensor -- ADInplaceOrView      <span class="cm"># fallthrough,实际不做事</span>
+[call] aten::add.Tensor -- CUDA                  <span class="cm"># redispatch 后落到这里</span>
+[call] aten::empty.memory_format -- BackendSelect <span class="cm"># wrapper 分配 out 触发的</span>
 [call] aten::empty.memory_format -- CUDA
 ...</pre>
 
-<p>这条轨迹直接对应 5.4-5.7 的描述:AutogradCUDA wrapper 先跑 → redispatch 落到 CUDA wrapper → 内部分配 out tensor 触发 <code>aten::empty</code> 走 BackendSelect → 最后真 elementwise kernel。</p>
-
-<h2 id="sec7">7. 与老博文的 drift</h2>
-
-<p>读旧资料时容易踩的几个坑:</p>
-
+<p>这条轨迹直接对应第 5 章的描述:</p>
 <ul>
-  <li><strong>2019 年的 PyTorch internals 博文</strong>把 dispatch 描述为"先 device/layout 再 dtype 两轮"。今天的 dispatcher 第一轮已经是 30+ 个 functionality 的多层结构 —— device/layout 只是其中一层,dtype 完全不在 dispatcher 里(由 <code>AT_DISPATCH_*</code> 在 kernel 内部 switch)。</li>
-  <li><strong>2020 年的 dispatcher 文章</strong>还在用 <code>AutoNonVariableTypeMode</code> 这个名字,现在的代码用 <code>AutoDispatchBelowAutograd</code> 和 <code>AutoDispatchBelowADInplaceOrView</code>。老名字以 alias 保留。</li>
-  <li><strong>官方 tutorial</strong>(dispatcher 那篇)的 <code>class MyAddFunction : public torch::autograd::Function&lt;MyAddFunction&gt;</code> 例子里也还在用旧 <code>AutoNonVariableTypeMode</code> guard。</li>
-  <li><strong>BackendComponent 拆分</strong>是 2022 年才做的。任何更早的资料把 DispatchKey 当一维大枚举看,理解机制没问题,但"为什么 AutogradCUDA 不是单独枚举值,是 AutogradFunctionality + CUDABit 组出来的"这种细节不能直接套。</li>
-  <li>一些 key 名变过:<code>VariableTensorId</code> → <code>Autograd</code> / <code>AutogradCPU</code> 等;<code>DefaultBackend</code> → <code>CompositeExplicitAutograd</code>(alias 还在);<code>Autocast</code> → <code>AutocastCUDA</code>(alias 还在)。</li>
-  <li><code>m.impl_UNBOXED</code> 已删,改用 <code>m.impl(..., torch::CppFunction::makeFromBoxedFunction&lt;...&gt;())</code>。</li>
+  <li><code>AutogradCUDA</code> 那行 → 5.5 的 <code>VariableType::add_Tensor</code></li>
+  <li><code>ADInplaceOrView</code> 一行 → fallthrough,不做事</li>
+  <li><code>CUDA</code> 那行 → 5.6 的 <code>wrapper_CUDA_add_Tensor</code></li>
+  <li><code>aten::empty</code> 两行 → 5.6 里 <code>at::detail::empty_cuda</code> 触发的(分配 out tensor)。注意它走了 <code>BackendSelect</code>!因为 <code>empty</code> 是 factory function,没有 tensor 输入,backend 信息要靠 <code>BackendSelect</code> 从 <code>TensorOptions</code> 里挖出来。</li>
 </ul>
+
+<h3>6.2 看注册表:<code>torch._C._dispatch_dump</code></h3>
+
+<p>验证"某个 op 在 dispatcher 表里有哪些 kernel 注册":</p>
+
+<pre class="code">>>> torch._C._dispatch_dump("aten::add.Tensor")
+schema: aten::add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -&gt; Tensor
+CPU: registered at .../RegisterCPU.cpp
+CUDA: registered at .../RegisterCUDA.cpp
+SparseCPU: ...
+AutogradCPU: registered at .../VariableType_2.cpp
+AutogradCUDA: registered at .../VariableType_2.cpp
+...</pre>
+
+<p>反向 dump(<strong>某个 key 下有哪些 op</strong>):</p>
+
+<pre class="code">>>> torch._C._dispatch_print_registrations_for_dispatch_key("CUDA")
+aten::abs ...
+aten::add ...
+... (几百个)</pre>
+
+<p>用途:你的自定义扩展加载后,验证它<strong>真的</strong>被注册到了想要的 key 上 —— 不少 bug 是宏写错、key 名拼错、链接顺序导致没被静态初始化。</p>
+
+<h3>6.3 用 Python 单步走:<code>torch._dispatch.python_dispatcher</code></h3>
+
+<p>PyTorch 暴露了一个<strong> Python 端的 dispatcher 模拟器</strong>,可以让你单步走过 dispatcher 流程,看每一层做什么。适合教学场景或者深度调试。它和 C++ dispatcher 行为完全一致 —— 实际上很多 <code>torch.compile</code> 的实现也借用了它。</p>
+
+<h3>6.4 GDB:进 C++ 调试器</h3>
+
+<p>当 Python tracing 不够,需要进 C++ 看具体内存状态时,常用断点:</p>
+
+<table>
+<thead><tr><th>断点</th><th>看什么</th></tr></thead>
+<tbody>
+<tr><td><code>c10::Dispatcher::callBoxed</code></td><td>任何 dispatcher 调用入口</td></tr>
+<tr><td><code>c10::impl::OperatorEntry::lookup</code></td><td>查表过程:看输入位图、看返回的 kernel 函数指针</td></tr>
+<tr><td><code>at::native::ufunc::add</code></td><td>真正算数值的 host/device 函数(5.7 那一行)</td></tr>
+<tr><td><code>AddBackward0::apply</code></td><td>反向节点的入口</td></tr>
+<tr><td><code>c10::impl::tls_local_dispatch_key_set</code></td><td>看当前 TLS 状态(autocast、no_grad、guard 状态)</td></tr>
+</tbody>
+</table>
+
+<h3>6.5 用 <code>torch.library</code> 在 Python 里注册 op</h3>
+
+<p>不想编 C++?<code>torch.library</code> 提供了等价的 Python API,适合写测试或验证机制:</p>
+
+<pre class="code">import torch
+
+lib = torch.library.Library("myops", "DEF")
+lib.define("custom_relu(Tensor self) -&gt; Tensor")
+
+@torch.library.impl(lib, "custom_relu", "CPU")
+def _impl_cpu(self):
+    return self.clamp(min=0)
+
+@torch.library.impl(lib, "custom_relu", "CUDA")
+def _impl_cuda(self):
+    return self.clamp(min=0)
+
+# 用法:
+y = torch.ops.myops.custom_relu(torch.randn(3, device="cuda"))</pre>
+
+<p>语义上和第 3 章那一套 C++ 宏完全等价 —— 内部走同一个 dispatcher。区别只在于"在哪个语言里写"。<strong>开发自定义 op 时建议先用 Python 验证流程,再翻译成 C++</strong>。</p>
+
+<h2 id="sec7">7. 与历史资料的兼容性提示</h2>
+
+<p>PyTorch dispatcher 在过去几年大幅重构。几篇被广泛引用的资料(包括官方 tutorial)有<strong>已经过期的 API 名字</strong> —— 单独看老文章会困惑。这一节是兼容性表,把"老名字"和"现在的对应"列出来。</p>
+
+<table>
+<thead>
+<tr><th>看老文章时遇到</th><th>现在叫什么 / 区别</th></tr>
+</thead>
+<tbody>
+<tr><td>"先 device/layout 再 dtype 两轮 dispatch"(ezyang 2019)</td><td>今天 dispatcher 第一轮已经是 30+ 个 functionality 的多层结构,device/layout 只是其中一层。dtype 不在 dispatcher 里,由 <code>AT_DISPATCH_*</code> 在 kernel 内部 switch(5.7 节)</td></tr>
+<tr><td><code>AutoNonVariableTypeMode</code>(2020 文章常用)</td><td>等价于 <code>AutoDispatchBelowAutograd</code>。老名字以 alias 保留</td></tr>
+<tr><td>没有 BackendComponent 拆分(2022 前所有资料)</td><td>2022 重构后,<code>AutogradCUDA</code> = <code>(AutogradFunctionality, CUDABit)</code> 二维组合,不再是单独枚举值(1.4 节)</td></tr>
+<tr><td><code>VariableTensorId</code></td><td>= <code>Autograd</code>(alias)/ <code>AutogradCPU</code>/<code>AutogradCUDA</code>(具体)</td></tr>
+<tr><td><code>DefaultBackend</code></td><td>= <code>CompositeExplicitAutograd</code>(alias 名保留)</td></tr>
+<tr><td><code>Autocast</code>(无 backend 后缀)</td><td>= <code>AutocastCUDA</code>(具体)/ alias 保留</td></tr>
+<tr><td><code>m.impl_UNBOXED("name", &amp;fn)</code></td><td>已删除。等价 <code>m.impl("name", torch::CppFunction::makeFromBoxedFunction&lt;&amp;fn&gt;())</code>(3.6 节)</td></tr>
+<tr><td>官方 tutorial 的 <code>at::AutoNonVariableTypeMode g;</code></td><td>替换为 <code>at::AutoDispatchBelowADInplaceOrView guard;</code>(3.8 节那个自定义 op 例子)</td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+<strong>读老博客时的心法</strong>:概念框架(dispatcher = key-indexed function table、autograd 包 backend、redispatch 实现层间传递)<strong>没变</strong>。变的是 API 名字、key 名字、底层位图结构。如果你看到老博客的描述和本文有出入,优先信本文(以当前源码为准),把老文当历史背景读。
+</div>
 
 <h2 id="sec8">参考资料</h2>
 
