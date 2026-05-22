@@ -1,0 +1,978 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Context Parallel 全景解析:从 RingAttention 到 MagiAttention</title>
+<meta name="post:title"           content="Context Parallel 全景解析:从 RingAttention 到 MagiAttention">
+<meta name="post:title_en"        content="A Survey of Context Parallel Methods: From RingAttention to MagiAttention">
+<meta name="post:slug"            content="context-parallel">
+<meta name="post:date"            content="2026-05-22">
+<meta name="post:tags"            content="LLM, 分布式训练, 长序列, Attention">
+<meta name="post:tags_en"         content="LLM, Distributed Training, Long Context, Attention">
+<meta name="post:reading"         content="40 分钟">
+<meta name="post:reading_en"      content="40 min">
+<meta name="post:summary"         content="把长序列 LLM 训练中的 8 类 Context Parallel 方案(AllGather KV / RingAttention / Striped+Zigzag / Ulysses A2A / USP / LoongTrain Double-Ring / MagiAttention 等)放在统一通信+计算建模框架下解析:每个方案解决什么问题、什么时候失效、在 Megatron-LM/TransformerEngine 等开源代码里落在哪里,文末给一张全方法对比总表 + 选型决策树。">
+<meta name="post:summary_en"      content="A unified communication-plus-compute analysis of 8 public Context Parallel methods for long-sequence LLM training (TE AllGather, RingAttention, Striped/Zigzag, DeepSpeed Ulysses, USP, LoongTrain Double-Ring, MagiAttention, and predecessors), each grounded in its open-source implementation and kill-switch. Ends with a side-by-side summary table and a method-selection decision tree.">
+<meta name="post:series"          content="llm-training">
+<meta name="post:series_title"    content="LLM 训练系统">
+<meta name="post:series_title_en" content="LLM Training Systems">
+<meta name="post:series_order"    content="1">
+<style>
+  :root {
+    --sidebar-w: 280px;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --bg: #ffffff;
+    --panel: #f6f8fa;
+    --border: #d0d7de;
+    --accent: #0969da;
+    --accent-soft: #ddf4ff;
+    --code-bg: #f6f8fa;
+    --kw: #cf222e;
+    --cm: #6e7781;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --bg: #0d1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --accent: #58a6ff;
+      --accent-soft: #1f6feb33;
+      --code-bg: #161b22;
+      --kw: #ff7b72;
+      --cm: #8b949e;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 16px; line-height: 1.7;
+    color: var(--fg); background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+  }
+  .layout { display: flex; align-items: flex-start; min-height: 100vh; }
+  aside.toc {
+    position: sticky; top: 0; align-self: flex-start;
+    flex: 0 0 var(--sidebar-w); width: var(--sidebar-w);
+    max-height: 100vh; overflow-y: auto;
+    padding: 28px 18px 28px 28px;
+    border-right: 1px solid var(--border);
+    background: var(--panel);
+    font-size: 0.88rem;
+  }
+  aside.toc strong { display: block; margin-bottom: 10px; font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+  aside.toc ul { list-style: none; padding-left: 0; margin: 0; }
+  aside.toc li { margin: 4px 0; }
+  aside.toc li ul { padding-left: 14px; margin: 4px 0; font-size: 0.84rem; }
+  aside.toc a { color: var(--fg); text-decoration: none; }
+  aside.toc a:hover { color: var(--accent); }
+
+  main.content {
+    flex: 1; min-width: 0;
+    max-width: 920px; margin: 0 auto;
+    padding: 36px 40px 80px;
+  }
+  h1 { font-size: 1.9rem; margin: 0 0 6px; letter-spacing: -0.01em; }
+  h2 { font-size: 1.4rem; margin: 36px 0 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+  h3 { font-size: 1.15rem; margin: 24px 0 8px; }
+  h4 { font-size: 1.02rem; margin: 18px 0 6px; color: var(--muted); }
+  p { margin: 10px 0; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    font-size: 0.88em;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+  pre.code, pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    line-height: 1.55;
+  }
+  pre code { background: transparent; border: 0; padding: 0; }
+  .kw { color: var(--kw); }
+  .cm { color: var(--cm); font-style: italic; }
+
+  table { border-collapse: collapse; margin: 14px 0; font-size: 0.92rem; width: 100%; }
+  th, td { border: 1px solid var(--border); padding: 7px 10px; vertical-align: top; text-align: left; }
+  th { background: var(--panel); font-weight: 600; }
+  td code { font-size: 0.85em; }
+
+  .callout {
+    background: var(--accent-soft);
+    border-left: 3px solid var(--accent);
+    padding: 12px 14px;
+    margin: 16px 0;
+    border-radius: 4px;
+    font-size: 0.94rem;
+  }
+  .callout.warn { background: #fff4e5; border-left-color: #d18616; }
+  .aside, .example, .practice {
+    margin: 18px 0; padding: 14px 16px; border-radius: 6px; font-size: 0.93rem;
+  }
+  .aside { background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--muted); }
+  .aside .label, .example .label, .practice .label {
+    display: inline-block; font-size: 0.72rem; font-weight: 700;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 6px;
+  }
+  .example  { background: #f0f7ff; border: 1px solid #cfe2f3; border-left: 4px solid #0969da; }
+  .example .label  { color: #0969da; }
+  .practice { background: #fff9e6; border: 1px solid #f3e3a0; border-left: 4px solid #d18616; }
+  .practice .label { color: #b56500; }
+  .figure-caption { font-size: 0.85rem; color: var(--muted); text-align: center; margin: 4px 0 12px; font-style: italic; }
+  @media (prefers-color-scheme: dark) {
+    .callout.warn { background: #2d2210; }
+    .example  { background: #0d2235; border-color: #214b73; }
+    .example .label { color: #58a6ff; }
+    .practice { background: #2d2210; border-color: #6b5520; }
+    .practice .label { color: #f0c674; }
+  }
+  .small { font-size: 0.85rem; color: var(--muted); }
+  .tag { background: var(--accent-soft); color: var(--accent); border-radius: 10px; padding: 1px 8px; font-size: 0.72rem; vertical-align: middle; }
+
+  @media (max-width: 900px) {
+    .layout { flex-direction: column; }
+    aside.toc { position: static; flex: none; width: 100%; max-height: none; border-right: 0; border-bottom: 1px solid var(--border); }
+    main.content { padding: 24px 18px 60px; }
+  }
+</style>
+<script>
+  window.MathJax = { tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath:[['$$','$$'],['\\[','\\]']] }, options:{ skipHtmlTags:['script','style','pre','code'] } };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+<div class="layout">
+
+<aside class="toc" aria-label="目录">
+<div class="lang-zh">
+<strong>目录</strong>
+<ul>
+  <li><a href="#sec0">0. 为什么需要 Context Parallel</a></li>
+  <li><a href="#sec1">1. 通用建模:通信 vs 计算</a>
+    <ul>
+      <li><a href="#sec1-1">1.1 attention 的 FLOPs 与通信量</a></li>
+      <li><a href="#sec1-2">1.2 两个评估场景</a></li>
+      <li><a href="#sec1-3">1.3 通信优先级:TP &gt; CP &gt; PP &gt; DP</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec2">2. 方法一:AllGather KV</a></li>
+  <li><a href="#sec3">3. 方法二:Ring Attention (P2P)</a>
+    <ul>
+      <li><a href="#sec3-1">3.1 思路与执行流</a></li>
+      <li><a href="#sec3-2">3.2 通信-计算 overlap 边界</a></li>
+      <li><a href="#sec3-3">3.3 反向传播</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec4">4. 方法三:因果 mask 的负载均衡</a>
+    <ul>
+      <li><a href="#sec4-1">4.1 问题:三角形负载</a></li>
+      <li><a href="#sec4-2">4.2 Striped Attention</a></li>
+      <li><a href="#sec4-3">4.3 Zigzag / DualChunkSwap</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec5">5. 方法四:Ulysses (A2A)</a>
+    <ul>
+      <li><a href="#sec5-1">5.1 思路:换轴分发</a></li>
+      <li><a href="#sec5-2">5.2 通信复杂度</a></li>
+      <li><a href="#sec5-3">5.3 致命约束:cp ≤ num_kv_heads</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec6">6. 方法五:USP / LoongTrain 2D</a>
+    <ul>
+      <li><a href="#sec6-1">6.1 思路:Ulysses × Ring 二维网格</a></li>
+      <li><a href="#sec6-2">6.2 LoongTrain 的 Double-Ring</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec7">7. 方法六:MagiAttention</a>
+    <ul>
+      <li><a href="#sec7-1">7.1 Flexible Flash Attention 内核</a></li>
+      <li><a href="#sec7-2">7.2 Dispatch Solver:任意 mask 的负载均衡</a></li>
+      <li><a href="#sec7-3">7.3 GroupCast/GroupReduce:零冗余通信</a></li>
+      <li><a href="#sec7-4">7.4 Multi-Stage Overlap</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec8">8. 其它方案与变体</a></li>
+  <li><a href="#sec9">9. 横向对比:全方法总表 + 选型决策</a>
+    <ul>
+      <li><a href="#sec9-1">9.1 八大方法总表</a></li>
+      <li><a href="#sec9-2">9.2 选型决策树</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec10">参考资料</a></li>
+</ul>
+</div>
+<div class="lang-en"><strong>EN translation pending — see lang-zh</strong></div>
+</aside>
+
+<main class="content">
+<div class="lang-zh">
+
+<h1>Context Parallel 全景解析:从 RingAttention 到 MagiAttention</h1>
+
+<p class="small">本文系统整理 LLM 长序列训练中的<strong>所有主流公开 Context Parallel(CP)方案</strong>:AllGather KV(TransformerEngine 默认)、Ring Attention(P2P)、Striped/Zigzag 因果负载均衡、DeepSpeed Ulysses(A2A)、USP/yunchang、LoongTrain Double-Ring、MagiAttention,以及若干次要变体。每个方案放在统一的"通信 + 计算"建模框架下分析:它解决什么瓶颈、在哪种规模下失效、在 Megatron-LM/TransformerEngine 等开源项目里落到哪个文件哪个类。文末有一张<strong>全方法对比总表</strong>和一棵<strong>选型决策树</strong>。</p>
+
+<p class="small">所有引用均来自<strong>公开</strong>源:arXiv 论文、开源 GitHub 仓库、官方文档。本文是「LLM 训练系统」系列第 1 篇。</p>
+
+<h2 id="sec0">0. 为什么需要 Context Parallel</h2>
+
+<p>从 GPT-3 (2K context) 到 GPT-4 (128K) 到 Gemini 1.5 (1M+),LLM 的上下文窗口在 5 年里扩大了 <strong>500 倍以上</strong>。Sora、视频生成、长文档 RAG、Agent 长任务、基因序列 ...... 几乎每个新场景都在推这条曲线。但训练长 context 的模型,会撞上两堵墙:</p>
+
+<ul>
+  <li><strong>显存墙</strong> —— 激活显存按 $O(S)$ 线性增长。一个 LLaMA2-7B 在 8K context 时激活已占 ~10 GB;128K context 直接 OOM,即使开 selective recomputation 也只能勉强撑住。</li>
+  <li><strong>算力墙</strong> —— attention 的 FLOPs 按 $O(S^2)$ 增长。32K → 128K(4×) 时 attention 时间增加 16×,主导整个 step 时间。</li>
+</ul>
+
+<p>已有的并行方式都<strong>救不了</strong>:</p>
+
+<table>
+<thead><tr><th>已有并行</th><th>为什么不够</th></tr></thead>
+<tbody>
+<tr><td><strong>Data Parallel (DP)</strong></td><td>每个 rank 都要持有完整序列的激活。S 增大,每个 rank 显存照样炸。</td></tr>
+<tr><td><strong>Tensor Parallel (TP)</strong></td><td>沿 hidden 维度切分;通信(AllReduce / AllGather)发生在<strong>每一层</strong>,且必须在 critical path 上。TP &gt; 8 时通信无法 overlap,扩展性差。</td></tr>
+<tr><td><strong>Pipeline Parallel (PP)</strong></td><td>沿 layer 维度切分。仍然每个 stage 持有完整 seq 激活,显存问题不变,只是把<strong>批</strong>切小。</td></tr>
+<tr><td><strong>Expert Parallel (EP)</strong></td><td>只对 MoE 层,跟 dense attention 完全正交。</td></tr>
+</tbody>
+</table>
+
+<p><strong>Context Parallel</strong> 是这套体系里专门为长 seq 设计的<strong>第五种正交并行</strong>:把长序列在 $S$ 这一维切成 cp 块,每块给一张 GPU。模型的<strong>所有非 attention 层</strong>(LayerNorm、FFN、QKV projection)天然可以在序列方向独立计算,完全不需要通信。唯独 attention 例外 —— 因为 $\text{Attention}(Q, K, V) = \text{softmax}(QK^T/\sqrt{d})\,V$ 中,每个 query token 需要和<strong>所有</strong> key/value token 算积。一个 rank 只持有 $S/\text{cp}$ 个 token 的 KV,但每个 token 都要看到全部 K V。</p>
+
+<div class="callout">
+<strong>核心问题</strong>:Context Parallel 的所有挑战和方法变体,归根到底都是 attention 这一层在做"KV 的跨 rank 通信"这一件事 —— 用什么通信原语?多少冗余?怎么和 attention 计算 overlap?怎么处理 causal mask 带来的不均衡?上层论文五花八门,但都在回答这同一个问题。
+</div>
+
+<p>本文按这套思路展开:先建立一个能横向对比的<strong>通用建模框架</strong>(§1),然后从最朴素的 AllGather KV(§2)开始,沿"通信原语演进"主线逐步引入 Ring Attention(§3)→ 解决 causal mask 的 Striped/Zigzag(§4)→ Ulysses 的换轴(§5)→ USP/LoongTrain 的二维(§6)→ MagiAttention 的灵活 mask + 零冗余通信(§7)。最后给一张八方法总表 + 选型决策树(§9)。</p>
+
+<h2 id="sec1">1. 通用建模:通信 vs 计算</h2>
+
+<p>横向对比各 CP 方案,需要把它们放进同一组等式里。这一节建立一个简化但准确的建模框架,后面每节都会用到。</p>
+
+<h3 id="sec1-1">1.1 attention 的 FLOPs 与通信量</h3>
+
+<p>记号(全文统一):</p>
+
+<table>
+<thead><tr><th>符号</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td>$S$</td><td>序列长度(per sample)</td></tr>
+<tr><td>$H$</td><td>注意力头数(MHA 时 $H_{kv} = H$)</td></tr>
+<tr><td>$H_{kv}$</td><td>KV 头数(GQA 时 $&lt; H$)</td></tr>
+<tr><td>$d$</td><td>单头隐藏维度</td></tr>
+<tr><td>$\text{cp}$</td><td>context parallel size</td></tr>
+<tr><td>$\text{tp}$</td><td>tensor parallel size(沿 head 维切)</td></tr>
+<tr><td>$\text{flops}$</td><td>单卡实际 GPU 算力 (TFLOPS)</td></tr>
+<tr><td>$BW$</td><td>实际通信带宽 (GB/s)</td></tr>
+</tbody>
+</table>
+
+<p>一次 forward attention 的<strong>计算量</strong>(忽略 softmax / LayerNorm,只算 $QK^T$ 和 $\text{attn} \cdot V$ 两次 matmul):</p>
+
+<p>$$ V_{\text{compute}} = 4 \times \frac{H}{\text{tp}} \times S^2 \times d $$</p>
+
+<p>其中 4 = 2 个 matmul × 2 FMA ops/element。<strong>因果 mask</strong> 让大约一半 entry 不算,除以 2:</p>
+
+<p>$$ V_{\text{compute, causal}} = 2 \times \frac{H}{\text{tp}} \times S^2 \times d $$</p>
+
+<p>引入 cp 后,每张卡只算 $1/\text{cp}$ 份(理想均衡):</p>
+
+<p>$$ V_{\text{compute, per GPU}} = \frac{V_{\text{compute}}}{\text{cp}} $$</p>
+
+<p>不同 CP 方法的核心差别在<strong>通信量</strong> $V_{\text{comm}}$:它取决于通信什么(KV / Q+KV+O)、通信多少次(1 次 AG vs cp-1 次 P2P)、通信粒度(整个 KV vs 分块)。我们用 $V_{\text{comm}}^{\text{method}}$ 在各节具体推导。</p>
+
+<p>一次 attention 的<strong>总时间</strong>(假设通信和计算不重叠):</p>
+
+<p>$$ T_{\text{attn}} = \frac{V_{\text{compute, per GPU}}}{\text{flops}} + \frac{V_{\text{comm}}}{BW} $$</p>
+
+<p>能 overlap 的话取 $\max$。这是后续比较的统一基准。</p>
+
+<h3 id="sec1-2">1.2 两个评估场景</h3>
+
+<p>同样的 CP 方法,放在不同问题规模下会显示不同性质。我们需要两套场景做对比:</p>
+
+<table>
+<thead><tr><th>场景</th><th>固定什么</th><th>变化什么</th><th>评估什么</th></tr></thead>
+<tbody>
+<tr><td><strong>场景 1:强扩展</strong></td><td>$S$ 固定 + $\text{tp}$ 固定</td><td>$\text{cp}$ 增大(用更多 GPU 算同一个 seq)</td><td>能不能继续线性加速?</td></tr>
+<tr><td><strong>场景 2:弱扩展</strong></td><td>$S$ 固定 + $\text{tp} \times \text{cp}$ 固定(总 GPU 数固定)</td><td>$\text{cp}$ vs $\text{tp}$ 的权衡</td><td>给定算力,怎么分给 TP 和 CP?</td></tr>
+</tbody>
+</table>
+
+<div class="example">
+<span class="label">小例 1.2</span>
+LLaMA2-7B 的 attention 参数:$H = 32, d = 128$。一个 $S = 128\text{K}$、$\text{tp} = 8$ 的训练:<br>
+<strong>compute(causal)</strong> = $2 \times 32/8 \times (128\text{K})^2 \times 128 = 2 \times 4 \times 1.7 \times 10^{10} \times 128 \approx 1.7 \times 10^{13}$ FLOPs/sample。<br>
+一张 H100 算力 ~989 TFLOPS(BF16),efficiency 0.55 → 实际 550 TFLOPS。每张卡 ($\text{cp} = 4$): $\frac{1.7 \times 10^{13}}{4 \times 5.5 \times 10^{14}} \approx 7.7$ ms。<br><br>
+attention 单卡占了 ~ms 级别 —— 通信预算就是几个 ms。注意这数字会随 $S^2/\text{cp}$ 标度。
+</div>
+
+<h3 id="sec1-3">1.3 通信优先级:TP &gt; CP &gt; PP &gt; DP</h3>
+
+<p>一个 4D 并行场景下($DP \times PP \times CP \times TP$),不同维度的通信频次和带宽需求差别很大,所以在 GPU 网格上分配位置时,要遵循<strong>优先级</strong>:</p>
+
+<ol>
+  <li><strong>TP</strong> 通信最重(每层都有 AllReduce),必须放在<strong>节点内 NVLink/NVSwitch</strong> 上(intra-node)。</li>
+  <li><strong>CP</strong> 通信次之(每层 attention 有 KV 通信),应优先 intra-node。如 intra-node 不够再延伸到 inter-node。</li>
+  <li><strong>PP</strong> 通信小(每 micro-batch 一次 send/recv),可以跨节点。</li>
+  <li><strong>DP</strong> 通信少且可异步(only reduce gradient),最适合跨节点。</li>
+</ol>
+
+<p>对应到 DGX-H100 (8 卡 NVLink + 8 张 NDR 400G InfiniBand) 这种典型机器:</p>
+
+<ul>
+  <li>NVLink 4.0 全连接:~900 GB/s (理论),~540 GB/s (实测) 单卡聚合带宽</li>
+  <li>InfiniBand NDR 8×50 GB/s:~50 GB/s (理论),~43 GB/s (实测) per NIC</li>
+</ul>
+
+<p>intra-node vs inter-node 带宽差 <strong>10×+</strong>。这个差距决定了:CP 一旦跨出节点边界,通信代价会跳变。后面 §6 LoongTrain 的 Double-Ring、§7 MagiAttention 的 GroupCast 都是在专门解决这个跨节点的痛点。</p>
+
+<h2 id="sec2">2. 方法一:AllGather KV</h2>
+
+<p>最朴素的方案:既然每张卡只有 $S/\text{cp}$ 段 KV,但 attention 需要全部 KV ——<strong>那就先 AllGather 把 KV 拼齐,再做 local attention</strong>。这正是 TransformerEngine 的默认 CP 实现(<code>cp_comm_type="all_gather"</code>)。</p>
+
+<h3>2.1 思路与张量形状</h3>
+
+<p>每张卡持有的 KV:<code>[H, S/cp, d]</code>。AllGather 后:<code>[H, S, d]</code>。Q 不变,仍是 <code>[H, S/cp, d]</code>。然后跑标准 FlashAttention,得 <code>[H, S/cp, d]</code> 的 output。</p>
+
+<pre class="code"><span class="cm"># transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py
+# 简化自 AttnFuncWithCPAndKVAllGather (line ~2948)</span>
+<span class="kw">def</span> forward(ctx, q, k, v, cp_group, ...):
+    cp_size = get_world_size(cp_group)
+
+    <span class="cm"># Step 1: AllGather K, V 跨 cp_group</span>
+    k_ag, _ = gather_along_first_dim(k, cp_group)   <span class="cm"># [cp*S/cp, ..] -&gt; [S, ..]</span>
+    v_ag, _ = gather_along_first_dim(v, cp_group)
+
+    <span class="cm"># Step 2: 因果 mask 下做 chunk 重排(§4 zigzag)</span>
+    chunk_ids = get_seq_chunk_ids_for_reordering(cp_size, k.device, True)
+    k_ag = torch.index_select(k_ag, dim=0, index=chunk_ids)
+    v_ag = torch.index_select(v_ag, dim=0, index=chunk_ids)
+
+    <span class="cm"># Step 3: 本地 FA(每卡处理自己的 Q chunk,但 KV 全有)</span>
+    out = flash_attn_func(q, k_ag, v_ag, causal=is_causal)
+    <span class="kw">return</span> out</pre>
+
+<h3>2.2 通信量与建模</h3>
+
+<p>每张卡需要的 KV 通信量(bf16,2 bytes):</p>
+
+<p>$$ V_{\text{comm}}^{\text{AG}} = 2 \times 2 \times \frac{H_{kv}}{\text{tp}} \times S \times d $$</p>
+
+<p>这里两个 2:一个是 K + V,一个是 bf16 字节数。注意是 $\frac{H_{kv}}{\text{tp}}$,GQA 下 $H_{kv} \ll H$,通信省得很多。</p>
+
+<p>时间(忽略 reordering 开销):</p>
+
+<p>$$ T_{\text{AG}} = \frac{V_{\text{compute}}}{\text{flops} \cdot \text{cp}} + \frac{V_{\text{comm}}^{\text{AG}}}{BW_{\text{AG}}} $$</p>
+
+<p>"AllGather 算法带宽" $BW_{\text{AG}}$ 在固定 tp 时基本和 cp 无关(NCCL 的 AG 实现是 ring 类拓扑,bus BW 几乎不随 rank 数变),所以:</p>
+
+<ul>
+  <li><strong>场景 1(tp 固定,cp 增大)</strong>:$T_{\text{compute}}$ 随 cp 线性下降,$T_{\text{comm}}$ 不变(因为 $V_{\text{comm}}$ 跟 cp 无关 —— 每卡都 gather 完整的 S)。<strong>cp 大了 attention 就变成 communication-bound</strong>,继续加 GPU 性价比迅速下降。</li>
+  <li><strong>场景 2(tp × cp 固定)</strong>:cp 增大 → tp 缩小 → $\frac{H_{kv}}{\text{tp}}$ 增大 → $V_{\text{comm}}$ 增大。所以<strong>这个场景下 cp 越大 attention 反而越慢</strong>。</li>
+</ul>
+
+<h3>2.3 优点与局限</h3>
+
+<table>
+<thead><tr><th>优点 ✓</th><th>缺点 ✗</th></tr></thead>
+<tbody>
+<tr><td>实现极其简单(AllGather + 标准 FA)</td><td>整个 AG 暴露在 critical path,无 overlap</td></tr>
+<tr><td>支持<strong>任意 attention mask</strong>(sliding window、block-causal、随机 mask 全行)</td><td>每卡显存峰值 = 完整 KV,部分抵消了 CP 省显存的初衷</td></tr>
+<tr><td>GQA 友好(只 gather $H_{kv}$,不是 $H$)</td><td>大 cp 时 attention 100% 通信瓶颈</td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+<strong>什么时候选 AllGather KV?</strong>cp 小(2-4)、用 GQA、且需要 sliding-window 等非标准 mask 时。TE 源码也确认:<code>cp_comm_type ∈ {"a2a", "all_gather"}</code> 才支持 sliding-window(<code>context_parallel.py:4638</code>)。
+</div>
+
+<h2 id="sec3">3. 方法二:Ring Attention (P2P)</h2>
+
+<p>AllGather 的痛点是<strong>"通信暴露在 critical path"</strong>。Ring Attention(Li et al. 2021,Liu et al. 2023)的核心思路:<strong>把 AllGather 拆成 cp 步 P2P send/recv,每步收到一块 KV 就跟本地 Q 算一次 attention,通信和计算同步进行</strong>。</p>
+
+<h3 id="sec3-1">3.1 思路与执行流</h3>
+
+<p>每张卡持有自己的 Q chunk,$K_i$ 在 ring 上转一圈。每一步:</p>
+
+<ol>
+  <li><strong>计算</strong>:当前手上的 $(Q_{\text{local}}, K_j, V_j)$ 算 partial attention,用 online softmax 累加。</li>
+  <li><strong>通信</strong>:把当前的 $(K_j, V_j)$ 通过 P2P send 给 ring 上下一个 rank;同时 recv 上一个 rank 的 $(K_{j-1}, V_{j-1})$。</li>
+  <li><strong>循环</strong>:重复 cp 次直到每块 KV 都和本地 Q 配过一次。</li>
+</ol>
+
+<p>关键是<strong>步骤 1 和 2 并行</strong>。如果通信时间 ≤ 计算时间,通信被完全隐藏。下图示意 cp=4 的情况:</p>
+
+<div style="overflow-x:auto; margin:1em 0;">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 240" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
+  <text x="450" y="24" text-anchor="middle" font-size="13" font-weight="700">Ring Attention (cp=4) — 每张卡逐步轮换 KV chunk</text>
+
+  <!-- timeline header -->
+  <text x="50" y="58" font-size="10" fill="#666">GPU 0</text>
+  <text x="50" y="86" font-size="10" fill="#666">GPU 1</text>
+  <text x="50" y="114" font-size="10" fill="#666">GPU 2</text>
+  <text x="50" y="142" font-size="10" fill="#666">GPU 3</text>
+
+  <text x="180" y="42" text-anchor="middle" font-size="10" fill="#444">Round 0</text>
+  <text x="370" y="42" text-anchor="middle" font-size="10" fill="#444">Round 1</text>
+  <text x="560" y="42" text-anchor="middle" font-size="10" fill="#444">Round 2</text>
+  <text x="750" y="42" text-anchor="middle" font-size="10" fill="#444">Round 3</text>
+
+  <!-- GPU 0 row -->
+  <g>
+    <rect x="100" y="50" width="160" height="20" fill="#e7f0fa" stroke="#0b6cc4"/>
+    <text x="180" y="64" text-anchor="middle" font-size="10">(Q0, K0V0)</text>
+    <rect x="290" y="50" width="160" height="20" fill="#fef0d8" stroke="#b96b1a"/>
+    <text x="370" y="64" text-anchor="middle" font-size="10">(Q0, K3V3)</text>
+    <rect x="480" y="50" width="160" height="20" fill="#eaf3ec" stroke="#1f8a4d"/>
+    <text x="560" y="64" text-anchor="middle" font-size="10">(Q0, K2V2)</text>
+    <rect x="670" y="50" width="160" height="20" fill="#f3e8f5" stroke="#7a4ea0"/>
+    <text x="750" y="64" text-anchor="middle" font-size="10">(Q0, K1V1)</text>
+  </g>
+
+  <!-- GPU 1 -->
+  <g>
+    <rect x="100" y="78" width="160" height="20" fill="#fef0d8" stroke="#b96b1a"/>
+    <text x="180" y="92" text-anchor="middle" font-size="10">(Q1, K1V1)</text>
+    <rect x="290" y="78" width="160" height="20" fill="#e7f0fa" stroke="#0b6cc4"/>
+    <text x="370" y="92" text-anchor="middle" font-size="10">(Q1, K0V0)</text>
+    <rect x="480" y="78" width="160" height="20" fill="#f3e8f5" stroke="#7a4ea0"/>
+    <text x="560" y="92" text-anchor="middle" font-size="10">(Q1, K3V3)</text>
+    <rect x="670" y="78" width="160" height="20" fill="#eaf3ec" stroke="#1f8a4d"/>
+    <text x="750" y="92" text-anchor="middle" font-size="10">(Q1, K2V2)</text>
+  </g>
+
+  <!-- GPU 2 -->
+  <g>
+    <rect x="100" y="106" width="160" height="20" fill="#eaf3ec" stroke="#1f8a4d"/>
+    <text x="180" y="120" text-anchor="middle" font-size="10">(Q2, K2V2)</text>
+    <rect x="290" y="106" width="160" height="20" fill="#fef0d8" stroke="#b96b1a"/>
+    <text x="370" y="120" text-anchor="middle" font-size="10">(Q2, K1V1)</text>
+    <rect x="480" y="106" width="160" height="20" fill="#e7f0fa" stroke="#0b6cc4"/>
+    <text x="560" y="120" text-anchor="middle" font-size="10">(Q2, K0V0)</text>
+    <rect x="670" y="106" width="160" height="20" fill="#f3e8f5" stroke="#7a4ea0"/>
+    <text x="750" y="120" text-anchor="middle" font-size="10">(Q2, K3V3)</text>
+  </g>
+
+  <!-- GPU 3 -->
+  <g>
+    <rect x="100" y="134" width="160" height="20" fill="#f3e8f5" stroke="#7a4ea0"/>
+    <text x="180" y="148" text-anchor="middle" font-size="10">(Q3, K3V3)</text>
+    <rect x="290" y="134" width="160" height="20" fill="#eaf3ec" stroke="#1f8a4d"/>
+    <text x="370" y="148" text-anchor="middle" font-size="10">(Q3, K2V2)</text>
+    <rect x="480" y="134" width="160" height="20" fill="#fef0d8" stroke="#b96b1a"/>
+    <text x="560" y="148" text-anchor="middle" font-size="10">(Q3, K1V1)</text>
+    <rect x="670" y="134" width="160" height="20" fill="#e7f0fa" stroke="#0b6cc4"/>
+    <text x="750" y="148" text-anchor="middle" font-size="10">(Q3, K0V0)</text>
+  </g>
+
+  <!-- caption -->
+  <text x="450" y="190" text-anchor="middle" font-size="11" fill="#444">每张卡的本地 Q chunk(Q0/Q1/Q2/Q3)不动,KV chunk(K0/K1/K2/K3)在 ring 上轮转,共 cp 步</text>
+  <text x="450" y="208" text-anchor="middle" font-size="11" fill="#444">每步 attention + 通信并发,online softmax 累加各 partial 输出</text>
+  <text x="450" y="226" text-anchor="middle" font-size="10" fill="#666" font-style="italic">参考 Li et al. arXiv:2105.13120 + Liu et al. arXiv:2310.01889</text>
+</svg>
+</div>
+
+<p>开源参考实现:</p>
+<ul>
+  <li><strong>原始 JAX 版</strong>:<a href="https://github.com/lhao499/RingAttention">lhao499/RingAttention</a>(Liu et al. 2023)</li>
+  <li><strong>Triton/PyTorch 社区版</strong>:<a href="https://github.com/zhuzilin/ring-flash-attention">zhuzilin/ring-flash-attention</a></li>
+  <li><strong>NVIDIA TransformerEngine</strong>:<code>AttnFuncWithCPAndKVP2P</code>(<code>context_parallel.py:1362</code>),通过 <code>cp_comm_type="p2p"</code> 启用</li>
+</ul>
+
+<h3 id="sec3-2">3.2 通信-计算 overlap 边界</h3>
+
+<p>每步(per chunk)的通信量与计算量:</p>
+
+<p>$$ V_{\text{comm}}^{\text{step}} = 4 \times \frac{H_{kv}}{\text{tp}} \times \frac{S}{\text{cp}} \times d $$</p>
+<p>$$ V_{\text{compute}}^{\text{step}} = 4 \times \frac{H}{\text{tp}} \times \frac{S^2}{\text{cp}^2} \times d $$</p>
+
+<p>4 = K + V × 2 bytes(bf16);计算分 $\frac{1}{\text{cp}^2}$ 是因为 Q chunk 是 $S/\text{cp}$、KV chunk 也是 $S/\text{cp}$。</p>
+
+<p>通信能被计算<strong>完全 hide</strong> 的条件:</p>
+
+<p>$$ \frac{V_{\text{comm}}^{\text{step}}}{BW} \leq \frac{V_{\text{compute}}^{\text{step}}}{\text{flops}} \quad\Longrightarrow\quad \text{cp} \leq \frac{BW \times S}{\text{flops}} \times \frac{H}{H_{kv}} $$</p>
+
+<p>这就是<strong>"通信-计算重叠边界"</strong> $\text{cp}_{\text{bor}}$。$\text{cp} \leq \text{cp}_{\text{bor}}$ 时通信被隐藏 → attention 时间 ≈ 计算时间 ≈ $V_{\text{compute}} / \text{flops}$,与 cp 成<strong>反比</strong>。$\text{cp} &gt; \text{cp}_{\text{bor}}$ 时通信暴露 → attention 时间反过来<strong>正比</strong>于 cp(因为还得跑 cp 步,每步通信暴露)。</p>
+
+<div class="example">
+<span class="label">小例 3.2</span>
+DGX-H100 + IB:实际 NVLink 带宽 540 GB/s,实际 IB 带宽 43 GB/s(单 NIC),H100 BF16 实际算力 550 TFLOPS。$S = 128\text{K}$,MHA(无 GQA):<br>
+<strong>intra-node:</strong> $\text{cp}_{\text{bor}} \approx \frac{540 \times 10^9 \times 128 \times 1024}{550 \times 10^{12}} \approx 128$ — intra-node 几乎不被通信束缚。<br>
+<strong>inter-node:</strong> $\text{cp}_{\text{bor}} \approx \frac{43 \times 10^9 \times 128 \times 1024}{550 \times 10^{12}} \approx 10$ — 一旦 cp 超过 ~10 跨出 NVLink,attention 立即进入通信瓶颈。<br><br>
+这就是为什么所有"P2P 类"方案在多节点扩展(strong scaling)时性能急剧下降。
+</div>
+
+<h3 id="sec3-3">3.3 反向传播</h3>
+
+<p>反向 Ring 比正向更复杂 —— 不仅要发 KV,还要发 KV 的梯度。每步通信量翻倍。同时反向 attention kernel 本身 FLOPs 也更高(约 2.5× forward)。TE 源码里这两条路径分别在 <code>cp_p2p_fwd_flash_attn</code> 和 <code>cp_p2p_bwd_flash_attn</code> 两个 helper 里。</p>
+
+<h3>3.4 优缺点</h3>
+
+<table>
+<thead><tr><th>优点 ✓</th><th>缺点 ✗</th></tr></thead>
+<tbody>
+<tr><td>通信和计算可重叠 → critical path 上只剩计算</td><td>cp &gt; cp_bor 时通信暴露,扩展性骤降</td></tr>
+<tr><td>每卡显存只需<strong>当前 KV chunk + 1 buffer</strong></td><td>因果 mask 下负载不均(见 §4)</td></tr>
+<tr><td>支持任意非 sliding-window 的 mask</td><td>跨节点 ring 只用一条 NIC 路径,其它 NIC 闲置</td></tr>
+</tbody>
+</table>
+
+<h2 id="sec4">4. 方法三:因果 mask 的负载均衡</h2>
+
+<p>Ring Attention 有个"隐形负载不均"问题,只在 <strong>causal mask</strong> 下出现 —— 也就是 GPT 类模型的标准 attention。本节专门讲怎么解决。</p>
+
+<h3 id="sec4-1">4.1 问题:三角形负载</h3>
+
+<p>用 $S = 8, \text{cp} = 2$ 举例,Causal mask 下哪些 $(i, j)$ 要算?$j \leq i$ 的下三角:</p>
+
+<pre class="code">
+              KV chunk
+              0,1,2,3  4,5,6,7
+       Q  0  [  ■        ░     ]    GPU 0 (持 Q0..Q3)
+       c  1  [  ■        ░     ]
+       h  2  [  ■        ░     ]
+       u  3  [  ■        ░     ]
+       n  ─────────────────────
+       k  4  [  ■        ■     ]    GPU 1 (持 Q4..Q7)
+          5  [  ■        ■     ]
+          6  [  ■        ■     ]
+          7  [  ■        ■     ]
+
+       ■ = 要算的位置;░ = 不算(j &gt; i)
+</pre>
+
+<p>朴素切分:GPU 0 持有 Q[0..3]、KV[0..3];GPU 1 持有 Q[4..7]、KV[4..7]。但因果 mask 下,<strong>GPU 0 只算左上角 4×4 一半 = 8 个 cell;GPU 1 要算 4×4 左半 + 4×4 右半的一半 = 16+8=24 个 cell</strong>。GPU 1 的工作量是 GPU 0 的 3 倍 —— 严重不均。Ring 中每一步都要等最慢的卡,所以整体被拖慢。</p>
+
+<h3 id="sec4-2">4.2 Striped Attention</h3>
+
+<p><strong>Striped Attention</strong>(Brandon et al., <a href="https://arxiv.org/abs/2311.09431">arXiv:2311.09431</a>)的解法:不让 token 连续切块,而是<strong>按 stride = cp 交错分配</strong>。每张卡分到的 token 是均匀散布在整个 sequence 里的"条带":</p>
+
+<pre class="code">
+       cp = 2 的 Striped 切分:
+       GPU 0 持有 token 0, 2, 4, 6  (偶数位置)
+       GPU 1 持有 token 1, 3, 5, 7  (奇数位置)
+
+       这样每张卡的 (Q_i, K_j) 配对中,causal mask
+       的"几何形状"几乎一致,负载完全均衡。
+</pre>
+
+<p>公开性能(论文 §5):<strong>A100 上 256K seq 提速 1.45×,16× TPUv4 上 786K seq 提速 1.65×</strong>。</p>
+
+<h3 id="sec4-3">4.3 Zigzag / DualChunkSwap</h3>
+
+<p>Striped 之外,实践上更常用的方案叫 <strong>Zigzag</strong>(社区命名)或 <strong>DualChunkSwap</strong>(TransformerEngine 用语)。思路:把 sequence 切成 <strong>2×cp</strong> 个 chunk,而不是 cp 个;每张卡分到<strong>一前一后</strong>两个 chunk。</p>
+
+<pre class="code">
+       cp = 2,seq 切成 4 个 chunk:
+       chunk_0  chunk_1  chunk_2  chunk_3
+
+       GPU 0 持有:chunk_0 + chunk_3  (头 + 尾)
+       GPU 1 持有:chunk_1 + chunk_2  (中间两块)
+
+       Causal mask 下:
+       - GPU 0 在 chunk_0 处工作量小 + chunk_3 处工作量大
+       - GPU 1 在 chunk_1 处工作量中 + chunk_2 处工作量中
+
+       两个之和几乎一致 → 负载均衡。
+</pre>
+
+<p>TransformerEngine 实现(<code>context_parallel.py:236</code>):</p>
+
+<pre class="code"><span class="kw">def</span> get_seq_chunk_ids_for_reordering_before_attn(cp_size, device):
+    <span class="cm">"""把 2*cp 个 chunk 重新排列,使第 rank 张卡拿到
+       chunk_{2*rank} 和 chunk_{2*cp - 2*rank - 1}。"""</span>
+    chunk_ids = torch.empty(2 * cp_size, dtype=torch.int32, device=device)
+    <span class="kw">for</span> rank <span class="kw">in</span> range(cp_size):
+        chunk_ids[rank]           = 2 * rank
+        chunk_ids[rank + cp_size] = 2 * cp_size - 2 * rank - 1
+    <span class="kw">return</span> chunk_ids</pre>
+
+<p>这个 reorder 在 dataloader 阶段(<code>megatron/core/utils.py</code> 的 <code>get_batch_on_this_cp_rank</code>)做一次,所以 attention kernel 内部跟普通 ring attention 完全一样,不增加 kernel 复杂度。</p>
+
+<div class="callout warn">
+<strong>命名混乱提醒</strong>:同一个技术在不同地方有不同名字 —— TransformerEngine 叫 <strong>DualChunkSwap</strong>,Megatron-LM 文档叫 <strong>load-balanced</strong>,社区(<code>zhuzilin/ring-flash-attention</code>、USP)叫 <strong>zigzag</strong>。Striped Attention 是<strong>另一个</strong>方案(交错按 token,粒度 = 1),不是同一个东西。论文里"zigzag"这名字没有正式 paper 起源,大致与 Striped(2023.11)同期在社区独立涌现。
+</div>
+
+<h3>4.4 实践提示</h3>
+
+<ul>
+  <li>这个 reorder<strong>必须</strong>在 dataloader 做,否则 attention mask 索引会错。</li>
+  <li>require sequence length 能被 <code>2 * cp_size</code> 整除(必要时 padding)。</li>
+  <li>Zigzag 是 TransformerEngine / Megatron-LM 默认开启的,你直接用 CP 就自动获得这个优化。</li>
+</ul>
+
+<h2 id="sec5">5. 方法四:Ulysses (A2A)</h2>
+
+<p>Ring/Striped/Zigzag 都是同一条路 —— 沿<strong>序列维 S</strong> 切,通过 P2P 转 KV。DeepSpeed 的 <strong>Ulysses</strong>(Jacobs et al., <a href="https://arxiv.org/abs/2309.14509">arXiv:2309.14509</a>)走了完全不同的思路:<strong>用 AllToAll 在 attention 前换轴</strong>,attention 时不分割 sequence 而是分割 head。</p>
+
+<h3 id="sec5-1">5.1 思路:换轴分发</h3>
+
+<p>每个 transformer block 进 attention 之前的张量:<code>[H, S/cp, d]</code>(沿 S 分布)。Ulysses 在 attention 前后各插一次 AllToAll:</p>
+
+<pre class="code">
+进 attention 前:                       attention 中:                       attention 后:
+─────────────────                       ─────────────                       ─────────────────
+GPU 0: [H, S/cp, d]    AlltoAll    GPU 0: [H/cp, S, d]    本地 FA      GPU 0: [H/cp, S, d]    AlltoAll    GPU 0: [H, S/cp, d]
+GPU 1: [H, S/cp, d]   ─────────→   GPU 1: [H/cp, S, d]    ──────→      GPU 1: [H/cp, S, d]   ─────────→   GPU 1: [H, S/cp, d]
+GPU 2: [H, S/cp, d]                GPU 2: [H/cp, S, d]                 GPU 2: [H/cp, S, d]                GPU 2: [H, S/cp, d]
+GPU 3: [H, S/cp, d]                GPU 3: [H/cp, S, d]                 GPU 3: [H/cp, S, d]                GPU 3: [H, S/cp, d]
+
+     ↑                                  ↑                                    ↑                                ↑
+   沿 S 切                          沿 H 切                              沿 H 切                          沿 S 切
+                                  每卡持完整 S                        每卡持完整 S
+                                  跑 H/cp 头 attention
+</pre>
+
+<p>开源参考:</p>
+<ul>
+  <li><strong>原版</strong>:<a href="https://github.com/microsoft/DeepSpeed">microsoft/DeepSpeed</a>,<code>deepspeed/sequence/layer.py</code> 的 <code>DistributedAttention</code></li>
+  <li><strong>TE 版</strong>:<code>AttnFuncWithCPAndQKVOA2A</code>(<code>context_parallel.py:3807</code>),通过 <code>cp_comm_type="a2a"</code> 启用</li>
+</ul>
+
+<h3 id="sec5-2">5.2 通信复杂度</h3>
+
+<p>Ulysses 一次 attention 做 <strong>4 次 AllToAll</strong>:正向 attention 前后各一次(QKV → output reshape),反向同样两次。总通信量(全部 token 都参与 A2A):</p>
+
+<p>$$ V_{\text{comm}}^{\text{Ulysses, per pass}} = 4 \times 2 \times \frac{H + 2 H_{kv}}{\text{tp}} \times \frac{S}{\text{cp}} \times d \times \frac{\text{cp} - 1}{\text{cp}} $$</p>
+
+<p>关键性质:<strong>通信量 per GPU 跟 cp 几乎无关</strong> —— A2A 的本质就是 $\frac{n-1}{n}$ 的 bus 带宽利用率。这是 Ulysses 区别于 Ring 的最大优势:cp 翻倍时,Ring 通信总量翻倍,Ulysses 通信几乎不变。</p>
+
+<p>论文原文表述(Jacobs et al. §3):<em>"maintains constant communication volume when sequence length and compute devices are increased proportionally"</em>。</p>
+
+<h3 id="sec5-3">5.3 致命约束:cp ≤ num_kv_heads</h3>
+
+<p>Ulysses 沿 head 维度切分,所以 <strong>cp 必须能整除 H(MHA)或 $H_{kv}$(GQA)</strong>。而且 TP 也是沿 head 切的,所以联合约束:</p>
+
+<p>$$ \text{tp} \times \text{cp} \leq H_{kv} $$</p>
+
+<div class="callout warn">
+<strong>这就是 Ulysses 的死穴</strong>。LLaMA3-8B 用 GQA-8(<code>num_kv_heads = 8</code>),所以 $\text{tp} \times \text{cp} \leq 8$。如果你想训 1M context,需要 cp = 256,完全做不到。<br><br>
+DeepSpeed-Ulysses<strong>不</strong>适合现代 GQA 大模型在长序列下的多节点扩展。这是单独使用它的根本限制。<br><br>
+解决思路:<strong>把它和 Ring 组合</strong>,Ulysses 在小范围内(<code>cp_a2a ≤ H_kv</code>)用,Ring 把剩下的 cp 维度撑起来 —— 这正是 §6 USP / LoongTrain 的核心。
+</div>
+
+<h2 id="sec6">6. 方法五:USP / LoongTrain 2D</h2>
+
+<p>Ring 强在<strong>能任意扩展</strong>但通信量大;Ulysses 强在<strong>通信量小</strong>但被 head 数卡死。一个自然的想法:<strong>把两者乘起来,做二维并行</strong>。这正是 USP(Fang & Zhao, <a href="https://arxiv.org/abs/2405.07719">arXiv:2405.07719</a>)和 LoongTrain(Gu et al., <a href="https://arxiv.org/abs/2406.18485">arXiv:2406.18485</a>)的共同思路。两篇论文发布只差几周(USP 5 月,LoongTrain 6 月),核心想法一致,LoongTrain 多了一个 Double-Ring 的工程优化。</p>
+
+<h3 id="sec6-1">6.1 思路:Ulysses × Ring 二维网格</h3>
+
+<p>把 cp 拆成两个维度:</p>
+
+<p>$$ \text{cp} = \text{cp}_{a2a} \times \text{cp}_{p2p} $$</p>
+
+<p>GPU 拓扑组织成<strong>二维网格</strong>:</p>
+
+<ul>
+  <li><strong>同一行(<code>cp_a2a</code> 个 rank)</strong>:用 Ulysses A2A 切 head。Intra-node NVLink 上,A2A 极快。约束 <code>cp_a2a ≤ H_kv / tp</code>。</li>
+  <li><strong>同一列(<code>cp_p2p</code> 个 rank)</strong>:用 Ring P2P 切 sequence。每个"a2a 组"内独立跑 Ring Attention。可以跨节点。</li>
+</ul>
+
+<p>所以一次 attention 的流程是:</p>
+
+<ol>
+  <li><strong>第 1 个 A2A</strong>:在 a2a 组内换轴,每个 rank 拿到 <code>H_kv/cp_a2a</code> 个 head 的完整 sequence。</li>
+  <li><strong>Ring Attention</strong>:在 p2p 组内对这部分 head 跑 ring attention(<code>cp_p2p</code> 步轮转)。</li>
+  <li><strong>第 2 个 A2A</strong>:换轴回来,output 还是 <code>[H/tp, S/cp, d]</code> 形状。</li>
+</ol>
+
+<div class="example">
+<span class="label">小例 6.1 — LLaMA3-8B 在 16 卡上</span>
+$H_{kv} = 8$,假设 tp=2,要 cp=16:<br>
+- 纯 Ulysses:cp ≤ $H_{kv} / \text{tp} = 4$ → 做不到 cp=16。<br>
+- 纯 Ring:cp=16 一路 P2P,跨节点单 NIC 瓶颈严重。<br>
+- USP/LoongTrain:cp_a2a=4(=$H_{kv}/\text{tp}$,顶到 head 上限),cp_p2p=4 → 总 cp=16。Intra-node 4 卡跑 A2A(NVLink 540 GB/s),inter-node 4 节点跑 Ring(IB 43 GB/s)。<strong>组合后能用上所有维度</strong>。
+</div>
+
+<p>实现:<a href="https://github.com/feifeibear/long-context-attention">feifeibear/long-context-attention</a>(yunchang)统一封装两个维度。TE 也实现了同样思路,通过 <code>cp_comm_type="a2a+p2p"</code> 启用,内部把 cp_group 拆成 <code>[a2a_group, p2p_group]</code>。</p>
+
+<p>USP 公开 benchmark(arXiv:2405.07719):<strong>LLAMA3-8B 208K seq,2 × 8 × A800 RDMA,269.8 TFLOPS,MFU 0.86</strong>。</p>
+
+<h3 id="sec6-2">6.2 LoongTrain 的 Double-Ring</h3>
+
+<p>纯 Ring 在 inter-node 通信时有个隐藏问题:每张 GPU 只能用<strong>一条 NIC 路径</strong>(因为 ring 是一个环)。一个 DGX-H100 有 8 张 IB NIC,但 ring 上每张卡只用一张,<strong>剩下 7 张 NIC 闲置</strong>。</p>
+
+<p>LoongTrain 的 <strong>Double-Ring Attention</strong> 把单一 ring 拆成<strong>双层 ring</strong>:</p>
+
+<ul>
+  <li><strong>内环(inner ring)</strong>:intra-node 几张 GPU 组成,走 NVLink。多个内环并行。</li>
+  <li><strong>外环(outer ring)</strong>:跨节点,内环之间用 P2P。<strong>所有 NIC 同时用</strong>。</li>
+</ul>
+
+<p>公开 benchmark(arXiv:2406.18485 abstract):<em>"improves Model FLOPs Utilization (MFU) by up to 2.88×"</em>,在 1M sequence 上对比 DeepSpeed-Ulysses 和 Megatron-CP。</p>
+
+<h3>6.3 USP / LoongTrain 的局限</h3>
+
+<table>
+<thead><tr><th>优点 ✓</th><th>缺点 ✗</th></tr></thead>
+<tbody>
+<tr><td>组合 Ulysses(通信省)+ Ring(可扩展)</td><td>Ring 那条腿仍受跨节点 P2P 的本质限制</td></tr>
+<tr><td>突破 Ulysses 的 head 上限</td><td>调 cp_a2a 和 cp_p2p 需要根据 topology 手动 tune</td></tr>
+<tr><td>开源成熟(yunchang / InternEvo)</td><td>Causal mask 下 Ring 那条腿仍然需要 zigzag/striped</td></tr>
+</tbody>
+</table>
+
+<h2 id="sec7">7. 方法六:MagiAttention</h2>
+
+<p>USP/LoongTrain 把 Ring 和 Ulysses 拼起来,缓解了大 cp 时的扩展性。但它们都没碰一个更深的问题:<strong>对于 sparse / varlen / block-causal / 视频 AR / MoD 等"非标准"mask,所有上述方法都不友好</strong>。</p>
+
+<p><strong>MagiAttention</strong>(SandAI 2025,<a href="https://github.com/SandAI-org/MagiAttention">GitHub</a>+<a href="https://sandai-org.github.io/MagiAttention/docs/main/blog/magi_attn.html">官方博客</a>)从这个角度切入,提出了一套完全不同的设计。它有四个核心组件,我们一个个看。</p>
+
+<h3 id="sec7-1">7.1 Flexible Flash Attention 内核(FFA)</h3>
+
+<p>传统 FlashAttention 把 mask 写死成 <code>causal</code> / <code>full</code> / <code>sliding_window</code> 几种枚举。<strong>FFA</strong> 用一组通用结构表达任意 mask:</p>
+
+<pre class="code">AttnSlice = (QRange, KRange, MaskType)
+         ↑       ↑         ↑
+       Q 段     KV 段    mask 类型: FULL / CAUSAL / INV-CAUSAL / BI-CAUSAL
+
+一个 mask = AttnSlice 的集合 = 多个矩形块的并集</pre>
+
+<p>例如一个 document-causal mask(每个文档内部 causal,跨文档不可见)就被表达为多个 <code>(Qrange, Krange, CAUSAL)</code> 的拼接;视频 AR 的 block-causal 也类似分解。FFA 内核能直接消化这个表达,不需要为每种 mask 手写一个 kernel。</p>
+
+<p>性能(README):<em>"performance comparable to Flash-Attention 3 on Hopper GPUs"</em> —— 也就是不损失 attention kernel 本身的速度。</p>
+
+<h3 id="sec7-2">7.2 Dispatch Solver:任意 mask 的负载均衡</h3>
+
+<p>这是 zigzag/striped 思路的<strong>泛化</strong>。Zigzag 假定 mask 是规整的因果三角形,所以闭式解(前 + 后)就能均衡。MagiAttention 面对的是任意 mask,需要正式建模成一个最优化问题:</p>
+
+<p>$$ f^* = \arg\min_f \max_j \text{SumArea}(B_j) $$</p>
+
+<p>其中 $f$ 是把 chunks 分到 cp 个 bucket 的分配方案,$B_j$ 是 bucket $j$ 的负载(mask 内的 entry 数)。这是 NP-hard,实际用<strong>贪心 min-heap</strong> 近似,$O(n \log n)$ 一次迭代。</p>
+
+<p>意义:<strong>任意 mask 都能做到几乎均衡的 sharding</strong>,不再受限于 zigzag 那种"只在 causal mask 上有效"的局部技巧。</p>
+
+<h3 id="sec7-3">7.3 GroupCast/GroupReduce:零冗余通信</h3>
+
+<p>这是 MagiAttention 区别于所有先驱的<strong>最大创新</strong>。Ring/Ulysses 都基于<strong>统一的</strong> P2P 或 A2A 拓扑,但实际通信中有大量冗余:</p>
+
+<ul>
+  <li>Ring 在 causal mask 下转的 KV,其中很多 entry 根本不会被用到(因为被 mask 掉)—— 论文里说 <em>"causal mask causes 25% redundant communication"</em>。</li>
+  <li>varlen block-causal 下冗余更高,<em>"can exceed 33% redundancy"</em>。</li>
+</ul>
+
+<p>MagiAttention 用<strong>两个新通信原语</strong>取代 P2P/A2A 的固定模式:</p>
+
+<table>
+<thead><tr><th>原语</th><th>语义</th><th>底层</th></tr></thead>
+<tbody>
+<tr><td><strong>GroupCast</strong>(正向)</td><td>给定 ranks → (起始 offset, 长度) 的 mapping,把<strong>需要的</strong> KV 段发给<strong>需要它的</strong> rank,不冗余</td><td>AllToAll-v + Range-Gather kernel</td></tr>
+<tr><td><strong>GroupReduce</strong>(反向)</td><td>类似,但 reduce 梯度,不分发</td><td>Range-Scatter-Reduce kernel</td></tr>
+</tbody>
+</table>
+
+<p>v1.0.5+ 用 <a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a>(DeepSeek 开源)做底层 hierarchical AllToAll-v,在 RDMA 上自动去重,直击 LoongTrain Double-Ring 解决的同一痛点 —— 但通过更通用的 AllToAll-v 原语,而不是 ring overlay。</p>
+
+<h3 id="sec7-4">7.4 Multi-Stage Overlap</h3>
+
+<p>把 GroupCast/GroupReduce 切成 stage,前一 stage 通信和后一 stage 的 FFA 计算 pipeline 并行,只有最后一个 stage 的计算不能被通信隐藏 —— 经典的 prologue/epilogue 重叠思路,但应用在 attention 这一层。</p>
+
+<h3>7.5 公开 benchmark</h3>
+
+<p>README 和官方博客里和 Ulysses、Ring P2P、Ring AllGather、USP、LoongTrain、Megatron HybridCP <strong>逐一对比</strong>,测试规模:H100 集群 8K seq/device,B200 集群 16K seq/device,cp 从 8 到 64。Mask 类型:full / causal / varlen full / varlen causal。</p>
+
+<p>博客图(Figs. 44-59):<em>"near-linear scalability on varlen causal masks"</em> on H100 + B200。具体 TFLOPS 数字只在图里给(没在文本里直接 quote),所以本文不引用具体值。</p>
+
+<h3>7.6 局限性</h3>
+
+<ul>
+  <li>FFA 当前 Hopper 优先(B200 通过 fork 的 FA4 v1.1.0+ 支持,Ampere v1.1.1+ 支持)。</li>
+  <li>GroupCast/GroupReduce 原生实现依赖 DeepEP,目前主要针对 NVLink + RDMA 的 Hopper 级拓扑。</li>
+</ul>
+
+<h2 id="sec8">8. 其它方案与变体</h2>
+
+<p>除上面六类主流方案,还有几个值得知道的:</p>
+
+<table>
+<thead><tr><th>方法</th><th>论文 / 仓库</th><th>关键 idea</th><th>现状</th></tr></thead>
+<tbody>
+<tr><td><strong>DistFlashAttn / LightSeq</strong></td><td><a href="https://arxiv.org/abs/2310.03294">arXiv:2310.03294</a> · <a href="https://github.com/RulinShao/LightSeq">RulinShao/LightSeq</a></td><td>token-level 负载均衡 + 通信重叠 + remat-aware checkpoint</td><td>2023.10 出现,早于 zigzag/striped。实践基本被 USP/LoongTrain 超越。</td></tr>
+<tr><td><strong>BurstAttention / BurstEngine</strong></td><td><a href="https://arxiv.org/abs/2403.09347">arXiv:2403.09347</a> · <a href="https://arxiv.org/abs/2509.19836">arXiv:2509.19836</a></td><td>Ring + GAO/LAO 两级优化 + topology-aware 改进</td><td>对 Ring 的进一步通信优化,被 MagiAttention 的 GroupCast 理念覆盖。</td></tr>
+<tr><td><strong>Tree Attention</strong></td><td><a href="https://arxiv.org/abs/2408.04093">arXiv:2408.04093</a> · <a href="https://github.com/Zyphra/tree_attention">Zyphra/tree_attention</a></td><td>树形 reduce 替代 ring,$O(\log P)$ 通信轮次</td><td>主要面向<strong>推理 / decode</strong>,训练适配少。</td></tr>
+<tr><td><strong>RSA (Li 2021)</strong></td><td><a href="https://arxiv.org/abs/2105.13120">arXiv:2105.13120</a></td><td>Ring Attention 的初代</td><td>没用 online softmax,被 Liu 2023 取代。</td></tr>
+</tbody>
+</table>
+
+<p>这些方案要么是过渡形态(被后续方案覆盖),要么聚焦在特定场景(推理/decode),所以选型决策树里不再单独列出。</p>
+
+<h2 id="sec9">9. 横向对比:全方法总表 + 选型决策</h2>
+
+<h3 id="sec9-1">9.1 八大方法总表</h3>
+
+<table>
+<thead>
+<tr><th>#</th><th>方法</th><th>通信原语</th><th>来源</th><th>关键 idea</th><th>致命约束</th><th>开源落点</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td>1</td>
+  <td><strong>AllGather KV</strong></td>
+  <td>AllGather</td>
+  <td>TE / Megatron</td>
+  <td>先 AG 完 KV 再做 local FA</td>
+  <td>整个 AG 在 critical path,不可重叠;显存峰值 = 完整 KV</td>
+  <td><code>AttnFuncWithCPAndKVAllGather</code>(TE <code>context_parallel.py:2948</code>)</td>
+</tr>
+<tr>
+  <td>2</td>
+  <td><strong>RingAttention (P2P)</strong></td>
+  <td>P2P send/recv ring</td>
+  <td>Li 2021 / Liu 2023 (<a href="https://arxiv.org/abs/2310.01889">2310.01889</a>)</td>
+  <td>分 chunk + online softmax,通信与计算并行</td>
+  <td>cp &gt; cp_bor 时通信暴露;ring 单 NIC,inter-node 扩展差</td>
+  <td><code>AttnFuncWithCPAndKVP2P</code> · zhuzilin/ring-flash-attention</td>
+</tr>
+<tr>
+  <td>3</td>
+  <td><strong>Striped Attention</strong></td>
+  <td>P2P + token 交错</td>
+  <td>Brandon 2023 (<a href="https://arxiv.org/abs/2311.09431">2311.09431</a>)</td>
+  <td>token-level stride 交错,causal 下负载均衡</td>
+  <td>不解决跨节点 BW 问题;只是 Ring 的修补</td>
+  <td>USP <code>stripe</code> impl</td>
+</tr>
+<tr>
+  <td>4</td>
+  <td><strong>Zigzag / DualChunkSwap</strong></td>
+  <td>P2P + 2×cp chunk 交换</td>
+  <td>社区 / TE / Megatron</td>
+  <td>chunk-level 头尾配对,causal 下负载均衡</td>
+  <td>同 Striped:不解决跨节点 BW</td>
+  <td>TE <code>get_seq_chunk_ids_for_reordering</code>(line 236)</td>
+</tr>
+<tr>
+  <td>5</td>
+  <td><strong>Ulysses (A2A)</strong></td>
+  <td>AllToAll(×4 per attention)</td>
+  <td>Jacobs 2023 (<a href="https://arxiv.org/abs/2309.14509">2309.14509</a>)</td>
+  <td>attention 前后换轴,在 head 维做并行</td>
+  <td>cp ≤ H_kv(LLaMA3-8B → cp ≤ 8)</td>
+  <td><code>DistributedAttention</code>(DeepSpeed) · <code>AttnFuncWithCPAndQKVOA2A</code>(TE)</td>
+</tr>
+<tr>
+  <td>6</td>
+  <td><strong>USP (2D)</strong></td>
+  <td>A2A(intra)+ P2P(inter)</td>
+  <td>Fang 2024 (<a href="https://arxiv.org/abs/2405.07719">2405.07719</a>)</td>
+  <td>Ulysses × Ring 二维网格,突破 head 上限</td>
+  <td>P2P 那条腿仍有 inter-node BW 痛点;需手动调 cp_a2a vs cp_p2p</td>
+  <td>feifeibear/long-context-attention (yunchang)</td>
+</tr>
+<tr>
+  <td>7</td>
+  <td><strong>LoongTrain (Double-Ring)</strong></td>
+  <td>A2A + 双层 ring</td>
+  <td>Gu 2024 (<a href="https://arxiv.org/abs/2406.18485">2406.18485</a>)</td>
+  <td>2D 思路 + 外环用所有 NIC 并行</td>
+  <td>仍需调参;mask 灵活性有限</td>
+  <td>InternLM/InternEvo</td>
+</tr>
+<tr>
+  <td>8</td>
+  <td><strong>MagiAttention</strong></td>
+  <td>GroupCast / GroupReduce(AllToAll-v + Range-Gather/Scatter)</td>
+  <td>SandAI 2025</td>
+  <td>FFA 任意 mask + 通用负载均衡 + 零冗余通信</td>
+  <td>Hopper 优先(其它架构用 forked FA4);依赖 DeepEP 底层</td>
+  <td>SandAI-org/MagiAttention + Megatron-LM-MagiAttention</td>
+</tr>
+</tbody>
+</table>
+
+<h3 id="sec9-2">9.2 选型决策树</h3>
+
+<p>把上表压缩成可操作的决策流。给定:cp size、是否 causal、是否 GQA、单 / 多节点。</p>
+
+<pre class="code">START
+  │
+  ├─ cp == 1
+  │      └→ 不需要 CP,跳过本系列
+  │
+  ├─ mask 是非标准的(varlen / sparse / block-causal / 视频 AR)
+  │      └→ <strong>MagiAttention</strong>(唯一能优雅表达任意 mask 的)
+  │
+  ├─ 需要 sliding-window mask
+  │      └→ <strong>AllGather KV</strong>(TE: cp_comm_type="all_gather") 或 <strong>Ulysses</strong>
+  │
+  ├─ cp ≤ 2 且 intra-node
+  │      └→ <strong>RingAttention + Zigzag</strong>(最简单,通信能重叠)
+  │
+  ├─ cp ≤ H_kv / tp,且 intra-node
+  │      └→ <strong>Ulysses</strong>(NVLink 上 A2A 极快,常数通信量)
+  │
+  ├─ cp 较大(8 ~ 32),且 cp &gt; H_kv / tp
+  │      └→ <strong>USP / LoongTrain 2D</strong>
+  │             ├─ cp_a2a = min(H_kv / tp, intra-node 大小)
+  │             └─ cp_p2p = cp / cp_a2a
+  │      多节点时优先 LoongTrain 的 Double-Ring
+  │
+  └─ cp 超大(&gt; 64),或追求极致 MFU,或要全 mask 灵活性
+         └→ <strong>MagiAttention</strong>(零冗余通信)
+</pre>
+
+<div class="callout">
+<strong>实践经验</strong>:<br>
+① <strong>Causal mask 下永远开 zigzag/DualChunkSwap</strong>,这是 free lunch,TE/Megatron 默认就开。<br>
+② <strong>tp + cp 的乘积要 fit head 数</strong>。LLaMA3-8B GQA-8,cp + tp 大于 8 时,Ulysses 必须配合 Ring 用。<br>
+③ <strong>跨节点 cp 永远是瓶颈</strong>。优先把 cp 留在 intra-node(NVLink),用 PP/DP 走跨节点。<br>
+④ <strong>新架构(B200 / GB200)</strong>下 NVLink 升级,intra-node 8 卡可以撑 cp=8 跑很长序列,USP/LoongTrain 的"2D"价值会变弱;但 MagiAttention 的"灵活 mask"价值不变(视频生成、MoD)。
+</div>
+
+<h2 id="sec10">参考资料</h2>
+
+<h4>论文</h4>
+
+<ul>
+  <li><a href="https://arxiv.org/abs/2105.13120">Li et al. 2021 — Sequence Parallelism: Long Sequence Training from System Perspective</a>(RSA 初代)</li>
+  <li><a href="https://arxiv.org/abs/2310.01889">Liu, Zaharia, Abbeel 2023 — Ring Attention with Blockwise Transformers for Near-Infinite Context</a>(Ring + FA online softmax)</li>
+  <li><a href="https://arxiv.org/abs/2311.09431">Brandon et al. 2023 — Striped Attention</a></li>
+  <li><a href="https://arxiv.org/abs/2309.14509">Jacobs et al. 2023 — DeepSpeed Ulysses</a></li>
+  <li><a href="https://arxiv.org/abs/2310.03294">DistFlashAttn / LightSeq</a></li>
+  <li><a href="https://arxiv.org/abs/2403.09347">BurstAttention</a></li>
+  <li><a href="https://arxiv.org/abs/2405.07719">Fang & Zhao 2024 — USP</a></li>
+  <li><a href="https://arxiv.org/abs/2406.18485">Gu et al. 2024 — LoongTrain</a></li>
+  <li><a href="https://arxiv.org/abs/2408.04093">Shyam et al. 2024 — Tree Attention</a></li>
+  <li><a href="https://sandai-org.github.io/MagiAttention/docs/main/blog/magi_attn.html">SandAI 2025 — MagiAttention 官方博客</a></li>
+</ul>
+
+<h4>开源代码</h4>
+
+<ul>
+  <li><a href="https://github.com/NVIDIA/TransformerEngine">NVIDIA/TransformerEngine</a> — <code>context_parallel.py</code> 中四种 CP 实现</li>
+  <li><a href="https://github.com/NVIDIA/Megatron-LM">NVIDIA/Megatron-LM</a> — <code>get_batch_on_this_cp_rank</code> 等</li>
+  <li><a href="https://github.com/microsoft/DeepSpeed">microsoft/DeepSpeed</a> — Ulysses 原版</li>
+  <li><a href="https://github.com/feifeibear/long-context-attention">feifeibear/long-context-attention</a> — USP / yunchang</li>
+  <li><a href="https://github.com/zhuzilin/ring-flash-attention">zhuzilin/ring-flash-attention</a> — Ring + Zigzag + Stripe 社区参考</li>
+  <li><a href="https://github.com/InternLM/InternEvo">InternLM/InternEvo</a> — LoongTrain 集成</li>
+  <li><a href="https://github.com/SandAI-org/MagiAttention">SandAI-org/MagiAttention</a> + <a href="https://github.com/SandAI-org/Megatron-LM-MagiAttention">Megatron-LM-MagiAttention</a></li>
+  <li><a href="https://github.com/lhao499/RingAttention">lhao499/RingAttention</a> — Liu 2023 JAX 参考</li>
+  <li><a href="https://github.com/Zyphra/tree_attention">Zyphra/tree_attention</a></li>
+</ul>
+
+<h4>官方文档</h4>
+
+<ul>
+  <li><a href="https://docs.nvidia.com/megatron-core/developer-guide/0.16.0/user-guide/features/context_parallel.html">NVIDIA Megatron-Core Context Parallel docs</a></li>
+</ul>
+
+</div>
+<div class="lang-en"><p><em>English translation pending — will be added in a follow-up commit.</em></p></div>
+</main>
+</div>
+<script src="../lang-toggle.js"></script>
+</body>
+</html>
