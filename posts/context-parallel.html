@@ -216,7 +216,63 @@
   <li><a href="#sec10">参考资料</a></li>
 </ul>
 </div>
-<div class="lang-en"><strong>EN translation pending — see lang-zh</strong></div>
+<div class="lang-en">
+<strong>Contents</strong>
+<ul>
+  <li><a href="#sec0">0. Why Context Parallel is needed</a></li>
+  <li><a href="#sec1">1. Unified model: communication vs compute</a>
+    <ul>
+      <li><a href="#sec1-1">1.1 FLOPs and communication volume of attention</a></li>
+      <li><a href="#sec1-2">1.2 Two evaluation scenarios</a></li>
+      <li><a href="#sec1-3">1.3 Communication priority: TP &gt; CP &gt; PP &gt; DP</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec2">2. Method 1: AllGather KV</a></li>
+  <li><a href="#sec3">3. Method 2: Ring Attention (P2P)</a>
+    <ul>
+      <li><a href="#sec3-1">3.1 Idea and execution flow</a></li>
+      <li><a href="#sec3-2">3.2 Communication-computation overlap boundary</a></li>
+      <li><a href="#sec3-3">3.3 Backward pass</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec4">4. Method 3: Load balancing under causal mask</a>
+    <ul>
+      <li><a href="#sec4-1">4.1 The problem: triangular load</a></li>
+      <li><a href="#sec4-2">4.2 Striped Attention</a></li>
+      <li><a href="#sec4-3">4.3 Zigzag / DualChunkSwap</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec5">5. Method 4: Ulysses (A2A)</a>
+    <ul>
+      <li><a href="#sec5-1">5.1 Idea: axis swap via dispatch</a></li>
+      <li><a href="#sec5-2">5.2 Communication complexity</a></li>
+      <li><a href="#sec5-3">5.3 Fatal constraint: cp ≤ num_kv_heads</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec6">6. Method 5: USP / LoongTrain 2D</a>
+    <ul>
+      <li><a href="#sec6-1">6.1 Idea: Ulysses × Ring 2D grid</a></li>
+      <li><a href="#sec6-2">6.2 LoongTrain's Double-Ring</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec7">7. Method 6: MagiAttention</a>
+    <ul>
+      <li><a href="#sec7-1">7.1 Flexible Flash Attention kernel</a></li>
+      <li><a href="#sec7-2">7.2 Dispatch Solver: load balance for arbitrary masks</a></li>
+      <li><a href="#sec7-3">7.3 GroupCast/GroupReduce: zero-redundant communication</a></li>
+      <li><a href="#sec7-4">7.4 Multi-Stage Overlap</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec8">8. Other methods and variants</a></li>
+  <li><a href="#sec9">9. Side-by-side: comprehensive table + method selection</a>
+    <ul>
+      <li><a href="#sec9-1">9.1 Comprehensive comparison table</a></li>
+      <li><a href="#sec9-2">9.2 Selection decision tree</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec10">References</a></li>
+</ul>
+</div>
 </aside>
 
 <main class="content">
@@ -970,7 +1026,757 @@ $H_{kv} = 8$,假设 tp=2,要 cp=16:<br>
 </ul>
 
 </div>
-<div class="lang-en"><p><em>English translation pending — will be added in a follow-up commit.</em></p></div>
+<div class="lang-en">
+
+<h1>A Survey of Context Parallel Methods: From RingAttention to MagiAttention</h1>
+
+<p class="small">This article systematically organizes <strong>all the major public Context Parallel (CP) methods</strong> used in long-sequence LLM training: AllGather KV (the TransformerEngine default), Ring Attention (P2P), Striped/Zigzag causal load balancing, DeepSpeed Ulysses (A2A), USP/yunchang, LoongTrain Double-Ring, MagiAttention, plus a few secondary variants. Each method is analyzed in a unified "communication + compute" modeling framework: what bottleneck it solves, at what scale it breaks, and where it lands in open-source projects like Megatron-LM / TransformerEngine. The article ends with a <strong>comprehensive comparison table</strong> and a <strong>selection decision tree</strong>.</p>
+
+<p class="small">All references are drawn from <strong>public</strong> sources: arXiv papers, open-source GitHub repositories, and official documentation. This is Part 1 of the "LLM Training Systems" series.</p>
+
+<h2 id="sec0">0. Why Context Parallel is needed</h2>
+
+<p>From GPT-3 (2K context) to GPT-4 (128K) to Gemini 1.5 (1M+), the LLM context window has expanded <strong>more than 500×</strong> in five years. Sora, video generation, long-document RAG, long-horizon agent tasks, genomic sequences — almost every new scenario pushes this curve. But training a long-context model runs into two walls:</p>
+
+<ul>
+  <li><strong>Memory wall</strong> — activation memory grows linearly as $O(S)$. A LLaMA2-7B at 8K context already uses ~10 GB for activations; at 128K it OOMs outright, and even selective recomputation barely keeps it afloat.</li>
+  <li><strong>Compute wall</strong> — attention FLOPs grow as $O(S^2)$. Going from 32K to 128K (4×) makes attention 16× more expensive, and it ends up dominating the entire step time.</li>
+</ul>
+
+<p>None of the existing parallelism schemes can <strong>save you</strong>:</p>
+
+<table>
+<thead><tr><th>Existing parallelism</th><th>Why it's not enough</th></tr></thead>
+<tbody>
+<tr><td><strong>Data Parallel (DP)</strong></td><td>Every rank holds the activations for the full sequence. As S grows, every rank's memory still explodes.</td></tr>
+<tr><td><strong>Tensor Parallel (TP)</strong></td><td>Splits along the hidden dimension; communication (AllReduce / AllGather) happens at <strong>every layer</strong> and must be on the critical path. Beyond TP &gt; 8 the communication can't be overlapped — poor scalability.</td></tr>
+<tr><td><strong>Pipeline Parallel (PP)</strong></td><td>Splits along the layer dimension. Each stage still holds full-sequence activations, so the memory problem is unchanged — it only chops up the <strong>batch</strong>.</td></tr>
+<tr><td><strong>Expert Parallel (EP)</strong></td><td>Applies only to MoE layers, completely orthogonal to dense attention.</td></tr>
+</tbody>
+</table>
+
+<p><strong>Context Parallel</strong> is the <strong>fifth orthogonal parallelism</strong> in this lineup, specifically designed for long sequences: split the long sequence into cp chunks along the $S$ dimension, one chunk per GPU. All <strong>non-attention layers</strong> of the model (LayerNorm, FFN, QKV projection) compute independently along the sequence direction and need no communication. Attention is the only exception — because in $\text{Attention}(Q, K, V) = \text{softmax}(QK^T/\sqrt{d})\,V$, every query token must take an inner product against <strong>all</strong> key/value tokens. A rank only holds $S/\text{cp}$ tokens of KV, but every token needs to see all KV.</p>
+
+<div class="callout">
+<strong>The core problem</strong>: all the challenges and method variants of Context Parallel ultimately boil down to a single thing — the attention layer's "cross-rank KV communication". Which communication primitive to use? How much redundancy is there? How do you overlap it with attention computation? How do you handle the imbalance introduced by the causal mask? The papers come in all shapes, but they're all answering this same question.
+</div>
+
+<p>The article unfolds along this line: first build a <strong>unified modeling framework</strong> for side-by-side comparison (§1), then start from the most naive AllGather KV (§2) and follow the "evolution of the communication primitive" through Ring Attention (§3) → Striped/Zigzag for causal masks (§4) → Ulysses's axis swap (§5) → USP/LoongTrain's 2D grid (§6) → MagiAttention's flexible mask + zero-redundant communication (§7). At the end we give a comprehensive eight-method table and a selection decision tree (§9).</p>
+
+<h2 id="sec1">1. Unified model: communication vs compute</h2>
+
+<p>Comparing CP methods side by side requires putting them into a single set of equations. This section builds a simplified but accurate modeling framework that every later section will lean on.</p>
+
+<h3 id="sec1-1">1.1 FLOPs and communication volume of attention</h3>
+
+<p>Notation (used throughout the article):</p>
+
+<table>
+<thead><tr><th>Symbol</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>$S$</td><td>Sequence length (per sample)</td></tr>
+<tr><td>$H$</td><td>Number of attention heads (with MHA, $H_{kv} = H$)</td></tr>
+<tr><td>$H_{kv}$</td><td>Number of KV heads (with GQA, $&lt; H$)</td></tr>
+<tr><td>$d$</td><td>Per-head hidden dimension</td></tr>
+<tr><td>$\text{cp}$</td><td>Context parallel size</td></tr>
+<tr><td>$\text{tp}$</td><td>Tensor parallel size (split along the head dimension)</td></tr>
+<tr><td>$\text{flops}$</td><td>Achievable per-GPU FLOPS (TFLOPS)</td></tr>
+<tr><td>$BW$</td><td>Achievable communication bandwidth (GB/s)</td></tr>
+</tbody>
+</table>
+
+<p>The <strong>compute</strong> for one forward attention (ignoring softmax / LayerNorm; only the two matmuls $QK^T$ and $\text{attn} \cdot V$):</p>
+
+<p>$$ V_{\text{compute}} = 4 \times \frac{H}{\text{tp}} \times S^2 \times d $$</p>
+
+<p>where 4 = 2 matmuls × 2 FMA ops/element. The <strong>causal mask</strong> drops about half the entries, so divide by 2:</p>
+
+<p>$$ V_{\text{compute, causal}} = 2 \times \frac{H}{\text{tp}} \times S^2 \times d $$</p>
+
+<p>Introducing cp, each GPU only computes $1/\text{cp}$ of the work (ideal balance):</p>
+
+<p>$$ V_{\text{compute, per GPU}} = \frac{V_{\text{compute}}}{\text{cp}} $$</p>
+
+<p>The core difference between CP methods lies in the <strong>communication volume</strong> $V_{\text{comm}}$: it depends on what is communicated (KV / Q+KV+O), how many times (1 AG vs cp-1 P2Ps), and at what granularity (whole KV vs chunks). We derive $V_{\text{comm}}^{\text{method}}$ in each section.</p>
+
+<p>The <strong>total time</strong> for one attention (assuming communication and compute do not overlap):</p>
+
+<p>$$ T_{\text{attn}} = \frac{V_{\text{compute, per GPU}}}{\text{flops}} + \frac{V_{\text{comm}}}{BW} $$</p>
+
+<p>If they can overlap, take $\max$. This is the unified baseline for all later comparisons.</p>
+
+<h3 id="sec1-2">1.2 Two evaluation scenarios</h3>
+
+<p>The same CP method exhibits different properties at different problem scales. We need two scenarios for comparison:</p>
+
+<table>
+<thead><tr><th>Scenario</th><th>Held fixed</th><th>Varies</th><th>Measures</th></tr></thead>
+<tbody>
+<tr><td><strong>Scenario 1: strong scaling</strong></td><td>$S$ fixed + $\text{tp}$ fixed</td><td>$\text{cp}$ grows (more GPUs on the same sequence)</td><td>Can we keep scaling linearly?</td></tr>
+<tr><td><strong>Scenario 2: weak scaling</strong></td><td>$S$ fixed + $\text{tp} \times \text{cp}$ fixed (total GPU count fixed)</td><td>$\text{cp}$ vs $\text{tp}$ tradeoff</td><td>Given a fixed compute budget, how to split between TP and CP?</td></tr>
+</tbody>
+</table>
+
+<div class="example">
+<span class="label">Example 1.2</span>
+LLaMA2-7B attention parameters: $H = 32, d = 128$. A training run with $S = 128\text{K}$, $\text{tp} = 8$:<br>
+<strong>compute (causal)</strong> = $2 \times 32/8 \times (128\text{K})^2 \times 128 = 2 \times 4 \times 1.7 \times 10^{10} \times 128 \approx 1.7 \times 10^{13}$ FLOPs/sample.<br>
+One H100 at ~989 TFLOPS (BF16) with 0.55 efficiency → effective 550 TFLOPS. Per GPU ($\text{cp} = 4$): $\frac{1.7 \times 10^{13}}{4 \times 5.5 \times 10^{14}} \approx 7.7$ ms.<br><br>
+Per-GPU attention sits at the millisecond scale — the communication budget is a few ms. Note this number scales with $S^2/\text{cp}$.
+</div>
+
+<h3 id="sec1-3">1.3 Communication priority: TP &gt; CP &gt; PP &gt; DP</h3>
+
+<p>In a 4D parallelism scenario ($DP \times PP \times CP \times TP$), the different dimensions have very different communication frequencies and bandwidth requirements, so when laying them out on the GPU mesh you should respect this <strong>priority</strong>:</p>
+
+<ol>
+  <li><strong>TP</strong> has the heaviest communication (an AllReduce at every layer) — must sit on <strong>intra-node NVLink/NVSwitch</strong>.</li>
+  <li><strong>CP</strong> is next (per-layer KV communication in attention) — should be intra-node first; spill to inter-node only when intra-node isn't enough.</li>
+  <li><strong>PP</strong> is light (one send/recv per micro-batch) — can cross nodes.</li>
+  <li><strong>DP</strong> communicates little and can be asynchronous (reduce gradients only) — the best fit for cross-node.</li>
+</ol>
+
+<p>Mapping this onto a typical machine like DGX-H100 (8 GPUs on NVLink + 8 NDR 400G InfiniBand NICs):</p>
+
+<ul>
+  <li>NVLink 4.0 full mesh: ~900 GB/s (theoretical), ~540 GB/s (measured) aggregate per GPU</li>
+  <li>InfiniBand NDR 8×50 GB/s: ~50 GB/s (theoretical), ~43 GB/s (measured) per NIC</li>
+</ul>
+
+<p>Intra-node vs inter-node bandwidth differ by <strong>10×+</strong>. This gap decides everything: once CP crosses the node boundary, the communication cost takes a step change. LoongTrain's Double-Ring in §6 and MagiAttention's GroupCast in §7 are both specifically attacking this inter-node pain point.</p>
+
+<h2 id="sec2">2. Method 1: AllGather KV</h2>
+
+<p>The most naive scheme: since each GPU has only $S/\text{cp}$ of KV but attention needs all of KV — <strong>just AllGather the KV first, then do a local attention</strong>. This is exactly the default CP implementation in TransformerEngine (<code>cp_comm_type="all_gather"</code>).</p>
+
+<h3>2.1 Idea and tensor shapes</h3>
+
+<p>Each GPU holds KV of shape <code>[H, S/cp, d]</code>. After AllGather: <code>[H, S, d]</code>. Q is unchanged, still <code>[H, S/cp, d]</code>. Then run a standard FlashAttention to get the output of shape <code>[H, S/cp, d]</code>.</p>
+
+<pre class="code"><span class="cm"># transformer_engine/pytorch/attention/dot_product_attention/context_parallel.py
+# Simplified from AttnFuncWithCPAndKVAllGather (line ~2948)</span>
+<span class="kw">def</span> forward(ctx, q, k, v, cp_group, ...):
+    cp_size = get_world_size(cp_group)
+
+    <span class="cm"># Step 1: AllGather K, V across cp_group</span>
+    k_ag, _ = gather_along_first_dim(k, cp_group)   <span class="cm"># [cp*S/cp, ..] -&gt; [S, ..]</span>
+    v_ag, _ = gather_along_first_dim(v, cp_group)
+
+    <span class="cm"># Step 2: chunk reorder for causal mask (§4 zigzag)</span>
+    chunk_ids = get_seq_chunk_ids_for_reordering(cp_size, k.device, True)
+    k_ag = torch.index_select(k_ag, dim=0, index=chunk_ids)
+    v_ag = torch.index_select(v_ag, dim=0, index=chunk_ids)
+
+    <span class="cm"># Step 3: local FA (each GPU processes its own Q chunk, but has full KV)</span>
+    out = flash_attn_func(q, k_ag, v_ag, causal=is_causal)
+    <span class="kw">return</span> out</pre>
+
+<h3>2.2 Communication volume and model</h3>
+
+<p>The KV communication volume per GPU (bf16, 2 bytes):</p>
+
+<p>$$ V_{\text{comm}}^{\text{AG}} = 2 \times 2 \times \frac{H_{kv}}{\text{tp}} \times S \times d $$</p>
+
+<p>The two 2s: one for K + V, one for bf16 byte size. Note the $\frac{H_{kv}}{\text{tp}}$ — under GQA, $H_{kv} \ll H$, so the savings are large.</p>
+
+<p>Time (ignoring reorder overhead):</p>
+
+<p>$$ T_{\text{AG}} = \frac{V_{\text{compute}}}{\text{flops} \cdot \text{cp}} + \frac{V_{\text{comm}}^{\text{AG}}}{BW_{\text{AG}}} $$</p>
+
+<p>The "AllGather algorithm bandwidth" $BW_{\text{AG}}$ is essentially independent of cp at fixed tp (NCCL's AG uses a ring-class topology, so bus BW barely varies with rank count), so:</p>
+
+<ul>
+  <li><strong>Scenario 1 (tp fixed, cp grows)</strong>: $T_{\text{compute}}$ drops linearly with cp, $T_{\text{comm}}$ is unchanged (because $V_{\text{comm}}$ is independent of cp — every GPU gathers the full $S$). <strong>Once cp is large, attention becomes communication-bound</strong>, and adding more GPUs has rapidly diminishing returns.</li>
+  <li><strong>Scenario 2 (tp × cp fixed)</strong>: cp grows → tp shrinks → $\frac{H_{kv}}{\text{tp}}$ grows → $V_{\text{comm}}$ grows. So <strong>in this scenario, larger cp actually makes attention slower</strong>.</li>
+</ul>
+
+<h3>2.3 Strengths and limits</h3>
+
+<table>
+<thead><tr><th>Strengths ✓</th><th>Weaknesses ✗</th></tr></thead>
+<tbody>
+<tr><td>Extremely simple to implement (AllGather + standard FA)</td><td>The full AG is exposed on the critical path, with no overlap</td></tr>
+<tr><td>Supports <strong>arbitrary attention masks</strong> (sliding window, block-causal, fully random masks)</td><td>Per-GPU peak memory = full KV, which partly defeats the memory-saving goal of CP</td></tr>
+<tr><td>GQA-friendly (gathers $H_{kv}$, not $H$)</td><td>At large cp, attention is 100% communication-bound</td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+<strong>When to pick AllGather KV?</strong> Small cp (2-4), GQA, and you need a non-standard mask like sliding-window. The TE source code confirms this: only <code>cp_comm_type ∈ {"a2a", "all_gather"}</code> supports sliding-window (<code>context_parallel.py:4638</code>).
+</div>
+
+<h2 id="sec3">3. Method 2: Ring Attention (P2P)</h2>
+
+<p>The pain point of AllGather is that <strong>"communication is on the critical path"</strong>. The core idea of Ring Attention (Li et al. 2021, Liu et al. 2023): <strong>split the AllGather into cp P2P send/recv steps; each step, take in a new KV chunk and immediately attention it against the local Q, so communication runs concurrently with compute</strong>.</p>
+
+<h3 id="sec3-1">3.1 Idea and execution flow</h3>
+
+<p>Each GPU holds its own Q chunk, and $K_i$ rotates around the ring. At each step:</p>
+
+<ol>
+  <li><strong>Compute</strong>: compute partial attention on the currently held $(Q_{\text{local}}, K_j, V_j)$, accumulating via online softmax.</li>
+  <li><strong>Communicate</strong>: P2P-send $(K_j, V_j)$ to the next rank in the ring; simultaneously recv $(K_{j-1}, V_{j-1})$ from the previous rank.</li>
+  <li><strong>Loop</strong>: repeat cp times, until each KV chunk has met every local Q chunk once.</li>
+</ol>
+
+<p>The key is that <strong>steps 1 and 2 run in parallel</strong>. If communication time ≤ compute time, the communication is fully hidden. The diagram below illustrates the cp=4 case:</p>
+
+<div style="overflow-x:auto; margin:1em 0;">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 240" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
+  <text x="450" y="24" text-anchor="middle" font-size="13" font-weight="700">Ring Attention (cp=4) — each GPU rotates KV chunks step by step</text>
+
+  <!-- timeline header -->
+  <text x="50" y="58" font-size="10" fill="#666">GPU 0</text>
+  <text x="50" y="86" font-size="10" fill="#666">GPU 1</text>
+  <text x="50" y="114" font-size="10" fill="#666">GPU 2</text>
+  <text x="50" y="142" font-size="10" fill="#666">GPU 3</text>
+
+  <text x="180" y="42" text-anchor="middle" font-size="10" fill="#444">Round 0</text>
+  <text x="370" y="42" text-anchor="middle" font-size="10" fill="#444">Round 1</text>
+  <text x="560" y="42" text-anchor="middle" font-size="10" fill="#444">Round 2</text>
+  <text x="750" y="42" text-anchor="middle" font-size="10" fill="#444">Round 3</text>
+
+  <!-- GPU 0 row -->
+  <g>
+    <rect x="100" y="50" width="160" height="20" fill="#e7f0fa" stroke="#0b6cc4"/>
+    <text x="180" y="64" text-anchor="middle" font-size="10">(Q0, K0V0)</text>
+    <rect x="290" y="50" width="160" height="20" fill="#fef0d8" stroke="#b96b1a"/>
+    <text x="370" y="64" text-anchor="middle" font-size="10">(Q0, K3V3)</text>
+    <rect x="480" y="50" width="160" height="20" fill="#eaf3ec" stroke="#1f8a4d"/>
+    <text x="560" y="64" text-anchor="middle" font-size="10">(Q0, K2V2)</text>
+    <rect x="670" y="50" width="160" height="20" fill="#f3e8f5" stroke="#7a4ea0"/>
+    <text x="750" y="64" text-anchor="middle" font-size="10">(Q0, K1V1)</text>
+  </g>
+
+  <!-- GPU 1 -->
+  <g>
+    <rect x="100" y="78" width="160" height="20" fill="#fef0d8" stroke="#b96b1a"/>
+    <text x="180" y="92" text-anchor="middle" font-size="10">(Q1, K1V1)</text>
+    <rect x="290" y="78" width="160" height="20" fill="#e7f0fa" stroke="#0b6cc4"/>
+    <text x="370" y="92" text-anchor="middle" font-size="10">(Q1, K0V0)</text>
+    <rect x="480" y="78" width="160" height="20" fill="#f3e8f5" stroke="#7a4ea0"/>
+    <text x="560" y="92" text-anchor="middle" font-size="10">(Q1, K3V3)</text>
+    <rect x="670" y="78" width="160" height="20" fill="#eaf3ec" stroke="#1f8a4d"/>
+    <text x="750" y="92" text-anchor="middle" font-size="10">(Q1, K2V2)</text>
+  </g>
+
+  <!-- GPU 2 -->
+  <g>
+    <rect x="100" y="106" width="160" height="20" fill="#eaf3ec" stroke="#1f8a4d"/>
+    <text x="180" y="120" text-anchor="middle" font-size="10">(Q2, K2V2)</text>
+    <rect x="290" y="106" width="160" height="20" fill="#fef0d8" stroke="#b96b1a"/>
+    <text x="370" y="120" text-anchor="middle" font-size="10">(Q2, K1V1)</text>
+    <rect x="480" y="106" width="160" height="20" fill="#e7f0fa" stroke="#0b6cc4"/>
+    <text x="560" y="120" text-anchor="middle" font-size="10">(Q2, K0V0)</text>
+    <rect x="670" y="106" width="160" height="20" fill="#f3e8f5" stroke="#7a4ea0"/>
+    <text x="750" y="120" text-anchor="middle" font-size="10">(Q2, K3V3)</text>
+  </g>
+
+  <!-- GPU 3 -->
+  <g>
+    <rect x="100" y="134" width="160" height="20" fill="#f3e8f5" stroke="#7a4ea0"/>
+    <text x="180" y="148" text-anchor="middle" font-size="10">(Q3, K3V3)</text>
+    <rect x="290" y="134" width="160" height="20" fill="#eaf3ec" stroke="#1f8a4d"/>
+    <text x="370" y="148" text-anchor="middle" font-size="10">(Q3, K2V2)</text>
+    <rect x="480" y="134" width="160" height="20" fill="#fef0d8" stroke="#b96b1a"/>
+    <text x="560" y="148" text-anchor="middle" font-size="10">(Q3, K1V1)</text>
+    <rect x="670" y="134" width="160" height="20" fill="#e7f0fa" stroke="#0b6cc4"/>
+    <text x="750" y="148" text-anchor="middle" font-size="10">(Q3, K0V0)</text>
+  </g>
+
+  <!-- caption -->
+  <text x="450" y="190" text-anchor="middle" font-size="11" fill="#444">Each GPU's local Q chunk (Q0/Q1/Q2/Q3) stays put; KV chunks (K0/K1/K2/K3) rotate in the ring for cp steps</text>
+  <text x="450" y="208" text-anchor="middle" font-size="11" fill="#444">Each step overlaps attention and communication; online softmax accumulates the partial outputs</text>
+  <text x="450" y="226" text-anchor="middle" font-size="10" fill="#666" font-style="italic">Reference: Li et al. arXiv:2105.13120 + Liu et al. arXiv:2310.01889</text>
+</svg>
+</div>
+
+<p>Open-source reference implementations:</p>
+<ul>
+  <li><strong>Original JAX version</strong>: <a href="https://github.com/lhao499/RingAttention">lhao499/RingAttention</a> (Liu et al. 2023)</li>
+  <li><strong>Community Triton/PyTorch version</strong>: <a href="https://github.com/zhuzilin/ring-flash-attention">zhuzilin/ring-flash-attention</a></li>
+  <li><strong>NVIDIA TransformerEngine</strong>: <code>AttnFuncWithCPAndKVP2P</code> (<code>context_parallel.py:1362</code>), enabled via <code>cp_comm_type="p2p"</code></li>
+</ul>
+
+<h3 id="sec3-2">3.2 Communication-computation overlap boundary</h3>
+
+<p>Per-step (per chunk) communication and compute:</p>
+
+<p>$$ V_{\text{comm}}^{\text{step}} = 4 \times \frac{H_{kv}}{\text{tp}} \times \frac{S}{\text{cp}} \times d $$</p>
+<p>$$ V_{\text{compute}}^{\text{step}} = 4 \times \frac{H}{\text{tp}} \times \frac{S^2}{\text{cp}^2} \times d $$</p>
+
+<p>4 = K + V × 2 bytes (bf16); compute scales as $\frac{1}{\text{cp}^2}$ because both the Q chunk and the KV chunk are of size $S/\text{cp}$.</p>
+
+<p>The condition for communication to be <strong>fully hidden</strong> by compute:</p>
+
+<p>$$ \frac{V_{\text{comm}}^{\text{step}}}{BW} \leq \frac{V_{\text{compute}}^{\text{step}}}{\text{flops}} \quad\Longrightarrow\quad \text{cp} \leq \frac{BW \times S}{\text{flops}} \times \frac{H}{H_{kv}} $$</p>
+
+<p>This is the <strong>"communication-computation overlap boundary"</strong> $\text{cp}_{\text{bor}}$. When $\text{cp} \leq \text{cp}_{\text{bor}}$, communication is hidden → attention time ≈ compute time ≈ $V_{\text{compute}} / \text{flops}$, which is <strong>inversely proportional</strong> to cp. When $\text{cp} &gt; \text{cp}_{\text{bor}}$, communication is exposed → attention time becomes <strong>proportional</strong> to cp (because you still run cp steps and the communication of every step is exposed).</p>
+
+<div class="example">
+<span class="label">Example 3.2</span>
+DGX-H100 + IB: measured NVLink bandwidth 540 GB/s, measured IB bandwidth 43 GB/s (per NIC), H100 effective BF16 compute 550 TFLOPS. $S = 128\text{K}$, MHA (no GQA):<br>
+<strong>intra-node:</strong> $\text{cp}_{\text{bor}} \approx \frac{540 \times 10^9 \times 128 \times 1024}{550 \times 10^{12}} \approx 128$ — intra-node, communication is hardly a bottleneck at all.<br>
+<strong>inter-node:</strong> $\text{cp}_{\text{bor}} \approx \frac{43 \times 10^9 \times 128 \times 1024}{550 \times 10^{12}} \approx 10$ — the moment cp exceeds ~10 and crosses out of NVLink, attention immediately becomes communication-bound.<br><br>
+This is exactly why every "P2P-class" method's performance crashes when strong-scaling across nodes.
+</div>
+
+<h3 id="sec3-3">3.3 Backward pass</h3>
+
+<p>Backward Ring is more complex than forward — you have to send not just KV but also the KV gradients. The per-step communication volume doubles. The backward attention kernel itself is also more compute-heavy (about 2.5× forward). In the TE source, the two paths live in the helpers <code>cp_p2p_fwd_flash_attn</code> and <code>cp_p2p_bwd_flash_attn</code>.</p>
+
+<h3>3.4 Strengths and weaknesses</h3>
+
+<table>
+<thead><tr><th>Strengths ✓</th><th>Weaknesses ✗</th></tr></thead>
+<tbody>
+<tr><td>Communication and compute overlap → only compute is left on the critical path</td><td>Beyond cp_bor, communication is exposed and scaling collapses</td></tr>
+<tr><td>Per-GPU memory only needs the <strong>current KV chunk + one buffer</strong></td><td>Load imbalance under causal mask (see §4)</td></tr>
+<tr><td>Supports arbitrary non-sliding-window masks</td><td>A cross-node ring uses only one NIC path; the other NICs sit idle</td></tr>
+</tbody>
+</table>
+
+<h2 id="sec4">4. Method 3: Load balancing under causal mask</h2>
+
+<p>Ring Attention has a "hidden load imbalance" that only shows up under the <strong>causal mask</strong> — i.e., the standard attention for GPT-class models. This section is dedicated to how to solve it.</p>
+
+<h3 id="sec4-1">4.1 The problem: triangular load</h3>
+
+<p>Take $S = 8, \text{cp} = 2$ as an example. Under a causal mask, which $(i, j)$ have to be computed? The lower triangle with $j \leq i$:</p>
+
+<pre class="code">
+              KV chunk
+              0,1,2,3  4,5,6,7
+       Q  0  [  ■        ░     ]    GPU 0 (holds Q0..Q3)
+       c  1  [  ■        ░     ]
+       h  2  [  ■        ░     ]
+       u  3  [  ■        ░     ]
+       n  ─────────────────────
+       k  4  [  ■        ■     ]    GPU 1 (holds Q4..Q7)
+          5  [  ■        ■     ]
+          6  [  ■        ■     ]
+          7  [  ■        ■     ]
+
+       ■ = compute;  ░ = skip (j &gt; i)
+</pre>
+
+<p>Naive partitioning: GPU 0 holds Q[0..3], KV[0..3]; GPU 1 holds Q[4..7], KV[4..7]. But under the causal mask, <strong>GPU 0 only computes half of the upper-left 4×4 = 8 cells; GPU 1 computes the full left 4×4 + half of the right 4×4 = 16+8 = 24 cells</strong>. GPU 1 has 3× the work of GPU 0 — severely imbalanced. Every Ring step has to wait on the slowest GPU, so the whole thing is dragged down.</p>
+
+<h3 id="sec4-2">4.2 Striped Attention</h3>
+
+<p><strong>Striped Attention</strong> (Brandon et al., <a href="https://arxiv.org/abs/2311.09431">arXiv:2311.09431</a>) solves this by not chunking tokens contiguously, but instead <strong>interleaving them with stride = cp</strong>. Each GPU's tokens are uniformly scattered across the whole sequence as a "stripe":</p>
+
+<pre class="code">
+       Striped partition with cp = 2:
+       GPU 0 holds tokens 0, 2, 4, 6  (even positions)
+       GPU 1 holds tokens 1, 3, 5, 7  (odd  positions)
+
+       This way every (Q_i, K_j) pair on every GPU sees
+       a nearly identical "geometry" of the causal mask,
+       so the load is fully balanced.
+</pre>
+
+<p>Published results (paper §5): <strong>1.45× speedup at 256K sequence on A100, 1.65× speedup at 786K sequence on 16× TPUv4</strong>.</p>
+
+<h3 id="sec4-3">4.3 Zigzag / DualChunkSwap</h3>
+
+<p>Beyond Striped, the scheme more often used in practice is called <strong>Zigzag</strong> (community name) or <strong>DualChunkSwap</strong> (the TransformerEngine term). The idea: split the sequence into <strong>2×cp</strong> chunks instead of cp; each GPU gets <strong>one front and one back</strong> chunk.</p>
+
+<pre class="code">
+       cp = 2, seq split into 4 chunks:
+       chunk_0  chunk_1  chunk_2  chunk_3
+
+       GPU 0 holds: chunk_0 + chunk_3  (front + back)
+       GPU 1 holds: chunk_1 + chunk_2  (middle two)
+
+       Under the causal mask:
+       - GPU 0: small work on chunk_0 + large work on chunk_3
+       - GPU 1: medium work on chunk_1 + medium work on chunk_2
+
+       The two sums are nearly equal → load-balanced.
+</pre>
+
+<p>TransformerEngine implementation (<code>context_parallel.py:236</code>):</p>
+
+<pre class="code"><span class="kw">def</span> get_seq_chunk_ids_for_reordering_before_attn(cp_size, device):
+    <span class="cm">"""Reorder 2*cp chunks so that the rank-th GPU gets
+       chunk_{2*rank} and chunk_{2*cp - 2*rank - 1}."""</span>
+    chunk_ids = torch.empty(2 * cp_size, dtype=torch.int32, device=device)
+    <span class="kw">for</span> rank <span class="kw">in</span> range(cp_size):
+        chunk_ids[rank]           = 2 * rank
+        chunk_ids[rank + cp_size] = 2 * cp_size - 2 * rank - 1
+    <span class="kw">return</span> chunk_ids</pre>
+
+<p>This reorder runs once in the dataloader (in <code>megatron/core/utils.py</code>'s <code>get_batch_on_this_cp_rank</code>), so the attention kernel itself is identical to plain ring attention — no extra kernel complexity.</p>
+
+<div class="callout warn">
+<strong>Naming confusion warning</strong>: the same technique goes by different names in different places — TransformerEngine calls it <strong>DualChunkSwap</strong>, the Megatron-LM docs call it <strong>load-balanced</strong>, and the community (<code>zhuzilin/ring-flash-attention</code>, USP) calls it <strong>zigzag</strong>. Striped Attention is a <strong>different</strong> scheme (token-level interleaving with granularity = 1), not the same thing. The name "zigzag" has no formal paper origin; it emerged in the community around the same time as Striped (2023.11), independently.
+</div>
+
+<h3>4.4 Practical notes</h3>
+
+<ul>
+  <li>This reorder <strong>must</strong> happen in the dataloader, otherwise the attention mask indices will be wrong.</li>
+  <li>The sequence length must be divisible by <code>2 * cp_size</code> (pad if necessary).</li>
+  <li>Zigzag is on by default in TransformerEngine / Megatron-LM, so you get this optimization for free as soon as you turn on CP.</li>
+</ul>
+
+<h2 id="sec5">5. Method 4: Ulysses (A2A)</h2>
+
+<p>Ring/Striped/Zigzag all walk the same road — split along the <strong>sequence dimension S</strong> and rotate KV via P2P. DeepSpeed's <strong>Ulysses</strong> (Jacobs et al., <a href="https://arxiv.org/abs/2309.14509">arXiv:2309.14509</a>) takes a completely different path: <strong>swap axes with AllToAll before attention</strong>, so that within attention you split along heads instead of the sequence.</p>
+
+<h3 id="sec5-1">5.1 Idea: axis swap via dispatch</h3>
+
+<p>The tensor entering attention in each transformer block: <code>[H, S/cp, d]</code> (distributed along S). Ulysses inserts one AllToAll before attention and one after:</p>
+
+<pre class="code">
+Before attention:                      Inside attention:                    After attention:
+─────────────────                      ─────────────                       ─────────────────
+GPU 0: [H, S/cp, d]    AlltoAll    GPU 0: [H/cp, S, d]    local FA      GPU 0: [H/cp, S, d]    AlltoAll    GPU 0: [H, S/cp, d]
+GPU 1: [H, S/cp, d]   ─────────→   GPU 1: [H/cp, S, d]    ──────→      GPU 1: [H/cp, S, d]   ─────────→   GPU 1: [H, S/cp, d]
+GPU 2: [H, S/cp, d]                GPU 2: [H/cp, S, d]                 GPU 2: [H/cp, S, d]                GPU 2: [H, S/cp, d]
+GPU 3: [H, S/cp, d]                GPU 3: [H/cp, S, d]                 GPU 3: [H/cp, S, d]                GPU 3: [H, S/cp, d]
+
+     ↑                                  ↑                                    ↑                                ↑
+  split S                            split H                              split H                          split S
+                                  each GPU has full S                  each GPU has full S
+                                  runs attention on H/cp heads
+</pre>
+
+<p>Open-source references:</p>
+<ul>
+  <li><strong>Original</strong>: <a href="https://github.com/microsoft/DeepSpeed">microsoft/DeepSpeed</a>, <code>DistributedAttention</code> in <code>deepspeed/sequence/layer.py</code></li>
+  <li><strong>TE version</strong>: <code>AttnFuncWithCPAndQKVOA2A</code> (<code>context_parallel.py:3807</code>), enabled via <code>cp_comm_type="a2a"</code></li>
+</ul>
+
+<h3 id="sec5-2">5.2 Communication complexity</h3>
+
+<p>Ulysses runs <strong>4 AllToAlls per attention</strong>: one before and one after in forward (QKV → output reshape), and the same two in backward. Total communication (all tokens participate in A2A):</p>
+
+<p>$$ V_{\text{comm}}^{\text{Ulysses, per pass}} = 4 \times 2 \times \frac{H + 2 H_{kv}}{\text{tp}} \times \frac{S}{\text{cp}} \times d \times \frac{\text{cp} - 1}{\text{cp}} $$</p>
+
+<p>Key property: <strong>per-GPU communication volume is essentially independent of cp</strong> — that's the essence of A2A, with a $\frac{n-1}{n}$ bus bandwidth utilization. This is Ulysses's biggest advantage over Ring: when cp doubles, Ring's total communication doubles while Ulysses's stays almost the same.</p>
+
+<p>The original wording in the paper (Jacobs et al. §3): <em>"maintains constant communication volume when sequence length and compute devices are increased proportionally"</em>.</p>
+
+<h3 id="sec5-3">5.3 Fatal constraint: cp ≤ num_kv_heads</h3>
+
+<p>Ulysses splits along the head dimension, so <strong>cp must divide H (MHA) or $H_{kv}$ (GQA)</strong>. TP also splits along heads, giving the joint constraint:</p>
+
+<p>$$ \text{tp} \times \text{cp} \leq H_{kv} $$</p>
+
+<div class="callout warn">
+<strong>This is Ulysses's kill switch</strong>. LLaMA3-8B uses GQA-8 (<code>num_kv_heads = 8</code>), so $\text{tp} \times \text{cp} \leq 8$. If you want to train on 1M context, you need cp = 256 — flat-out impossible.<br><br>
+DeepSpeed-Ulysses by itself is <strong>not</strong> suitable for multi-node scaling of modern GQA large models on long sequences. That's its fundamental limitation as a standalone method.<br><br>
+The fix: <strong>combine it with Ring</strong> — use Ulysses in a small range (<code>cp_a2a ≤ H_kv</code>) and let Ring carry the rest of the cp dimension. This is the heart of USP / LoongTrain in §6.
+</div>
+
+<h2 id="sec6">6. Method 5: USP / LoongTrain 2D</h2>
+
+<p>Ring's strength is <strong>arbitrary scalability</strong> but with large communication; Ulysses's strength is <strong>small communication</strong> but capped by the head count. The natural idea: <strong>multiply them together and do 2D parallelism</strong>. This is the shared idea behind USP (Fang &amp; Zhao, <a href="https://arxiv.org/abs/2405.07719">arXiv:2405.07719</a>) and LoongTrain (Gu et al., <a href="https://arxiv.org/abs/2406.18485">arXiv:2406.18485</a>). The two papers are only weeks apart (USP in May, LoongTrain in June), with the same core idea; LoongTrain adds the Double-Ring engineering optimization on top.</p>
+
+<h3 id="sec6-1">6.1 Idea: Ulysses × Ring 2D grid</h3>
+
+<p>Split cp into two dimensions:</p>
+
+<p>$$ \text{cp} = \text{cp}_{a2a} \times \text{cp}_{p2p} $$</p>
+
+<p>The GPU topology is organized as a <strong>2D grid</strong>:</p>
+
+<ul>
+  <li><strong>Same row (<code>cp_a2a</code> ranks)</strong>: Ulysses A2A splits heads. On intra-node NVLink, A2A is extremely fast. Constraint: <code>cp_a2a ≤ H_kv / tp</code>.</li>
+  <li><strong>Same column (<code>cp_p2p</code> ranks)</strong>: Ring P2P splits the sequence. Each "a2a group" runs Ring Attention independently. Can cross nodes.</li>
+</ul>
+
+<p>So one attention does the following:</p>
+
+<ol>
+  <li><strong>First A2A</strong>: swap axes within the a2a group; each rank ends up with <code>H_kv/cp_a2a</code> heads of the full sequence.</li>
+  <li><strong>Ring Attention</strong>: within the p2p group, run ring attention on these heads (<code>cp_p2p</code> rotations).</li>
+  <li><strong>Second A2A</strong>: swap axes back; output is still shaped <code>[H/tp, S/cp, d]</code>.</li>
+</ol>
+
+<div class="example">
+<span class="label">Example 6.1 — LLaMA3-8B on 16 GPUs</span>
+$H_{kv} = 8$; assume tp=2 and want cp=16:<br>
+- Pure Ulysses: cp ≤ $H_{kv} / \text{tp} = 4$ → can't reach cp=16.<br>
+- Pure Ring: cp=16 in one P2P chain, severe single-NIC bottleneck across nodes.<br>
+- USP/LoongTrain: cp_a2a=4 (= $H_{kv}/\text{tp}$, maxed out on heads), cp_p2p=4 → total cp=16. Intra-node 4 GPUs run A2A (NVLink 540 GB/s), inter-node 4 nodes run Ring (IB 43 GB/s). <strong>The combined scheme uses every dimension available</strong>.
+</div>
+
+<p>Implementation: <a href="https://github.com/feifeibear/long-context-attention">feifeibear/long-context-attention</a> (yunchang) wraps both dimensions uniformly. TE also implements the same idea, enabled via <code>cp_comm_type="a2a+p2p"</code>, splitting the cp_group internally into <code>[a2a_group, p2p_group]</code>.</p>
+
+<p>USP's public benchmark (arXiv:2405.07719): <strong>LLAMA3-8B at 208K seq on 2 × 8 × A800 RDMA, 269.8 TFLOPS, MFU 0.86</strong>.</p>
+
+<h3 id="sec6-2">6.2 LoongTrain's Double-Ring</h3>
+
+<p>Pure Ring has a hidden issue during inter-node communication: each GPU can only use <strong>one NIC path</strong> (because a ring is a single loop). A DGX-H100 has 8 IB NICs, but a ring uses only one of them per GPU, leaving <strong>7 NICs idle</strong>.</p>
+
+<p>LoongTrain's <strong>Double-Ring Attention</strong> splits the single ring into a <strong>two-level ring</strong>:</p>
+
+<ul>
+  <li><strong>Inner ring</strong>: a few intra-node GPUs forming a ring over NVLink. Multiple inner rings run in parallel.</li>
+  <li><strong>Outer ring</strong>: cross-node P2P between inner rings. <strong>All NICs are used simultaneously</strong>.</li>
+</ul>
+
+<p>Public benchmark (arXiv:2406.18485 abstract): <em>"improves Model FLOPs Utilization (MFU) by up to 2.88×"</em>, on 1M sequence vs DeepSpeed-Ulysses and Megatron-CP.</p>
+
+<h3>6.3 Limits of USP / LoongTrain</h3>
+
+<table>
+<thead><tr><th>Strengths ✓</th><th>Weaknesses ✗</th></tr></thead>
+<tbody>
+<tr><td>Combines Ulysses (cheap communication) + Ring (scalable)</td><td>The Ring leg still bears the intrinsic cost of cross-node P2P</td></tr>
+<tr><td>Breaks past the Ulysses head cap</td><td>cp_a2a and cp_p2p must be tuned by hand per topology</td></tr>
+<tr><td>Mature open source (yunchang / InternEvo)</td><td>The Ring leg still needs zigzag/striped under causal mask</td></tr>
+</tbody>
+</table>
+
+<h2 id="sec7">7. Method 6: MagiAttention</h2>
+
+<p>USP/LoongTrain glue Ring and Ulysses together and ease the scalability problem at large cp. But neither tackles a deeper issue: <strong>for "non-standard" masks like sparse / varlen / block-causal / video AR / MoD, none of the methods above are friendly</strong>.</p>
+
+<p><strong>MagiAttention</strong> (SandAI 2025, <a href="https://github.com/SandAI-org/MagiAttention">GitHub</a> + <a href="https://sandai-org.github.io/MagiAttention/docs/main/blog/magi_attn.html">official blog</a>) cuts in from this angle and proposes a completely different design. It has four core components, which we walk through one by one.</p>
+
+<h3 id="sec7-1">7.1 Flexible Flash Attention kernel (FFA)</h3>
+
+<p>Traditional FlashAttention hard-codes the mask as one of a few enums: <code>causal</code> / <code>full</code> / <code>sliding_window</code>. <strong>FFA</strong> expresses any mask via a generic structure:</p>
+
+<pre class="code">AttnSlice = (QRange, KRange, MaskType)
+         ↑       ↑         ↑
+       Q range  KV range  mask type: FULL / CAUSAL / INV-CAUSAL / BI-CAUSAL
+
+A mask = a set of AttnSlices = the union of rectangular blocks</pre>
+
+<p>For example, a document-causal mask (causal within each document, invisible across documents) is expressed as the concatenation of multiple <code>(Qrange, Krange, CAUSAL)</code> slices; video AR's block-causal decomposes similarly. The FFA kernel directly consumes this representation — no need to write a kernel per mask.</p>
+
+<p>Performance (README): <em>"performance comparable to Flash-Attention 3 on Hopper GPUs"</em> — i.e., no degradation in the attention kernel speed itself.</p>
+
+<h3 id="sec7-2">7.2 Dispatch Solver: load balance for arbitrary masks</h3>
+
+<p>This is the <strong>generalization</strong> of zigzag/striped. Zigzag assumes the mask is a regular causal triangle, so a closed-form solution (front + back) gives balance. MagiAttention faces arbitrary masks and has to formalize this as an optimization problem:</p>
+
+<p>$$ f^* = \arg\min_f \max_j \text{SumArea}(B_j) $$</p>
+
+<p>where $f$ is the assignment of chunks to cp buckets and $B_j$ is the load (entries inside the mask) of bucket $j$. This is NP-hard; in practice they use a <strong>greedy min-heap</strong> approximation, $O(n \log n)$ per iteration.</p>
+
+<p>Significance: <strong>any mask can be sharded with near-perfect balance</strong>, no longer limited to a local trick like zigzag that only works on causal masks.</p>
+
+<h3 id="sec7-3">7.3 GroupCast/GroupReduce: zero-redundant communication</h3>
+
+<p>This is MagiAttention's <strong>biggest innovation</strong> relative to all its predecessors. Ring/Ulysses both rest on a <strong>uniform</strong> P2P or A2A topology, but the actual communication carries a lot of redundancy:</p>
+
+<ul>
+  <li>The KV that Ring rotates under a causal mask contains many entries that are never used (they get masked out) — the paper notes <em>"causal mask causes 25% redundant communication"</em>.</li>
+  <li>Under varlen block-causal the redundancy is higher, <em>"can exceed 33% redundancy"</em>.</li>
+</ul>
+
+<p>MagiAttention replaces the fixed P2P/A2A patterns with <strong>two new communication primitives</strong>:</p>
+
+<table>
+<thead><tr><th>Primitive</th><th>Semantics</th><th>Backing</th></tr></thead>
+<tbody>
+<tr><td><strong>GroupCast</strong> (forward)</td><td>Given a ranks → (start offset, length) mapping, send the <strong>needed</strong> KV ranges to the <strong>ranks that need them</strong>, with no redundancy</td><td>AllToAll-v + Range-Gather kernel</td></tr>
+<tr><td><strong>GroupReduce</strong> (backward)</td><td>Same shape, but reduces gradients instead of dispatching</td><td>Range-Scatter-Reduce kernel</td></tr>
+</tbody>
+</table>
+
+<p>v1.0.5+ uses <a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a> (open-sourced by DeepSeek) as the underlying hierarchical AllToAll-v, which auto-dedupes on RDMA — hitting the same pain point that LoongTrain's Double-Ring addresses, but through a more general AllToAll-v primitive instead of a ring overlay.</p>
+
+<h3 id="sec7-4">7.4 Multi-Stage Overlap</h3>
+
+<p>Slice GroupCast/GroupReduce into stages and pipeline the communication of one stage against the FFA compute of the next, so only the last stage's compute can't be hidden behind communication — the classic prologue/epilogue overlap idea, applied at the attention layer.</p>
+
+<h3>7.5 Public benchmarks</h3>
+
+<p>The README and the official blog compare <strong>head-to-head</strong> against Ulysses, Ring P2P, Ring AllGather, USP, LoongTrain, and Megatron HybridCP. Test scales: H100 cluster at 8K seq/device, B200 cluster at 16K seq/device, cp from 8 to 64. Mask types: full / causal / varlen full / varlen causal.</p>
+
+<p>Blog figures (Figs. 44-59): <em>"near-linear scalability on varlen causal masks"</em> on H100 + B200. Specific TFLOPS numbers appear only in the figures (not quoted in text), so we don't reproduce values here.</p>
+
+<h3>7.6 Limitations</h3>
+
+<ul>
+  <li>FFA currently prioritizes Hopper (B200 supported via a forked FA4 in v1.1.0+, Ampere in v1.1.1+).</li>
+  <li>Native GroupCast/GroupReduce depends on DeepEP and currently targets the Hopper-class topology with NVLink + RDMA.</li>
+</ul>
+
+<h2 id="sec8">8. Other methods and variants</h2>
+
+<p>Beyond the six main methods above, a few others are worth knowing:</p>
+
+<table>
+<thead><tr><th>Method</th><th>Paper / repo</th><th>Key idea</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td><strong>DistFlashAttn / LightSeq</strong></td><td><a href="https://arxiv.org/abs/2310.03294">arXiv:2310.03294</a> · <a href="https://github.com/RulinShao/LightSeq">RulinShao/LightSeq</a></td><td>Token-level load balance + communication overlap + remat-aware checkpoint</td><td>Appeared in 2023.10, earlier than zigzag/striped. In practice largely superseded by USP/LoongTrain.</td></tr>
+<tr><td><strong>BurstAttention / BurstEngine</strong></td><td><a href="https://arxiv.org/abs/2403.09347">arXiv:2403.09347</a> · <a href="https://arxiv.org/abs/2509.19836">arXiv:2509.19836</a></td><td>Ring + GAO/LAO two-level optimization + topology-aware improvements</td><td>Further communication optimization on Ring, subsumed by MagiAttention's GroupCast idea.</td></tr>
+<tr><td><strong>Tree Attention</strong></td><td><a href="https://arxiv.org/abs/2408.04093">arXiv:2408.04093</a> · <a href="https://github.com/Zyphra/tree_attention">Zyphra/tree_attention</a></td><td>Tree-shaped reduce instead of ring, $O(\log P)$ communication rounds</td><td>Mainly aimed at <strong>inference / decode</strong>, little training adaptation.</td></tr>
+<tr><td><strong>RSA (Li 2021)</strong></td><td><a href="https://arxiv.org/abs/2105.13120">arXiv:2105.13120</a></td><td>First generation of Ring Attention</td><td>Lacked online softmax; superseded by Liu 2023.</td></tr>
+</tbody>
+</table>
+
+<p>These methods are either transitional forms (covered by later schemes) or focused on specific scenarios (inference/decode), so they don't appear separately in the selection decision tree.</p>
+
+<h2 id="sec9">9. Side-by-side: comprehensive table + method selection</h2>
+
+<h3 id="sec9-1">9.1 Comprehensive table of the eight methods</h3>
+
+<table>
+<thead>
+<tr><th>#</th><th>Method</th><th>Communication primitive</th><th>Origin</th><th>Key idea</th><th>Fatal limitation</th><th>Open-source location</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td>1</td>
+  <td><strong>AllGather KV</strong></td>
+  <td>AllGather</td>
+  <td>TE / Megatron</td>
+  <td>AG the KV first, then run local FA</td>
+  <td>Full AG on the critical path, no overlap; peak memory = full KV</td>
+  <td><code>AttnFuncWithCPAndKVAllGather</code> (TE <code>context_parallel.py:2948</code>)</td>
+</tr>
+<tr>
+  <td>2</td>
+  <td><strong>RingAttention (P2P)</strong></td>
+  <td>P2P send/recv ring</td>
+  <td>Li 2021 / Liu 2023 (<a href="https://arxiv.org/abs/2310.01889">2310.01889</a>)</td>
+  <td>Chunk + online softmax, communication and compute in parallel</td>
+  <td>Communication exposed when cp &gt; cp_bor; single-NIC ring, poor inter-node scaling</td>
+  <td><code>AttnFuncWithCPAndKVP2P</code> · zhuzilin/ring-flash-attention</td>
+</tr>
+<tr>
+  <td>3</td>
+  <td><strong>Striped Attention</strong></td>
+  <td>P2P + token interleaving</td>
+  <td>Brandon 2023 (<a href="https://arxiv.org/abs/2311.09431">2311.09431</a>)</td>
+  <td>Token-level stride interleaving, load-balanced under causal</td>
+  <td>Doesn't solve cross-node BW; only patches Ring</td>
+  <td>USP <code>stripe</code> impl</td>
+</tr>
+<tr>
+  <td>4</td>
+  <td><strong>Zigzag / DualChunkSwap</strong></td>
+  <td>P2P + 2×cp chunk swap</td>
+  <td>Community / TE / Megatron</td>
+  <td>Chunk-level front-back pairing, load-balanced under causal</td>
+  <td>Same as Striped: doesn't solve cross-node BW</td>
+  <td>TE <code>get_seq_chunk_ids_for_reordering</code> (line 236)</td>
+</tr>
+<tr>
+  <td>5</td>
+  <td><strong>Ulysses (A2A)</strong></td>
+  <td>AllToAll (×4 per attention)</td>
+  <td>Jacobs 2023 (<a href="https://arxiv.org/abs/2309.14509">2309.14509</a>)</td>
+  <td>Axis swap before/after attention; parallelize along heads</td>
+  <td>cp ≤ H_kv (LLaMA3-8B → cp ≤ 8)</td>
+  <td><code>DistributedAttention</code> (DeepSpeed) · <code>AttnFuncWithCPAndQKVOA2A</code> (TE)</td>
+</tr>
+<tr>
+  <td>6</td>
+  <td><strong>USP (2D)</strong></td>
+  <td>A2A (intra) + P2P (inter)</td>
+  <td>Fang 2024 (<a href="https://arxiv.org/abs/2405.07719">2405.07719</a>)</td>
+  <td>Ulysses × Ring 2D grid, breaks the head cap</td>
+  <td>P2P leg still suffers inter-node BW pain; need to hand-tune cp_a2a vs cp_p2p</td>
+  <td>feifeibear/long-context-attention (yunchang)</td>
+</tr>
+<tr>
+  <td>7</td>
+  <td><strong>LoongTrain (Double-Ring)</strong></td>
+  <td>A2A + two-level ring</td>
+  <td>Gu 2024 (<a href="https://arxiv.org/abs/2406.18485">2406.18485</a>)</td>
+  <td>2D idea + outer ring uses all NICs in parallel</td>
+  <td>Still needs tuning; limited mask flexibility</td>
+  <td>InternLM/InternEvo</td>
+</tr>
+<tr>
+  <td>8</td>
+  <td><strong>MagiAttention</strong></td>
+  <td>GroupCast / GroupReduce (AllToAll-v + Range-Gather/Scatter)</td>
+  <td>SandAI 2025</td>
+  <td>FFA arbitrary mask + general load balance + zero-redundant communication</td>
+  <td>Hopper-first (other architectures use a forked FA4); depends on DeepEP underneath</td>
+  <td>SandAI-org/MagiAttention + Megatron-LM-MagiAttention</td>
+</tr>
+</tbody>
+</table>
+
+<h3 id="sec9-2">9.2 Selection decision tree</h3>
+
+<p>The table above compressed into an actionable flow. Given: cp size, causal or not, GQA or not, single-node or multi-node.</p>
+
+<pre class="code">START
+  │
+  ├─ cp == 1
+  │      └→ no CP needed, skip this series
+  │
+  ├─ mask is non-standard (varlen / sparse / block-causal / video AR)
+  │      └→ <strong>MagiAttention</strong> (the only one that expresses arbitrary masks cleanly)
+  │
+  ├─ sliding-window mask required
+  │      └→ <strong>AllGather KV</strong> (TE: cp_comm_type="all_gather") or <strong>Ulysses</strong>
+  │
+  ├─ cp ≤ 2 and intra-node
+  │      └→ <strong>RingAttention + Zigzag</strong> (simplest; communication overlaps)
+  │
+  ├─ cp ≤ H_kv / tp and intra-node
+  │      └→ <strong>Ulysses</strong> (A2A is extremely fast on NVLink; constant communication volume)
+  │
+  ├─ cp moderate (8 ~ 32) and cp &gt; H_kv / tp
+  │      └→ <strong>USP / LoongTrain 2D</strong>
+  │             ├─ cp_a2a = min(H_kv / tp, intra-node size)
+  │             └─ cp_p2p = cp / cp_a2a
+  │      Prefer LoongTrain's Double-Ring on multi-node
+  │
+  └─ cp very large (&gt; 64), or pursuing peak MFU, or needing full mask flexibility
+         └→ <strong>MagiAttention</strong> (zero-redundant communication)
+</pre>
+
+<div class="callout">
+<strong>Practical tips</strong>:<br>
+① <strong>Always turn on zigzag/DualChunkSwap under causal masks</strong> — it's a free lunch and TE/Megatron enable it by default.<br>
+② <strong>The product of tp and cp must fit the head count</strong>. With LLaMA3-8B GQA-8, when tp + cp exceeds 8, Ulysses must be combined with Ring.<br>
+③ <strong>Cross-node cp is always a bottleneck</strong>. Keep cp intra-node (NVLink) as a priority; let PP/DP cross node boundaries.<br>
+④ On <strong>new architectures (B200 / GB200)</strong>, NVLink is upgraded — intra-node 8 GPUs can handle cp=8 on very long sequences, weakening the "2D" value of USP/LoongTrain; but MagiAttention's "flexible mask" value is unchanged (video generation, MoD).
+</div>
+
+<h2 id="sec10">References</h2>
+
+<h4>Papers</h4>
+
+<ul>
+  <li><a href="https://arxiv.org/abs/2105.13120">Li et al. 2021 — Sequence Parallelism: Long Sequence Training from System Perspective</a> (first RSA)</li>
+  <li><a href="https://arxiv.org/abs/2310.01889">Liu, Zaharia, Abbeel 2023 — Ring Attention with Blockwise Transformers for Near-Infinite Context</a> (Ring + FA online softmax)</li>
+  <li><a href="https://arxiv.org/abs/2311.09431">Brandon et al. 2023 — Striped Attention</a></li>
+  <li><a href="https://arxiv.org/abs/2309.14509">Jacobs et al. 2023 — DeepSpeed Ulysses</a></li>
+  <li><a href="https://arxiv.org/abs/2310.03294">DistFlashAttn / LightSeq</a></li>
+  <li><a href="https://arxiv.org/abs/2403.09347">BurstAttention</a></li>
+  <li><a href="https://arxiv.org/abs/2405.07719">Fang &amp; Zhao 2024 — USP</a></li>
+  <li><a href="https://arxiv.org/abs/2406.18485">Gu et al. 2024 — LoongTrain</a></li>
+  <li><a href="https://arxiv.org/abs/2408.04093">Shyam et al. 2024 — Tree Attention</a></li>
+  <li><a href="https://sandai-org.github.io/MagiAttention/docs/main/blog/magi_attn.html">SandAI 2025 — MagiAttention official blog</a></li>
+</ul>
+
+<h4>Open-source code</h4>
+
+<ul>
+  <li><a href="https://github.com/NVIDIA/TransformerEngine">NVIDIA/TransformerEngine</a> — the four CP implementations in <code>context_parallel.py</code></li>
+  <li><a href="https://github.com/NVIDIA/Megatron-LM">NVIDIA/Megatron-LM</a> — <code>get_batch_on_this_cp_rank</code> etc.</li>
+  <li><a href="https://github.com/microsoft/DeepSpeed">microsoft/DeepSpeed</a> — original Ulysses</li>
+  <li><a href="https://github.com/feifeibear/long-context-attention">feifeibear/long-context-attention</a> — USP / yunchang</li>
+  <li><a href="https://github.com/zhuzilin/ring-flash-attention">zhuzilin/ring-flash-attention</a> — community reference for Ring + Zigzag + Stripe</li>
+  <li><a href="https://github.com/InternLM/InternEvo">InternLM/InternEvo</a> — LoongTrain integration</li>
+  <li><a href="https://github.com/SandAI-org/MagiAttention">SandAI-org/MagiAttention</a> + <a href="https://github.com/SandAI-org/Megatron-LM-MagiAttention">Megatron-LM-MagiAttention</a></li>
+  <li><a href="https://github.com/lhao499/RingAttention">lhao499/RingAttention</a> — Liu 2023 JAX reference</li>
+  <li><a href="https://github.com/Zyphra/tree_attention">Zyphra/tree_attention</a></li>
+</ul>
+
+<h4>Official docs</h4>
+
+<ul>
+  <li><a href="https://docs.nvidia.com/megatron-core/developer-guide/0.16.0/user-guide/features/context_parallel.html">NVIDIA Megatron-Core Context Parallel docs</a></li>
+</ul>
+
+</div>
 </main>
 </div>
 <script src="../lang-toggle.js"></script>
