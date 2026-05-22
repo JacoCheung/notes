@@ -154,6 +154,7 @@
 <body>
 
 <nav class="toc" aria-label="目录">
+<div class="lang-zh">
 <strong>目录</strong>
 <ul>
   <li><a href="#sec1">1. 原始数据集</a>
@@ -184,7 +185,7 @@
   <li><a href="#sec4">4. 总结</a></li>
   <li><a href="#sec5">5. Batch 张量流(B=2 示例)</a>
     <ul>
-      
+
       <li><a href="#sec5-1">5.1 输入示例(B=2, L=4)</a></li>
       <li><a href="#sec5-2">5.2 Collate 后的张量</a></li>
       <li><a href="#sec5-3">5.3 每表 Lookup 次数</a></li>
@@ -196,9 +197,56 @@
     </ul>
   </li>
 </ul>
+</div>
+<div class="lang-en">
+<strong>Contents</strong>
+<ul>
+  <li><a href="#sec1">1. Raw Dataset</a>
+    <ul>
+      <li><a href="#sec1-1">1.1 Source and Scale</a></li>
+      <li><a href="#sec1-2">1.2 File Inventory</a></li>
+      <li><a href="#sec1-3">1.3 <code>multi_event.parquet</code> Schema</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec2">2. Training Feature Inventory</a>
+    <ul>
+      <li><a href="#sec2-1">2.1 Sparse Non-Sequential Features</a></li>
+      <li><a href="#sec2-2">2.2 Sparse Sequential Features</a></li>
+      <li><a href="#sec2-3">2.3 Dense Features</a></li>
+      <li><a href="#sec2-4">2.4 Cross-Product Sparse Features</a></li>
+      <li><a href="#sec2-5">2.5 Embedding Table Overview</a></li>
+      <li><a href="#sec2-6">2.6 <code>ScoringPair</code> Field Index</a></li>
+      <li><a href="#sec2-7">2.7 Multi-Task Labels</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec3">3. Preprocessing and Data Loading</a>
+    <ul>
+      <li><a href="#sec3-1">3.1 DataLoader Runtime Derivation</a></li>
+      <li><a href="#sec3-2">3.2 Candidate Generation</a></li>
+      <li><a href="#sec3-3">3.3 Multi-Event Concatenation into Long History Sequences</a></li>
+    </ul>
+  </li>
+  <li><a href="#sec4">4. Summary</a></li>
+  <li><a href="#sec5">5. Batch Tensor Flow (B=2 example)</a>
+    <ul>
+
+      <li><a href="#sec5-1">5.1 Input Example (B=2, L=4)</a></li>
+      <li><a href="#sec5-2">5.2 Collated Tensors</a></li>
+      <li><a href="#sec5-3">5.3 Per-Table Lookup Counts</a></li>
+      <li><a href="#sec5-4">5.4 Lookup-to-Token Conversion</a></li>
+      <li><a href="#sec5-5">5.5 Post-Lookup Tensor Shapes</a></li>
+      <li><a href="#sec5-6">5.6 Dense Feature Processing Path</a></li>
+      <li><a href="#sec5-7">5.7 Attention Input Token Layout (by feature name)</a></li>
+      <li><a href="#sec5-8">5.8 End-to-End Visualization (Raw → Attention)</a></li>
+    </ul>
+  </li>
+</ul>
+</div>
 </nav>
 
 <main class="content">
+
+<div class="lang-zh">
 
 <h1>oneTrans+YaMBDA study</h1>
 
@@ -1550,7 +1598,1360 @@ pos:    仅 S 段在 SequentialTokenizer 内加了 per-pool pos_emb;
 </ol>
 </div>
 
+</div><!-- /lang-zh -->
+
+<div class="lang-en">
+
+<h1>oneTrans + YaMBDA study</h1>
+
+<p><strong>Repository</strong>: <a href="https://github.com/AMD-AGI/Primus-DLRM">github.com/AMD-AGI/Primus-DLRM</a> &mdash; AMD-AGI's open-source DLRM/OneTrans benchmark implementation. All code references, line numbers, and config paths in this post are pinned to the <code>main</code> branch of that repo.</p>
+
+<p>This document walks through the complete data flow of the Yambda dataset inside Primus-DLRM &mdash; how it is preprocessed, featurized, and finally fed into the OneTrans model &mdash; from raw input all the way to the attention input and the loss.</p>
+
+<div class="callout note">
+Reading guide: §1&ndash;§2 are the <strong>static feature inventory</strong> (dataset fields, training features, embedding tables); §3 is the <strong>preprocessing logic</strong>; §5 is the <strong>dynamic data flow</strong> (per-tensor shapes + per-layer seqlen evolution). The detailed take-aways live at the end in §4.
+</div>
+
+<hr>
+
+<h2 id="sec1">1. Raw Dataset</h2>
+
+<h3 id="sec1-1">1.1 Source and Scale</h3>
+<ul>
+  <li><strong>Yambda</strong> (YaMBDA / Yandex Music Behavior Dataset) was publicly released by Yandex Music in <strong>2024</strong> through HuggingFace <code>yandex/yambda</code> (Apache 2.0).</li>
+  <li>Three tiers: <strong>50M / 500M / 5B</strong> events &mdash; Primus-DLRM defaults to <strong>Yambda-5B</strong> (4.79B real events).</li>
+  <li>5B-tier global stats:
+    <ul>
+      <li>Users: <strong>1M</strong></li>
+      <li>Items: <strong>9.39M</strong></li>
+      <li>Behavior types: 5 (<code>listen / like / dislike / unlike / undislike</code>)</li>
+      <li>Raw size: ~195 GB, ~20 bytes/event</li>
+    </ul>
+  </li>
+</ul>
+
+<h3 id="sec1-2">1.2 File Inventory</h3>
+<p>Downloaded from HuggingFace, see <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/download.py#L11-L26">download.py:11-26</a>.</p>
+
+<table>
+<thead>
+<tr><th>File</th><th>Type</th><th>Content</th></tr>
+</thead>
+<tbody>
+<tr><td><code>flat/&lt;size&gt;/multi_event.parquet</code></td><td><strong>Event stream</strong></td><td>The actual training data &mdash; row-level user-track interactions</td></tr>
+<tr><td><code>embeddings.parquet</code></td><td><strong>Item catalog metadata</strong></td><td>Pretrained audio embedding per track, 128-d (~14 GB, shared across all 3 tiers)</td></tr>
+<tr><td><code>artist_item_mapping.parquet</code></td><td>Item catalog metadata</td><td>item_id &rarr; artist_id</td></tr>
+<tr><td><code>album_item_mapping.parquet</code></td><td>Item catalog metadata</td><td>item_id &rarr; album_id</td></tr>
+</tbody>
+</table>
+
+<h3 id="sec1-3">1.3 <code>multi_event.parquet</code> Schema</h3>
+<p>From <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py#L166-L172">preprocessing.py:166-172</a>.</p>
+
+<table>
+<thead>
+<tr><th>Column</th><th>Physical meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>uid</code></td><td>User ID</td></tr>
+<tr><td><code>item_id</code></td><td>Track ID</td></tr>
+<tr><td><code>timestamp</code></td><td>Second-level timestamp (aligned to 5-second granularity)</td></tr>
+<tr><td><code>event_type</code></td><td><code>listen / like / dislike / unlike / undislike</code></td></tr>
+<tr><td><code>is_organic</code></td><td>Whether the listen was spontaneous (0 = triggered by recommendation impression, 1 = user-initiated)</td></tr>
+<tr><td><code>played_ratio_pct</code></td><td>Fraction of the track that was played (0&ndash;100)</td></tr>
+<tr><td><code>track_length_seconds</code></td><td>Track duration</td></tr>
+</tbody>
+</table>
+
+<div class="callout note">
+Note: <code>artist_id / album_id</code> are <strong>not in the event table</strong>. They have to be joined on-the-fly via <code>artist_item_mapping / album_item_mapping</code> using <code>item_id</code>.
+</div>
+
+<hr>
+
+<h2 id="sec2">2. Training Feature Inventory</h2>
+
+<p>The repo's schema is defined in <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/schemas/yambda.yaml">configs/schemas/yambda.yaml</a>, and the embedding tables plus dense features are defined inside each config file. We split features below by <em>whether they are sequence-typed</em>.</p>
+
+<h3 id="sec2-1">2.1 Sparse Non-Sequential Features</h3>
+<p>Source: user context + the candidate track itself. 4 scalar features in total, mapping to <strong>4 native sparse tables</strong>.</p>
+
+<table>
+<thead>
+<tr><th>Feature</th><th>Meaning</th><th>Table</th><th>num_embeddings</th></tr>
+</thead>
+<tbody>
+<tr><td><code>uid</code></td><td>Current user</td><td><code>uid</code></td><td>1,000,001</td></tr>
+<tr><td><code>item</code></td><td>Candidate track</td><td><code>item</code></td><td>9,390,624</td></tr>
+<tr><td><code>artist</code></td><td>Artist of the candidate track</td><td><code>artist</code></td><td>1,293,395</td></tr>
+<tr><td><code>album</code></td><td>Album of the candidate track</td><td><code>album</code></td><td>3,367,692</td></tr>
+</tbody>
+</table>
+
+<p class="small">(See <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/bench_onetrans_large_5b.yaml#L46-L50">bench_onetrans_large_5b.yaml:46-50</a>.)</p>
+
+<h3 id="sec2-2">2.2 Sparse Sequential Features</h3>
+
+<p>The soul of OneTrans: user history is sliced by behavior into <strong>3 pools</strong>, each pool records 3 kinds of entity IDs, so every sample carries <strong>9 sequences</strong>. <code>L = history_length</code> (5B config uses L=500 &rarr; S-token sequence length <code>L_S = 1500</code>).</p>
+
+<table>
+<thead>
+<tr><th>Pool (behavior pool)</th><th>Definition (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L189-L191">dataset.py:189-191</a>)</th><th>3 sequence names</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td><strong><code>hist_lp</code> (listen-plus)</strong></td>
+  <td><code>event_type==listen &and; played_ratio_pct &ge; 50%</code> (positive feedback)</td>
+  <td><code>hist_lp_item / hist_lp_artist / hist_lp_album</code></td>
+</tr>
+<tr>
+  <td><strong><code>hist_like</code></strong></td>
+  <td><code>event_type==like</code> (explicit like)</td>
+  <td><code>hist_like_item / hist_like_artist / hist_like_album</code></td>
+</tr>
+<tr>
+  <td><strong><code>hist_skip</code></strong></td>
+  <td><code>event_type==listen &and; played_ratio_pct &lt; 50%</code> (early-skip, negative feedback)</td>
+  <td><code>hist_skip_item / hist_skip_artist / hist_skip_album</code></td>
+</tr>
+</tbody>
+</table>
+
+<div class="callout note">
+Note: these 9 sequences have <strong>no independent embedding tables</strong> &mdash; each one shares a table with its corresponding non-sequential scalar (one table each for item/artist/album):
+<pre><code>- { name: item, features: [item, hist_lp_item, hist_like_item, hist_skip_item], ... }</code></pre>
+i.e. the candidate track and the history tracks share the same 9.39M-row item table &mdash; the 4 native sparse features each own one table.
+</div>
+
+<h3 id="sec2-3">2.3 Dense Features</h3>
+<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/bench_onetrans_large_5b.yaml#L58-L62">bench_onetrans_large_5b.yaml:58-62</a>:</p>
+
+<table>
+<thead>
+<tr><th>Feature</th><th>Dim</th><th>Source</th></tr>
+</thead>
+<tbody>
+<tr><td><code>audio_embed</code></td><td><strong>128</strong></td><td>Pretrained audio embedding of the candidate track (from <code>embeddings.parquet</code>)</td></tr>
+<tr><td><code>user_counters</code></td><td><strong>6</strong></td><td>User's [listen+, like, skip] counts in [7d, 30d] windows (2 windows &times; 3 behaviors)</td></tr>
+<tr><td><code>item_counters</code></td><td><strong>6</strong></td><td>Item's [impression, listen+, like] counts in [7d, 30d] windows</td></tr>
+<tr><td><code>cross_counters</code></td><td><strong>18</strong></td><td>Multiple cross counts for user &times; item in [7d, 30d] windows</td></tr>
+</tbody>
+</table>
+
+<p>The counter features are computed at preprocessing time by <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/counters.py">primus_dlrm/data/counters.py</a> using Numba sliding windows.</p>
+
+<h3 id="sec2-4">2.4 Cross-Product Sparse Features</h3>
+<p>Only enabled by <code>bench_onetrans_large_5b_cross_feat_shampoo.yaml</code>. These 7 cross tables (<code>user_x_artist</code> / <code>user_x_album</code> / <code>user_x_hour</code> / <code>item_x_hour</code> / <code>artist_x_hour</code> / <code>user_x_is_organic</code> / <code>user_x_artist_x_hour</code>) are the key design that blows up the embedding footprint.</p>
+
+<h3 id="sec2-5">2.5 Embedding Table Overview</h3>
+
+<p>Every sparse feature eventually hits one of these 11 tables:</p>
+
+<table>
+<thead>
+<tr><th>#</th><th>Table</th><th>Rows</th><th>Type</th><th>Which KJT features look up this table</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td><code>item</code></td><td>9.39M</td><td>native</td><td><code>item</code> (candidate) + <code>hist_lp_item</code> / <code>hist_like_item</code> / <code>hist_skip_item</code> (3 history sequences)</td></tr>
+<tr><td>2</td><td><code>artist</code></td><td>1.29M</td><td>native</td><td><code>artist</code> + <code>hist_lp_artist</code> / <code>hist_like_artist</code> / <code>hist_skip_artist</code></td></tr>
+<tr><td>3</td><td><code>album</code></td><td>3.37M</td><td>native</td><td><code>album</code> + <code>hist_lp_album</code> / <code>hist_like_album</code> / <code>hist_skip_album</code></td></tr>
+<tr><td>4</td><td><code>uid</code></td><td>1M</td><td>native</td><td><code>uid</code></td></tr>
+<tr><td>5</td><td><code>user_x_artist</code></td><td>100M</td><td>cross (hashed)</td><td><code>user_x_artist</code></td></tr>
+<tr><td>6</td><td><code>user_x_album</code></td><td>40M</td><td>cross (hashed)</td><td><code>user_x_album</code></td></tr>
+<tr><td>7</td><td><code>user_x_hour</code></td><td>24M</td><td>cross (unique)</td><td><code>user_x_hour</code></td></tr>
+<tr><td>8</td><td><code>item_x_hour</code></td><td>40M</td><td>cross (hashed)</td><td><code>item_x_hour</code></td></tr>
+<tr><td>9</td><td><code>artist_x_hour</code></td><td>32M</td><td>cross (unique)</td><td><code>artist_x_hour</code></td></tr>
+<tr><td>10</td><td><code>user_x_is_organic</code></td><td>2M</td><td>cross (unique)</td><td><code>user_x_is_organic</code></td></tr>
+<tr><td>11</td><td><code>user_x_artist_x_hour</code></td><td>40M</td><td>cross (hashed 3-way)</td><td><code>user_x_artist_x_hour</code></td></tr>
+</tbody>
+</table>
+
+<div class="callout note">
+<strong>Key mapping rule</strong> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/pipeline_batch.py">pipeline_batch.py</a>): for each sparse tensor in a batch, <code>schema.batch_to_feature</code> maps the "batch field name" to a "KJT feature name", and then <code>embedding_tables[*].features</code> resolves which table that feature belongs to. <strong>The 4 native tables are shared by 13 KJT features</strong> (candidate + 9 history sequences, sharing item/artist/album/uid); <strong>each of the 7 cross tables owns exactly 1 KJT feature</strong>.
+</div>
+
+<h3 id="sec2-6">2.6 <code>ScoringPair</code> Field Index</h3>
+
+<p>Each training sample (defined in <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L110-L143">dataset.py:110-143</a>) corresponds to one <code>(user, candidate_item, target_event)</code> scoring, grouped by field family:</p>
+
+<table>
+<thead>
+<tr><th>Field family</th><th>Count</th><th>Shape</th><th>Related section</th></tr>
+</thead>
+<tbody>
+<tr><td>sparse non-sequential scalar</td><td>4</td><td><code>[B]</code> each</td><td><a href="#sec2-1">§2.1</a></td></tr>
+<tr><td>sparse sequential</td><td>9 (3 pool &times; 3 entity)</td><td><code>[B, L]</code> each</td><td><a href="#sec2-2">§2.2</a></td></tr>
+<tr><td>sparse cross-product (optional)</td><td>7</td><td><code>[B]</code> each</td><td><a href="#sec2-4">§2.4</a></td></tr>
+<tr><td>dense</td><td>4</td><td><code>[B, 128] / [B, 6] &times; 2 / [B, 18]</code></td><td><a href="#sec2-3">§2.3</a></td></tr>
+<tr><td>labels</td><td>4 (multi-task)</td><td><code>[B]</code> each</td><td><a href="#sec2-7">§2.7</a></td></tr>
+</tbody>
+</table>
+
+<p>Concrete field names, semantics, and padding behavior are in the sub-sections above. A worked <code>B=2</code> sample (with specific IDs / values per field) is unrolled in <a href="#sec5-1">§5.1</a>.</p>
+
+<h3 id="sec2-7">2.7 Multi-Task Labels</h3>
+<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L558-L561">dataset.py:558-561</a>:</p>
+
+<table>
+<thead>
+<tr><th>Task</th><th>Loss</th><th>Derivation</th></tr>
+</thead>
+<tbody>
+<tr><td><code>listen_plus</code></td><td>BCE</td><td><code>(event_type==listen) &and; (played_ratio_pct &ge; 50)</code></td></tr>
+<tr><td><code>like</code></td><td>BCE</td><td><code>event_type==like</code></td></tr>
+<tr><td><code>dislike</code></td><td>BCE</td><td><code>event_type==dislike</code></td></tr>
+<tr><td><code>played_ratio</code></td><td>MSE</td><td><code>played_ratio_pct / 100</code></td></tr>
+</tbody>
+</table>
+
+<p>The 5B config only activates <code>listen_plus: 1.0</code> by default.</p>
+
+<hr>
+
+<h2 id="sec3">3. Preprocessing and Data Loading</h2>
+
+<p>The <code>preprocess()</code> entry-point in <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py">primus_dlrm/data/preprocessing.py</a> does everything in one pass:</p>
+
+<pre><code>Raw parquet (4.79B rows, ~195 GB)
+   &darr; (1) streaming load                                _load_chunked
+event DataFrame (event_type text &rarr; uint8 encoded)
+   &darr; (2) Global Temporal Split (300d train + 30 min gap + 1d test)
+   |                                                       _compute_split_boundaries
+   &darr; (3) 30-minute session segmentation                  _build_sessions
+   &darr;
+   |---&gt; train_sessions.parquet         (aggregated by uid/session_id)
+   |---&gt; session_index.parquet          (4) per-user cumulative length, O(1) history lookup
+   |---&gt; item_popularity.npy            (5) global item frequency over train (popularity baseline + neg sampling)
+   '---&gt; data/shared_metadata/          (6) embeddings/artist/album mapping shared across all 3 tiers
+</code></pre>
+
+<p class="small">Key code: <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py#L123-L132">_compute_split_boundaries</a> &middot; <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py#L150-L176">_build_sessions</a> &middot; <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py#L218-L287">_load_and_save_metadata</a>. <code>event_type</code> encoding: <code>listen=0, like=1, dislike=2, unlike=3, undislike=4</code>. Test users must have appeared in train, otherwise they are dropped.</p>
+
+<h3 id="sec3-1">3.1 DataLoader Runtime Derivation</h3>
+<p>See <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py">primus_dlrm/data/dataset.py</a>:</p>
+
+<ol>
+  <li>Flatten session events into NumPy arrays of <code>(uid, item, ts, event_type, played_ratio_pct, is_organic, ...)</code>, loaded as <strong>MAP_SHARED + PROT_READ</strong> mmap with zero virtual-memory commitment (key &mdash; at 5B tier, 8 ranks &times; 700 GB cache would otherwise blow up overcommit).</li>
+  <li>Derived masks: <code>flat_is_listen_plus / flat_is_like / flat_is_skip</code> (three boolean arrays).</li>
+  <li>After sampling <code>(user, target_event)</code>, <strong>scan back through the user's events before the target moment</strong>, and slice with the three masks to get 9 history sequences (clipped to <code>history_length</code>).</li>
+  <li>Compute <code>hour_of_day = (ts // 3600) % 24</code> on the fly (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L588">dataset.py:588</a>), read <code>is_organic</code>, used for cross-feature hashing.</li>
+  <li><strong>xxhash64 computes cross-feature IDs on the fly</strong> (not persisted, see <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/hashing.py">hashing.py</a>) &rarr; fed into the KeyedJaggedTensor.</li>
+</ol>
+
+<h3 id="sec3-2">3.2 Candidate Generation</h3>
+
+<p>The repo has <strong>no explicit negative sampling</strong> &mdash; the candidate of each training sample is just an actual event's item on the user's timeline, and the label comes from that event's <code>event_type</code> and <code>played_ratio</code>.</p>
+
+<h4>(a) Enumerating sample positions (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L458-L500"><code>_build_sample_positions</code></a>)</h4>
+
+<pre><code>for uid in users:
+    user_event_count = user_end[uid] - user_start[uid]
+    n_samples_for_this_user = max(user_event_count - L, 0)   # skip the first L (not enough history)
+    valid_positions += [user_start[uid] + L, user_start[uid] + L + 1, ..., user_end[uid] - 1]
+</code></pre>
+
+<p>On each user's timeline, <strong>every event position starting from the (L+1)-th is a training sample</strong>. 1M users &times; several thousand events on average &rarr; billions of training samples.</p>
+
+<h4>(b) Candidate derivation when fetching a sample (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L505-L564"><code>YambdaTrainDataset.__getitem__</code></a>)</h4>
+
+<pre><code>flat_pos      = self._positions[idx]                          # pick an event position
+uid           = self.store.flat_uid[flat_pos]
+target_item   = self.store.flat_item_ids[flat_pos]            # &larr; candidate item
+event_type    = self.store.flat_event_types[flat_pos]         # &larr; determines label
+played_ratio  = self.store.flat_played_ratio[flat_pos]
+target_artist = self.item_to_artist[target_item]              # on-the-fly mapping join
+target_album  = self.item_to_album[target_item]
+audio         = self.audio_embeddings[target_item]            # pretrained 128-d audio
+</code></pre>
+
+<h4>(c) Label derivation</h4>
+
+<table>
+<thead>
+<tr><th>Event's event_type</th><th>listen+</th><th>like</th><th>dislike</th><th>played_ratio</th></tr>
+</thead>
+<tbody>
+<tr><td>listen, played_ratio &ge; 50%</td><td><strong>1</strong></td><td>0</td><td>0</td><td>0.5&ndash;1.0</td></tr>
+<tr><td>listen, played_ratio &lt; 50%</td><td>0 (implicit negative)</td><td>0</td><td>0</td><td>0.0&ndash;0.5</td></tr>
+<tr><td>like</td><td>0</td><td><strong>1</strong></td><td>0</td><td>0</td></tr>
+<tr><td>dislike</td><td>0</td><td>0</td><td><strong>1</strong></td><td>0</td></tr>
+<tr><td>unlike / undislike</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
+</tbody>
+</table>
+
+<p>Each event yields at most one label equal to 1. This is classic <strong>implicit-feedback multi-task ranking</strong>: listen+ negatives come from real "listened-but-not-finished" events, like / dislike negatives come from real events doing other actions; the training signal is entirely derived from the actual behavior distribution &mdash; <strong>there is no need to sample negative items from all 9.39M items</strong>.</p>
+
+<p class="small">Note: the repo's <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/negatives.py">data/negatives.py</a> does offer in-batch BPR negative sampling, but with <code>contrastive_weight=0</code> by default this path does not participate in default training.</p>
+
+<h3 id="sec3-3">3.3 Multi-Event Concatenation into Long History Sequences</h3>
+
+<p>Key insight: <strong>"concatenating a user's multiple interactions into one time-ordered long sequence" is NOT done by the DataLoader at <code>__getitem__</code> time &mdash; it is done once, in <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L146-L206"><code>FlatEventStore.__init__</code></a></strong>. Each <code>__getitem__</code> just slices a window from the already-built long array.</p>
+
+<h4>(a) One-shot flatten (preprocessing + Store-construction stage)</h4>
+
+<pre><code># preprocess() output
+train_sessions.parquet  # each row = one session: (uid, session_id, [item_ids list], [timestamps list], ...)
+
+# What FlatEventStore.__init__ does at load time:
+sorted_sessions = sessions_df.sort(["uid", "session_id"])    # (1) sort by uid, then by session_id within user
+exploded = sorted_sessions.explode([                          # (2) explode each row's list columns into multiple rows
+    "item_ids", "timestamps", "event_types",
+    "is_organic", "played_ratio_pct", "track_length_seconds",
+])
+# Each row is now one event; row order = (uid ascending, session_id ascending within uid, list order within session).
+# Since _build_sessions has already sorted events within session by time, the whole array is causally time-ordered.
+
+self.flat_uid          = exploded["uid"].to_numpy()           # int64 [N_total]
+self.flat_item_ids     = exploded["item_ids"].to_numpy()       # int64 [N_total]
+self.flat_timestamps   = exploded["timestamps"].to_numpy()     # int64 [N_total]
+self.flat_event_types  = exploded["event_types"].to_numpy()    # int64 [N_total]
+self.flat_played_ratio = exploded["played_ratio_pct"].to_numpy() # f32 [N_total]
+self.flat_is_organic   = exploded["is_organic"].to_numpy()     # int8 [N_total]
+</code></pre>
+
+<p>At the 5B tier <code>N_total &asymp; 4.79B</code>. These flat arrays are written to disk via <code>np.save</code> and loaded via mmap, so 8 ranks share the same read-only data.</p>
+
+<h4>(b) Per-user range index (O(1) user-slice lookup)</h4>
+
+<pre><code>uid_changes   = np.where(np.diff(flat_uid) != 0)[0] + 1     # user boundary points
+starts        = np.concatenate([[0], uid_changes])
+ends          = np.concatenate([uid_changes, [N_total]])
+self.user_start = np.full(max_uid, -1)
+self.user_end   = np.full(max_uid, -1)
+self.user_start[uid_vals] = starts
+self.user_end[uid_vals]   = ends
+</code></pre>
+
+<p>For any <code>uid</code>, the user's complete time-ordered event history is the contiguous slice <code>flat_*[user_start[uid] : user_end[uid]]</code> &mdash; <strong>sessions are concatenated seamlessly</strong>; session boundaries are not retained in the sequence.</p>
+
+<h4>(c) Window scanning when fetching a sample (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L604-L636"><code>_get_split_history</code></a>)</h4>
+
+<pre><code>L          = config.data.history_length                       # 5B config = 500
+scan_end   = flat_pos                                           # current event position (exclusive)
+scan_start = max(user_start[uid], flat_pos - 500)              # rewind window, capped at 500 events
+
+item_ids = self.store.flat_item_ids[scan_start:scan_end]
+is_lp    = self.store.flat_is_listen_plus[scan_start:scan_end]   # precomputed boolean masks
+is_like  = self.store.flat_is_like[scan_start:scan_end]
+is_skip  = self.store.flat_is_skip[scan_start:scan_end]
+
+lp_items   = item_ids[is_lp][-L:]      # &larr; filter by pool, take the most recent L
+like_items = item_ids[is_like][-L:]
+skip_items = item_ids[is_skip][-L:]
+
+# pad/lookup: short sequences are zero-padded on the LEFT (right-aligned, newest at [L-1])
+padded = np.zeros(L, dtype=np.int64)
+padded[L - n:] = items
+</code></pre>
+
+<h4>(d) One-picture summary</h4>
+
+<pre><code>FlatEventStore (one-shot, shared across all users):
+
+  flat_uid          [...0 0 0 0 ... 0 | 1 1 1 1 1 ... 1 | 2 2 2 ... 2 | ...]
+  flat_item_ids     [..............................                       ...]
+  flat_timestamps   [..............................                       ...]
+  ...
+                     '--uid=0 span--''---uid=1 span----''--uid=2--'
+                     ^                          ^      ^
+                     user_start[0]              user_start[1]  user_start[2]
+
+Each training sample (one __getitem__ call):
+  ,- flat_pos = self._positions[idx]
+  |
+  | scan window: from user_start[uid] to flat_pos (rewind up to 500 events) &larr; scan_start..scan_end
+  |       &darr; slice into 3 pools via is_lp / is_like / is_skip
+  |       &darr; take the most recent L per pool, left-pad 0 to length L
+  |       &darr; map artist/album sequences via item_to_artist / item_to_album
+  |
+  '- ScoringPair(9 history sequences of shape [L] + candidate scalars + dense + cross + labels)
+</code></pre>
+
+<h4>Key design trade-offs</h4>
+
+<ul>
+  <li><strong>Flatten once at preprocessing time, zero-copy window scan at training time</strong> &mdash; avoids the DataLoader worker having to repeatedly group / sort / explode.</li>
+  <li><strong>Right-aligned padding + positional embedding 0..L-1</strong> &mdash; the newest event is always at index <code>L-1</code>, so "most recent time" is stable across users; but padding occupies the early positional embeddings, so the model has to learn to distinguish padding from a zero embedding.</li>
+  <li><strong>Session boundaries are dropped</strong> &mdash; the flat sequence has no "[SEP]" marker between sessions; the model can only infer them from <code>timestamps</code> gaps (which are not fed in as tokens), so no explicit session-aware modeling happens.</li>
+  <li><strong>Rewind window hard-coded at 500</strong> &mdash; regardless of how <code>history_length</code> is configured, the effective real-token count is capped at 500 (summed across 3 pools). Setting L &gt; 500 just yields more padding, not more signal.</li>
+</ul>
+
+<hr>
+
+<h2 id="sec4">4. Summary</h2>
+
+<ul>
+  <li><strong>Raw data</strong>: Yambda is Yandex Music's public release of 4.79B real interaction events, each with 7 fields (<code>uid, item_id, timestamp, event_type, is_organic, played_ratio_pct, track_length_seconds</code>) plus three shared catalog files (audio embeddings, item&rarr;artist, item&rarr;album).</li>
+  <li><strong>Training time</strong>: 4 non-sequential sparse features (uid/item/artist/album) + 9 sequential sparse features (3 pool &times; 3 entity, sharing 4 native tables) + 4 dense families (audio_embed/user_counters/item_counters/cross_counters), plus 4 labels (listen+/like/dislike/played_ratio).</li>
+  <li><strong>Preprocessing</strong>: GTS temporal split (300d train + 30min gap + 1d test) &rarr; 30-minute session segmentation &rarr; listen+/like/skip three-pool split &rarr; multi-window counters.</li>
+  <li><strong>Cross-product implementation</strong>: the repo ships 7 cross tables (names, cardinalities, hashing behavior all defined), with cross-platform-reproducible xxhash64; current <code>embedding_dim=64</code> keeps the embedding footprint at ~75 GB.</li>
+</ul>
+
+<hr>
+
+<h2 id="sec5">5. Batch Tensor Flow (B=2 example)</h2>
+
+<h3 id="sec5-1">5.1 Input Example (B=2, L=4)</h3>
+
+<p>(The actual 5B config uses <code>B_per_gpu=2048, L=500</code>. We shrink L to 4 here for readability.)</p>
+
+<h4>Sample #0 &mdash; user 42 scoring track #999</h4>
+<pre><code>uid              = 42
+item_id          = 999          # candidate
+artist_id        = 88           # artist of the candidate (joined via mapping)
+album_id         = 333          # album of the candidate
+
+# The user's 4 most-recent listen+ history items (fully listened &ge; 50%) before target time
+hist_lp_item_ids   = [101, 102, 103, 104]
+hist_lp_artist_ids = [ 11,  12,  11,  13]
+hist_lp_album_ids  = [201, 202, 201, 203]
+
+hist_like_item_ids   = [102, 105,   0,   0]   # only 2 likes, 0-padded at the tail
+hist_like_artist_ids = [ 12,  14,   0,   0]
+hist_like_album_ids  = [202, 204,   0,   0]
+
+hist_skip_item_ids   = [301, 302, 303, 304]
+hist_skip_artist_ids = [ 21,  22,  21,  23]
+hist_skip_album_ids  = [401, 402, 401, 403]
+
+# Cross-product IDs computed on the fly (assume the event's timestamp gives hour=14, is_organic=1)
+cross_ids = {
+  "user_x_artist":         xxhash64(42, 88)        % 100_000_000 = 42_103_771,
+  "user_x_album":          xxhash64(42, 333)       %  40_000_000 = 18_204_009,
+  "user_x_hour":           xxhash64(42, 14)        %  24_000_000 =  1_008_544,
+  "item_x_hour":           xxhash64(999, 14)       %  40_000_000 = 27_113_002,
+  "artist_x_hour":         xxhash64(88, 14)        %  32_000_000 = 14_750_388,
+  "user_x_is_organic":     xxhash64(42, 1)         %   2_000_000 =     31_557,
+  "user_x_artist_x_hour":  xxhash64(42, 88, 14)    %  40_000_000 = 33_902_115,
+}
+
+# Dense
+audio_embed     = [0.12, -0.04, ..., 0.56]   # 128 floats
+user_counters   = [u7d_lp, u7d_like, u7d_skip, u30d_lp, u30d_like, u30d_skip]
+item_counters   = [i7d_expose, i7d_lp, i7d_like, i30d_expose, i30d_lp, i30d_like]
+cross_counters  = [...]                       # 18 floats
+
+# Labels
+listen_plus = 1.0   # the user did indeed fully listen &ge; 50% afterwards
+like        = 0.0
+dislike     = 0.0
+listen_pct  = 0.85
+</code></pre>
+
+<h4>Sample #1 &mdash; user 7 scoring track #2024 (only the fields that differ from #0)</h4>
+<pre><code>uid=7 &middot; item_id=2024 &middot; artist_id=501 &middot; album_id=1700
+
+# The same user has different real-history lengths per pool: lp=2 / like=4 / skip=2, padding sits at the head
+hist_lp_item_ids   = [555, 556,   0,   0]      # note 0-padding at the front (right-aligned)
+hist_like_item_ids = [556, 600, 700, 800]
+hist_skip_item_ids = [901, 902,   0,   0]
+# (artist / album use the same right-aligned padding, values omitted)
+
+# Cross IDs go through the same xxhash64 flow; assume hour=3, is_organic=0 here
+cross_ids = { "user_x_artist": xxhash64(7, 501) % 100M, ... }   # 7 values, depend on context
+
+# Labels: this sample is a like, not a listen+
+listen_plus = 0.0   &middot;   like = 1.0   &middot;   dislike = 0.0   &middot;   listen_pct = 0.0
+</code></pre>
+
+<h3 id="sec5-2">5.2 Collated Tensors</h3>
+
+<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/pipeline_batch.py#L103-L131"><code>collate_pipeline_batch</code></a> stitches a list of samples into a <code>PipelineBatch</code>:</p>
+
+<h4>(a) Dense tensor dict (<code>PipelineBatch.tensors</code>)</h4>
+<pre><code>tensors = {
+    "audio_embed":     shape [2, 128]   float32,
+    "user_counters":   shape [2,   6]   float32,
+    "item_counters":   shape [2,   6]   float32,
+    "cross_counters":  shape [2,  18]   float32,
+    "listen_plus":     shape [2]        float32,   # label
+    "like":            shape [2]        float32,
+    "dislike":         shape [2]        float32,
+    "listen_pct":      shape [2]        float32,
+}
+</code></pre>
+
+<h4>(b) Single KJT (<code>PipelineBatch.unpooled_kjt</code>) &mdash; carries all sparse IDs</h4>
+
+<p>Concatenated in schema <code>kjt_feature_order</code>:</p>
+
+<pre><code>keys = [
+  # 4 native-table candidate / non-sequential lookups
+  "item", "artist", "album", "uid",
+  # 3 item-table sequences (sharing the same 9.39M table)
+  "hist_lp_item", "hist_like_item", "hist_skip_item",
+  # 3 artist-table sequences
+  "hist_lp_artist", "hist_like_artist", "hist_skip_artist",
+  # 3 album-table sequences
+  "hist_lp_album", "hist_like_album", "hist_skip_album",
+  # 7 cross tables (1 scalar each)
+  "user_x_artist", "user_x_album", "user_x_hour",
+  "item_x_hour",   "artist_x_hour", "user_x_is_organic",
+  "user_x_artist_x_hour",
+]
+# 20 KJT keys in total
+
+# Number of IDs each sample contributes per feature:
+#   scalar feature   &rarr; 1
+#   sequence feature &rarr; L (= 4)
+lengths = [
+  # B=2, 4 scalars (item/artist/album/uid)
+  1, 1,    1, 1,    1, 1,    1, 1,
+  # B=2, 3 hist_*_item (L=4)
+  4, 4,    4, 4,    4, 4,
+  # B=2, 3 hist_*_artist
+  4, 4,    4, 4,    4, 4,
+  # B=2, 3 hist_*_album
+  4, 4,    4, 4,    4, 4,
+  # B=2, 7 cross scalars
+  1, 1,    1, 1,    1, 1,    1, 1,    1, 1,    1, 1,    1, 1,
+]   # shape [B &times; num_keys] = [2 &times; 20] = 40 lengths
+
+values = torch.cat([
+  # item-table lookups (sample0_item, sample1_item, sample0_hist_lp_item[0..3], ...)
+  [999, 2024],                                        # "item"     scalar &times; B
+  [ 88,  501],                                        # "artist"   scalar &times; B
+  [333, 1700],                                        # "album"    scalar &times; B
+  [ 42,    7],                                        # "uid"      scalar &times; B
+  [101,102,103,104,  555,556,  0,  0],                # "hist_lp_item"      B&times;L
+  [102,105,  0,  0,  556,600,700,800],                # "hist_like_item"    B&times;L
+  [301,302,303,304,  901,902,  0,  0],                # "hist_skip_item"    B&times;L
+  [ 11, 12, 11, 13,   70, 71,  0,  0],                # "hist_lp_artist"    B&times;L
+  ...                                                  # same pattern continues (hist_like_artist, hist_skip_artist,
+                                                       #             hist_lp_album, hist_like_album, hist_skip_album)
+  # 7 cross-table scalar IDs (B=2 each)
+  [42_103_771, ...],                                  # "user_x_artist"
+  [18_204_009, ...],                                  # "user_x_album"
+  ...
+])
+# total length of values = 4&times;B (scalar native) + 9&times;B&times;L (sequence native) + 7&times;B (cross)
+#                        = 4&times;2 + 9&times;2&times;4 + 7&times;2
+#                        = 8 + 72 + 14 = 94 int64 IDs
+</code></pre>
+
+<h3 id="sec5-3">5.3 Per-Table Lookup Counts</h3>
+
+<p>The full 11-table list is in <a href="#sec2-5">§2.5</a>; here we focus on the actual GPU TBE query volume each table sees per batch:</p>
+
+<table>
+<thead>
+<tr><th>Table</th><th>Lookups per user</th><th>Batch lookup formula</th><th>B=2, L=4 example</th><th>Real 5B config (B=2048, L=500)</th></tr>
+</thead>
+<tbody>
+<tr><td><code>item</code> (9.39M)</td><td>1 + 3L</td><td>B &times; (1 + 3L)</td><td>2 &times; 13 = <strong>26</strong></td><td>2048 &times; 1501 = <strong>3,074,048</strong></td></tr>
+<tr><td><code>artist</code> (1.29M)</td><td>1 + 3L</td><td>B &times; (1 + 3L)</td><td>26</td><td>3,074,048</td></tr>
+<tr><td><code>album</code> (3.37M)</td><td>1 + 3L</td><td>B &times; (1 + 3L)</td><td>26</td><td>3,074,048</td></tr>
+<tr><td><code>uid</code> (1M)</td><td>1</td><td>B</td><td>2</td><td>2,048</td></tr>
+<tr><td>each cross table (7 in total)</td><td>1 each &rarr; 7 in total</td><td>B each</td><td>2 each &rarr; 14 in total</td><td>2,048 each &rarr; 14,336 in total</td></tr>
+<tr><td><strong>Total</strong></td><td><strong>3&middot;(1+3L) + 1 + 7 = 9L + 11</strong></td><td><strong>B&middot;(9L + 11)</strong></td><td><strong>47/user &rarr; 94</strong></td><td><strong>4,511/user &rarr; 9,238,528</strong></td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+<strong>Observations:</strong>
+<ul>
+  <li>~<strong>99.9% of sparse queries</strong> are concentrated on the 3 native sequence tables (item / artist / album) &mdash; this is why sequence length L directly drives TBE throughput pressure.</li>
+  <li>There are many cross tables (7), but each gets only B lookups per batch, so total volume is small. The real bottleneck is <strong>the size of the tables themselves</strong> (a single <code>user_x_artist</code> at 100M rows &times; dim=512 = 204.8 GB) and <strong>all-to-all</strong> communication shapes.</li>
+  <li>Sequence padding zeros also hit row 0 (the placeholder embedding); if needed, the model side can mask them out.</li>
+</ul>
+</div>
+
+<h3 id="sec5-4">5.4 Lookup-to-Token Conversion</h3>
+
+<pre><code>9 sequences (B, L, D) &rarr; pool aggregation (per-event shared MLP tokenizer) &rarr; 3 &times; (B, L, d_model)
+                        &rarr; concat &rarr; S-tokens [B, 3L, d_model]  (5B config = [B, 1500, 384])
+
+4 native scalars (item/artist/album/uid) + 7 cross scalars + 4 dense families
+    &rarr; concat-and-project &rarr; Auto-Split tokenizer &rarr; NS-tokens [B, n_ns_tokens, d_model]
+                                              (5B config = [B, 16, 384])
+
+OneTrans Stack: on forward, S-tokens are pyramid-trimmed across layers (1500 &rarr; 16), NS-tokens stay at 16
+              &darr;
+final [B, 16, d_model] passes through head_proj &rarr; [B, 384] &rarr; task head(s)
+    5B default: 1 Linear(384 &rarr; 1) outputting the listen+ logit (configurable up to 4 tasks, see &sect;2.7)
+</code></pre>
+
+<h3 id="sec5-5">5.5 Post-Lookup Tensor Shapes</h3>
+
+<p>The repo defaults to <code>pooling="none"</code> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/config.py#L108">config.py:108</a>) &rarr; it goes through the <strong>unpooled <code>EmbeddingCollection</code> (EC)</strong> rather than EBC, so the sequence dimension is preserved. <code>TorchRecEmbeddings.forward</code> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/embedding.py#L126-L174">embedding.py:126-174</a>) output rule:</p>
+
+<table>
+<thead>
+<tr><th>Input ID tensor</th><th>Feature type</th><th>Post-lookup shape</th></tr>
+</thead>
+<tbody>
+<tr><td><code>[B]</code></td><td>scalar feature (in <code>scalar_feature_names</code>)</td><td><code>[B, D]</code></td></tr>
+<tr><td><code>[B, L]</code></td><td>sequence feature</td><td><code>[B, L, D]</code></td></tr>
+</tbody>
+</table>
+
+<p>Plugging in the 5B config (<code>B=2048, L=500, D=embedding_dim=64</code>), here are the concrete post-lookup shapes for all 20 tensors (13 native KJT keys + 7 cross):</p>
+
+<table>
+<thead>
+<tr><th>KJT feature</th><th>Source table</th><th>Type</th><th>Post-lookup shape (B=2048, L=500, D=64)</th></tr>
+</thead>
+<tbody>
+<tr><td colspan="4"><strong>4 native scalars (non-sequential)</strong></td></tr>
+<tr><td><code>item</code></td><td><code>item</code> table (9.39M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>artist</code></td><td><code>artist</code> table (1.29M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>album</code></td><td><code>album</code> table (3.37M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>uid</code></td><td><code>uid</code> table (1M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td colspan="4"><strong>9 sequential (L-axis preserved)</strong></td></tr>
+<tr><td><code>hist_lp_item / hist_like_item / hist_skip_item</code></td><td><code>item</code> table (9.39M)</td><td>sequence</td><td>each <code>[2048, 500, 64]</code></td></tr>
+<tr><td><code>hist_lp_artist / hist_like_artist / hist_skip_artist</code></td><td><code>artist</code> table</td><td>sequence</td><td>each <code>[2048, 500, 64]</code></td></tr>
+<tr><td><code>hist_lp_album / hist_like_album / hist_skip_album</code></td><td><code>album</code> table</td><td>sequence</td><td>each <code>[2048, 500, 64]</code></td></tr>
+<tr><td colspan="4"><strong>7 cross scalars (non-sequential)</strong></td></tr>
+<tr><td><code>user_x_artist</code></td><td><code>user_x_artist</code> table (100M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>user_x_album</code></td><td><code>user_x_album</code> (40M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>user_x_hour</code></td><td><code>user_x_hour</code> (24M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>item_x_hour</code></td><td><code>item_x_hour</code> (40M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>artist_x_hour</code></td><td><code>artist_x_hour</code> (32M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>user_x_is_organic</code></td><td><code>user_x_is_organic</code> (2M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>user_x_artist_x_hour</code></td><td><code>user_x_artist_x_hour</code> (40M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+<strong>Total sparse-side activation volume</strong>: 9 &times; (2048&times;500&times;64) + (4+7) &times; (2048&times;64) = <strong>&asymp; 590M floats &asymp; 2.36 GB / batch</strong> (halved to &asymp; 1.18 GB under BF16).<br>
+<strong>The 9 history sequences eat 99.6% of this</strong> &mdash; which is why OneTrans's S-token sequence is the main load source for the sparse backend's all-to-all communication.
+</div>
+
+<p class="small">Tip: the <code>scalar_feature_names</code> set (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/embedding.py#L169-L172">embedding.py:169-172</a>) decides whether the reshape goes to <code>[B,D]</code> or <code>[B,-1,D]</code>. This set is auto-registered from the config's <code>feature.scalar_features</code> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/bench_onetrans_large_5b.yaml#L57">bench_onetrans_large_5b.yaml:57</a>) plus the 7 cross scalars.</p>
+
+<h3 id="sec5-6">5.6 Dense Feature Processing Path</h3>
+
+<p><strong>Conclusion: yes, dense features are used, and they are an essential input to OneTrans's NS-tokens.</strong> Dense features skip the embedding lookup (they are already float vectors) and travel down a separate path. The source / semantics of each dense family are in <a href="#sec2-3">§2.3</a>; here we focus on <strong>the processing logic and shape evolution</strong> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/bench_onetrans_large_5b.yaml#L58-L62">config fields</a>):</p>
+
+<table>
+<thead>
+<tr><th>Dense feature</th><th>Input (B=2048)</th><th>Processing</th><th>After projection</th></tr>
+</thead>
+<tbody>
+<tr><td><code>audio_embed</code></td><td><code>[2048, 128]</code></td><td><code>project=true</code> &middot; Linear(128&rarr;D) + GeLU</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>user_counters</code></td><td><code>[2048, 6]</code></td><td><code>project=false</code> &middot; concat as-is</td><td><code>[2048, 6]</code></td></tr>
+<tr><td><code>item_counters</code></td><td><code>[2048, 6]</code></td><td><code>project=false</code> &middot; concat as-is</td><td><code>[2048, 6]</code></td></tr>
+<tr><td><code>cross_counters</code></td><td><code>[2048, 18]</code></td><td><code>project=true</code> &middot; Linear(18&rarr;D) + ReLU</td><td><code>[2048, 64]</code></td></tr>
+</tbody>
+</table>
+
+<p class="small">Note: the projection target dim is <code>embedding_dim = D = 64</code> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L341">onetrans.py:341</a>), not <code>d_model = 384</code> &mdash; this keeps dense projections at the same magnitude as sparse scalar embeddings, making them directly concat-able.</p>
+
+<h4>Destination inside OneTrans (code: <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L522-L532"><code>OneTransModel._build_ns_raw</code></a>)</h4>
+
+<pre><code>NS raw vector = concat([
+  # 11 sparse scalar embeddings (already looked up, top half of &sect;5.5)
+  item_emb,             # [B, D=64]
+  artist_emb,           # [B, D]
+  album_emb,            # [B, D]
+  uid_emb,              # [B, D]
+  user_x_artist_emb,    # [B, D]
+  ... (7 cross in total),  # each [B, D]
+  # 4 dense features
+  audio_embed_proj,     # [B, D=64]   Linear(128 &rarr; 64) + GeLU   project=true
+  user_counters,        # [B, 6]      concat as-is                   project=false
+  item_counters,        # [B, 6]      concat as-is                   project=false
+  cross_counters_proj,  # [B, D=64]   Linear(18 &rarr; 64) + ReLU     project=true
+], dim=-1)
+
+# ns_raw_dim = 11 &times; D + 2 &times; D + 2 &times; 6
+#           = 11 &times; 64 + 2 &times; 64 + 12
+#           = 704 + 128 + 12 = 844
+# shape: [B, 844] = [2048, 844]
+
+&darr; AutoSplitTokenizer (onetrans.py:260-276):
+    proj = Linear(844, 16 &times; 384) &rarr; GeLU &rarr; Linear(16 &times; 384, 16 &times; 384)
+    .view(B, 16, 384)
+
+NS-tokens = [B, n_ns_tokens, d_model] = [2048, 16, 384]
+</code></pre>
+
+<h4>Do dense features feed attention? &mdash; <span class="ok">Yes, via the NS-tokens channel.</span></h4>
+
+<p>NS-tokens are concatenated directly with S-tokens before entering the Transformer block (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L565-L582"><code>_backbone</code></a>):</p>
+
+<pre><code>s_tokens  = [B, 1500, 384]    # 3 pool &times; L=500 history &rarr; via SequentialTokenizer
+ns_tokens = [B,   16, 384]    # 11 sparse scalars + 4 dense &rarr; via AutoSplitTokenizer
+
+x = torch.cat([s_tokens, ns_tokens], dim=1)   # [B, 1516, 384]
+
+for layer in self.blocks:
+    x = block(x, mask=pyramid_mask, ...)       # MixedAttention sees the full x
+</code></pre>
+
+<p>Inside <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L85-L161"><code>MixedAttention</code></a>:</p>
+
+<table>
+<thead>
+<tr><th>Token segment</th><th>Q/K/V source</th><th>Parameterization</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td>S-tokens (<code>x[:, :1500]</code>)</td>
+  <td><code>s_qkv = Linear(d_model, 3&middot;d_model)</code></td>
+  <td>All S-tokens <strong>share</strong> a single weight set</td>
+</tr>
+<tr>
+  <td>NS-tokens (<code>x[:, 1500:]</code>, includes all dense)</td>
+  <td><code>ns_qkv_weight: [n_ns, 3&middot;d_model, d_model]</code>, via <code>einsum("btn,tmn-&gt;btm")</code></td>
+  <td>Each NS-token has <strong>its own</strong> weight set (token-specific)</td>
+</tr>
+</tbody>
+</table>
+
+<p>Q/K/V are then concatenated back into <code>[B, 1516, n_heads, d_head]</code> and run through <strong>causal SDPA / FlashAttention / Primus-Turbo</strong>. The dense features therefore appear:</p>
+
+<ol>
+  <li><strong>As Queries</strong>: NS-tokens can attend to any history S-token (looking back at user history).</li>
+  <li><strong>As Keys/Values</strong>: S-tokens can also attend to NS-tokens (fusing candidate + dense info into every history position) &mdash; "<em>sequence positions attend over candidate and context tokens</em>".</li>
+  <li><strong>Pyramid trim only trims S-tokens</strong> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L568-L572">onetrans.py:568-572</a>); NS-tokens (and the dense info inside them) <strong>retain all 16 across every layer</strong>.</li>
+</ol>
+
+<h3 id="sec5-7">5.7 Attention Input Token Layout (by feature name)</h3>
+
+<p>&sect;5.4 gave the tokenization overview, &sect;5.5 gave the per-lookup output shapes. This section answers directly: <strong>for the attention input <code>x: [B, 1516, 384]</code>, which named features sit at each position, and in what order?</strong></p>
+
+<h4>S-tokens (positions 0..1499): 3 pools &times; L, each segment right-aligned</h4>
+
+<pre><code>position 0   .. L-1      | hist_lp pool (listen+)        &larr; YAML sequence_groups dict-insertion order
+position L   .. 2L-1     | hist_like pool                 (bench_onetrans_large_5b.yaml:53-56)
+position 2L  .. 3L-1     | hist_skip pool
+
+Inside each pool block (positions 0..L-1):
+    index 0     &larr; oldest (left-padded with 0 if real events &lt; L)
+    ...
+    index L-1   &larr; newest                                (dataset.py:615-623: padded[L-n:] = items)
+
+Content of each S-token (per pool g, per event t):
+    s_token[g, t] = SeqTokenizer_g( concat[ hist_g_item[t], hist_g_artist[t], hist_g_album[t] ] )  +  pos_emb_g[t]
+                    |-- Linear(3D=192, d_model=384) + GeLU + Linear(384, 384) --|
+    Each pool owns its own SequentialTokenizer weights + its own pos_emb; the 3 pools do not share (onetrans.py:243-257, 327-332).
+    Concat: pool_tokens are appended in dict order, then torch.cat(..., dim=1) (onetrans.py:554-559).
+</code></pre>
+
+<h4>NS-tokens (positions 1500..1515): no per-token feature alignment</h4>
+
+<p><strong>Key:</strong> these 16 tokens <strong>cannot be mapped position-by-position back to named features</strong>. <code>AutoSplitTokenizer</code> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L260-L276">onetrans.py:260-276</a>) is <code>Linear(844, 16&middot;d_model) &rarr; GeLU &rarr; Linear(...) &rarr; view(B, 16, d_model)</code> &mdash; each output channel is a linear mixture of all 844 input dimensions, so token-position semantics are learned at training time. The underlying 844-d raw vector is laid out in named-feature order (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L522-L532">onetrans.py:522-532</a>), as in the diagram below (horizontal width proportional to dim count):</p>
+
+<div style="overflow-x:auto; margin:1em 0;">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 290" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
+  <text x="640" y="22" text-anchor="middle" font-size="13" font-weight="600">Composition of the 844-d NS raw vector (fed into AutoSplitTokenizer &rarr; 16 NS tokens)</text>
+  <text x="640" y="40" text-anchor="middle" font-size="10" fill="#666">Each segment's width is proportional to its dim count (a 64-dim segment &asymp; 93 px, a 6-dim counter segment &asymp; 9 px). Colors: blue = native sparse, orange = cross sparse, green = projected dense, gray = raw dense.</text>
+
+  <!-- 4 native sparse (blue, x=25..397) -->
+  <g>
+    <rect x="25"  y="65" width="93" height="100" fill="#e7f0fa" stroke="#0b6cc4" stroke-width="1.4"/>
+    <text x="71.5"  y="115" text-anchor="middle" font-size="11" font-family="monospace" transform="rotate(-90, 71.5, 115)">uid</text>
+    <rect x="118" y="65" width="93" height="100" fill="#e7f0fa" stroke="#0b6cc4" stroke-width="1.4"/>
+    <text x="164.5" y="115" text-anchor="middle" font-size="11" font-family="monospace" transform="rotate(-90, 164.5, 115)">item</text>
+    <rect x="211" y="65" width="93" height="100" fill="#e7f0fa" stroke="#0b6cc4" stroke-width="1.4"/>
+    <text x="257.5" y="115" text-anchor="middle" font-size="11" font-family="monospace" transform="rotate(-90, 257.5, 115)">artist</text>
+    <rect x="304" y="65" width="93" height="100" fill="#e7f0fa" stroke="#0b6cc4" stroke-width="1.4"/>
+    <text x="350.5" y="115" text-anchor="middle" font-size="11" font-family="monospace" transform="rotate(-90, 350.5, 115)">album</text>
+  </g>
+
+  <!-- 7 cross sparse (orange, x=397..1048) -->
+  <g>
+    <rect x="397" y="65" width="93" height="100" fill="#fef0d8" stroke="#b96b1a" stroke-width="1.4"/>
+    <text x="443.5" y="115" text-anchor="middle" font-size="11" font-family="monospace" transform="rotate(-90, 443.5, 115)">user_x_artist</text>
+    <rect x="490" y="65" width="93" height="100" fill="#fef0d8" stroke="#b96b1a" stroke-width="1.4"/>
+    <text x="536.5" y="115" text-anchor="middle" font-size="11" font-family="monospace" transform="rotate(-90, 536.5, 115)">user_x_album</text>
+    <rect x="583" y="65" width="93" height="100" fill="#fef0d8" stroke="#b96b1a" stroke-width="1.4"/>
+    <text x="629.5" y="115" text-anchor="middle" font-size="11" font-family="monospace" transform="rotate(-90, 629.5, 115)">user_x_hour</text>
+    <rect x="676" y="65" width="93" height="100" fill="#fef0d8" stroke="#b96b1a" stroke-width="1.4"/>
+    <text x="722.5" y="115" text-anchor="middle" font-size="11" font-family="monospace" transform="rotate(-90, 722.5, 115)">item_x_hour</text>
+    <rect x="769" y="65" width="93" height="100" fill="#fef0d8" stroke="#b96b1a" stroke-width="1.4"/>
+    <text x="815.5" y="115" text-anchor="middle" font-size="11" font-family="monospace" transform="rotate(-90, 815.5, 115)">artist_x_hour</text>
+    <rect x="862" y="65" width="93" height="100" fill="#fef0d8" stroke="#b96b1a" stroke-width="1.4"/>
+    <text x="908.5" y="115" text-anchor="middle" font-size="11" font-family="monospace" transform="rotate(-90, 908.5, 115)">user_x_is_organic</text>
+    <rect x="955" y="65" width="93" height="100" fill="#fef0d8" stroke="#b96b1a" stroke-width="1.4"/>
+    <text x="1001.5" y="115" text-anchor="middle" font-size="11" font-family="monospace" transform="rotate(-90, 1001.5, 115)">user_x_artist_x_hour</text>
+  </g>
+
+  <!-- 4 dense (x=1048..1252) -->
+  <g>
+    <!-- audio_embed: green (projected) -->
+    <rect x="1048" y="65" width="93" height="100" fill="#e8f5e9" stroke="#2e7d32" stroke-width="1.4"/>
+    <text x="1094.5" y="115" text-anchor="middle" font-size="11" font-family="monospace" transform="rotate(-90, 1094.5, 115)">audio_embed</text>
+    <!-- user_counters: gray (raw, 6 dims) -->
+    <rect x="1141" y="65" width="9"  height="100" fill="#f0f0f0" stroke="#888" stroke-width="1.2"/>
+    <!-- item_counters: gray (raw, 6 dims) -->
+    <rect x="1150" y="65" width="9"  height="100" fill="#f0f0f0" stroke="#888" stroke-width="1.2"/>
+    <!-- cross_counters: green (projected) -->
+    <rect x="1159" y="65" width="93" height="100" fill="#e8f5e9" stroke="#2e7d32" stroke-width="1.4"/>
+    <text x="1205.5" y="115" text-anchor="middle" font-size="11" font-family="monospace" transform="rotate(-90, 1205.5, 115)">cross_counters</text>
+  </g>
+
+  <!-- Leader callouts for narrow counter boxes -->
+  <g font-size="9" fill="#444">
+    <text x="1100" y="55" text-anchor="middle">user_counters (6, raw)</text>
+    <line x1="1110" y1="58" x2="1145.5" y2="65" stroke="#666"/>
+    <text x="1208" y="195" text-anchor="middle">item_counters (6, raw)</text>
+    <line x1="1190" y1="187" x2="1154.5" y2="165" stroke="#666"/>
+  </g>
+
+  <!-- Channel-range tick axis -->
+  <line x1="25" y1="178" x2="1252" y2="178" stroke="#888"/>
+  <g font-size="9" fill="#666">
+    <line x1="25"   y1="173" x2="25"   y2="183" stroke="#888"/>
+    <text x="25"    y="195" text-anchor="middle">0</text>
+    <line x1="397"  y1="173" x2="397"  y2="183" stroke="#888"/>
+    <text x="397"   y="195" text-anchor="middle">256</text>
+    <line x1="1048" y1="173" x2="1048" y2="183" stroke="#888"/>
+    <text x="1048"  y="195" text-anchor="middle">704</text>
+    <line x1="1141" y1="173" x2="1141" y2="183" stroke="#888"/>
+    <text x="1141"  y="195" text-anchor="middle">768</text>
+    <line x1="1252" y1="173" x2="1252" y2="183" stroke="#888"/>
+    <text x="1252"  y="195" text-anchor="middle">844</text>
+  </g>
+
+  <!-- Group brackets -->
+  <g font-size="10" fill="#444">
+    <line x1="25"   y1="220" x2="397"  y2="220" stroke="#0b6cc4" stroke-width="1.6"/>
+    <text x="211"   y="236" text-anchor="middle" fill="#0b6cc4" font-weight="600">4 native sparse &times; 64 = 256</text>
+
+    <line x1="397"  y1="220" x2="1048" y2="220" stroke="#b96b1a" stroke-width="1.6"/>
+    <text x="722.5" y="236" text-anchor="middle" fill="#b96b1a" font-weight="600">7 cross sparse &times; 64 = 448</text>
+
+    <line x1="1048" y1="220" x2="1252" y2="220" stroke="#2e7d32" stroke-width="1.6"/>
+    <text x="1150"  y="236" text-anchor="middle" fill="#2e7d32" font-weight="600">4 dense features: 64 + 6 + 6 + 64 = 140</text>
+  </g>
+
+  <!-- bottom note -->
+  <text x="640" y="270" text-anchor="middle" font-size="11" fill="#444">Total <tspan font-weight="600">11 &times; 64 + 64 + 6 + 6 + 64 = 844</tspan>  &rarr;  AutoSplitTokenizer: <tspan font-family="monospace">Linear(844, 16&middot;384) &rarr; GeLU &rarr; Linear(6144, 6144) &rarr; .view(B, 16, 384)</tspan></text>
+</svg>
+</div>
+
+<p>Although the NS-token segment doesn't expose per-position feature labels, <code>MixedAttention</code>/<code>MixedFFN</code> give the NS segment <strong>a dedicated Q/K/V weight per token position</strong> (<code>ns_qkv_weight: [16, 3&middot;d_model, d_model]</code>) &mdash; after training, the token position itself encodes identity.</p>
+
+<h4>Final attention input tensor layout</h4>
+
+<pre><code>x = torch.cat([s_tokens, ns_tokens], dim=1)     # [B, 1516, d_model]
+                                                  (onetrans.py:565-566)
+
+position layout (5B config, L=500):
+    0    ..   499  &rarr;  hist_lp    &times;  L     (oldest @ 0,   newest @ 499)
+    500  ..   999  &rarr;  hist_like  &times;  L     (oldest @ 500, newest @ 999)
+    1000 ..  1499  &rarr;  hist_skip  &times;  L     (oldest @ 1000,newest @ 1499)
+    1500 ..  1515  &rarr;  NS tokens  &times; 16     (no per-position feature label)
+
+mask:   pyramid causal mask, trims only the S segment; NS keeps all 16 every layer (onetrans.py:568-572)
+pos:    only the S segment adds per-pool pos_emb inside SequentialTokenizer;
+        the NS segment has no global pos_emb &mdash; token position is implicitly encoded by ns_qkv_weight
+</code></pre>
+
+<div style="overflow-x:auto; margin:1em 0;">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 460" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
+  <defs>
+    <marker id="ar2en" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#444"/>
+    </marker>
+  </defs>
+
+  <text x="640" y="22" text-anchor="middle" font-size="13" font-weight="600">Attention input x = [B, 1516, 384] &mdash; per-position feature layout (5B config, L=500)</text>
+
+  <!-- Top: position bar -->
+  <text x="20"   y="60" font-size="10" fill="#666">position</text>
+  <line x1="20" y1="68" x2="1260" y2="68" stroke="#999" stroke-width="1"/>
+  <text x="60"   y="80" font-size="10">0</text>
+  <text x="290"  y="80" font-size="10">499</text>
+  <text x="340"  y="80" font-size="10">500</text>
+  <text x="570"  y="80" font-size="10">999</text>
+  <text x="620"  y="80" font-size="10">1000</text>
+  <text x="845"  y="80" font-size="10">1499</text>
+  <text x="900"  y="80" font-size="10">1500</text>
+  <text x="1240" y="80" font-size="10" text-anchor="end">1515</text>
+
+  <!-- S-token blocks -->
+  <g>
+    <rect x="20"  y="100" width="300" height="120" fill="#e7f0fa" stroke="#0b6cc4" stroke-width="1.4" rx="4"/>
+    <text x="170" y="122" text-anchor="middle" font-weight="600" fill="#0b6cc4">hist_lp pool</text>
+    <text x="170" y="142" text-anchor="middle" font-size="10">L = 500 tokens</text>
+    <text x="170" y="160" text-anchor="middle" font-size="10">SeqTokenizer_lp(concat[</text>
+    <text x="170" y="175" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_lp_item</tspan>,</text>
+    <text x="170" y="190" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_lp_artist</tspan>,</text>
+    <text x="170" y="205" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_lp_album</tspan>]) + pos_emb_lp</text>
+  </g>
+  <g>
+    <rect x="335" y="100" width="295" height="120" fill="#eaf3ec" stroke="#1f8a4d" stroke-width="1.4" rx="4"/>
+    <text x="482" y="122" text-anchor="middle" font-weight="600" fill="#1f8a4d">hist_like pool</text>
+    <text x="482" y="142" text-anchor="middle" font-size="10">L = 500 tokens</text>
+    <text x="482" y="160" text-anchor="middle" font-size="10">SeqTokenizer_like(concat[</text>
+    <text x="482" y="175" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_like_item</tspan>,</text>
+    <text x="482" y="190" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_like_artist</tspan>,</text>
+    <text x="482" y="205" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_like_album</tspan>]) + pos_emb_like</text>
+  </g>
+  <g>
+    <rect x="645" y="100" width="240" height="120" fill="#fbeede" stroke="#b96b1a" stroke-width="1.4" rx="4"/>
+    <text x="765" y="122" text-anchor="middle" font-weight="600" fill="#b96b1a">hist_skip pool</text>
+    <text x="765" y="142" text-anchor="middle" font-size="10">L = 500 tokens</text>
+    <text x="765" y="160" text-anchor="middle" font-size="10">SeqTokenizer_skip(concat[</text>
+    <text x="765" y="175" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_skip_item</tspan>,</text>
+    <text x="765" y="190" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_skip_artist</tspan>,</text>
+    <text x="765" y="205" text-anchor="middle" font-size="10"><tspan font-family="monospace">hist_skip_album</tspan>]) + pos_emb_skip</text>
+  </g>
+
+  <!-- NS-token block -->
+  <g>
+    <rect x="900" y="100" width="360" height="120" fill="#f3e8f5" stroke="#7a4ea0" stroke-width="1.4" rx="4"/>
+    <text x="1080" y="122" text-anchor="middle" font-weight="600" fill="#7a4ea0">NS tokens (16, no per-token feature)</text>
+    <text x="1080" y="142" text-anchor="middle" font-size="10">AutoSplitTokenizer( 844-d raw ).view(B, 16, 384)</text>
+    <text x="1080" y="162" text-anchor="middle" font-size="10">Per token position: ns_qkv_weight[i, :, :] is learned independently</text>
+    <text x="1080" y="182" text-anchor="middle" font-size="10">(token-position semantics emerge implicitly from training)</text>
+  </g>
+
+  <!-- Time direction arrow inside one pool (using hist_lp) -->
+  <text x="60"  y="245" font-size="9" fill="#666">oldest (idx 0, becomes 0-pad if real events &lt; L)</text>
+  <line x1="60" y1="252" x2="280" y2="252" stroke="#444" marker-end="url(#ar2en)"/>
+  <text x="280" y="245" font-size="9" fill="#666" text-anchor="end">newest (idx L-1)</text>
+
+  <!-- 844-d composition under NS block -->
+  <text x="900" y="245" font-size="10" font-weight="600" fill="#444">Underlying 844-d raw vector (before AutoSplitTokenizer):</text>
+  <g font-size="9">
+    <!-- 11 sparse &times; 64 -->
+    <rect x="900" y="252" width="32" height="22" fill="#e7f0fa" stroke="#0b6cc4"/>
+    <text x="916" y="267" text-anchor="middle">uid</text>
+    <rect x="932" y="252" width="32" height="22" fill="#e7f0fa" stroke="#0b6cc4"/>
+    <text x="948" y="267" text-anchor="middle">item</text>
+    <rect x="964" y="252" width="32" height="22" fill="#e7f0fa" stroke="#0b6cc4"/>
+    <text x="980" y="267" text-anchor="middle">artist</text>
+    <rect x="996" y="252" width="32" height="22" fill="#e7f0fa" stroke="#0b6cc4"/>
+    <text x="1012" y="267" text-anchor="middle">album</text>
+    <rect x="1028" y="252" width="120" height="22" fill="#fef0d8" stroke="#b96b1a"/>
+    <text x="1088" y="267" text-anchor="middle">7 &times; cross scalar (64 each)</text>
+    <rect x="1148" y="252" width="32" height="22" fill="#e8f5e9" stroke="#2e7d32"/>
+    <text x="1164" y="267" text-anchor="middle">audio</text>
+    <rect x="1180" y="252" width="20" height="22" fill="#fff" stroke="#888"/>
+    <text x="1190" y="267" text-anchor="middle">u_c</text>
+    <rect x="1200" y="252" width="20" height="22" fill="#fff" stroke="#888"/>
+    <text x="1210" y="267" text-anchor="middle">i_c</text>
+    <rect x="1220" y="252" width="40" height="22" fill="#e8f5e9" stroke="#2e7d32"/>
+    <text x="1240" y="267" text-anchor="middle">cross_c</text>
+    <!-- legend / dims -->
+    <text x="900"  y="290" font-size="9" fill="#666">0  4&times;64 = 256 (sparse native)  |  256  7&times;64 = 448 (sparse cross)  |  704  64 (audio_embed proj)  |  768  6 (user_counters)  |  774  6 (item_counters)  |  780  64 (cross_counters proj)  |  844</text>
+  </g>
+
+  <!-- Note callouts -->
+  <g font-size="11" fill="#444">
+    <text x="20" y="335" font-weight="600">Notes</text>
+    <text x="20" y="354">- Pool order [hist_lp, hist_like, hist_skip] comes from the YAML sequence_groups dict-insertion order (CPython 3.7+ preserves order).</text>
+    <text x="20" y="372">- Each S-token feeds an MLP over the concat of 3 entities (item/artist/album) &mdash; the 3 pools each own an independent SeqTokenizer + independent pos_emb, not shared.</text>
+    <text x="20" y="390">- Time direction inside S: padded[L-n:] = items, right-aligned &mdash; index L-1 is always newest, index 0 may be a 0-pad (when the user has fewer than L real events).</text>
+    <text x="20" y="408">- The NS segment has no global pos_emb; token-position differentiation is handled by MixedAttention's ns_qkv_weight[16, 3&middot;d_model, d_model].</text>
+    <text x="20" y="426">- The causal pyramid mask acts only on the S segment (progressively shorter per layer); the NS segment keeps all 16 every layer.</text>
+  </g>
+</svg>
+</div>
+
+<hr>
+
+<h3 id="sec5-8">5.8 End-to-End Visualization (Raw &rarr; Attention)</h3>
+
+<p>We split the data flow into two figures, joined at the <strong>attention input [B, 1516, 384]</strong>: <strong>Figure A</strong> shows how data is built from raw input up to the attention input; <strong>Figure B</strong> shows how the attention input passes through 8 Transformer layers, splits off NS-tokens, goes through the head to produce a prediction, and finally the loss. 5B config: <code>B=2048, L=500, D=64, d_model=384, n_ns_tokens=16, n_layers=8</code>.</p>
+
+<div style="overflow-x:auto; margin:1em 0;">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1100" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
+  <defs>
+    <marker id="arrAen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#555"/>
+    </marker>
+    <marker id="arrA-ren" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#cf222e"/>
+    </marker>
+  </defs>
+
+  <text x="640" y="22" font-size="14" font-weight="700" text-anchor="middle" fill="#1f2328">Figure A: data construction &mdash; Raw Input &rarr; Attention input</text>
+  <text x="640" y="40" font-size="10" text-anchor="middle" fill="#57606a">bottom-up &middot; B=2048, L=500, D=64, d_model=384, n_ns_tokens=16</text>
+
+  <!-- Attention input (top of this figure) -->
+  <g>
+    <rect x="380" y="64" width="520" height="68" rx="6" fill="#ffb3b3" stroke="#cf222e" stroke-width="2.5"/>
+    <text x="640" y="86" text-anchor="middle" font-weight="700" font-size="12">Attention input x</text>
+    <text x="640" y="108" text-anchor="middle" font-family="monospace" font-size="15" font-weight="700" fill="#a01818">[B, 1516, 384]</text>
+    <text x="640" y="124" text-anchor="middle" font-size="9" fill="#57606a">S-tokens (0..1499) + NS-tokens (1500..1515)</text>
+  </g>
+  <text x="920" y="100" font-size="10" fill="#57606a" font-style="italic">(Figure B continues upward from here)</text>
+
+  <line x1="640" y1="172" x2="640" y2="132" stroke="#cf222e" stroke-width="1.5" marker-end="url(#arrA-ren)"/>
+  <g>
+    <rect x="540" y="172" width="200" height="30" rx="4" fill="#fff" stroke="#666"/>
+    <text x="640" y="190" text-anchor="middle" font-weight="600" font-size="11">torch.cat([S, NS], dim=1)</text>
+  </g>
+
+  <line x1="320" y1="288" x2="320" y2="186" stroke="#444" stroke-width="1.4"/>
+  <line x1="320" y1="186" x2="540" y2="186" stroke="#444" stroke-width="1.4"/>
+  <line x1="960" y1="288" x2="960" y2="186" stroke="#444" stroke-width="1.4"/>
+  <line x1="960" y1="186" x2="740" y2="186" stroke="#444" stroke-width="1.4"/>
+
+  <!-- S/NS tokens -->
+  <g>
+    <rect x="170" y="216" width="300" height="70" rx="5" fill="#fff3a0" stroke="#a08c00" stroke-width="1.5"/>
+    <text x="320" y="234" text-anchor="middle" font-weight="700">S-tokens</text>
+    <text x="320" y="256" text-anchor="middle" font-family="monospace" font-weight="700" font-size="14" fill="#7a6700">[B, 1500, 384]</text>
+    <text x="320" y="274" text-anchor="middle" font-size="9" fill="#57606a">3 pools &times; L = 1500 tokens</text>
+  </g>
+  <g>
+    <rect x="810" y="216" width="300" height="70" rx="5" fill="#fff3a0" stroke="#a08c00" stroke-width="1.5"/>
+    <text x="960" y="234" text-anchor="middle" font-weight="700">NS-tokens</text>
+    <text x="960" y="256" text-anchor="middle" font-family="monospace" font-weight="700" font-size="14" fill="#7a6700">[B, 16, 384]</text>
+    <text x="960" y="274" text-anchor="middle" font-size="9" fill="#57606a">n_ns_tokens = 16</text>
+  </g>
+
+  <line x1="320" y1="334" x2="320" y2="286" stroke="#444" stroke-width="1.4" marker-end="url(#arrAen)"/>
+  <line x1="960" y1="334" x2="960" y2="286" stroke="#444" stroke-width="1.4" marker-end="url(#arrAen)"/>
+
+  <!-- Tokenizer ops -->
+  <g>
+    <rect x="180" y="334" width="280" height="42" rx="4" fill="#fff" stroke="#666"/>
+    <text x="320" y="352" text-anchor="middle" font-weight="600" font-size="11">SequentialTokenizer &times; 3 + cat(dim=1)</text>
+    <text x="320" y="366" text-anchor="middle" font-size="9" fill="#57606a">Linear(192&rarr;384) + GeLU + Linear + pos_emb &middot; per-pool independent weights</text>
+  </g>
+  <g>
+    <rect x="820" y="334" width="280" height="42" rx="4" fill="#fff" stroke="#666"/>
+    <text x="960" y="352" text-anchor="middle" font-weight="600" font-size="11">AutoSplitTokenizer</text>
+    <text x="960" y="366" text-anchor="middle" font-size="9" fill="#57606a">Linear(844&rarr;16&middot;384) + GeLU + Linear &rarr; view</text>
+  </g>
+
+  <line x1="320" y1="416" x2="320" y2="376" stroke="#444" stroke-width="1.4" marker-end="url(#arrAen)"/>
+  <line x1="960" y1="416" x2="960" y2="376" stroke="#444" stroke-width="1.4" marker-end="url(#arrAen)"/>
+
+  <!-- pool_raw / ns_raw -->
+  <g>
+    <rect x="170" y="416" width="300" height="66" rx="5" fill="#fde7c5" stroke="#cf6f30" stroke-width="1.5"/>
+    <text x="320" y="434" text-anchor="middle" font-weight="700">pool_raw &times; 3</text>
+    <text x="320" y="454" text-anchor="middle" font-family="monospace" font-weight="700" font-size="13" fill="#9a3412">3 &times; [B, 500, 192]</text>
+    <text x="320" y="472" text-anchor="middle" font-size="9" fill="#57606a">3 &times; D = 192 (item+artist+album cat'd)</text>
+  </g>
+  <g>
+    <rect x="810" y="416" width="300" height="66" rx="5" fill="#fde7c5" stroke="#cf6f30" stroke-width="1.5"/>
+    <text x="960" y="434" text-anchor="middle" font-weight="700">ns_raw</text>
+    <text x="960" y="454" text-anchor="middle" font-family="monospace" font-weight="700" font-size="13" fill="#9a3412">[B, 844]</text>
+    <text x="960" y="472" text-anchor="middle" font-size="9" fill="#57606a">11&times;64 + 64+6+6+64 = 844</text>
+  </g>
+
+  <line x1="320" y1="528" x2="320" y2="482" stroke="#444" stroke-width="1.4" marker-end="url(#arrAen)"/>
+  <g>
+    <rect x="200" y="528" width="240" height="28" rx="4" fill="#fff" stroke="#666"/>
+    <text x="320" y="546" text-anchor="middle" font-size="10" font-weight="600">cat([item, artist, album], dim=-1)</text>
+  </g>
+  <g>
+    <rect x="820" y="528" width="280" height="28" rx="4" fill="#fff" stroke="#666"/>
+    <text x="960" y="546" text-anchor="middle" font-size="10" font-weight="600">cat(8 ctx + 3 cand + 4 dense, dim=-1)</text>
+  </g>
+
+  <!-- NS multi-source merge arrows -->
+  <line x1="460" y1="620" x2="900" y2="556" stroke="#444" stroke-width="1.1"/>
+  <line x1="700" y1="620" x2="940" y2="556" stroke="#444" stroke-width="1.1"/>
+  <line x1="1030" y1="620" x2="1020" y2="556" stroke="#444" stroke-width="1.1"/>
+
+  <line x1="200" y1="620" x2="280" y2="556" stroke="#444" stroke-width="1.4" marker-end="url(#arrAen)"/>
+
+  <!-- 4 lanes of post-lookup tensors -->
+  <g>
+    <rect x="60" y="620" width="280" height="64" rx="4" fill="#bdd9f1" stroke="#3d6da8" stroke-width="1.5"/>
+    <text x="200" y="638" text-anchor="middle" font-weight="700" font-size="11">9 &times; history emb</text>
+    <text x="200" y="658" text-anchor="middle" font-family="monospace" font-weight="700" fill="#2a3e6e">9 &times; [B, 500, 64]</text>
+    <text x="200" y="676" text-anchor="middle" font-size="9" fill="#57606a">3 pool &times; {item, artist, album}</text>
+  </g>
+  <g>
+    <rect x="360" y="620" width="200" height="64" rx="4" fill="#f8c8d8" stroke="#c14a7e" stroke-width="1.5"/>
+    <text x="460" y="638" text-anchor="middle" font-weight="700" font-size="11">8 &times; contextual emb</text>
+    <text x="460" y="658" text-anchor="middle" font-family="monospace" font-weight="700" fill="#7a3e58">8 &times; [B, 64]</text>
+    <text x="460" y="676" text-anchor="middle" font-size="9" fill="#57606a">uid + 7 cross</text>
+  </g>
+  <g>
+    <rect x="580" y="620" width="240" height="64" rx="4" fill="#bdd9f1" stroke="#3d6da8" stroke-width="1.5" stroke-dasharray="5,3"/>
+    <text x="700" y="638" text-anchor="middle" font-weight="700" font-size="11">3 &times; candidate emb (tgt)</text>
+    <text x="700" y="658" text-anchor="middle" font-family="monospace" font-weight="700" fill="#2a3e6e">3 &times; [B, 64]</text>
+    <text x="700" y="676" text-anchor="middle" font-size="9" fill="#57606a">item / artist / album (candidate)</text>
+  </g>
+  <g>
+    <rect x="840" y="620" width="380" height="64" rx="4" fill="#a8e5c8" stroke="#2a8e5b" stroke-width="1.5"/>
+    <text x="1030" y="638" text-anchor="middle" font-weight="700" font-size="11">4 dense (with optional Linear projection)</text>
+    <text x="1030" y="658" text-anchor="middle" font-family="monospace" font-weight="700" fill="#1a5e3b">audio&rarr;[B,64] &middot; u_cnt[B,6] &middot; i_cnt[B,6] &middot; x_cnt&rarr;[B,64]</text>
+    <text x="1030" y="676" text-anchor="middle" font-size="9" fill="#57606a">project=true goes through Linear; false stays as-is</text>
+  </g>
+
+  <!-- Lookup ops -->
+  <line x1="200" y1="730" x2="200" y2="684" stroke="#444" stroke-width="1.4" marker-end="url(#arrAen)"/>
+  <line x1="460" y1="730" x2="460" y2="684" stroke="#444" stroke-width="1.4" marker-end="url(#arrAen)"/>
+  <line x1="700" y1="730" x2="700" y2="684" stroke="#444" stroke-width="1.4" marker-end="url(#arrAen)"/>
+  <line x1="1030" y1="730" x2="1030" y2="684" stroke="#2a8e5b" stroke-width="1.4" stroke-dasharray="3,3" marker-end="url(#arrAen)"/>
+
+  <g><rect x="130" y="730" width="140" height="26" rx="4" fill="#fff" stroke="#666"/>
+    <text x="200" y="748" text-anchor="middle" font-size="10">EC lookup (unpooled)</text></g>
+  <g><rect x="400" y="730" width="120" height="26" rx="4" fill="#fff" stroke="#666"/>
+    <text x="460" y="748" text-anchor="middle" font-size="10">EC lookup</text></g>
+  <g><rect x="640" y="730" width="120" height="26" rx="4" fill="#fff" stroke="#666"/>
+    <text x="700" y="748" text-anchor="middle" font-size="10">EC lookup</text></g>
+  <g><rect x="960" y="730" width="140" height="26" rx="4" fill="#fff" stroke="#666" stroke-dasharray="3,3"/>
+    <text x="1030" y="748" text-anchor="middle" font-size="10">(no lookup)</text></g>
+
+  <!-- Tables stacked -->
+  <g>
+    <rect x="80" y="790" width="240" height="80" rx="4" fill="#bdd9f1" stroke="#3d6da8"/>
+    <rect x="86" y="784" width="240" height="80" rx="4" fill="#bdd9f1" stroke="#3d6da8"/>
+    <rect x="92" y="778" width="240" height="80" rx="4" fill="#bdd9f1" stroke="#3d6da8"/>
+    <text x="212" y="798" text-anchor="middle" font-weight="700" font-size="11">3 item-side tables</text>
+    <text x="212" y="816" text-anchor="middle" font-size="10" font-family="monospace">item 9.39M &times; D=64</text>
+    <text x="212" y="830" text-anchor="middle" font-size="10" font-family="monospace">artist 1.29M &times; 64</text>
+    <text x="212" y="844" text-anchor="middle" font-size="10" font-family="monospace">album 3.37M &times; 64</text>
+  </g>
+
+  <g>
+    <rect x="360" y="790" width="200" height="80" rx="4" fill="#f8c8d8" stroke="#c14a7e"/>
+    <rect x="366" y="784" width="200" height="80" rx="4" fill="#f8c8d8" stroke="#c14a7e"/>
+    <rect x="372" y="778" width="200" height="80" rx="4" fill="#f8c8d8" stroke="#c14a7e"/>
+    <text x="462" y="798" text-anchor="middle" font-weight="700" font-size="11">8 contextual tables</text>
+    <text x="462" y="816" text-anchor="middle" font-size="9" font-family="monospace">uid 1M &middot; u_x_art 100M</text>
+    <text x="462" y="830" text-anchor="middle" font-size="9" font-family="monospace">u_x_alb 40M &middot; u_x_hr 24M</text>
+    <text x="462" y="844" text-anchor="middle" font-size="9" font-family="monospace">+ i_x_hr &middot; a_x_hr &middot; ...</text>
+  </g>
+
+  <g>
+    <rect x="840" y="790" width="380" height="80" rx="4" fill="#fff" stroke="#2a8e5b" stroke-dasharray="4,3"/>
+    <text x="1030" y="814" text-anchor="middle" font-weight="700" font-size="11">(no embedding table)</text>
+    <text x="1030" y="832" text-anchor="middle" font-size="9" fill="#57606a">audio_embed comes from embeddings.parquet</text>
+    <text x="1030" y="848" text-anchor="middle" font-size="9" fill="#57606a">counters come from preprocessing</text>
+  </g>
+
+  <path d="M 332 802 Q 460 730 580 678" stroke="#3d6da8" fill="none" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrAen)"/>
+  <text x="500" y="754" text-anchor="middle" font-size="9" fill="#3d6da8" font-style="italic">candidate scalars share the 3 left tables</text>
+
+  <line x1="200" y1="910" x2="200" y2="870" stroke="#444" stroke-width="1.2" marker-end="url(#arrAen)"/>
+  <line x1="460" y1="910" x2="460" y2="870" stroke="#444" stroke-width="1.2" marker-end="url(#arrAen)"/>
+  <line x1="1030" y1="910" x2="1030" y2="870" stroke="#444" stroke-width="1.2" stroke-dasharray="3,3" marker-end="url(#arrAen)"/>
+  <path d="M 700 910 Q 510 890 332 840" stroke="#444" fill="none" stroke-width="1.2" stroke-dasharray="3,2" marker-end="url(#arrAen)"/>
+
+  <!-- Input IDs -->
+  <g>
+    <rect x="60" y="910" width="280" height="72" rx="4" fill="#e6f0fa" stroke="#3d6da8" stroke-width="1.2"/>
+    <text x="200" y="928" text-anchor="middle" font-weight="700" font-size="11">history sequence IDs</text>
+    <text x="200" y="946" text-anchor="middle" font-family="monospace" font-size="11">hist_lp_{item,artist,album} [B, L]</text>
+    <text x="200" y="962" text-anchor="middle" font-family="monospace" font-size="11">hist_like_&middot;, hist_skip_&middot;  [B, L]</text>
+    <text x="200" y="978" text-anchor="middle" font-size="9" fill="#57606a">9 sequences &middot; L=500</text>
+  </g>
+  <g>
+    <rect x="360" y="910" width="200" height="72" rx="4" fill="#fcecf2" stroke="#c14a7e" stroke-width="1.2"/>
+    <text x="460" y="928" text-anchor="middle" font-weight="700" font-size="11">contextual scalar IDs</text>
+    <text x="460" y="946" text-anchor="middle" font-family="monospace" font-size="11">uid [B]</text>
+    <text x="460" y="962" text-anchor="middle" font-family="monospace" font-size="11">7 &times; cross IDs [B]</text>
+    <text x="460" y="978" text-anchor="middle" font-size="9" fill="#57606a">8 int64</text>
+  </g>
+  <g>
+    <rect x="580" y="910" width="240" height="72" rx="4" fill="#e6f0fa" stroke="#3d6da8" stroke-width="1.2" stroke-dasharray="5,3"/>
+    <text x="700" y="928" text-anchor="middle" font-weight="700" font-size="11">candidate scalar IDs (tgt)</text>
+    <text x="700" y="946" text-anchor="middle" font-family="monospace" font-size="11">item_id [B]</text>
+    <text x="700" y="962" text-anchor="middle" font-family="monospace" font-size="11">artist_id / album_id [B]</text>
+    <text x="700" y="978" text-anchor="middle" font-size="9" fill="#57606a">3 int64</text>
+  </g>
+  <g>
+    <rect x="840" y="910" width="380" height="72" rx="4" fill="#dcf2e5" stroke="#2a8e5b" stroke-width="1.2"/>
+    <text x="1030" y="928" text-anchor="middle" font-weight="700" font-size="11">dense vectors (float32)</text>
+    <text x="1030" y="946" text-anchor="middle" font-family="monospace" font-size="11">audio_embed [B,128] &middot; user_counters [B,6]</text>
+    <text x="1030" y="962" text-anchor="middle" font-family="monospace" font-size="11">item_counters [B,6] &middot; cross_counters [B,18]</text>
+    <text x="1030" y="978" text-anchor="middle" font-size="9" fill="#57606a">4 float32 vectors</text>
+  </g>
+
+  <text x="640" y="1014" text-anchor="middle" font-style="italic" font-size="10" fill="#57606a">colored boxes = tensors (with shape) &middot; white boxes = ops &middot; dashed = candidate / shared mapping</text>
+  <text x="640" y="1032" text-anchor="middle" font-style="italic" font-size="10" fill="#57606a">ns_raw split: 8 contextual emb &times; D = 512 &middot; 3 candidate emb &times; D = 192 &middot; 4 dense projected/passed = 140 &middot; total 844</text>
+</svg>
+</div>
+
+<div style="overflow-x:auto; margin:1em 0;">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1140" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
+  <defs>
+    <marker id="arrBen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#555"/>
+    </marker>
+    <marker id="arrB-ren" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#cf222e"/>
+    </marker>
+  </defs>
+
+  <text x="640" y="22" font-size="14" font-weight="700" text-anchor="middle" fill="#1f2328">Figure B: model forward &mdash; Attention input &rarr; 8-layer Transformer &rarr; Head &rarr; Loss</text>
+  <text x="640" y="40" font-size="10" text-anchor="middle" fill="#57606a">bottom-up &middot; B=2048, d_model=384, n_ns_tokens=16, n_layers=8</text>
+
+  <!-- Loss (TOP) -->
+  <g>
+    <rect x="450" y="60" width="380" height="40" rx="4" fill="#fff" stroke="#cf222e" stroke-width="1.5"/>
+    <text x="640" y="78" text-anchor="middle" font-weight="700" fill="#cf222e">Task Loss</text>
+    <text x="640" y="92" text-anchor="middle" font-size="9" fill="#57606a">BCE(listen+)   &larr; default 5B config only enables listen_plus = 1.0</text>
+  </g>
+  <line x1="640" y1="138" x2="640" y2="100" stroke="#cf222e" stroke-width="1.5" marker-end="url(#arrB-ren)"/>
+
+  <!-- Predictions -->
+  <g>
+    <rect x="440" y="138" width="400" height="50" rx="4" fill="#d6c5e8" stroke="#7c4fa6" stroke-width="1.5"/>
+    <text x="640" y="158" text-anchor="middle" font-weight="700">task prediction</text>
+    <text x="640" y="178" text-anchor="middle" font-family="monospace" font-size="12" font-weight="700" fill="#5a3580">[B] (one scalar per sample)</text>
+  </g>
+  <line x1="640" y1="220" x2="640" y2="188" stroke="#444" stroke-width="1.4" marker-end="url(#arrBen)"/>
+
+  <!-- Task heads op -->
+  <g>
+    <rect x="520" y="220" width="240" height="32" rx="4" fill="#fff" stroke="#666"/>
+    <text x="640" y="240" text-anchor="middle" font-weight="600" font-size="11">Linear(d_model &rarr; 1)</text>
+  </g>
+  <!-- Configurability note -->
+  <text x="860" y="170" font-size="9" fill="#57606a" font-style="italic">Configurable: setting any of</text>
+  <text x="860" y="182" font-size="9" fill="#57606a" font-style="italic">like / dislike / played_ratio in loss_weights</text>
+  <text x="860" y="194" font-size="9" fill="#57606a" font-style="italic">to &gt; 0 activates the corresponding head</text>
+  <text x="860" y="206" font-size="9" fill="#57606a" font-style="italic">&rarr; up to 4 Linear(d_model &rarr; 1) heads</text>
+  <line x1="640" y1="280" x2="640" y2="252" stroke="#444" stroke-width="1.4" marker-end="url(#arrBen)"/>
+
+  <!-- h tensor -->
+  <g>
+    <rect x="490" y="280" width="300" height="46" rx="4" fill="#d6c5e8" stroke="#7c4fa6" stroke-width="1.5"/>
+    <text x="640" y="298" text-anchor="middle" font-weight="700" font-size="11">h = head_proj(ns_out.flatten)</text>
+    <text x="640" y="316" text-anchor="middle" font-family="monospace" font-weight="700" fill="#5a3580">[B, d_model] = [B, 384]</text>
+  </g>
+  <line x1="640" y1="354" x2="640" y2="326" stroke="#444" stroke-width="1.4" marker-end="url(#arrBen)"/>
+
+  <!-- head_proj op -->
+  <g>
+    <rect x="480" y="354" width="320" height="32" rx="4" fill="#fff" stroke="#666"/>
+    <text x="640" y="374" text-anchor="middle" font-weight="600" font-size="11">head_proj: Linear(6144 &rarr; 384) + GeLU + Dropout</text>
+  </g>
+  <line x1="640" y1="414" x2="640" y2="386" stroke="#444" stroke-width="1.4" marker-end="url(#arrBen)"/>
+
+  <!-- ns_out main branch -->
+  <g>
+    <rect x="490" y="414" width="300" height="46" rx="4" fill="#fff3a0" stroke="#a08c00" stroke-width="1.5"/>
+    <text x="640" y="432" text-anchor="middle" font-weight="700" font-size="11">ns_out = x_final[:, -16:]</text>
+    <text x="640" y="450" text-anchor="middle" font-family="monospace" font-weight="700" fill="#7a6700">[B, 16, 384]</text>
+  </g>
+
+  <!-- s_repr left branch (contrastive optional) -->
+  <text x="220" y="406" text-anchor="middle" font-size="10" fill="#57606a" font-style="italic">Used only when contrastive_weight &gt; 0</text>
+  <g opacity="0.7">
+    <rect x="80" y="414" width="280" height="46" rx="4" fill="#fff3a0" stroke="#a08c00" stroke-width="1.5" stroke-dasharray="4,3"/>
+    <text x="220" y="432" text-anchor="middle" font-weight="700" font-size="11">s_repr = x_final[:, :16].mean(1)</text>
+    <text x="220" y="450" text-anchor="middle" font-family="monospace" font-weight="700" fill="#7a6700">[B, 384]</text>
+  </g>
+
+  <!-- Split op -->
+  <line x1="220" y1="510" x2="220" y2="460" stroke="#444" stroke-width="1.4" stroke-dasharray="4,3" marker-end="url(#arrBen)"/>
+  <line x1="640" y1="510" x2="640" y2="460" stroke="#444" stroke-width="1.4" marker-end="url(#arrBen)"/>
+  <g>
+    <rect x="120" y="510" width="640" height="40" rx="4" fill="#fff" stroke="#666"/>
+    <text x="440" y="528" text-anchor="middle" font-weight="600" font-size="11">split:  x_final[:, :16].mean &rarr; s_repr  |  x_final[:, -16:] &rarr; ns_out</text>
+    <text x="440" y="542" text-anchor="middle" font-size="9" fill="#57606a">final_norm (RMSNorm) applies to all 32 tokens of x_final</text>
+  </g>
+  <line x1="440" y1="588" x2="440" y2="550" stroke="#444" stroke-width="1.4" marker-end="url(#arrBen)"/>
+
+  <!-- x_final -->
+  <g>
+    <rect x="220" y="588" width="440" height="58" rx="5" fill="#fff3a0" stroke="#a08c00" stroke-width="2"/>
+    <text x="440" y="608" text-anchor="middle" font-weight="700">x_final (after 8 layers + final_norm)</text>
+    <text x="440" y="630" text-anchor="middle" font-family="monospace" font-weight="700" font-size="13" fill="#7a6700">[B, 32, 384] = [B, 2 &times; n_ns_tokens, d_model]</text>
+    <text x="440" y="644" text-anchor="middle" font-size="9" fill="#57606a">first 16 = remaining S-tokens &middot; last 16 = NS-tokens</text>
+  </g>
+
+  <!-- 8 layers stack -->
+  <line x1="440" y1="700" x2="440" y2="646" stroke="#444" stroke-width="1.4" marker-end="url(#arrBen)"/>
+
+  <g>
+    <rect x="100" y="700" width="1080" height="222" rx="6" fill="#fef6e3" stroke="#a08c00" stroke-width="1.5"/>
+    <text x="640" y="720" text-anchor="middle" font-weight="700" fill="#7a6700">Transformer Stack: 8 &times; OneTransBlock (MixedAttention + MixedFFN, pre-norm)</text>
+    <text x="640" y="736" text-anchor="middle" font-size="9" fill="#57606a">use_pyramid=True &middot; each layer trims the Q segment to the trailing q_len tokens; KV keeps full length (asymmetric Q/KV)</text>
+
+    <line x1="160" y1="752" x2="1120" y2="752" stroke="#a08c00" stroke-width="0.5"/>
+    <text x="220" y="766" font-weight="700" font-size="11">Layer</text>
+    <text x="360" y="766" font-weight="700" font-size="11">input x.shape</text>
+    <text x="520" y="766" font-weight="700" font-size="11">q_s (S part)</text>
+    <text x="680" y="766" font-weight="700" font-size="11">q_len = q_s + 16</text>
+    <text x="860" y="766" font-weight="700" font-size="11">output x.shape</text>
+    <text x="1020" y="766" font-weight="700" font-size="11">Note</text>
+    <line x1="160" y1="772" x2="1120" y2="772" stroke="#a08c00"/>
+
+    <text x="220" y="788" font-family="monospace">0</text>
+    <text x="360" y="788" font-family="monospace">[B, 1516, 384]</text>
+    <text x="520" y="788" font-family="monospace">1500</text>
+    <text x="680" y="788" font-family="monospace">1516</text>
+    <text x="860" y="788" font-family="monospace">[B, 1516, 384]</text>
+    <text x="1020" y="788" font-size="9" fill="#57606a">symmetric (no trim)</text>
+
+    <text x="220" y="804" font-family="monospace">1</text>
+    <text x="360" y="804" font-family="monospace">[B, 1516, 384]</text>
+    <text x="520" y="804" font-family="monospace">1288</text>
+    <text x="680" y="804" font-family="monospace">1304</text>
+    <text x="860" y="804" font-family="monospace">[B, 1304, 384]</text>
+    <text x="1020" y="804" font-size="9" fill="#57606a">drop oldest 212 S</text>
+
+    <text x="220" y="820" font-family="monospace">2</text>
+    <text x="360" y="820" font-family="monospace">[B, 1304, 384]</text>
+    <text x="520" y="820" font-family="monospace">1076</text>
+    <text x="680" y="820" font-family="monospace">1092</text>
+    <text x="860" y="820" font-family="monospace">[B, 1092, 384]</text>
+    <text x="1020" y="820" font-size="9" fill="#57606a">-212</text>
+
+    <text x="220" y="836" font-family="monospace">3</text>
+    <text x="360" y="836" font-family="monospace">[B, 1092, 384]</text>
+    <text x="520" y="836" font-family="monospace">864</text>
+    <text x="680" y="836" font-family="monospace">880</text>
+    <text x="860" y="836" font-family="monospace">[B, 880, 384]</text>
+    <text x="1020" y="836" font-size="9" fill="#57606a">-212</text>
+
+    <text x="220" y="852" font-family="monospace">4</text>
+    <text x="360" y="852" font-family="monospace">[B, 880, 384]</text>
+    <text x="520" y="852" font-family="monospace">652</text>
+    <text x="680" y="852" font-family="monospace">668</text>
+    <text x="860" y="852" font-family="monospace">[B, 668, 384]</text>
+    <text x="1020" y="852" font-size="9" fill="#57606a">-212</text>
+
+    <text x="220" y="868" font-family="monospace">5</text>
+    <text x="360" y="868" font-family="monospace">[B, 668, 384]</text>
+    <text x="520" y="868" font-family="monospace">440</text>
+    <text x="680" y="868" font-family="monospace">456</text>
+    <text x="860" y="868" font-family="monospace">[B, 456, 384]</text>
+    <text x="1020" y="868" font-size="9" fill="#57606a">-212</text>
+
+    <text x="220" y="884" font-family="monospace">6</text>
+    <text x="360" y="884" font-family="monospace">[B, 456, 384]</text>
+    <text x="520" y="884" font-family="monospace">228</text>
+    <text x="680" y="884" font-family="monospace">244</text>
+    <text x="860" y="884" font-family="monospace">[B, 244, 384]</text>
+    <text x="1020" y="884" font-size="9" fill="#57606a">-212</text>
+
+    <text x="220" y="904" font-family="monospace" font-weight="700">7</text>
+    <text x="360" y="904" font-family="monospace" font-weight="700">[B, 244, 384]</text>
+    <text x="520" y="904" font-family="monospace" font-weight="700">16</text>
+    <text x="680" y="904" font-family="monospace" font-weight="700">32</text>
+    <text x="860" y="904" font-family="monospace" font-weight="700" fill="#cf222e">[B, 32, 384]</text>
+    <text x="1020" y="904" font-size="9" fill="#cf222e" font-weight="600">S compressed to L_NS!</text>
+  </g>
+
+  <!-- Attention input (bottom of this figure) -->
+  <line x1="640" y1="966" x2="640" y2="922" stroke="#cf222e" stroke-width="1.8" marker-end="url(#arrB-ren)"/>
+  <g>
+    <rect x="380" y="966" width="520" height="74" rx="6" fill="#ffb3b3" stroke="#cf222e" stroke-width="2.5"/>
+    <text x="640" y="990" text-anchor="middle" font-weight="700" font-size="12">Attention input x</text>
+    <text x="640" y="1014" text-anchor="middle" font-family="monospace" font-size="15" font-weight="700" fill="#a01818">[B, 1516, 384]</text>
+    <text x="640" y="1032" text-anchor="middle" font-size="9" fill="#57606a">S-tokens (first 1500) + NS-tokens (last 16)</text>
+  </g>
+  <text x="920" y="1006" font-size="10" fill="#57606a" font-style="italic">(How data arrives here: see Figure A)</text>
+
+  <text x="640" y="1080" text-anchor="middle" font-style="italic" font-size="10" fill="#57606a">An 8-layer pyramid trims ~212 tokens off the S segment per layer; the NS segment always keeps its 16 tokens.</text>
+  <text x="640" y="1098" text-anchor="middle" font-style="italic" font-size="10" fill="#57606a">Final x_final splits in two: the first 16 feed the contrastive loss (optional); the last 16 feed the task head (default 5B activates 1; configurable up to 4).</text>
+</svg>
+</div>
+
+<div class="callout note">
+<strong>Reading tips:</strong>
+<ol>
+  <li><strong>The 192 dim in Figure A's pool_raw</strong> = 3 &times; D (per position, item+artist+album concatenated along the feature axis); <strong>3 is not a token count</strong>, the 500 positions are unchanged.</li>
+  <li><strong>The 844 dim in Figure A's ns_raw</strong> = 11&times;64 (11 sparse scalars at 64 each) + 64 + 6 + 6 + 64 (4 dense).</li>
+  <li><strong>SequentialTokenizer is per-pool</strong>: the 3 pools use 3 independent Linear weight sets + 3 independent positional embeddings; the same item ID appearing in different pools produces different tokens.</li>
+  <li><strong>The pyramid in Figure B</strong>: the S segment is trimmed by ~212 tokens per layer (1500 &rarr; 16), while the NS segment stays at 16; the final-layer output is <code>[B, 32, 384]</code>, with the first 16 being the residual S and the last 16 being NS.</li>
+  <li>x_final <strong>uses only the last 16</strong> (NS-tokens) for prediction; the first 16 are used only for contrastive loss when contrastive_weight &gt; 0.</li>
+</ol>
+</div>
+
+</div><!-- /lang-en -->
+
 </main>
 
+<script src="../lang-toggle.js"></script>
 </body>
 </html>

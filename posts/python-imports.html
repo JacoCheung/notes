@@ -306,6 +306,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
     <a class="toc-back-to-top" href="#">↑ 回到顶部</a>
   </aside>
   <main class="content">
+    <div class="lang-zh">
     <h1 id="python-import-vs">Python Import 机制笔记：绝对导入 vs 相对导入<a class="headerlink" href="#python-import-vs" title="Permanent link">#</a></h1>
 <h2 id="1">1. 基础概念<a class="headerlink" href="#1" title="Permanent link">#</a></h2>
 <h3 id="module">Module（模块）<a class="headerlink" href="#module" title="Permanent link">#</a></h3>
@@ -551,6 +552,254 @@ $<span class="w"> </span>python<span class="w"> </span>pkg/a.py
 <li>启动命令是 <code>python file.py</code> 还是 <code>python -m pkg.file</code>？前者几乎一定会让 <code>__package__</code> 丢失。</li>
 <li><code>__init__.py</code> 是不是在导入时就触发了循环？</li>
 </ol>
+    </div>
+    <div class="lang-en">
+    <h1 id="python-import-vs">Python Import Mechanism: Absolute vs Relative<a class="headerlink" href="#python-import-vs" title="Permanent link">#</a></h1>
+<h2 id="1">1. Foundations<a class="headerlink" href="#1" title="Permanent link">#</a></h2>
+<h3 id="module">Module<a class="headerlink" href="#module" title="Permanent link">#</a></h3>
+<p>A single <code>.py</code> file <em>is</em> a module. Once <code>import</code>ed, it becomes a module object and is cached in <code>sys.modules</code> so it never executes twice.</p>
+<h3 id="package">Package<a class="headerlink" href="#package" title="Permanent link">#</a></h3>
+<p>A <strong>directory containing an <code>__init__.py</code></strong> is a package (a "regular package"). It is itself a module object, but additionally carries a <code>__path__</code> attribute that holds child modules and child packages.</p>
+<blockquote>
+<p>Since PEP 420 there is also the <strong>namespace package</strong>: a directory with <em>no</em> <code>__init__.py</code> that can be stitched together from multiple physical directories. It is a real production-grade footgun, so it gets its own section below ("Namespace package").</p>
+</blockquote>
+<h3 id="__init__py">What <code>__init__.py</code> does<a class="headerlink" href="#__init__py" title="Permanent link">#</a></h3>
+<ol>
+<li><strong>Marker</strong>: tells Python to treat the directory as a regular package.</li>
+<li><strong>Initialization code</strong>: runs once on the first <code>import pkg</code> (even <code>from pkg.a import x</code> first executes <code>pkg/__init__.py</code>).</li>
+<li><strong>Re-export façade</strong>: a typical idiom is to write <code>from .a import Foo</code> inside it, so that callers can use <code>from pkg import Foo</code> directly.</li>
+<li><strong>Defining <code>__all__</code></strong>: controls which names <code>from pkg import *</code> exposes.</li>
+</ol>
+<h3 id="packagetop-level-package">Top-level package<a class="headerlink" href="#packagetop-level-package" title="Permanent link">#</a></h3>
+<p><strong>A direct child of some entry in <code>sys.path</code></strong> — if that child is a directory carrying an <code>__init__.py</code>, it is a top-level package.</p>
+<p>Example: <code>sys.path</code> contains <code>/home/me/proj</code>, and <code>/home/me/proj/app/__init__.py</code> exists, therefore <code>app</code> is a top-level package. <code>app.pkg</code> and <code>app.pkg.sub</code> are its sub-packages, but they are <strong>not</strong> top-level.</p>
+<p>Who counts as "top-level" is decided entirely by <code>sys.path</code>; it has <strong>no necessary relationship</strong> to how deeply directories nest on disk.</p>
+<h3 id="namespace-packagepep-420">Namespace package (PEP 420)<a class="headerlink" href="#namespace-packagepep-420" title="Permanent link">#</a></h3>
+<p>A directory with <strong>no <code>__init__.py</code></strong> that Python nonetheless treats as a package. The core differences from a regular package:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>regular package</th>
+<th>namespace package</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>__init__.py</code></td>
+<td>required</td>
+<td><strong>must be absent</strong></td>
+</tr>
+<tr>
+<td><code>__file__</code></td>
+<td>present</td>
+<td>absent</td>
+</tr>
+<tr>
+<td><code>__path__</code></td>
+<td>plain list</td>
+<td><code>_NamespacePath</code> (stitched from several physical directories)</td>
+</tr>
+<tr>
+<td>Purpose</td>
+<td>one wheel owns the whole package</td>
+<td>multiple wheels <strong>splice</strong> into the same import namespace</td>
+</tr>
+</tbody>
+</table>
+<p>Canonical use case: a hub-style directory like <code>fbgemm_gpu/experimental/</code> deliberately omits <code>__init__.py</code> so that independent wheels — <code>fbgemm_gpu_experimental_hstu</code>, <code>fbgemm_gpu_experimental_gen_ai</code>, etc. — can each install their own sub-package into <code>site-packages/fbgemm_gpu/experimental/&lt;name&gt;/</code>, and at runtime Python merges them all into a single <code>fbgemm_gpu.experimental</code> namespace.</p>
+<p><strong>Critical constraint</strong>: the moment <em>any</em> wheel drops an <code>__init__.py</code> into that directory, it instantly degrades into a regular package and the sub-directories that other wheels install there are <strong>no longer discoverable</strong> (see Pitfall 6).</p>
+<hr />
+<h2 id="2-import">2. How <code>import</code> actually works<a class="headerlink" href="#2-import" title="Permanent link">#</a></h2>
+<h3 id="syspath"><code>sys.path</code> decides what can be found<a class="headerlink" href="#syspath" title="Permanent link">#</a></h3>
+<p>What <code>import X</code> really does: the interpreter takes the dotted name <code>X</code>, looks it up in <code>sys.modules</code>; on a miss, it asks the finders to walk <code>sys.path</code> for a top-level package, then descends through each sub-package's <code>__path__</code> one segment at a time.</p>
+<p>Where <code>sys.path</code> entries come from:
+- The directory of the startup script (<code>python a.py</code> → the directory containing <code>a.py</code> is inserted at <code>sys.path[0]</code>).
+- <code>python -m pkg.mod</code> → the <strong>current working directory</strong> is inserted at <code>sys.path[0]</code> (this is one of the biggest differences between <code>-m</code> and running a file directly).
+- The <code>PYTHONPATH</code> environment variable.
+- The installed site-packages.</p>
+<h3 id="__name__-__package__"><code>__name__</code> and <code>__package__</code><a class="headerlink" href="#__name__-__package__" title="Permanent link">#</a></h3>
+<p>Every module carries these two attributes, and they decide how relative imports resolve.</p>
+<table>
+<thead>
+<tr>
+<th>How it was launched</th>
+<th><code>__name__</code></th>
+<th><code>__package__</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>python app/pkg/a.py</code> (run as a file)</td>
+<td><code>"__main__"</code></td>
+<td><code>None</code> or <code>""</code></td>
+</tr>
+<tr>
+<td><code>python -m app.pkg.a</code> (run as a module)</td>
+<td><code>"__main__"</code></td>
+<td><code>"app.pkg"</code></td>
+</tr>
+<tr>
+<td>Imported elsewhere as <code>import app.pkg.a</code></td>
+<td><code>"app.pkg.a"</code></td>
+<td><code>"app.pkg"</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Relative imports (<code>from . import x</code>) only consult <code>__package__</code></strong>: they take it as the starting point, and each extra dot strips off one level. If <code>__package__</code> is <code>None</code>/<code>""</code>, the relative import fails outright.</p>
+<p>That is exactly why running a file inside a package with <code>python a.py</code> immediately breaks on <code>from . import b</code> — the file has no idea which package it belongs to.</p>
+<h3 id="vs">Absolute imports vs. relative imports<a class="headerlink" href="#vs" title="Permanent link">#</a></h3>
+<ul>
+<li><strong>Absolute import</strong>: <code>from app.pkg import b</code> — looks up the full path starting at a <code>sys.path</code> root. Readable, and stays valid when files move between packages.</li>
+<li><strong>Relative import</strong>: <code>from . import b</code>, <code>from ..sib import e</code> — computed from <code>__package__</code>. Survives renaming the top-level package, but <strong>cannot cross past the top level</strong>, and cannot be used at a script entry point.</li>
+</ul>
+<p>PEP 8 recommends absolute imports; relative imports are appropriate for <strong>intra-package</strong> sibling/close-relative references.</p>
+<h3 id="dotted-name">How a dotted name is resolved one segment at a time<a class="headerlink" href="#dotted-name" title="Permanent link">#</a></h3>
+<p><code>from a.b.c import d</code> is not resolved in one step. It walks the <code>.</code>s segment by segment, and each segment is independently decided to be a regular package, a namespace package, or a plain module:</p>
+<ol>
+<li>Find <code>a</code>: walk <code>sys.path</code> looking for a directory or file named <code>a</code>, write it into <code>sys.modules['a']</code>.</li>
+<li>Find <code>a.b</code>: look for <code>b</code> in <code>a.__path__</code>, running the finder once more. If <code>a</code> is a namespace package, <code>a.__path__</code> may be a union of several physical directories, and <code>b</code> may come from any of them.</li>
+<li>Find <code>a.b.c</code>: look for <code>c</code> in <code>a.b.__path__</code>.</li>
+<li>From the module object <code>a.b.c</code>, fetch the attribute <code>d</code>.</li>
+</ol>
+<p>Every module loaded along the way is written into <code>sys.modules</code>, so a repeat import hits the cache directly and never runs the finder again. Once any intermediate layer has been imported, changing <code>sys.path</code> afterwards will <em>not</em> cause it to be "re-resolved".</p>
+<h3 id="import">Two hidden side effects of <code>import</code><a class="headerlink" href="#import" title="Permanent link">#</a></h3>
+<p>These two side effects explain a great deal of the confusion around "why does an empty <code>__init__.py</code> still let me do this?"</p>
+<p><strong>(a) <code>import a.b</code> sets <code>b</code> as an attribute on <code>a</code>.</strong> The import system makes this assignment proactively when it loads a submodule; it is <strong>not</strong> something that only happens if <code>__init__.py</code> contains <code>from . import b</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">a.b</span>           <span class="c1"># even if a/__init__.py is completely empty</span>
+<span class="n">a</span><span class="o">.</span><span class="n">b</span><span class="o">.</span><span class="n">foo</span><span class="p">()</span>            <span class="c1"># this still works: the import system already bound b onto a</span>
+</code></pre></div>
+<p><strong>(b) <code>from a import b</code>, when it cannot find an attribute <code>b</code> on <code>a</code>, falls back to loading the submodule <code>a.b</code>.</strong> This is why <code>from a import b</code> still pulls in the submodule even when <code>__init__.py</code> has no <code>from . import b</code>. <strong>Note</strong> that this fallback only applies to a single attribute hop — <code>from a import b.c</code> is a syntax error.</p>
+<h3 id="package_1">Ambiguity from same-named submodules / top-level packages<a class="headerlink" href="#package_1" title="Permanent link">#</a></h3>
+<p>The import system <strong>only looks at names</strong>; it does not understand "logically the same package". Two common ambiguities:</p>
+<ul>
+<li><strong>Two top-level packages with the same name collide</strong>: if <code>sys.path</code> contains two directories that both hold a <code>foo/</code>, <code>import foo</code> only gets the one in the <strong>first</strong> <code>sys.path</code> entry that matches; the other is invisible forever. Diagnose with <code>foo.__file__</code>.</li>
+<li><strong>Same-named submodules meaning different things</strong>: for example, <code>fbgemm_gpu.experimental.hstu.hstu_ops_gpu</code> (the C++/CUDA binding) and <code>fbgemm_gpu.experimental.hstu.hstu_blackwell.hstu_ops_gpu</code> (the Triton implementation) are two entirely different modules that happen to share the same file name at the end. They are distinguished by the absolute path, and the usual practice is to bring them in with aliases at the call site — <code>import ... as _sm90</code> / <code>as _sm100</code> — and dispatch through those aliases.</li>
+</ul>
+<hr />
+<h2 id="3">3. Worked examples<a class="headerlink" href="#3" title="Permanent link">#</a></h2>
+<p>Assume the following project layout (<code>sys.path</code> contains <code>/proj</code>, so <code>app</code> is the top-level package):</p>
+<div class="highlight"><pre><span></span><code>/proj/
+  app/                  &lt;- top-level package
+    __init__.py
+    main.py             &lt;- entry point: python -m app.main
+    pkg/
+      __init__.py
+      a.py
+      b.py
+      sub/
+        __init__.py
+        c.py
+    sib/
+      __init__.py
+      e.py
+      sub2/
+        __init__.py
+        f.py
+</code></pre></div>
+<h3 id="1-module">Example 1: importing a sibling module in the same directory<a class="headerlink" href="#1-module" title="Permanent link">#</a></h3>
+<p><code>app/pkg/a.py</code> wants <code>foo</code> from <code>app/pkg/b.py</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># relative (recommended for intra-package use)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.</span><span class="w"> </span><span class="kn">import</span> <span class="n">b</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.b</span><span class="w"> </span><span class="kn">import</span> <span class="n">foo</span>
+
+<span class="c1"># absolute (also valid)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">app.pkg</span><span class="w"> </span><span class="kn">import</span> <span class="n">b</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">app.pkg.b</span><span class="w"> </span><span class="kn">import</span> <span class="n">foo</span>
+</code></pre></div>
+<p>The single <code>.</code> means "the current package", that is, <code>__package__ == "app.pkg"</code>.</p>
+<h3 id="2-package">Example 2: importing from a sibling package<a class="headerlink" href="#2-package" title="Permanent link">#</a></h3>
+<p><code>app/pkg/a.py</code> wants <code>bar</code> from <code>app/sib/e.py</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># relative: two dots back up to app, then descend into sib</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..sib</span><span class="w"> </span><span class="kn">import</span> <span class="n">e</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..sib.e</span><span class="w"> </span><span class="kn">import</span> <span class="n">bar</span>
+
+<span class="c1"># absolute</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">app.sib</span><span class="w"> </span><span class="kn">import</span> <span class="n">e</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">app.sib.e</span><span class="w"> </span><span class="kn">import</span> <span class="n">bar</span>
+</code></pre></div>
+<p>Note that <code>..</code> cannot cross past the top-level package. Here both <code>pkg</code> and <code>sib</code> are sub-packages of <code>app</code>, so <code>..</code> reaching <code>app</code> is legal. If <code>app</code> itself had no <code>__init__.py</code>, this would be illegal.</p>
+<h3 id="3-package">Example 3: importing from one level down inside a sibling package<a class="headerlink" href="#3-package" title="Permanent link">#</a></h3>
+<p><code>app/pkg/a.py</code> wants <code>baz</code> from <code>app/sib/sub2/f.py</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># relative</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..sib.sub2</span><span class="w"> </span><span class="kn">import</span> <span class="n">f</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..sib.sub2.f</span><span class="w"> </span><span class="kn">import</span> <span class="n">baz</span>
+
+<span class="c1"># absolute</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">app.sib.sub2</span><span class="w"> </span><span class="kn">import</span> <span class="n">f</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">app.sib.sub2.f</span><span class="w"> </span><span class="kn">import</span> <span class="n">baz</span>
+</code></pre></div>
+<h3 id="4">Example 4: the script entry point<a class="headerlink" href="#4" title="Permanent link">#</a></h3>
+<p><code>app/main.py</code> serves as the entry point and pulls in other modules:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># main.py — recommended launch: python -m app.main</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">app.pkg.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">something</span>    <span class="c1"># absolute, most robust</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.pkg.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">something</span>       <span class="c1"># relative, requires __package__ == &quot;app&quot;, i.e. launched with -m</span>
+</code></pre></div>
+<hr />
+<h2 id="4_1">4. Pitfalls (common error cases)<a class="headerlink" href="#4_1" title="Permanent link">#</a></h2>
+<h3 id="1importerror-attempted-relative-import-with-no-known-parent-package">Pitfall 1: <code>ImportError: attempted relative import with no known parent package</code><a class="headerlink" href="#1importerror-attempted-relative-import-with-no-known-parent-package" title="Permanent link">#</a></h3>
+<p><div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/proj/app/pkg
+$<span class="w"> </span>python<span class="w"> </span>a.py
+</code></pre></div>
+<code>a.py</code> contains <code>from . import b</code>. When run as a file, <code>a.py</code>'s <code>__name__ == "__main__"</code> and <code>__package__</code> is <code>None</code> — it simply does not know it belongs to <code>app.pkg</code>, so the relative import has no starting point.</p>
+<p><strong>Fix</strong>:
+- Switch to <code>python -m app.pkg.a</code> (run from <code>/proj</code>), so the interpreter loads it as a module and <code>__package__</code> is set to <code>"app.pkg"</code>.
+- Or write <code>a.py</code> as a pure script that uses only absolute imports, e.g. <code>from app.pkg import b</code> (assuming <code>/proj</code> is on <code>sys.path</code>).</p>
+<h3 id="2modulenotfounderror-no-module-named-app">Pitfall 2: <code>ModuleNotFoundError: No module named 'app'</code><a class="headerlink" href="#2modulenotfounderror-no-module-named-app" title="Permanent link">#</a></h3>
+<p><div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/home/me
+$<span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>app.main
+</code></pre></div>
+The current directory is <code>/home/me</code>, so <code>sys.path[0]</code> is <code>/home/me</code>, which contains no <code>app/</code> directory at all. The interpreter cannot locate the top-level package.</p>
+<p><strong>Fix</strong>:
+- <code>cd /proj &amp;&amp; python -m app.main</code>, or
+- <code>PYTHONPATH=/proj python -m app.main</code>, or
+- Install the project as an editable package (<code>pip install -e .</code> with <code>pyproject.toml</code>) so that <code>app</code> ends up in site-packages.</p>
+<p>Variant: <code>from app.pgk.a import x</code> (typo, <code>pkg</code> → <code>pgk</code>) raises the same error — the message only tells you "no such name", not that you misspelled it.</p>
+<h3 id="3importerror-attempted-relative-import-beyond-top-level-package">Pitfall 3: <code>ImportError: attempted relative import beyond top-level package</code><a class="headerlink" href="#3importerror-attempted-relative-import-beyond-top-level-package" title="Permanent link">#</a></h3>
+<p><div class="highlight"><pre><span></span><code><span class="c1"># Inside app/__init__.py:</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..util</span><span class="w"> </span><span class="kn">import</span> <span class="n">helper</span>
+</code></pre></div>
+<code>app</code> is already the top-level package, and <code>..</code> tries to back out to <code>app</code>'s "parent package" — which does not exist. Python forbids relative imports from crossing the boundary of the top-level package.</p>
+<p><strong>Note</strong>: "top-level package" in this error message means <strong>the top-level package that the relative import started from</strong> (here, <code>app</code>) — it does <em>not</em> mean "I am already at the outermost directory". Even if there are other directories on disk outside <code>app/</code>, that is irrelevant: the "top" is whatever <code>sys.path</code> defines as the top.</p>
+<p><strong>Fix</strong>: use an absolute import, <code>from util import helper</code> (assuming <code>util</code> is also a top-level package), or relocate <code>util</code> under <code>app</code> so it becomes <code>app.util</code>.</p>
+<h3 id="4__init__py-import-importerror-cannot-import-name-x">Pitfall 4: a circular <code>import</code> in <code>__init__.py</code> → <code>ImportError: cannot import name 'X'</code><a class="headerlink" href="#4__init__py-import-importerror-cannot-import-name-x" title="Permanent link">#</a></h3>
+<p><div class="highlight"><pre><span></span><code><span class="c1"># app/pkg/__init__.py</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">Foo</span>
+
+<span class="c1"># app/pkg/a.py</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.</span><span class="w"> </span><span class="kn">import</span> <span class="n">b</span>           <span class="c1"># triggers re-entry into pkg/__init__.py</span>
+
+<span class="c1"># app/pkg/b.py</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">Foo</span>        <span class="c1"># at this point a has not finished executing, Foo is not yet defined</span>
+</code></pre></div>
+The error shows up as <code>ImportError: cannot import name 'Foo' from partially initialized module 'app.pkg.a'</code>.</p>
+<p><strong>Fix</strong>: break the cross-dependency apart (lazily <code>import</code> inside function bodies, or split the shared core into its own module). Do not re-export at the top of <code>__init__.py</code> any symbol whose construction will loop back through the package.</p>
+<h3 id="5-syspath0">Pitfall 5: the "fake top-level" caused by <code>sys.path[0]</code><a class="headerlink" href="#5-syspath0" title="Permanent link">#</a></h3>
+<p><div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/proj/app
+$<span class="w"> </span>python<span class="w"> </span>pkg/a.py
+</code></pre></div>
+<code>a.py</code>'s <code>from app.pkg import b</code> raises <code>ModuleNotFoundError: No module named 'app'</code>. The reason: <code>python pkg/a.py</code> inserts <code>/proj/app/pkg</code> at <code>sys.path[0]</code> — now <code>pkg</code> looks like a top-level package, but <code>app</code> is no longer a direct child of <em>any</em> <code>sys.path</code> entry.</p>
+<p><strong>Fix</strong>: always launch with <code>python -m app.pkg.a</code> from the project root; never run a file inside a package with <code>python xxx.py</code>.</p>
+<h3 id="6-namespace-package-__init__py">Pitfall 6: someone "helpfully" adds an <code>__init__.py</code> to a namespace package<a class="headerlink" href="#6-namespace-package-__init__py" title="Permanent link">#</a></h3>
+<p>Suppose someone decides that <code>fbgemm_gpu/experimental/</code> "looks irregular" without an <code>__init__.py</code> and drops one in. Consequences:</p>
+<ul>
+<li><code>fbgemm_gpu.experimental</code> degrades from a namespace package into a regular package.</li>
+<li>Its <code>__path__</code> changes from the splice-capable <code>_NamespacePath</code> into a plain single-directory list.</li>
+<li>Sub-directories that other wheels (<code>fbgemm_gpu_experimental_gen_ai</code>, etc.) installed into <code>experimental/gen_ai/</code> at <em>other</em> locations are <strong>no longer discoverable</strong> — only the sub-directories under the one directory holding the squatted <code>__init__.py</code> count.</li>
+</ul>
+<p>The error looks like <code>ModuleNotFoundError: No module named 'fbgemm_gpu.experimental.gen_ai'</code>, even though <code>gen_ai/</code> visibly exists on disk.</p>
+<p><strong>Fix</strong>: delete that rogue <code>__init__.py</code>. The rule for deciding whether a directory should have an <code>__init__.py</code>: <strong>is this directory owned by a single wheel, or is it a namespace meant to be stitched from multiple wheels?</strong> The former must have one; the latter absolutely must not.</p>
+<hr />
+<h2 id="5">5. Diagnostic checklist<a class="headerlink" href="#5" title="Permanent link">#</a></h2>
+<p>When you hit an import error, work through these in order:</p>
+<ol>
+<li><code>python -c "import sys; print(sys.path)"</code> — is the parent directory of the top-level package present?</li>
+<li><code>python -c "import app; print(app.__file__)"</code> — is the <code>app</code> that gets found the one you expected? (Watch out for same-name collisions.)</li>
+<li>In the failing file, <code>print(__name__, __package__)</code> — is the relative-import starting point what you thought?</li>
+<li>Is the launch command <code>python file.py</code> or <code>python -m pkg.file</code>? The former almost guarantees <code>__package__</code> is lost.</li>
+<li>Does <code>__init__.py</code> trigger a cycle at import time?</li>
+</ol>
+    </div>
   </main>
 </div>
 <script>
@@ -591,5 +840,6 @@ $<span class="w"> </span>python<span class="w"> </span>pkg/a.py
   headings.forEach(h => observer.observe(h));
 })();
 </script>
+<script src="../lang-toggle.js"></script>
 </body>
 </html>
