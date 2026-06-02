@@ -436,6 +436,111 @@
 
   <hr>
 
+  <h2>七、Back-to-back GEMM（B2B）</h2>
+  <p>$D = (A \cdot B) \cdot C$ 这种串联两个 GEMM 的模式（注意力的 $Q K^\top V$ 是典型例子，先忽略 softmax）有一个独立于前面所有讨论的新优化维度：<strong>中间矩阵 $P = A \cdot B$ 不必落回 DRAM</strong>。设 $A \in \mathbb{R}^{M \times K}$、$B \in \mathbb{R}^{K \times N}$、$C \in \mathbb{R}^{N \times L}$，则 $P \in \mathbb{R}^{M \times N}$、$D \in \mathbb{R}^{M \times L}$，两个 GEMM 的总 FLOPs：</p>
+  <div class="eq">
+    $$\text{FLOPs}_\text{total} \;=\; 2MNK + 2MNL \;=\; 2MN(K+L)$$
+  </div>
+
+  <h3>1. 理论下界（完美融合）</h3>
+  <p>沿用 §一 的口径：所有输入只从主存读一次，输出只写一次，中间 $P$ 全程留在 on-chip。</p>
+  <ul>
+    <li>读 $A$：$MK$ 元素</li>
+    <li>读 $B$：$KN$ 元素</li>
+    <li>读 $C$：$NL$ 元素</li>
+    <li>写 $D$：$ML$ 元素</li>
+  </ul>
+  <div class="eq">
+    $$\text{AI}_\text{ideal}^\text{B2B} \;=\; \frac{2MN(K+L)}{(MK + KN + NL + ML) \cdot b}$$
+  </div>
+  <p>注意 $P$ 完全不进分母。B2B 融合的全部价值都来自消除中间张量的 DRAM 读写。</p>
+
+  <h3>2. 朴素双 kernel（中间张量物化到 DRAM）</h3>
+  <p>把 GEMM1、GEMM2 当两个独立 kernel 调度：GEMM1 写出 $P$，GEMM2 再读回 $P$。相比融合下界，分母多出 $2MN$：</p>
+  <div class="eq">
+    $$\text{AI}_\text{naive}^\text{B2B} \;=\; \frac{2MN(K+L)}{(MK + KN + \mathbf{2MN} + NL + ML) \cdot b}$$
+  </div>
+  <p>提升倍数：</p>
+  <div class="eq">
+    $$\frac{\text{AI}_\text{ideal}^\text{B2B}}{\text{AI}_\text{naive}^\text{B2B}} \;=\; 1 + \frac{2MN}{MK + KN + NL + ML}$$
+  </div>
+  <p>当 $N$ 在 $\{M, K, L\}$ 中占主导（典型如 attention：$M = N = $ seq_len，而 $K = L = $ head_dim 小很多），这个比值会非常大；反之 $N$ 远小于 $\{M, K, L\}$ 时融合近乎无收益。</p>
+
+  <h3>3. 分块布局：$M$ 联动、$N$ 决定融合方式</h3>
+  <p>B2B 的核心约束是 <strong>GEMM1 的 $N$ 维就是 GEMM2 的归约维</strong>。这导致：</p>
+  <ul>
+    <li><strong>$M$ 联动</strong>：同一个 CTA 必须包揽 $D$ 的 $M_t \times L_t$ 块的全部计算 —— 因为 GEMM1 和 GEMM2 用的是同一组 $M_t$ 行的 $A$。</li>
+    <li><strong>$N$ 决定布局类型</strong>：GEMM1 产出的 $M_t \times N$ 这块 "行片" 必须留在 on-chip（RF / smem），否则就退化回朴素双 kernel。</li>
+    <li><strong>$L$ 自由</strong>：GEMM2 的 $L$ 维与 GEMM1 解耦，可独立选 $L_t$。</li>
+  </ul>
+
+  <h4>布局 A：整行 $P$ 物化（$N$ 小）</h4>
+  <p>适用条件：$N$ 不大（典型如注意力的 head_dim $\le 128$）。一个 CTA 把整行 $M_t \times N$ 的 $P$ 算完留在 RF / smem，再用 GEMM2 沿 $N$ 累加：</p>
+<pre class="code"><span class="cm"># 布局 A：整 N 物化</span>
+<span class="kw">for</span> i0 <span class="kw">in</span> 0..M <span class="kw">step</span> Mt:
+    <span class="kw">for</span> l0 <span class="kw">in</span> 0..L <span class="kw">step</span> Lt:
+        <span class="cm"># —— GEMM1：算出 Mt × N 的 P_tile，留在 RF/smem ——</span>
+        P_tile = 0                                    <span class="cm"># Mt × N 累加器</span>
+        <span class="kw">for</span> k0 <span class="kw">in</span> 0..K <span class="kw">step</span> Kt:
+            P_tile += A[i0:i0+Mt, k0:k0+Kt] @ B[k0:k0+Kt, :]
+        <span class="cm"># —— GEMM2：用整行 P_tile 沿 N 归约 ——</span>
+        D_tile = 0                                    <span class="cm"># Mt × Lt</span>
+        <span class="kw">for</span> n0 <span class="kw">in</span> 0..N <span class="kw">step</span> Nt:
+            D_tile += P_tile[:, n0:n0+Nt] @ C[n0:n0+Nt, l0:l0+Lt]
+        D[i0:i0+Mt, l0:l0+Lt] = D_tile
+</pre>
+  <p>这是 CUTLASS 的 B2B GEMM 例子默认采用的布局。</p>
+
+  <h4>布局 B：$N$ 切片流式（$N$ 大，FlashAttention 模式）</h4>
+  <p>当 $N$ 大到塞不下整行 $P$（如 attention 里 $N = $ seq_len $= $ 8K～128K）时，沿 $N$ 切块流式，让 $P$ 永远只是个 $M_t \times N_t$ 小块：</p>
+<pre class="code"><span class="cm"># 布局 B：N 维切片流式</span>
+<span class="kw">for</span> i0 <span class="kw">in</span> 0..M <span class="kw">step</span> Mt:
+    <span class="kw">for</span> l0 <span class="kw">in</span> 0..L <span class="kw">step</span> Lt:
+        D_tile = 0                                    <span class="cm"># Mt × Lt，留在 RF</span>
+        <span class="kw">for</span> n0 <span class="kw">in</span> 0..N <span class="kw">step</span> Nt:        <span class="cm"># 中间维切片</span>
+            <span class="cm"># —— GEMM1 子块：Mt × Nt，留在 RF ——</span>
+            P_sub = A[i0:i0+Mt, :] @ B[:, n0:n0+Nt]
+            <span class="cm"># —— GEMM2 增量累加 ——</span>
+            D_tile += P_sub @ C[n0:n0+Nt, l0:l0+Lt]
+        D[i0:i0+Mt, l0:l0+Lt] = D_tile
+</pre>
+  <p>这个模式下 $P$ 完全不需要整行存在 on-chip，<strong>代价是 $A$ 可能被多次加载</strong>（每个 $N_t$ 步都要把当前 $M_t$ 行重新读一遍 $B$ 的一列条带），除非 $K$ 很小且 $A$ 行能驻留 smem。FlashAttention 在这个基础上还把 softmax 的归一化也做成在线累加。</p>
+
+  <h4>布局 C：smem 中转</h4>
+  <p>GEMM1 把 $P$ 写到 smem 而非寄存器，GEMM2 从 smem 重读。寄存器压力小、smem 压力大；Hopper 上还能配合 wgmma 用 smem 操作数。CUTLASS B2B GEMM 实现可切换 RF / smem 两种中转模式。</p>
+
+  <h3>4. on-chip 容量约束与融合的临界条件</h3>
+  <p>融合的可行性受 on-chip 存储制约（类比 §一 §4 的 cache 容量约束）：</p>
+  <ul>
+    <li><strong>布局 A</strong>（整 $N$ 物化）：累加器 $\sim M_t \cdot N \cdot b$ 字节，再加 GEMM2 累加器 $M_t \cdot L_t \cdot b$ 和 $A / B / C$ 的 smem 缓冲。Hopper 上 RF $\le 256$ KB/CTA，典型 $M_t \cdot N$ 上限 $\sim 64$K 元素。所以只有 $N \le 128$ 量级时才走得通。</li>
+    <li><strong>布局 B</strong>（$N$ 切片）：累加器 $\sim M_t \cdot (N_t + L_t) \cdot b$ 字节，$N_t$ 通常取 32–128。</li>
+    <li><strong>布局 C</strong>（smem 中转）：smem 占用 $\sim M_t \cdot N_t \cdot b$ 字节加双缓冲；smem 总量 $\sim 228$ KB/SM 是约束上限。</li>
+  </ul>
+  <p>融合何时<strong>真正</strong>带来访存比的显著提升（即朴素 AI 远低于融合 AI），等价于：</p>
+  <div class="eq">
+    $$2MN \;\gtrsim\; MK + KN + NL + ML$$
+  </div>
+  <p>即<strong>中间张量比输入加输出还大</strong>。下面是几种典型场景的数值对照（FP16，$b = 2$）：</p>
+  <table>
+    <thead>
+      <tr><th>场景</th><th>$M, N, K, L$</th><th>$\text{AI}_\text{naive}$</th><th>$\text{AI}_\text{B2B}$</th><th>提升</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>方阵 B2B</td><td>$4096, 4096, 4096, 4096$</td><td>$\sim 1365$</td><td>$\sim 2048$</td><td>$1.5\times$</td></tr>
+      <tr><td>Attention（短）</td><td>seq $= 4096$，$d = 128$</td><td>$\sim 120$</td><td>$\sim 2048$</td><td>$\mathbf{17\times}$</td></tr>
+      <tr><td>Attention（长）</td><td>seq $= 32768$，$d = 128$</td><td>$\sim 127$</td><td>$\sim 16384$</td><td>$\mathbf{129\times}$</td></tr>
+      <tr><td>瘦中间（MoE-like）</td><td>$M = K = L = 4096$，$N = 64$</td><td>$\sim 62$</td><td>$\sim 63$</td><td>$1.0\times$（可忽略）</td></tr>
+    </tbody>
+  </table>
+  <p>几个直觉：</p>
+  <ul>
+    <li><strong>Attention 是 B2B 融合的核心受益场景</strong>：$M = N = $ seq，$2MN$ 是 seq 的平方，占分母主导，导致 $\text{AI}_\text{naive} \to (K+L)/b$（仅由 head_dim 决定，与 seq 无关），而 $\text{AI}_\text{B2B} \approx N/2$（随 seq 线性增长）。seq 越长，融合的收益越夸张。</li>
+    <li><strong>方阵 B2B 收益约 $1.5\times$</strong>：$2MN \approx 2 \cdot M^2$，分母 $4 M^2$，提升固定在 $1.5\times$ 上下。普通方阵 B2B 不是首要优化目标。</li>
+    <li><strong>"瘦中间" 情形几乎没有收益</strong>：$N \ll M, K, L$ 时 $2MN$ 项对分母贡献极小。这种 shape 不需要专门走 B2B 优化。</li>
+  </ul>
+
+  <hr>
+
   <h2 id="tldr">TL;DR</h2>
   <ul>
     <li>方阵 tile：$\text{AI} = T / b$，随 $T$ 线性增长，受 cache 容量的平方根限制。</li>
@@ -446,6 +551,7 @@
     <li>$MN$ 小到 tile 数 $\lt$ SM 数时必须切 $K$ 维：<strong>Stream-K &gt; Split-K</strong>，辅以 Persistent / Cluster 调度。</li>
     <li>工程选型：$K_t$ = MMA atom × 3–6 stages；$M_t \times N_t$ 方形优先受寄存器约束；$M_o \times N_o$（swizzle group）拟合 $\sim 0.5 \cdot M_{L2}$。</li>
     <li>任何一侧被问题固有地压小（GEMV、batched MoE、LLM decode），都会从根本上变 memory-bound——这是算法层面（拼 $M$、FlashDecoding）而非 kernel 层面的问题。</li>
+    <li><strong>B2B GEMM</strong>：$D = (A B) C$ 融合可消除中间张量 $2MN$ 的 DRAM 读写，提升 $= 1 + 2MN / (MK+KN+NL+ML)$。Attention 是最大受益场景（$\text{AI}_\text{naive}$ 卡在 $(K+L)/b$，融合后 $\text{AI} \approx N / 2$ 随 seq 线性增长）；方阵 B2B 收益固定 $1.5\times$；瘦中间近乎无收益。</li>
   </ul>
 
   <hr>
@@ -870,6 +976,111 @@
 
   <hr>
 
+  <h2>7. Back-to-back GEMM (B2B)</h2>
+  <p>The chained pattern $D = (A \cdot B) \cdot C$ (attention's $Q K^\top V$ is the canonical example, ignoring softmax for now) opens a new optimization axis on top of everything discussed so far: <strong>the intermediate matrix $P = A \cdot B$ does not have to land back in DRAM</strong>. Let $A \in \mathbb{R}^{M \times K}$, $B \in \mathbb{R}^{K \times N}$, $C \in \mathbb{R}^{N \times L}$, so $P \in \mathbb{R}^{M \times N}$ and $D \in \mathbb{R}^{M \times L}$. The total FLOPs of both GEMMs:</p>
+  <div class="eq">
+    $$\text{FLOPs}_\text{total} \;=\; 2MNK + 2MNL \;=\; 2MN(K+L)$$
+  </div>
+
+  <h3>1. Theoretical lower bound (perfect fusion)</h3>
+  <p>Following the discipline of §1: every input is read from main memory once, every output is written once, and $P$ stays on-chip throughout.</p>
+  <ul>
+    <li>Read $A$: $MK$ elements</li>
+    <li>Read $B$: $KN$ elements</li>
+    <li>Read $C$: $NL$ elements</li>
+    <li>Write $D$: $ML$ elements</li>
+  </ul>
+  <div class="eq">
+    $$\text{AI}_\text{ideal}^\text{B2B} \;=\; \frac{2MN(K+L)}{(MK + KN + NL + ML) \cdot b}$$
+  </div>
+  <p>Notice that $P$ does not appear in the denominator at all. The entire payoff of B2B fusion comes from eliminating the DRAM read and write of the intermediate tensor.</p>
+
+  <h3>2. Naive two-kernel (intermediate materialized to DRAM)</h3>
+  <p>If GEMM1 and GEMM2 are dispatched as two independent kernels, GEMM1 writes $P$ out and GEMM2 reads it back. The denominator gains an extra $2MN$:</p>
+  <div class="eq">
+    $$\text{AI}_\text{naive}^\text{B2B} \;=\; \frac{2MN(K+L)}{(MK + KN + \mathbf{2MN} + NL + ML) \cdot b}$$
+  </div>
+  <p>Improvement factor:</p>
+  <div class="eq">
+    $$\frac{\text{AI}_\text{ideal}^\text{B2B}}{\text{AI}_\text{naive}^\text{B2B}} \;=\; 1 + \frac{2MN}{MK + KN + NL + ML}$$
+  </div>
+  <p>When $N$ dominates $\{M, K, L\}$ (the attention case: $M = N = $ seq_len while $K = L = $ head_dim are much smaller) the ratio gets very large. Conversely, if $N$ is much smaller than $\{M, K, L\}$ fusion brings almost nothing.</p>
+
+  <h3>3. Tiling layout: $M$ is coupled, $N$ picks the fusion mode</h3>
+  <p>The core constraint of B2B is that <strong>GEMM1's $N$ dimension is GEMM2's reduction dimension</strong>. Consequences:</p>
+  <ul>
+    <li><strong>$M$ is coupled</strong>: a single CTA must own the entire computation of the $M_t \times L_t$ output tile of $D$, because GEMM1 and GEMM2 both consume the same group of $M_t$ rows of $A$.</li>
+    <li><strong>$N$ determines the layout flavor</strong>: the $M_t \times N$ "row slice" produced by GEMM1 must stay on-chip (RF or smem), otherwise the kernel degrades into the naive two-kernel case.</li>
+    <li><strong>$L$ is free</strong>: GEMM2's $L$ dimension is decoupled from GEMM1; $L_t$ can be picked independently.</li>
+  </ul>
+
+  <h4>Layout A: materialize the entire $P$ row ($N$ small)</h4>
+  <p>Applicable when $N$ is small (typical: head_dim $\le 128$ in attention). A CTA computes the entire $M_t \times N$ tile of $P$, keeps it in RF or smem, then runs GEMM2 accumulating along $N$:</p>
+<pre class="code"><span class="cm"># Layout A: materialize the whole N row</span>
+<span class="kw">for</span> i0 <span class="kw">in</span> 0..M <span class="kw">step</span> Mt:
+    <span class="kw">for</span> l0 <span class="kw">in</span> 0..L <span class="kw">step</span> Lt:
+        <span class="cm"># —— GEMM1: produce Mt × N P_tile, keep in RF/smem ——</span>
+        P_tile = 0                                    <span class="cm"># Mt × N accumulator</span>
+        <span class="kw">for</span> k0 <span class="kw">in</span> 0..K <span class="kw">step</span> Kt:
+            P_tile += A[i0:i0+Mt, k0:k0+Kt] @ B[k0:k0+Kt, :]
+        <span class="cm"># —— GEMM2: reduce along N using the whole P_tile ——</span>
+        D_tile = 0                                    <span class="cm"># Mt × Lt</span>
+        <span class="kw">for</span> n0 <span class="kw">in</span> 0..N <span class="kw">step</span> Nt:
+            D_tile += P_tile[:, n0:n0+Nt] @ C[n0:n0+Nt, l0:l0+Lt]
+        D[i0:i0+Mt, l0:l0+Lt] = D_tile
+</pre>
+  <p>This is the default layout in the CUTLASS B2B GEMM example.</p>
+
+  <h4>Layout B: stream over $N$ ($N$ large, the FlashAttention mode)</h4>
+  <p>When $N$ is too large to fit a whole row of $P$ on-chip (e.g. attention with $N = $ seq_len $= $ 8K to 128K), tile along $N$ and keep $P$ as a small $M_t \times N_t$ block forever:</p>
+<pre class="code"><span class="cm"># Layout B: stream over the N dimension</span>
+<span class="kw">for</span> i0 <span class="kw">in</span> 0..M <span class="kw">step</span> Mt:
+    <span class="kw">for</span> l0 <span class="kw">in</span> 0..L <span class="kw">step</span> Lt:
+        D_tile = 0                                    <span class="cm"># Mt × Lt, stays in RF</span>
+        <span class="kw">for</span> n0 <span class="kw">in</span> 0..N <span class="kw">step</span> Nt:        <span class="cm"># slice the inner dim</span>
+            <span class="cm"># —— GEMM1 sub-block: Mt × Nt, stays in RF ——</span>
+            P_sub = A[i0:i0+Mt, :] @ B[:, n0:n0+Nt]
+            <span class="cm"># —— GEMM2 accumulates incrementally ——</span>
+            D_tile += P_sub @ C[n0:n0+Nt, l0:l0+Lt]
+        D[i0:i0+Mt, l0:l0+Lt] = D_tile
+</pre>
+  <p>In this mode $P$ never needs a full row on-chip. <strong>The cost is that $A$ may be loaded multiple times</strong> (each $N_t$ step re-reads the current $M_t$ rows against a column stripe of $B$), unless $K$ is small enough for the $A$ rows to live in smem. FlashAttention adds an online softmax normalization on top.</p>
+
+  <h4>Layout C: smem as the intermediate</h4>
+  <p>GEMM1 writes $P$ into smem rather than RF; GEMM2 re-reads from smem. Register pressure drops at the cost of smem pressure. On Hopper this also pairs with wgmma's smem operands. The CUTLASS B2B GEMM kernel exposes both RF and smem variants.</p>
+
+  <h3>4. On-chip capacity and when fusion actually pays</h3>
+  <p>Feasibility is bounded by on-chip storage (the analog of §1.4's cache-capacity constraint):</p>
+  <ul>
+    <li><strong>Layout A</strong> (whole-$N$ materialization): accumulator $\sim M_t \cdot N \cdot b$ bytes, plus the GEMM2 accumulator $M_t \cdot L_t \cdot b$ and smem buffers for $A / B / C$. On Hopper the RF cap is 256 KB/CTA, so $M_t \cdot N$ tops out around 64K elements, which means $N \le \sim 128$ in practice.</li>
+    <li><strong>Layout B</strong> ($N$ streaming): accumulator $\sim M_t \cdot (N_t + L_t) \cdot b$ bytes, $N_t$ typically 32 to 128.</li>
+    <li><strong>Layout C</strong> (smem intermediate): smem usage $\sim M_t \cdot N_t \cdot b$ bytes plus double buffering, capped by the $\sim 228$ KB/SM smem budget.</li>
+  </ul>
+  <p>Fusion actually delivers a meaningful AI improvement (i.e. naive AI is much lower than fused AI) when:</p>
+  <div class="eq">
+    $$2MN \;\gtrsim\; MK + KN + NL + ML$$
+  </div>
+  <p>That is, <strong>when the intermediate tensor is larger than inputs plus outputs combined</strong>. Concrete numbers under FP16 ($b = 2$):</p>
+  <table>
+    <thead>
+      <tr><th>Scenario</th><th>$M, N, K, L$</th><th>$\text{AI}_\text{naive}$</th><th>$\text{AI}_\text{B2B}$</th><th>Speedup</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Square B2B</td><td>$4096, 4096, 4096, 4096$</td><td>$\sim 1365$</td><td>$\sim 2048$</td><td>$1.5\times$</td></tr>
+      <tr><td>Attention (short)</td><td>seq $= 4096$, $d = 128$</td><td>$\sim 120$</td><td>$\sim 2048$</td><td>$\mathbf{17\times}$</td></tr>
+      <tr><td>Attention (long)</td><td>seq $= 32768$, $d = 128$</td><td>$\sim 127$</td><td>$\sim 16384$</td><td>$\mathbf{129\times}$</td></tr>
+      <tr><td>Skinny middle (MoE-like)</td><td>$M = K = L = 4096$, $N = 64$</td><td>$\sim 62$</td><td>$\sim 63$</td><td>$1.0\times$ (negligible)</td></tr>
+    </tbody>
+  </table>
+  <p>Intuitions:</p>
+  <ul>
+    <li><strong>Attention is the headline beneficiary of B2B fusion</strong>: with $M = N = $ seq, the $2MN$ term is quadratic in seq and dominates the denominator, so $\text{AI}_\text{naive} \to (K+L) / b$ (determined only by head_dim, independent of seq), while $\text{AI}_\text{B2B} \approx N / 2$ (linear in seq). The longer the sequence, the more dramatic the fusion payoff.</li>
+    <li><strong>Square B2B caps out at $\sim 1.5\times$</strong>: with $2MN \approx 2 M^2$ and the denominator at $4 M^2$, the ratio sits at $1.5\times$ regardless of $M$. Plain square B2B is not the primary optimization target.</li>
+    <li><strong>"Skinny middle" sees no benefit</strong>: when $N \ll M, K, L$, the $2MN$ term contributes almost nothing to the denominator. Shapes like this do not need a dedicated B2B kernel.</li>
+  </ul>
+
+  <hr>
+
   <h2 id="tldr">TL;DR</h2>
   <ul>
     <li>Square tile: $\text{AI} = T / b$, linear in $T$, capped by the square root of the cache capacity.</li>
@@ -880,6 +1091,7 @@
     <li>When $MN$ is small enough that tile count $\lt$ SM count, $K$ must be split: <strong>Stream-K &gt; Split-K</strong>, complemented by Persistent / Cluster scheduling.</li>
     <li>Engineering picks: $K_t$ = MMA atom &times; 3 to 6 stages; $M_t \times N_t$ prefers square subject to register file; $M_o \times N_o$ (swizzle group) fits $\sim 0.5 \cdot M_{L2}$.</li>
     <li>If either side is intrinsically small (GEMV, batched MoE, LLM decode), the workload becomes fundamentally memory-bound. That is an algorithm-level problem (stitch $M$, FlashDecoding), not a kernel-level one.</li>
+    <li><strong>B2B GEMM</strong>: fusing $D = (A B) C$ removes the $2MN$ DRAM round-trip of the intermediate tensor; speedup $= 1 + 2MN / (MK+KN+NL+ML)$. Attention is the marquee beneficiary ($\text{AI}_\text{naive}$ caps at $(K+L)/b$ regardless of seq, fused $\text{AI} \approx N / 2$ grows linearly with seq). Square B2B is fixed at $1.5\times$. Skinny middle gives essentially no benefit.</li>
   </ul>
 
   <hr>
