@@ -18,138 +18,10 @@
 <meta name="post:series_order" content="2">
 <meta name="post:summary"    content="dispatcher 那篇文章的姐妹篇 —— 从 Python DispatchKey 这一层钻进去,讲清 C++ 调用走到一半反向跳回 Python 的完整机制:PyInterpreterVTable + TensorImpl::pyobj_slot + PythonFallbackKernel + TorchDispatchMode API。配合 FakeTensorMode / make_fx + ProxyTorchDispatchMode / DTensor 三个真实用户案例,以及它在 torch.compile 流水线中的角色。">
 <meta name="post:summary_en" content="Sister article to the dispatcher deep dive. Zooms into the Python DispatchKey: how a C++ op call mid-flight reverse-jumps back into Python via PyInterpreterVTable, TensorImpl::pyobj_slot, PythonFallbackKernel, and the TorchDispatchMode protocol. Includes worked case studies on FakeTensorMode, make_fx + ProxyTorchDispatchMode, DTensor, and the mechanism's role in torch.compile's AOTAutograd pipeline.">
-<style>
-  :root {
-    --sidebar-w: 280px;
-    --fg: #1f2328;
-    --muted: #57606a;
-    --bg: #ffffff;
-    --panel: #f6f8fa;
-    --border: #d0d7de;
-    --accent: #0969da;
-    --accent-soft: #ddf4ff;
-    --code-bg: #f6f8fa;
-    --kw: #cf222e;
-    --cm: #6e7781;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --fg: #e6edf3;
-      --muted: #8b949e;
-      --bg: #0d1117;
-      --panel: #161b22;
-      --border: #30363d;
-      --accent: #58a6ff;
-      --accent-soft: #1f6feb33;
-      --code-bg: #161b22;
-      --kw: #ff7b72;
-      --cm: #8b949e;
-    }
-  }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
-                 "Hiragino Sans GB", "Microsoft YaHei", Roboto, "Helvetica Neue", Arial, sans-serif;
-    font-size: 16px; line-height: 1.7;
-    color: var(--fg); background: var(--bg);
-    -webkit-font-smoothing: antialiased;
-  }
-  .layout { display: flex; align-items: flex-start; min-height: 100vh; }
-  aside.toc {
-    position: sticky; top: 0; align-self: flex-start;
-    flex: 0 0 var(--sidebar-w); width: var(--sidebar-w);
-    max-height: 100vh; overflow-y: auto;
-    padding: 28px 18px 28px 28px;
-    border-right: 1px solid var(--border);
-    background: var(--panel);
-    font-size: 0.88rem;
-  }
-  aside.toc strong { display: block; margin-bottom: 10px; font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
-  aside.toc ul { list-style: none; padding-left: 0; margin: 0; }
-  aside.toc li { margin: 4px 0; }
-  aside.toc li ul { padding-left: 14px; margin: 4px 0; font-size: 0.84rem; }
-  aside.toc a { color: var(--fg); text-decoration: none; }
-  aside.toc a:hover { color: var(--accent); }
-
-  main.content {
-    flex: 1; min-width: 0;
-    max-width: 920px; margin: 0 auto;
-    padding: 36px 40px 80px;
-  }
-  h1 { font-size: 1.9rem; margin: 0 0 6px; letter-spacing: -0.01em; }
-  h2 { font-size: 1.4rem; margin: 36px 0 12px; padding-top: 12px; border-top: 1px solid var(--border); }
-  h3 { font-size: 1.15rem; margin: 24px 0 8px; }
-  h4 { font-size: 1.02rem; margin: 18px 0 6px; color: var(--muted); }
-  p { margin: 10px 0; }
-  a { color: var(--accent); text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  code {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-    font-size: 0.88em;
-    background: var(--code-bg);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 1px 5px;
-  }
-  pre.code, pre {
-    background: var(--code-bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 14px 16px;
-    overflow-x: auto;
-    font-size: 0.85rem;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-    line-height: 1.55;
-  }
-  pre code { background: transparent; border: 0; padding: 0; }
-  .kw { color: var(--kw); }
-  .cm { color: var(--cm); font-style: italic; }
-
-  table { border-collapse: collapse; margin: 14px 0; font-size: 0.92rem; width: 100%; }
-  th, td { border: 1px solid var(--border); padding: 7px 10px; vertical-align: top; text-align: left; }
-  th { background: var(--panel); font-weight: 600; }
-  td code { font-size: 0.85em; }
-
-  .callout {
-    background: var(--accent-soft);
-    border-left: 3px solid var(--accent);
-    padding: 12px 14px;
-    margin: 16px 0;
-    border-radius: 4px;
-    font-size: 0.94rem;
-  }
-  .callout.warn { background: #fff4e5; border-left-color: #d18616; }
-  .aside, .example, .practice {
-    margin: 18px 0; padding: 14px 16px; border-radius: 6px; font-size: 0.93rem;
-  }
-  .aside { background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--muted); }
-  .aside .label, .example .label, .practice .label {
-    display: inline-block; font-size: 0.72rem; font-weight: 700;
-    letter-spacing: 0.08em; text-transform: uppercase;
-    color: var(--muted); margin-bottom: 6px;
-  }
-  .example  { background: #f0f7ff; border: 1px solid #cfe2f3; border-left: 4px solid #0969da; }
-  .example .label  { color: #0969da; }
-  .practice { background: #fff9e6; border: 1px solid #f3e3a0; border-left: 4px solid #d18616; }
-  .practice .label { color: #b56500; }
-  .figure-caption { font-size: 0.85rem; color: var(--muted); text-align: center; margin: 4px 0 12px; font-style: italic; }
-  @media (prefers-color-scheme: dark) {
-    .callout.warn { background: #2d2210; }
-    .example  { background: #0d2235; border-color: #214b73; }
-    .example .label { color: #58a6ff; }
-    .practice { background: #2d2210; border-color: #6b5520; }
-    .practice .label { color: #f0c674; }
-  }
-  .small { font-size: 0.85rem; color: var(--muted); }
-  .tag { background: var(--accent-soft); color: var(--accent); border-radius: 10px; padding: 1px 8px; font-size: 0.72rem; vertical-align: middle; }
-
-  @media (max-width: 900px) {
-    .layout { flex-direction: column; }
-    aside.toc { position: static; flex: none; width: 100%; max-height: none; border-right: 0; border-bottom: 1px solid var(--border); }
-    main.content { padding: 24px 18px 60px; }
-  }
-</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
 </head>
 <body>
 <div class="layout">
@@ -1520,11 +1392,11 @@ thread_local std::optional&lt;c10::impl::LocalDispatchKeySet&gt; tls_on_entry;</
 
 <h1>PyTorch C++↔Python Bidirectional Dispatch: TorchDispatchMode and the Reverse Jump</h1>
 
-<p class="small">This is the sister article to <a href="pytorch-dispatcher.html"><i>PyTorch Dispatcher: A Full-Stack Walkthrough</i></a>. The previous article followed the "Python → CUDA" path top-down through a single op call; this one goes the other way — diving into the <code>Python</code> layer of the dispatcher to explain, in full, how a C++ call mid-flight jumps back to Python so user code can intercept every op. All PyTorch source citations are from the <code>pytorch/pytorch</code> <code>main</code> branch (May 2026).</p>
+<p class="small">This is the sister article to <a href="pytorch-dispatcher.html"><i>PyTorch Dispatcher: A Full-Stack Walkthrough</i></a>. The previous article followed the "Python → CUDA" path top-down through a single op call; this one goes the other way, diving into the <code>Python</code> layer of the dispatcher to explain, in full, how a C++ call mid-flight jumps back to Python so user code can intercept every op. All PyTorch source citations are from the <code>pytorch/pytorch</code> <code>main</code> branch (May 2026).</p>
 
 <h2 id="sec1">1. The need for a reverse jump</h2>
 
-<p>This chapter establishes motivation. The previous article described the dispatcher as a "top-down" chain: Python call → autograd wrapper → backend kernel → actual arithmetic. But for many modern PyTorch features (<code>torch.compile</code>, shape inference, distributed tensors), this chain is <strong>not enough</strong> — we have to "reverse jump" from inside C++ back into Python so that user/framework code can insert itself <strong>at the op call site</strong>. This chapter explains why such a reverse jump is needed, when it happens, and how it relates to the dispatcher of the previous article. By the end you should be able to mentally draw the full loop: the "forward jump" (previous article) and the "reverse jump" (this article).</p>
+<p>This chapter establishes motivation. The previous article described the dispatcher as a "top-down" chain: Python call → autograd wrapper → backend kernel → actual arithmetic. But for many modern PyTorch features (<code>torch.compile</code>, shape inference, distributed tensors), this chain is <strong>not enough</strong>. We have to "reverse jump" from inside C++ back into Python so that user/framework code can insert itself <strong>at the op call site</strong>. This chapter explains why such a reverse jump is needed, when it happens, and how it relates to the dispatcher of the previous article. By the end you should be able to mentally draw the full loop: the "forward jump" (previous article) and the "reverse jump" (this article).</p>
 
 <h3 id="sec1-1">1.1 What we already know</h3>
 
@@ -1536,7 +1408,7 @@ thread_local std::optional&lt;c10::impl::LocalDispatchKeySet&gt; tls_on_entry;</
   <li>Compute a <strong>64-bit bitmap</strong> (<code>DispatchKeySet</code>) from input tensor attributes and TLS state, indicating which keys are currently active.</li>
   <li>Take the <strong>highest-priority</strong> key in the bitmap.</li>
   <li>Jump to the function pointer registered under that key.</li>
-  <li>That function body may optionally mask "itself" out of the bitmap and redispatch, handing control to the next layer — for example, the autograd kernel, after building the backward graph node, redispatches to the CUDA kernel that performs the actual arithmetic.</li>
+  <li>That function body may optionally mask "itself" out of the bitmap and redispatch, handing control to the next layer. For example, the autograd kernel, after building the backward graph node, redispatches to the CUDA kernel that performs the actual arithmetic.</li>
 </ol>
 
 <p>The priority ladder, top to bottom, is roughly: mode layer (Python / Functionalize / Autocast, etc.) → autograd layer → backend layer (CPU / CUDA / MPS, etc.). This ordering automatically enforces layer constraints such as "record the backward graph before computing" and "downcast precision before autograd."</p>
@@ -1549,7 +1421,7 @@ thread_local std::optional&lt;c10::impl::LocalDispatchKeySet&gt; tls_on_entry;</
 
 <p>Given this mechanism, we can ask a seemingly innocent question:</p>
 
-<p class="small" style="text-align:center; font-style:italic;">"I want to <strong>intercept every ATen op call PyTorch makes</strong> — to inspect the inputs, modify them, or skip the real computation entirely and return a value of my own choosing."</p>
+<p class="small" style="text-align:center; font-style:italic;">"I want to <strong>intercept every ATen op call PyTorch makes</strong>, to inspect the inputs, modify them, or skip the real computation entirely and return a value of my own choosing."</p>
 
 <p>This sounds abstract, but <strong>it is exactly the essence of several core features</strong>:</p>
 
@@ -1559,13 +1431,13 @@ thread_local std::optional&lt;c10::impl::LocalDispatchKeySet&gt; tls_on_entry;</
 </thead>
 <tbody>
 <tr><td><code>torch.compile</code> graph capture</td><td>The user writes <code>def f(x, y): return (x + y).relu()</code>, and the compiler must turn this function into an <code>fx.Graph</code>. How do we know what ops are inside? The answer is to <strong>actually run it once</strong>, but capture every ATen op as it executes and record it into the graph.</td></tr>
-<tr><td>FakeTensorMode (shape inference)</td><td>Call <code>x @ y</code> but without actually allocating GPU memory or running the matmul — only know "what shape/dtype/device the output would have." Every op call must be intercepted and routed through a "fake" implementation that computes only meta information, not values.</td></tr>
+<tr><td>FakeTensorMode (shape inference)</td><td>Call <code>x @ y</code> but without actually allocating GPU memory or running the matmul; only know "what shape/dtype/device the output would have." Every op call must be intercepted and routed through a "fake" implementation that computes only meta information, not values.</td></tr>
 <tr><td>DTensor (distributed)</td><td>A tensor is sharded across multiple GPUs. A single <code>add</code> operation becomes: (1) inspect input sharding; (2) insert all-reduce if necessary; (3) each rank computes its local add; (4) wrap the result back into a DTensor. These decisions must be made at the op call site.</td></tr>
-<tr><td>Debugging / logging</td><td>"I want to print every op's input shapes across the whole model" — a simple request, but it has to fire <strong>every time</strong> an op is called.</td></tr>
+<tr><td>Debugging / logging</td><td>"I want to print every op's input shapes across the whole model": a simple request, but it has to fire <strong>every time</strong> an op is called.</td></tr>
 </tbody>
 </table>
 
-<p>All of these have the same shape: <strong>"insert my own logic at the op call site."</strong> And that logic must be in <strong>Python</strong> (because users, researchers, and third-party frameworks all write Python — we cannot demand every new tool reimplement ATen in C++).</p>
+<p>All of these have the same shape: <strong>"insert my own logic at the op call site."</strong> And that logic must be in <strong>Python</strong> (because users, researchers, and third-party frameworks all write Python, and we cannot demand every new tool reimplement ATen in C++).</p>
 
 <p>But the dispatcher is C++! It stores C++ function pointers and jumps to C++ functions. How do we make a <strong>Python function</strong> appear as a "row" in the dispatcher table?</p>
 
@@ -1585,7 +1457,7 @@ with FakeTensorMode():
     print(z.shape, z.dtype, z.device)
     <span class="cm"># prints: torch.Size([1024, 512]) torch.float32 cuda:0</span></pre>
 
-<p>This <strong>does not</strong> actually allocate 4 MB of GPU memory, and <strong>does not</strong> actually run a matmul. But PyTorch knows: if you <strong>really</strong> ran this snippet, the output would be a <code>[1024, 512]</code> fp32 CUDA tensor. How is that inference made? <code>FakeTensorMode</code> intercepts <strong>every call</strong> to <code>torch.randn</code> and <code>@</code> (i.e. <code>aten::matmul</code>) inside the dispatch chain and runs a "fake" implementation — computing shape only, not values.</p>
+<p>This <strong>does not</strong> actually allocate 4 MB of GPU memory, and <strong>does not</strong> actually run a matmul. But PyTorch knows: if you <strong>really</strong> ran this snippet, the output would be a <code>[1024, 512]</code> fp32 CUDA tensor. How is that inference made? <code>FakeTensorMode</code> intercepts <strong>every call</strong> to <code>torch.randn</code> and <code>@</code> (i.e. <code>aten::matmul</code>) inside the dispatch chain and runs a "fake" implementation that computes shape only, not values.</p>
 
 <h4>(b) make_fx / ProxyTorchDispatchMode</h4>
 
@@ -1625,13 +1497,13 @@ y = x @ w                                                            <span class
 
 <h3 id="sec1-4">1.4 Why we can't intercept at the Python layer</h3>
 
-<p>You might think: "Why not just override <code>torch.add</code>, <code>torch.matmul</code> directly? They're Python functions I control — just add a hook."</p>
+<p>You might think: "Why not just override <code>torch.add</code>, <code>torch.matmul</code> directly? They're Python functions I control; just add a hook."</p>
 
 <p>This idea corresponds to the older mechanism called the <code>__torch_function__</code> protocol, which does exist. But it can only intercept <code>torch.*</code> APIs that the user <strong>directly calls</strong>. It cannot see any of the following:</p>
 
 <ul>
-  <li><strong>Ops produced inside autograd</strong>. On the backward of <code>z = x + y</code>, the autograd engine calls <code>AddBackward0::apply</code>, whose body calls <code>at::add</code> / <code>at::mul</code> — these don't go through <code>torch.add</code>; they run directly in C++. <code>__torch_function__</code> never sees them.</li>
-  <li><strong>Sub-ops produced by decomposition</strong>. On some backends <code>torch.softmax</code> is decomposed into <code>exp + sum + div</code> — these sub-ops are also dispatched directly in C++, bypassing the user Python layer.</li>
+  <li><strong>Ops produced inside autograd</strong>. On the backward of <code>z = x + y</code>, the autograd engine calls <code>AddBackward0::apply</code>, whose body calls <code>at::add</code> / <code>at::mul</code>. These don't go through <code>torch.add</code>; they run directly in C++. <code>__torch_function__</code> never sees them.</li>
+  <li><strong>Sub-ops produced by decomposition</strong>. On some backends <code>torch.softmax</code> is decomposed into <code>exp + sum + div</code>. These sub-ops are also dispatched directly in C++, bypassing the user Python layer.</li>
   <li><strong>Third-party operators that call other operators</strong>. A custom op whose body calls <code>at::clamp_min</code> is another C++-to-C++ jump.</li>
 </ul>
 
@@ -1652,10 +1524,10 @@ y = x @ w                                                            <span class
 <thead><tr><th>Question</th><th>Answer</th></tr></thead>
 <tbody>
 <tr><td>How does it know to jump to Python?</td><td><code>DispatchKey::Python</code> is in the bitmap (pushed by a mode's context or carried by a tensor subclass)</td></tr>
-<tr><td>Where does it jump to?</td><td><code>PythonFallbackKernel</code> — the boxed kernel registered to the <code>Python</code> key</td></tr>
+<tr><td>Where does it jump to?</td><td><code>PythonFallbackKernel</code>, the boxed kernel registered to the <code>Python</code> key</td></tr>
 <tr><td>How does it find the Python function?</td><td>(1) TLS mode stack → take the mode's <code>__torch_dispatch__</code>; (2) input tensor's <code>pyobj_slot</code> → take the subclass's <code>__torch_dispatch__</code></td></tr>
 <tr><td>How is Python actually called?</td><td>Through a <code>PyInterpreterVTable</code> virtual function: acquire the GIL, convert IValue args to PyObjects, invoke Python, convert back</td></tr>
-<tr><td>How is recursion avoided?</td><td><code>ExcludeDispatchKeyGuard</code> masks <code>Python</code> and "below" — ops called from inside the Python body skip the Python kernel</td></tr>
+<tr><td>How is recursion avoided?</td><td><code>ExcludeDispatchKeyGuard</code> masks <code>Python</code> and "below"; ops called from inside the Python body skip the Python kernel</td></tr>
 </tbody>
 </table>
 
@@ -1663,7 +1535,7 @@ y = x @ w                                                            <span class
 
 <h2 id="sec2">2. The C++ → Python physical mechanism</h2>
 
-<p>This chapter unpacks the table at the end of §1.4, row by row, at the source level. By the end you should be able to mentally draw the full flow from "the dispatcher sees the <code>Python</code> key" through GIL acquisition, argument conversion, Python function lookup, result return, and recursion prevention. All paths are pinned to the PyTorch <code>main</code> branch — these files were reshuffled in 2024-2025, so if you see an old blog pointing to <code>c10/core/PyInterpreter.h</code> and the file isn't there, it's because it now lives at <code>c10/core/impl/PyInterpreter.h</code>.</p>
+<p>This chapter unpacks the table at the end of §1.4, row by row, at the source level. By the end you should be able to mentally draw the full flow from "the dispatcher sees the <code>Python</code> key" through GIL acquisition, argument conversion, Python function lookup, result return, and recursion prevention. All paths are pinned to the PyTorch <code>main</code> branch. These files were reshuffled in 2024-2025, so if you see an old blog pointing to <code>c10/core/PyInterpreter.h</code> and the file isn't there, it's because it now lives at <code>c10/core/impl/PyInterpreter.h</code>.</p>
 
 <h3 id="sec2-1">2.1 The zero-dependency tension between c10 and CPython</h3>
 
@@ -1687,10 +1559,10 @@ y = x @ w                                                            <span class
 <p>PyTorch resolves this conflict with a classic <strong>inversion of control (IoC)</strong> design:</p>
 
 <ol>
-  <li><strong><code>libc10</code> defines an abstract interface</strong> (<code>PyInterpreterVTable</code>) — a bunch of pure virtual functions saying "I need Python to do these things for me, but I don't know how."</li>
+  <li><strong><code>libc10</code> defines an abstract interface</strong> (<code>PyInterpreterVTable</code>): a bunch of pure virtual functions saying "I need Python to do these things for me, but I don't know how."</li>
   <li><strong><code>libtorch_python</code> (the layer that actually loads CPython) fills in the concrete vtable during <strong>static initialization</strong></strong>, writing the pointer back into a c10 global.</li>
-  <li><strong>At runtime, c10 calls</strong> Python-related functionality through the vtable's virtual functions — <strong>at compile time it has no idea CPython exists</strong>, at link time it does not need <code>libpython.so</code>; but <strong>at run time</strong>, if <code>libtorch_python</code> has been loaded, the vtable is valid.</li>
-  <li>In processes without Python, the vtable is a "no-op" version — calls to these virtuals raise friendly errors instead of segfaulting.</li>
+  <li><strong>At runtime, c10 calls</strong> Python-related functionality through the vtable's virtual functions. <strong>At compile time it has no idea CPython exists</strong>, at link time it does not need <code>libpython.so</code>; but <strong>at run time</strong>, if <code>libtorch_python</code> has been loaded, the vtable is valid.</li>
+  <li>In processes without Python, the vtable is a "no-op" version: calls to these virtuals raise friendly errors instead of segfaulting.</li>
 </ol>
 
 <p>This IoC determines that every <strong>C++→Python</strong> call <strong>must</strong> pass through the vtable. The next section examines what the vtable looks like.</p>
@@ -1751,17 +1623,17 @@ struct C10_API PyInterpreter {
 </tbody>
 </table>
 
-<p>This article focuses on the <strong>second group</strong> — the <code>dispatch</code> virtual. Its concrete implementation (inside <code>libtorch_python</code>) is the <code>ConcretePyInterpreterVTable::dispatch</code> that §2.6 will unpack.</p>
+<p>This article focuses on the <strong>second group</strong>: the <code>dispatch</code> virtual. Its concrete implementation (inside <code>libtorch_python</code>) is the <code>ConcretePyInterpreterVTable::dispatch</code> that §2.6 will unpack.</p>
 
 <div class="example">
-<span class="label">Example 2.2 — why disarm exists</span>
-At PyTorch process exit, the Python interpreter is torn down first (<code>Py_Finalize</code>), but C++ objects held by <code>libtorch</code> may be destroyed <strong>after</strong> Python (for example a cached tensor that is freed after atexit). Those destructors call <code>pyobj_slot.decref()</code> — but Python is already dead, so a real <code>Py_DECREF</code> would segfault.<br><br>
-<code>disarm()</code> is invoked when Python teardown begins; it <strong>replaces the entire vtable pointer</strong> with a noop version. Subsequent C++ calls to <code>decref(...)</code> go through the noop — silently doing nothing. If you ever see the diagnostic "<em>attempted to call dispatch on a Tensor with nontrivial PyObject after corresponding interpreter died</em>", that is this mechanism in action.
+<span class="label">Example 2.2 / why disarm exists</span>
+At PyTorch process exit, the Python interpreter is torn down first (<code>Py_Finalize</code>), but C++ objects held by <code>libtorch</code> may be destroyed <strong>after</strong> Python (for example a cached tensor that is freed after atexit). Those destructors call <code>pyobj_slot.decref()</code>, but Python is already dead, so a real <code>Py_DECREF</code> would segfault.<br><br>
+<code>disarm()</code> is invoked when Python teardown begins; it <strong>replaces the entire vtable pointer</strong> with a noop version. Subsequent C++ calls to <code>decref(...)</code> go through the noop, silently doing nothing. If you ever see the diagnostic "<em>attempted to call dispatch on a Tensor with nontrivial PyObject after corresponding interpreter died</em>", that is this mechanism in action.
 </div>
 
 <h3 id="sec2-3">2.3 TensorImpl::pyobj_slot: the reverse pointer</h3>
 
-<p>The vtable solves the problem of "how c10 calls a Python function." There is a dual problem: <strong>given a C++ <code>TensorImpl</code>, how do we find the corresponding Python object?</strong> This is essential for tensor subclasses — when the dispatcher routes a method on a <code>FakeTensor</code>, what it has is a C++ <code>TensorImpl*</code>, but the <code>__torch_dispatch__</code> it wants to call is defined on the Python <code>FakeTensor</code> class.</p>
+<p>The vtable solves the problem of "how c10 calls a Python function." There is a dual problem: <strong>given a C++ <code>TensorImpl</code>, how do we find the corresponding Python object?</strong> This is essential for tensor subclasses: when the dispatcher routes a method on a <code>FakeTensor</code>, what it has is a C++ <code>TensorImpl*</code>, but the <code>__torch_dispatch__</code> it wants to call is defined on the Python <code>FakeTensor</code> class.</p>
 
 <p>The answer is: <strong>every <code>TensorImpl</code> embeds a <code>PyObjectSlot</code></strong>, which is just an atomic <code>PyObject*</code> (pointing to the Python-side <code>THPVariable</code> object, i.e. the <code>torch.Tensor</code> Python wrapper). It is defined in <a href="https://github.com/pytorch/pytorch/blob/main/c10/core/impl/PyObjectSlot.h"><code>c10/core/impl/PyObjectSlot.h</code></a>:</p>
 
@@ -1809,7 +1681,7 @@ struct C10_API PyObjectSlot {
 
 <ol>
   <li><strong>The first time a regular <code>torch.Tensor</code> is wrapped from Python</strong>: the Python C-binding layer (<code>THPVariable_Wrap</code>) creates a new <code>THPVariable</code> object and writes its pointer into <code>pyobj_slot</code>. The next time C++ wants to "wrap back into Python", it reuses this wrapper instead of creating a new one.</li>
-  <li><strong>When a tensor subclass (such as <code>FakeTensor</code>) is constructed</strong>: the Python-side constructor actively calls <code>store_pyobj(self)</code>, and at the same time <strong>sets <code>DispatchKey::Python</code> into that <code>TensorImpl</code>'s <code>key_set_</code></strong> — this is the key marker that will trigger <code>PythonFallbackKernel</code>.</li>
+  <li><strong>When a tensor subclass (such as <code>FakeTensor</code>) is constructed</strong>: the Python-side constructor actively calls <code>store_pyobj(self)</code>, and at the same time <strong>sets <code>DispatchKey::Python</code> into that <code>TensorImpl</code>'s <code>key_set_</code></strong>. This is the key marker that will trigger <code>PythonFallbackKernel</code>.</li>
 </ol>
 
 <div class="callout">
@@ -1912,16 +1784,16 @@ void pythonFallback(const c10::OperatorHandle&amp; op,
 <p>This function body concentrates all the decision-making of the <strong>"C++→Python jump"</strong>. Reading section by section:</p>
 
 <ol>
-  <li><strong>(1) Guard block</strong>: on entry the fallback immediately masks out "<code>Python</code> and every lower-priority key" (<code>after_Python_keyset</code> is a precomputed constant, unpacked in §2.5). This guarantees that any op called from inside the Python body will <strong>not</strong> retrigger this fallback — otherwise it would be infinite recursion.</li>
-  <li><strong>(2) Path A: mode stack non-empty</strong>. This is the entry point for modes such as <code>FakeTensorMode</code> and <code>ProxyTorchDispatchMode</code>. They push themselves onto <code>TorchDispatchModeTLS</code> in <code>__enter__</code> and pop in <code>__exit__</code>. <code>pythonFallback</code> takes only the top mode — LIFO priority.</li>
+  <li><strong>(1) Guard block</strong>: on entry the fallback immediately masks out "<code>Python</code> and every lower-priority key" (<code>after_Python_keyset</code> is a precomputed constant, unpacked in §2.5). This guarantees that any op called from inside the Python body will <strong>not</strong> retrigger this fallback; otherwise it would be infinite recursion.</li>
+  <li><strong>(2) Path A: mode stack non-empty</strong>. This is the entry point for modes such as <code>FakeTensorMode</code> and <code>ProxyTorchDispatchMode</code>. They push themselves onto <code>TorchDispatchModeTLS</code> in <code>__enter__</code> and pop in <code>__exit__</code>. <code>pythonFallback</code> takes only the top mode (LIFO priority).</li>
   <li><strong>(3) Path B: input tensor carries the Python key</strong>. This is the tensor-subclass path (e.g. a <code>FakeTensor</code> passed as an argument). <code>tensors_with_python_key_present</code> checks the key; <code>interpreter</code> finds a tensor with a pyobj_slot for the entry point. Only when both conditions hold do we really jump.</li>
-  <li><strong>Path B's "false positive" branch</strong>: if inputs have a PyInterpreter but none carry the Python key (meaning these tensors have Python wrappers but no one wants to intercept), we <strong>mask the Python bit and redispatch</strong> — this handles the common "Python wrapper exists but no interception needed" case (every regular <code>torch.Tensor</code> takes this branch).</li>
+  <li><strong>Path B's "false positive" branch</strong>: if inputs have a PyInterpreter but none carry the Python key (meaning these tensors have Python wrappers but no one wants to intercept), we <strong>mask the Python bit and redispatch</strong>. This handles the common "Python wrapper exists but no interception needed" case (every regular <code>torch.Tensor</code> takes this branch).</li>
 </ol>
 
 <div class="aside">
-<span class="label">Aside 2.4 — mode-stack priority vs subclass priority</span>
-Observe in the code above: <strong>the mode stack path is written first, the subclass path second</strong>. This is the key priority decision — <strong>if a mode is present and an input tensor also carries the Python key, the mode wins</strong>.<br><br>
-This is a reasonable design choice. A mode is a "global transformation actively declared by the user" (<code>with FakeTensorMode():</code>), while a subclass is an "intrinsic property of the input data." When the two conflict, the actively declared semantics are stronger and more explicit — a user writing <code>with FakeTensorMode():</code> expects <strong>every</strong> op to be faked, even if some inputs belong to another subclass.
+<span class="label">Aside 2.4 / mode-stack priority vs subclass priority</span>
+Observe in the code above: <strong>the mode stack path is written first, the subclass path second</strong>. This is the key priority decision: <strong>if a mode is present and an input tensor also carries the Python key, the mode wins</strong>.<br><br>
+This is a reasonable design choice. A mode is a "global transformation actively declared by the user" (<code>with FakeTensorMode():</code>), while a subclass is an "intrinsic property of the input data." When the two conflict, the actively declared semantics are stronger and more explicit. A user writing <code>with FakeTensorMode():</code> expects <strong>every</strong> op to be faked, even if some inputs belong to another subclass.
 </div>
 
 <h3 id="sec2-5">2.5 ExcludeDispatchKeyGuard and after_Python_keyset</h3>
@@ -1946,22 +1818,22 @@ This is a reasonable design choice. A mode is a "global transformation actively 
 <p>When the Python <code>__torch_dispatch__</code> body calls <code>func(*args)</code> (meaning "I'm done, let the dispatcher continue"), this call passes through the <code>at::*</code> API into <code>Dispatcher::call</code>. While computing the bitmap, <strong>the exclude set is automatically subtracted</strong>: the <code>Python</code> bit is cleared, the highest bit becomes <code>Autograd*</code> or a lower backend key, and the call <strong>lands directly on the real implementation</strong> instead of triggering <code>pythonFallback</code> again.</p>
 
 <div class="example">
-<span class="label">Example 2.5 — a full mode intercept + pass-through trace</span>
+<span class="label">Example 2.5 / a full mode intercept + pass-through trace</span>
 Trace the bitmap through <code>with MyMode(): z = x + y</code>:<br><br>
 1. <strong>Top-level dispatcher::call</strong>: bitmap = {<code>Python</code>, <code>AutogradCUDA</code>, <code>CUDA</code>} (because we are inside the mode → TLS include contains <code>Python</code>). Highest = <code>Python</code>, jump to <code>pythonFallback</code>.<br>
 2. <strong>Inside <code>pythonFallback</code></strong>: <code>ExcludeDispatchKeyGuard</code> adds <code>{Python, Autograd*, CUDA, ...}</code> to TLS exclude. Then it invokes the mode's <code>__torch_dispatch__(func=aten.add.Tensor, args=(x, y))</code>.<br>
 3. <strong>Inside the Python <code>__torch_dispatch__</code></strong>: the user writes <code>return func(*args, **kwargs)</code> (meaning: I do nothing, please continue). This calls <code>at::add</code>, entering the top-level <code>Dispatcher::call</code> again.<br>
 4. <strong>Nested dispatcher::call</strong>: initial bitmap = {<code>Python</code>, <code>AutogradCUDA</code>, <code>CUDA</code>} (still inside the mode), but TLS exclude now <strong>subtracts</strong> <code>{Python, Autograd*, CUDA, ...}</code>. After the subtraction, the highest bit = ???<br>
 5. ★ <strong>Caveat: the exclude set also contains the Autograd and CUDA bits!</strong> So the remaining bitmap is empty?<br><br>
-Actually no — look closely at <code>after_Python_keyset</code>: <code>FULL_AFTER, Python</code> denotes bits "<em>after</em> Python" (lower priority). The XOR yields "<code>Python</code> itself, plus everything after Python" — i.e. Python and below. So the exclude contains <code>{Python, ADInplaceOrView, Autograd*, ..., CUDA, ...}</code>.<br>
-6. After subtraction, from <code>{Python, AutogradCUDA, CUDA}</code> we get the empty set — can the dispatch still happen?<br><br>
-<strong>The answer lies in Path B</strong>: in the real scenario <code>x</code> and <code>y</code> do not carry the Python key (they are plain CUDA tensors). The <strong>second</strong> call into <code>pythonFallback</code> reaches the "no tensor with Python key" branch, masks the Python bit, and forces a redispatch; the highest bit then becomes <code>AutogradCUDA</code> — the chain correctly continues.<br><br>
+Actually no: look closely at <code>after_Python_keyset</code>. <code>FULL_AFTER, Python</code> denotes bits "<em>after</em> Python" (lower priority). The XOR yields "<code>Python</code> itself, plus everything after Python" (i.e. Python and below). So the exclude contains <code>{Python, ADInplaceOrView, Autograd*, ..., CUDA, ...}</code>.<br>
+6. After subtraction, from <code>{Python, AutogradCUDA, CUDA}</code> we get the empty set. Can the dispatch still happen?<br><br>
+<strong>The answer lies in Path B</strong>: in the real scenario <code>x</code> and <code>y</code> do not carry the Python key (they are plain CUDA tensors). The <strong>second</strong> call into <code>pythonFallback</code> reaches the "no tensor with Python key" branch, masks the Python bit, and forces a redispatch; the highest bit then becomes <code>AutogradCUDA</code>, and the chain correctly continues.<br><br>
 <strong>For the tensor subclass path</strong>: the input tensor carries the Python key, but its <code>__torch_dispatch__</code> usually first calls <code>unwrap(x)</code> to "peel" the tensor into a plain one, then calls <code>func(unwrapped_args)</code>. The plain tensors no longer carry the Python key, so the subsequent redispatch also lands on the backend.
 </div>
 
 <h3 id="sec2-6">2.6 ConcretePyInterpreterVTable::dispatch: crossing the boundary</h3>
 
-<p>In Path A, <code>pythonFallback</code> calls <code>cur_mode-&gt;pyinterpreter()-&gt;dispatch(op, stack)</code>. This <code>dispatch</code> is the virtual from §2.2 — the actual implementation lives in <a href="https://github.com/pytorch/pytorch/blob/main/torch/csrc/PyInterpreter.cpp"><code>torch/csrc/PyInterpreter.cpp</code></a> at lines 177-218:</p>
+<p>In Path A, <code>pythonFallback</code> calls <code>cur_mode-&gt;pyinterpreter()-&gt;dispatch(op, stack)</code>. This <code>dispatch</code> is the virtual from §2.2; the actual implementation lives in <a href="https://github.com/pytorch/pytorch/blob/main/torch/csrc/PyInterpreter.cpp"><code>torch/csrc/PyInterpreter.cpp</code></a> at lines 177-218:</p>
 
 <pre class="code"><span class="cm">// torch/csrc/PyInterpreter.cpp</span>
 void ConcretePyInterpreterVTable::dispatch(
@@ -2010,10 +1882,10 @@ void ConcretePyInterpreterVTable::dispatch(
 <p>These are the <strong>6 actual boundary-crossing steps</strong>. Section by section:</p>
 
 <ol>
-  <li><strong>(1) <code>py::gil_scoped_acquire g;</code></strong>: <strong>acquire the GIL</strong>. This is the C++ thread's "ticket" into the Python interpreter — without the GIL you cannot safely call any CPython API. RAII object, released automatically on function exit.</li>
+  <li><strong>(1) <code>py::gil_scoped_acquire g;</code></strong>: <strong>acquire the GIL</strong>. This is the C++ thread's "ticket" into the Python interpreter. Without the GIL you cannot safely call any CPython API. RAII object, released automatically on function exit.</li>
   <li><strong>(2) <code>getTorchApiFunction(op)</code></strong>: from the op name ("aten::add.Tensor") look up the corresponding Python function object (<code>torch.ops.aten.add.Tensor</code>). This function object is passed to Python later, becoming the <code>func</code> argument of <code>__torch_dispatch__</code>.</li>
   <li><strong>(3) Collect the "overloaded" list</strong>: walk the IValue inputs, find tensors carrying the Python key, and collect them into <code>overloaded_args</code>. The Python side needs this list to determine, by MRO order, which subclass's <code>__torch_dispatch__</code> to invoke.</li>
-  <li><strong>(4) <code>parseIValuesToPyArgsKwargs</code></strong>: convert all IValues into Python objects (args becomes a tuple, kwargs a dict). For tensor arguments, <code>py::cast(tensor)</code> first tries the existing wrapper from <code>pyobj_slot_</code>, falling back to constructing a new one — this is where the reverse pointer of §2.3 earns its keep.</li>
+  <li><strong>(4) <code>parseIValuesToPyArgsKwargs</code></strong>: convert all IValues into Python objects (args becomes a tuple, kwargs a dict). For tensor arguments, <code>py::cast(tensor)</code> first tries the existing wrapper from <code>pyobj_slot_</code>, falling back to constructing a new one. This is where the reverse pointer of §2.3 earns its keep.</li>
   <li><strong>(5) <code>handle_torch_function_no_python_arg_parser</code></strong>: the actual "call Python" step. It walks the <code>TorchDispatchModeTLS</code> stack plus the MRO of <code>overloaded_args</code>, finds the first object with a <code>__torch_dispatch__</code>, and passes <code>(func, types, args, kwargs)</code> to it. The specific dispatch priority:<br>
     &nbsp;&nbsp;&nbsp;<strong>(a)</strong> mode stack from top to bottom, until one returns something other than <code>NotImplemented</code>;<br>
     &nbsp;&nbsp;&nbsp;<strong>(b)</strong> subclasses in MRO order, walking <code>overloaded_args</code>.<br>
@@ -2021,13 +1893,13 @@ void ConcretePyInterpreterVTable::dispatch(
   <li><strong>(6) <code>pushPyOutToStack</code></strong>: Python returns a PyObject (possibly a tensor, tuple, scalar, etc.). Convert it back to an IValue and push it onto the stack; the top-level dispatcher picks it up as the final result.</li>
 </ol>
 
-<p>The cost of one execution of these 6 steps: GIL acquisition + dozens of PyObject creations + one Python function call + the reverse conversion. Empirically 5-15 µs (compared to ~50 ns for a pure C++ dispatch — 100-300x slower). This is the cost we'll revisit in §7 when discussing "when not to use <code>__torch_dispatch__</code>."</p>
+<p>The cost of one execution of these 6 steps: GIL acquisition + dozens of PyObject creations + one Python function call + the reverse conversion. Empirically 5-15 µs (compared to ~50 ns for a pure C++ dispatch, so 100-300x slower). This is the cost we'll revisit in §7 when discussing "when not to use <code>__torch_dispatch__</code>."</p>
 
 <div class="callout">
 <strong>Three mental models to take away from this chapter</strong>:<br>
 (1) <strong>The vtable is the key to decoupling c10 from Python</strong>. <code>libc10</code> does not depend on CPython; "calling Python" is abstracted as virtual functions, and the vtable is filled in at runtime by <code>libtorch_python</code>.<br>
 (2) <strong><code>pyobj_slot</code> is the reverse pointer</strong>. Every <code>TensorImpl</code> stores 8 bytes pointing to its Python wrapper. The tensor-subclass path relies on it to find <code>__torch_dispatch__</code>.<br>
-(3) <strong><code>ExcludeDispatchKeyGuard</code> prevents recursion</strong>. Ops called from inside the Python body automatically skip the <code>Python</code> kernel and fall straight to the backend — implementing the "I'm done, you continue" recursion semantics.
+(3) <strong><code>ExcludeDispatchKeyGuard</code> prevents recursion</strong>. Ops called from inside the Python body automatically skip the <code>Python</code> kernel and fall straight to the backend, implementing the "I'm done, you continue" recursion semantics.
 </div>
 
 <h2 id="sec3">3. The TorchDispatchMode Python protocol</h2>
@@ -2075,8 +1947,8 @@ class TorchDispatchMode:
 <p>The key parts are <code>__enter__</code> and <code>__exit__</code>:</p>
 
 <ul>
-  <li><code>__enter__</code> calls <code>_push_mode(self)</code>, which is the core of the Python ↔ C++ bridge. Through the CPython binding it calls <code>c10::impl::TorchDispatchModeTLS::push(mode)</code> — the mode enters the C++-side <strong>thread-local mode stack</strong>. It also calls <code>c10::impl::tls_set_dispatch_key_included(DispatchKey::Python, true)</code> to set the <code>Python</code> bit in the TLS include set. The next time the dispatcher computes the bitmap, the <code>Python</code> bit will be 1.</li>
-  <li><code>__exit__</code> reverses everything — the mode leaves the C++ stack, and if the stack becomes empty, the <code>Python</code> bit is removed from the TLS include set.</li>
+  <li><code>__enter__</code> calls <code>_push_mode(self)</code>, which is the core of the Python ↔ C++ bridge. Through the CPython binding it calls <code>c10::impl::TorchDispatchModeTLS::push(mode)</code>, so the mode enters the C++-side <strong>thread-local mode stack</strong>. It also calls <code>c10::impl::tls_set_dispatch_key_included(DispatchKey::Python, true)</code> to set the <code>Python</code> bit in the TLS include set. The next time the dispatcher computes the bitmap, the <code>Python</code> bit will be 1.</li>
+  <li><code>__exit__</code> reverses everything: the mode leaves the C++ stack, and if the stack becomes empty, the <code>Python</code> bit is removed from the TLS include set.</li>
 </ul>
 
 <p>So the actual effect chain of a <code>with MyMode():</code> statement is:</p>
@@ -2120,25 +1992,25 @@ C++:     TorchDispatchModeTLS::pop()         <span class="cm"># Python bit leave
 <tr><td><code>func</code></td><td><code>OpOverload</code></td><td>The operator overload currently being dispatched, e.g. <code>torch.ops.aten.add.Tensor</code>. You can use its <code>_schema</code> to inspect the signature; you can also call <code>func(args)</code> directly to continue dispatch. <strong>Equivalent to the <code>torch_api_function_overload</code> from step (2) in §2.6</strong>.</td></tr>
 <tr><td><code>types</code></td><td><code>tuple[type, ...]</code></td><td>Tuple of "subclass types carrying the Python key" present in the inputs. For example if inputs contain a <code>FakeTensor</code> and a <code>DTensor</code>, <code>types</code> is <code>(FakeTensor, DTensor)</code>. Modes generally don't use it; subclasses use it to decide "should I handle this or <code>return NotImplemented</code> to let the next subclass handle it?"</td></tr>
 <tr><td><code>args</code></td><td><code>tuple</code></td><td>Positional arguments, <strong>already converted from IValue to Python objects</strong>. Tensor arguments are Python <code>torch.Tensor</code> (the corresponding wrapper retrieved via pyobj_slot).</td></tr>
-<tr><td><code>kwargs</code></td><td><code>dict</code> or <code>None</code></td><td>Keyword arguments. <strong>Note the default is None rather than {}</strong> — standard Python practice to avoid mutable defaults.</td></tr>
+<tr><td><code>kwargs</code></td><td><code>dict</code> or <code>None</code></td><td>Keyword arguments. <strong>Note the default is None rather than {}</strong>: standard Python practice to avoid mutable defaults.</td></tr>
 </tbody>
 </table>
 
 <h4>Three semantics of the return value</h4>
 
-<p>The return value of <code>__torch_dispatch__</code> is not a plain function return — it has <strong>three special semantics</strong>:</p>
+<p>The return value of <code>__torch_dispatch__</code> is not a plain function return; it has <strong>three special semantics</strong>:</p>
 
 <table>
 <thead><tr><th>Return</th><th>Semantics</th><th>What it triggers</th></tr></thead>
 <tbody>
-<tr><td><code>func(*args, **kwargs)</code></td><td>"I do nothing; let the dispatcher continue"</td><td>Triggers the redispatch of §2.5 — Python is excluded, the highest bit becomes Autograd or backend, normal execution.</td></tr>
+<tr><td><code>func(*args, **kwargs)</code></td><td>"I do nothing; let the dispatcher continue"</td><td>Triggers the redispatch of §2.5: Python is excluded, the highest bit becomes Autograd or backend, normal execution.</td></tr>
 <tr><td>Any other value (<code>Tensor</code> / <code>tuple</code> / dict, etc.)</td><td>"I'm done; this is the answer"</td><td>This value <strong>replaces</strong> the real computation result and is returned upstream.</td></tr>
 <tr><td><code>NotImplemented</code> (the singleton)</td><td>"I can't handle this; let the next mode/subclass try"</td><td>Dispatch falls through to the next mode on the stack or the next subclass in MRO.</td></tr>
 </tbody>
 </table>
 
 <div class="example">
-<span class="label">Example 3.2 — writing a LoggingMode</span>
+<span class="label">Example 3.2 / writing a LoggingMode</span>
 The simplest mode: log every op, do not change behavior.
 <pre class="code">import torch
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -2161,7 +2033,7 @@ with LoggingMode():
 # aten.randn.default : [Size([3,4]), ...]
 # aten.add.Tensor : [Size([3, 4]), Size([3, 4])]
 # aten.relu.default : [Size([3, 4])]</span></pre>
-Fewer than 10 lines implements a complete "operator interceptor." Note that <code>torch.randn</code> is intercepted too — modes see <strong>every ATen op call</strong> at the dispatcher layer, not just the ones the user wrote.
+Fewer than 10 lines implements a complete "operator interceptor." Note that <code>torch.randn</code> is intercepted too: modes see <strong>every ATen op call</strong> at the dispatcher layer, not just the ones the user wrote.
 </div>
 
 <h3 id="sec3-3">3.3 mode stack vs subclass: two paths</h3>
@@ -2173,7 +2045,7 @@ Fewer than 10 lines implements a complete "operator interceptor." Note that <cod
 <p>This is the style of §3.1-§3.2: subclass <code>TorchDispatchMode</code>, activate with a <code>with</code> block. <strong>Characteristics</strong>:</p>
 
 <ul>
-  <li><strong>Globally effective</strong>: once inside the <code>with</code> block, <strong>every</strong> op call goes through its <code>__torch_dispatch__</code> — including <strong>factory ops</strong> (<code>torch.empty</code>, <code>torch.arange</code>, etc., which have no tensor inputs). This is why <code>FakeTensorMode</code> can intercept <code>torch.empty</code> — plain tensor subclasses can't, because factory ops have no tensor inputs.</li>
+  <li><strong>Globally effective</strong>: once inside the <code>with</code> block, <strong>every</strong> op call goes through its <code>__torch_dispatch__</code>, including <strong>factory ops</strong> (<code>torch.empty</code>, <code>torch.arange</code>, etc., which have no tensor inputs). This is why <code>FakeTensorMode</code> can intercept <code>torch.empty</code>; plain tensor subclasses can't, because factory ops have no tensor inputs.</li>
   <li>Triggered by TLS include setting the <code>Python</code> key; the scope of effect is the <strong>entire dynamic scope of the <code>with</code> block</strong> (including any function called from within).</li>
   <li>When multiple modes are present they form a <strong>LIFO stack</strong>, top of stack first.</li>
 </ul>
@@ -2198,11 +2070,11 @@ Fewer than 10 lines implements a complete "operator interceptor." Note that <cod
 </ul>
 
 <div class="aside">
-<span class="label">Aside 3.3 — why two paths are needed</span>
+<span class="label">Aside 3.3 / why two paths are needed</span>
 By design, modes and subclasses handle different concerns:<br><br>
 <strong>Subclasses</strong> express "<em>this tensor itself</em> has special semantics." For example, a <code>FakeTensor</code> instance represents "fake data"; when it participates in an op, that op naturally takes the fake path. The "semantics follow the data" requirement is naturally expressed by a subclass.<br><br>
-<strong>Modes</strong> express "<em>this section of code</em> has special semantics." For example, inside <code>with FakeTensorMode():</code> every op goes through fake — including factory ops (which create fake tensors). The "semantics follow the code scope" requirement can only be expressed by a mode.<br><br>
-In practice the two often cooperate: tensors produced inside <code>FakeTensorMode</code> are themselves <code>FakeTensor</code> subclasses, so even after leaving the <code>with</code> block they continue to identify themselves — the mode creates, the subclass preserves.
+<strong>Modes</strong> express "<em>this section of code</em> has special semantics." For example, inside <code>with FakeTensorMode():</code> every op goes through fake, including factory ops (which create fake tensors). The "semantics follow the code scope" requirement can only be expressed by a mode.<br><br>
+In practice the two often cooperate: tensors produced inside <code>FakeTensorMode</code> are themselves <code>FakeTensor</code> subclasses, so even after leaving the <code>with</code> block they continue to identify themselves. The mode creates; the subclass preserves.
 </div>
 
 <h4>(C) Priority when both are present</h4>
@@ -2224,31 +2096,31 @@ if interpreter &amp;&amp; tensors_with_python_key_present {
 
 <h3 id="sec3-4">3.4 How "<code>return func(*args)</code>" recurses</h3>
 
-<p>This is the most frequently appearing line in <code>__torch_dispatch__</code>, but its semantics are non-trivial: it <strong>is not a plain function call</strong> — it <strong>triggers a nested dispatcher call</strong>. Let's slow-motion this:</p>
+<p>This is the most frequently appearing line in <code>__torch_dispatch__</code>, but its semantics are non-trivial: it <strong>is not a plain function call</strong>. It <strong>triggers a nested dispatcher call</strong>. Walking through it slowly:</p>
 
 <pre class="code">def __torch_dispatch__(self, func, types, args=(), kwargs=None):
     kwargs = kwargs or {}
     <span class="cm"># maybe some interception logic ...</span>
     return func(*args, **kwargs)         <span class="cm"># ← this line</span></pre>
 
-<p><code>func</code> is an <code>OpOverload</code> (e.g. <code>torch.ops.aten.add.Tensor</code>). Calling it is <strong>not a regular Python function call</strong> — internally <code>OpOverload.__call__</code> routes through <code>torch._C._dispatch_call_*</code>, equivalent to calling <code>at::add(...)</code> in C++ and entering the <strong>top-level <code>Dispatcher::call</code></strong>.</p>
+<p><code>func</code> is an <code>OpOverload</code> (e.g. <code>torch.ops.aten.add.Tensor</code>). Calling it is <strong>not a regular Python function call</strong>: internally <code>OpOverload.__call__</code> routes through <code>torch._C._dispatch_call_*</code>, equivalent to calling <code>at::add(...)</code> in C++ and entering the <strong>top-level <code>Dispatcher::call</code></strong>.</p>
 
 <p>When the nested call computes the bitmap:</p>
 
 <ul>
   <li>Tensor arguments <code>args[0]</code>, <code>args[1]</code> have <code>key_set_</code>: say <code>{AutogradCUDA, CUDA}</code>.</li>
   <li>TLS include: still contains <code>Python</code> (we are still inside the <code>with Mode():</code> block).</li>
-  <li>TLS exclude: <strong>★ critical</strong> — we are still within the lifetime of the <code>ExcludeDispatchKeyGuard</code> in <code>pythonFallback</code>, so exclude contains <code>after_Python_keyset</code> (Python and below).</li>
+  <li>TLS exclude: <strong>★ critical</strong>. We are still within the lifetime of the <code>ExcludeDispatchKeyGuard</code> in <code>pythonFallback</code>, so exclude contains <code>after_Python_keyset</code> (Python and below).</li>
   <li>Bitmap = <code>(key_set ∪ include) − exclude</code> = <code>{AutogradCUDA, CUDA} − {Python, Autograd*, CUDA, ...}</code>.</li>
 </ul>
 
-<p>Wait — does exclude contain <code>AutogradCUDA</code> and <code>CUDA</code>? Then the bitmap is empty?</p>
+<p>Wait. Does exclude contain <code>AutogradCUDA</code> and <code>CUDA</code>? Then the bitmap is empty?</p>
 
 <p><strong>Here is a subtle point</strong>: <code>after_Python_keyset</code> excludes <strong>every functionality bit ≤ Python</strong>. But runtime keys (like <code>AutogradCUDA</code>) are <strong>combinations of a functionality bit and a backend bit</strong>. The backend bit is not in exclude. After subtraction, the <code>AutogradFunctionality</code> bit is cleared, but the <code>CUDABit</code> remains. The dispatcher recombines the bitmap, the highest bit becomes <code>AutogradFunctionality</code> ... wait, that's excluded ...</p>
 
 <p>Looking carefully at the code, <code>after_Python_keyset</code> only excludes <strong>"Python and lower-priority functionalities"</strong>. <strong>The Autograd functionality bit is above Python</strong> (higher priority, larger bit index), so the Autograd bit is <strong>not</strong> in the exclude set.</p>
 
-<p>So the actual bitmap is: <code>(original) − (Python and below functionality bits) = {AutogradFunctionality, CUDABit}</code> remains. The highest functionality bit is <code>AutogradFunctionality</code>, which combined with the CUDABit yields the runtime key <code>AutogradCUDA</code> — jumping to the autograd wrapper, after which the chain continues down to the CUDA kernel. <strong>Correct</strong>.</p>
+<p>So the actual bitmap is: <code>(original) − (Python and below functionality bits) = {AutogradFunctionality, CUDABit}</code> remains. The highest functionality bit is <code>AutogradFunctionality</code>, which combined with the CUDABit yields the runtime key <code>AutogradCUDA</code>: jumping to the autograd wrapper, after which the chain continues down to the CUDA kernel. <strong>Correct</strong>.</p>
 
 <div class="callout warn">
 <strong>Cognitive trap</strong>: my first time reading this, I also assumed <code>after_Python_keyset</code> includes autograd, so that each <code>return func(*args)</code> jumps straight to the backend, bypassing autograd. It doesn't. <strong>Autograd is above Python</strong> (higher priority); <code>after_Python_keyset</code> only masks Python and below; <code>func(*args)</code> goes through the autograd wrapper normally and records the backward graph as expected.<br><br>
@@ -2281,7 +2153,7 @@ This means <strong>every op triggered inside a mode is still differentiable</str
 <p>In short: <code>__torch_function__</code> is "the hook when the user calls a <code>torch.*</code> API," <code>__torch_dispatch__</code> is "the hook when PyTorch actually <strong>runs</strong> the op." The former is at the <strong>surface</strong>; the latter is at the <strong>core</strong>.</p>
 
 <div class="example">
-<span class="label">Example 3.5 — the same call, two hooks see different things</span>
+<span class="label">Example 3.5 / the same call, two hooks see different things</span>
 <pre class="code">class TF:                                  <span class="cm"># torch_function implementation</span>
     def __torch_function__(self, func, types, args=(), kwargs=None):
         print(f"TF: {func.__name__}")
@@ -2309,7 +2181,7 @@ TD: aten.mul.Tensor                          ← ...
 TD: aten.sum.dim_IntList                     ← ...
 TD: ...(a dozen more sub-ops called by backward)
 </span></pre>
-<code>__torch_function__</code> sees <strong>1 call</strong>: "<code>torch.softmax</code>". <code>__torch_dispatch__</code> sees <strong>more than a dozen</strong> ATen ops, including every sub-op called during backward. <strong>This is why graph capture must use <code>__torch_dispatch__</code></strong> — otherwise the backward graph is invisible.
+<code>__torch_function__</code> sees <strong>1 call</strong>: "<code>torch.softmax</code>". <code>__torch_dispatch__</code> sees <strong>more than a dozen</strong> ATen ops, including every sub-op called during backward. <strong>This is why graph capture must use <code>__torch_dispatch__</code></strong>; otherwise the backward graph is invisible.
 </div>
 
 <h2 id="sec4">4. The four Python-family DispatchKeys</h2>
@@ -2328,15 +2200,15 @@ TD: ...(a dozen more sub-ops called by backward)
   <g font-size="11">
     <rect x="120" y="60" width="600" height="36" fill="#f3e8f5" stroke="#7a4ea0" stroke-width="1.6"/>
     <text x="420" y="78" text-anchor="middle" font-weight="700" fill="#7a4ea0">PythonDispatcher</text>
-    <text x="420" y="92" text-anchor="middle" font-size="9">"<em>let Python take over the dispatcher entirely</em>" — replace the whole table lookup</text>
+    <text x="420" y="92" text-anchor="middle" font-size="9">"<em>let Python take over the dispatcher entirely</em>"; replace the whole table lookup</text>
 
     <rect x="120" y="100" width="600" height="36" fill="#f3e8f5" stroke="#7a4ea0" stroke-width="1.6"/>
     <text x="420" y="118" text-anchor="middle" font-weight="700" fill="#7a4ea0">PreDispatch</text>
-    <text x="420" y="132" text-anchor="middle" font-size="9">"<em>trace entry point above autograd</em>" — used by make_fx(pre_dispatch=True)</text>
+    <text x="420" y="132" text-anchor="middle" font-size="9">"<em>trace entry point above autograd</em>"; used by make_fx(pre_dispatch=True)</text>
 
     <rect x="120" y="140" width="600" height="36" fill="#f3e8f5" stroke="#7a4ea0" stroke-width="1.6"/>
     <text x="420" y="158" text-anchor="middle" font-weight="700" fill="#7a4ea0">PythonTLSSnapshot</text>
-    <text x="420" y="172" text-anchor="middle" font-size="9">"<em>record a TLS entry snapshot</em>" — restore TLS state across Python calls</text>
+    <text x="420" y="172" text-anchor="middle" font-size="9">"<em>record a TLS entry snapshot</em>"; restore TLS state across Python calls</text>
 
     <rect x="120" y="180" width="600" height="32" fill="#e7f0fa" stroke="#0b6cc4" stroke-width="1.4"/>
     <text x="420" y="200" text-anchor="middle" font-size="10">Functionalize · Named · Conjugate · Negative · ZeroTensor</text>
@@ -2350,7 +2222,7 @@ TD: ...(a dozen more sub-ops called by backward)
 
     <rect x="120" y="292" width="600" height="36" fill="#f3e8f5" stroke="#7a4ea0" stroke-width="1.6"/>
     <text x="420" y="310" text-anchor="middle" font-weight="700" fill="#7a4ea0">Python</text>
-    <text x="420" y="324" text-anchor="middle" font-size="9">"<em>TorchDispatchMode + tensor subclass</em>" — the protagonist of this article</text>
+    <text x="420" y="324" text-anchor="middle" font-size="9">"<em>TorchDispatchMode + tensor subclass</em>"; the protagonist of this article</text>
 
     <rect x="120" y="332" width="600" height="32" fill="#eaf3ec" stroke="#1f8a4d" stroke-width="1.6"/>
     <text x="420" y="352" text-anchor="middle" font-weight="700" fill="#1f8a4d">CPU · CUDA · MPS · ... (backend)</text>
@@ -2363,22 +2235,22 @@ TD: ...(a dozen more sub-ops called by backward)
 </svg>
 </div>
 
-<p>The picture clearly shows: <strong>the Python family is split into 4 keys; some sit above autograd, some below</strong>. This is the key insight — they are not redundant; they support different "interception timings."</p>
+<p>The picture clearly shows: <strong>the Python family is split into 4 keys; some sit above autograd, some below</strong>. This is the key insight: they are not redundant; they support different "interception timings."</p>
 
 <h3 id="sec4-2">4.2 What PythonDispatcher / PreDispatch / Python / Snapshot each do</h3>
 
 <table>
 <thead><tr><th>Key</th><th>Position</th><th>Semantics</th><th>Who uses it?</th></tr></thead>
 <tbody>
-<tr><td><code>PythonDispatcher</code></td><td>Highest</td><td>"<strong>The whole dispatcher is taken over by Python</strong>" — let Python fully decide which kernel to invoke. Comment: "<em>This is a bypass that allows you to skip running the C++ dispatcher entirely.</em>"</td><td><code>torch._library.SimpleOperatorRegistry</code>, PT2 internal meta-meta-dispatchers</td></tr>
+<tr><td><code>PythonDispatcher</code></td><td>Highest</td><td>"<strong>The whole dispatcher is taken over by Python</strong>": let Python fully decide which kernel to invoke. Comment: "<em>This is a bypass that allows you to skip running the C++ dispatcher entirely.</em>"</td><td><code>torch._library.SimpleOperatorRegistry</code>, PT2 internal meta-meta-dispatchers</td></tr>
 <tr><td><code>PreDispatch</code></td><td>Second highest</td><td>"<strong>Intercept <strong>before</strong> autograd</strong>". The captured graph keeps in-place ops and does not decompose composites. <code>ProxyTorchDispatchMode(pre_dispatch=True)</code> uses this key instead of the plain <code>Python</code> key.</td><td><code>make_fx(pre_dispatch=True)</code>; <code>torch.compile</code>'s AOTAutograd pre-dispatch tracing stage</td></tr>
-<tr><td><code>PythonTLSSnapshot</code></td><td>Third</td><td>"<strong>Record a TLS state snapshot</strong>". When the dispatcher first enters (from the highest-priority key downward), the current included/excluded state is saved into the <code>tls_on_entry</code> global. When the Python side later invokes a C++ API, it needs to "restore the entry-time TLS state" — this layer guarantees the snapshot is available.</td><td><code>pythonFallback</code>'s internal RAII guard; TLS consistency guarantees for Python ↔ C++ nested calls</td></tr>
-<tr><td><code>Python</code></td><td><strong>Below</strong> autograd</td><td>"<strong>Default entry point for modes and subclasses</strong>". Most common modes and subclasses register here — everything in §2-§3 of this article is at this layer.</td><td><code>FakeTensorMode</code>, <code>LoggingMode</code>, etc.; all non-PreDispatch modes</td></tr>
+<tr><td><code>PythonTLSSnapshot</code></td><td>Third</td><td>"<strong>Record a TLS state snapshot</strong>". When the dispatcher first enters (from the highest-priority key downward), the current included/excluded state is saved into the <code>tls_on_entry</code> global. When the Python side later invokes a C++ API, it needs to "restore the entry-time TLS state"; this layer guarantees the snapshot is available.</td><td><code>pythonFallback</code>'s internal RAII guard; TLS consistency guarantees for Python ↔ C++ nested calls</td></tr>
+<tr><td><code>Python</code></td><td><strong>Below</strong> autograd</td><td>"<strong>Default entry point for modes and subclasses</strong>". Most common modes and subclasses register here; everything in §2-§3 of this article is at this layer.</td><td><code>FakeTensorMode</code>, <code>LoggingMode</code>, etc.; all non-PreDispatch modes</td></tr>
 </tbody>
 </table>
 
 <div class="example">
-<span class="label">Example 4.2 — PreDispatch vs Python difference</span>
+<span class="label">Example 4.2 / PreDispatch vs Python difference</span>
 For the same code, the two modes see <strong>different things</strong>:
 <pre class="code">def f(x):
     return torch.relu(x + 1)
@@ -2390,12 +2262,12 @@ gm = make_fx(f, tracing_mode="real")(torch.randn(3))
 <span class="cm"># (b) PreDispatch: above autograd → see user-level ATen ops</span>
 gm = make_fx(f, tracing_mode="real", pre_dispatch=True)(torch.randn(3))
 <span class="cm"># graph roughly: add(x, 1) → relu(.) ← relu kept as a single op</span></pre>
-<strong>Reason</strong>: a composite op like <code>relu</code> is decomposed into <code>clamp_min</code> at the autograd layer (or via <code>CompositeImplicitAutograd</code>). <code>Python</code> being below autograd means "decomposition has already happened" — we see the post-decomposition form. <code>PreDispatch</code>, above autograd, sees the pre-decomposition form.<br><br>
+<strong>Reason</strong>: a composite op like <code>relu</code> is decomposed into <code>clamp_min</code> at the autograd layer (or via <code>CompositeImplicitAutograd</code>). <code>Python</code> being below autograd means "decomposition has already happened", so we see the post-decomposition form. <code>PreDispatch</code>, above autograd, sees the pre-decomposition form.<br><br>
 This difference matters <strong>enormously</strong> for <code>torch.compile</code>: it wants PreDispatch to capture ops at as "high level" as possible, so that Inductor can later perform more aggressive fusions (decomposed fine-grained ops may have lost semantic information needed for downstream optimization).
 </div>
 
 <div class="aside">
-<span class="label">Aside 4.2 — registration of the four keys</span>
+<span class="label">Aside 4.2 / registration of the four keys</span>
 The fallbacks for all four keys are registered in <code>aten/src/ATen/core/PythonFallbackKernel.cpp</code> (seen in §2.4):
 <pre class="code">TORCH_LIBRARY_IMPL(_, PythonDispatcher,    m) { m.fallback(... pythonDispatcherFallback ...); }
 TORCH_LIBRARY_IMPL(_, PreDispatch,         m) { m.fallback(... preDispatchFallback ...);     }
@@ -2406,7 +2278,7 @@ All four fallbacks follow the same pattern of "jump to Python via the PyInterpre
 
 <h2 id="sec5">5. Three case studies</h2>
 
-<p>The first four chapters were about mechanism. This chapter is about <strong>users</strong> — three real PyTorch subsystems all built on top of <code>__torch_dispatch__</code>. After these three, you should feel the <strong>generality</strong> of the mechanism: a single protocol supports shape inference, graph capture, and distributed tensors — three quite different features.</p>
+<p>The first four chapters were about mechanism. This chapter is about <strong>users</strong>: three real PyTorch subsystems all built on top of <code>__torch_dispatch__</code>. After these three, you should feel the <strong>generality</strong> of the mechanism: a single protocol supports shape inference, graph capture, and distributed tensors, three quite different features.</p>
 
 <h3 id="sec5-1">5.1 FakeTensorMode: shape inference without computation</h3>
 
@@ -2414,7 +2286,7 @@ All four fallbacks follow the same pattern of "jump to Python via the PyInterpre
 
 <p>Use cases:</p>
 <ul>
-  <li><strong>During <code>torch.compile</code></strong>: Inductor needs the output shape of every op in the graph in order to codegen, but should not actually run the model — fake it.</li>
+  <li><strong>During <code>torch.compile</code></strong>: Inductor needs the output shape of every op in the graph to codegen, but should not actually run the model. Fake it.</li>
   <li><strong>OOM estimation</strong>: before deployment, run one fake forward on a small machine to tally memory usage and verify it will fit on the target GPU.</li>
   <li><strong>Dynamic shapes (symbolic shapes)</strong>: when input shapes are symbolic, run once with fake tensors to infer the symbolic shape expression of every intermediate tensor.</li>
 </ul>
@@ -2455,7 +2327,7 @@ def dispatch(self, func, types, args=(), kwargs=None):
 <p>The "fake" logic inside <code>_dispatch_impl</code>:</p>
 <ol>
   <li><strong>Map every <code>FakeTensor</code> argument to a meta tensor</strong> (shape/dtype/stride only, no storage).</li>
-  <li>Actually call the op on these meta tensors — this runs the op's meta kernel (every ATen op has a "meta" implementation that computes only output shape, not values).</li>
+  <li>Actually call the op on these meta tensors. This runs the op's meta kernel (every ATen op has a "meta" implementation that computes only output shape, not values).</li>
   <li>Wrap the output meta tensors as <code>FakeTensor</code>, attaching a reference to the originating fake mode and the user-expected fake device.</li>
 </ol>
 
@@ -2466,7 +2338,7 @@ def dispatch(self, func, types, args=(), kwargs=None):
 <p>When the user writes <code>torch.randn(1024, 1024, device="cuda")</code>, the <code>aten::randn</code> call has <strong>no tensor inputs</strong>. The subclass path cannot catch it (no tensor, no Python key). But the mode path can: <code>FakeTensorMode.__torch_dispatch__</code> still fires and <strong>forwards to <code>randn</code> on the meta device</strong> (a meta <code>randn</code> neither allocates nor randomizes; it just produces a shape descriptor), then wraps the result as a <code>FakeTensor</code>.</p>
 
 <div class="callout warn">
-<strong>FakeTensorMode is a singleton at a time</strong>. <code>TorchDispatchModeTLS</code> reserves a fixed slot in <code>infra_modes_</code> (mentioned in §2.3) for FakeTensorMode — pushing a second instance is a no-op. This is because "fake" semantics don't nest meaningfully (a doubly-fake tensor is not meaningful). By contrast, <code>ProxyTorchDispatchMode</code> can be nested (supporting nested tracing).
+<strong>FakeTensorMode is a singleton at a time</strong>. <code>TorchDispatchModeTLS</code> reserves a fixed slot in <code>infra_modes_</code> (mentioned in §2.3) for FakeTensorMode; pushing a second instance is a no-op. This is because "fake" semantics don't nest meaningfully (a doubly-fake tensor is not meaningful). By contrast, <code>ProxyTorchDispatchMode</code> can be nested (supporting nested tracing).
 </div>
 
 <h3 id="sec5-2">5.2 ProxyTorchDispatchMode + make_fx: graph capture</h3>
@@ -2540,7 +2412,7 @@ def __torch_dispatch__(self, func, types, args=(), kwargs=None):
 <p>This "record + execute" pattern is the heart of graph capture: <strong>run the real code once, and at each step record "what I just did."</strong></p>
 
 <div class="example">
-<span class="label">Example 5.2 — tracing a trace</span>
+<span class="label">Example 5.2 / tracing a trace</span>
 <pre class="code">def f(x, y):
     return (x + y).relu()
 
@@ -2555,7 +2427,7 @@ call_function  add     aten.add.Tensor     (x, y)          {}
 call_function  relu    aten.relu.default   (add,)          {}
 output         output  output              ((relu,),)      {}
 </span></pre>
-<strong>Note <code>pre_dispatch=True</code></strong> — relu is preserved as a single op. With the regular <code>Python</code> key, you would see <code>clamp_min</code> (the decomposition of relu).
+<strong>Note <code>pre_dispatch=True</code></strong>: relu is preserved as a single op. With the regular <code>Python</code> key, you would see <code>clamp_min</code> (the decomposition of relu).
 </div>
 
 <h3 id="sec5-3">5.3 DTensor: distributed tensors</h3>
@@ -2564,7 +2436,7 @@ output         output  output              ((relu,),)      {}
 <ol>
   <li>Input <code>x</code> holds 1/4 of the 0th dimension on ranks 0/1/2/3 (row-sharded);</li>
   <li>Weight <code>w</code> is fully replicated across all ranks;</li>
-  <li>How should <code>x @ w</code> be computed? <strong>Each rank does a local matmul, no collective needed</strong> — because the output is naturally row-sharded;</li>
+  <li>How should <code>x @ w</code> be computed? <strong>Each rank does a local matmul, no collective needed</strong>, because the output is naturally row-sharded;</li>
   <li>But if it were <code>x.T @ x</code>, the output is a <strong>partial sum</strong>, requiring an <code>all-reduce</code> to materialize the true value.</li>
 </ol>
 
@@ -2580,15 +2452,15 @@ output         output  output              ((relu,),)      {}
 </ol>
 
 <div class="aside">
-<span class="label">Aside 5.3 — DTensor is a data-driven protocol</span>
-Interestingly, DTensor has <strong>no "with DTensorMode():" mode entry</strong>. All interception is triggered by the tensor itself being a <code>DTensor</code> subclass. This is because DTensor is the textbook case of "<em>semantics following the data</em>" — once your tensor is distributed, every op that uses it must consider distribution; there is no "I want to temporarily not be distributed" scenario. This choice of "subclass instead of mode" stands in contrast to <code>FakeTensorMode</code> — the latter is the textbook case of "<em>semantics following the code</em>."
+<span class="label">Aside 5.3 / DTensor is a data-driven protocol</span>
+Interestingly, DTensor has <strong>no "with DTensorMode():" mode entry</strong>. All interception is triggered by the tensor itself being a <code>DTensor</code> subclass. This is because DTensor is the textbook case of "<em>semantics following the data</em>": once your tensor is distributed, every op that uses it must consider distribution; there is no "I want to temporarily not be distributed" scenario. This choice of "subclass instead of mode" stands in contrast to <code>FakeTensorMode</code>, which is the textbook case of "<em>semantics following the code</em>."
 </div>
 
 <h3 id="sec5-4">5.4 When the protocol becomes the bottleneck: C++ fast path</h3>
 
 <p>In the second half of 2025, PR <a href="https://github.com/pytorch/pytorch/pull/167051">#167051</a> performed a major refactor of DTensor's core path: <strong>moving the sharding decisions of common ops from Python to C++</strong>. This is an interesting case of the <code>__torch_dispatch__</code> protocol itself changing from "Python implementation" to "C++ implementation + Python fallback."</p>
 
-<p>Motivation: DTensor's <code>__torch_dispatch__</code> pays the 5-15 µs boundary-crossing cost of §2.6 on every op. For training loops that invoke a few thousand ops per iteration, this accumulates to tens of milliseconds — 5-10% of the entire step time.</p>
+<p>Motivation: DTensor's <code>__torch_dispatch__</code> pays the 5-15 µs boundary-crossing cost of §2.6 on every op. For training loops that invoke a few thousand ops per iteration, this accumulates to tens of milliseconds, 5-10% of the entire step time.</p>
 
 <p>Solution: implement a <strong>"DTensor fast path" in C++</strong>:</p>
 
@@ -2619,11 +2491,11 @@ Interestingly, DTensor has <strong>no "with DTensorMode():" mode entry</strong>.
 <strong>The philosophical value of this PR exceeds its performance value</strong>: it shows that <code>__torch_dispatch__</code> is <strong>a protocol</strong>, not "a Python implementation mechanism." <strong>Once you have nailed down the semantics of "op-level interception + sharding decision," moving the implementation to C++ is a performance optimization, not a paradigm shift</strong>. All <strong>callers</strong> (users, other framework modules) still treat DTensor as a "<code>__torch_dispatch__</code>-style interceptor"; the API does not change.
 </div>
 
-<p>A similar C++ fast-path pattern will likely be extended to other "performance-sensitive" protocol implementations such as FakeTensor and Functionalization. <strong>The protocol layer is stable; the implementation layer can migrate from Python to C++</strong> — a sign of PyTorch's design maturity.</p>
+<p>A similar C++ fast-path pattern will likely be extended to other "performance-sensitive" protocol implementations such as FakeTensor and Functionalization. <strong>The protocol layer is stable; the implementation layer can migrate from Python to C++</strong>. This is a sign of PyTorch's design maturity.</p>
 
 <h2 id="sec6">6. Connection to torch.compile</h2>
 
-<p><code>torch.compile</code> is the headline feature of PyTorch 2 — compiling Python models into efficient GPU kernels. Its graph capture mechanism <strong>fully depends</strong> on the <code>__torch_dispatch__</code> described in this article. This chapter spells out the connection without going into Inductor's compilation details (that's another major topic).</p>
+<p><code>torch.compile</code> is the headline feature of PyTorch 2: compiling Python models into efficient GPU kernels. Its graph capture mechanism <strong>fully depends</strong> on the <code>__torch_dispatch__</code> described in this article. This chapter spells out the connection without going into Inductor's compilation details (that's another major topic).</p>
 
 <h3>6.1 Dynamo and AOTAutograd: two stages</h3>
 
@@ -2663,7 +2535,7 @@ with FakeTensorMode():
 
 <span class="cm"># 6. tracer.graph now contains the full forward + backward; hand it to Inductor.</span></pre>
 
-<p>This is where the name AOTAutograd comes from — "<strong>Ahead-Of-Time</strong> Autograd": extract the <strong>backward graph</strong> ahead of time rather than at run time. <code>__torch_dispatch__</code> is the <strong>only</strong> mechanism that makes this possible — without it, the ops invoked inside the backward pass are invisible and the capture fails.</p>
+<p>This is where the name AOTAutograd comes from: "<strong>Ahead-Of-Time</strong> Autograd", extracting the <strong>backward graph</strong> ahead of time rather than at run time. <code>__torch_dispatch__</code> is the <strong>only</strong> mechanism that makes this possible. Without it, the ops invoked inside the backward pass are invisible and the capture fails.</p>
 
 <h3>6.3 The role of PreDispatch in the PT2 pipeline</h3>
 
@@ -2707,10 +2579,10 @@ with FakeTensorMode():
 <table>
 <thead><tr><th>Good fit for <code>__torch_dispatch__</code></th><th>Poor fit</th></tr></thead>
 <tbody>
-<tr><td>Graph capture (<code>make_fx</code>, AOTAutograd) — one-time trace, cost amortized over many executes</td><td>Per-step transforms (run every training step). Compile with <code>torch.compile</code> or functorch transforms instead.</td></tr>
-<tr><td>Shape inference (<code>FakeTensorMode</code>) — much faster than actually running kernels</td><td>Replacing a C++ kernel with a Python one "for convenience" — pays the boundary cost on every call</td></tr>
-<tr><td>Debugging / logging (one-off interception scripts) — runs once during development to inspect behavior</td><td>Production inference fast path — 5 µs × thousands of ops is unacceptable</td></tr>
-<tr><td>Experimental tensor subclasses (new representations: quantized, complex, sparse) — protocol is clean, implementation is quick</td><td>Performance-critical scenarios (latency-critical inference) — needs a C++ fast path</td></tr>
+<tr><td>Graph capture (<code>make_fx</code>, AOTAutograd): one-time trace, cost amortized over many executes</td><td>Per-step transforms (run every training step). Compile with <code>torch.compile</code> or functorch transforms instead.</td></tr>
+<tr><td>Shape inference (<code>FakeTensorMode</code>): much faster than actually running kernels</td><td>Replacing a C++ kernel with a Python one "for convenience"; pays the boundary cost on every call</td></tr>
+<tr><td>Debugging / logging (one-off interception scripts): runs once during development to inspect behavior</td><td>Production inference fast path; 5 µs × thousands of ops is unacceptable</td></tr>
+<tr><td>Experimental tensor subclasses (new representations: quantized, complex, sparse): protocol is clean, implementation is quick</td><td>Performance-critical scenarios (latency-critical inference); needs a C++ fast path</td></tr>
 </tbody>
 </table>
 
@@ -2718,11 +2590,11 @@ with FakeTensorMode():
 
 <h4>Pitfall 1: reference cycles <code>TensorImpl ↔ PyObject ↔ Mode</code></h4>
 
-<p><code>pyobj_slot_</code> holds a <code>PyObject*</code> (incref'd), and the Python wrapper holds an <code>intrusive_ptr&lt;TensorImpl&gt;</code> (refcount) — this forms a <strong>reference cycle</strong>. PyTorch uses a tagged-pointer scheme to break the cycle in most situations, but <strong>if you stash a tensor on a mode's <code>self</code> field</strong>, the reference will be kept alive until <code>mode.__exit__</code>. If the mode is long-lived, those tensors leak. <strong>Solution</strong>: wrap tensors stashed on a mode with <code>weakref</code>, or clear them explicitly in <code>__exit__</code>.</p>
+<p><code>pyobj_slot_</code> holds a <code>PyObject*</code> (incref'd), and the Python wrapper holds an <code>intrusive_ptr&lt;TensorImpl&gt;</code> (refcount): this forms a <strong>reference cycle</strong>. PyTorch uses a tagged-pointer scheme to break the cycle in most situations, but <strong>if you stash a tensor on a mode's <code>self</code> field</strong>, the reference will be kept alive until <code>mode.__exit__</code>. If the mode is long-lived, those tensors leak. <strong>Solution</strong>: wrap tensors stashed on a mode with <code>weakref</code>, or clear them explicitly in <code>__exit__</code>.</p>
 
 <h4>Pitfall 2: LIFO confusion with nested modes</h4>
 
-<p><code>pythonFallback</code> only looks at the top mode. If you want "<strong>multiple modes chained together</strong>", you have to call the next one explicitly from inside your own <code>__torch_dispatch__</code> — either via <code>return func(*args)</code> to let the dispatcher continue (which <strong>does not</strong> revisit the next mode on the stack but falls straight to the backend), or by actively calling <code>super().__torch_dispatch__(...)</code> (going through the Python inheritance chain). <strong>Remember</strong>: <code>return func</code> does not mean "call the next mode" — it skips the <strong>entire</strong> Python layer.</p>
+<p><code>pythonFallback</code> only looks at the top mode. If you want "<strong>multiple modes chained together</strong>", you have to call the next one explicitly from inside your own <code>__torch_dispatch__</code>: either via <code>return func(*args)</code> to let the dispatcher continue (which <strong>does not</strong> revisit the next mode on the stack but falls straight to the backend), or by actively calling <code>super().__torch_dispatch__(...)</code> (going through the Python inheritance chain). <strong>Remember</strong>: <code>return func</code> does not mean "call the next mode"; it skips the <strong>entire</strong> Python layer.</p>
 
 <h4>Pitfall 3: the <code>_DISPATCH_HANDLE_DIRECTLY</code> trap</h4>
 
@@ -2746,15 +2618,15 @@ thread_local std::optional&lt;c10::impl::LocalDispatchKeySet&gt; tls_on_entry;</
 
 <h4>Pitfall 6: FakeTensorMode singleton</h4>
 
-<p>The aside in §2.3 noted that <code>infra_modes_</code> reserves a fixed slot for FakeTensorMode — a second push is a no-op. If you try to nest fake modes (<code>with FakeTensorMode(): with FakeTensorMode():</code>), the inner one will not actually take effect; all ops still flow through the outer one. This is an <strong>intentional</strong> design choice (nested fakes have no sensible semantics), but easy to get wrong. <strong>Solution</strong>: don't nest FakeTensorMode; if you need "a local real operation inside fake," use <code>FakeTensorMode.disable()</code> to turn it off temporarily.</p>
+<p>The aside in §2.3 noted that <code>infra_modes_</code> reserves a fixed slot for FakeTensorMode, and a second push is a no-op. If you try to nest fake modes (<code>with FakeTensorMode(): with FakeTensorMode():</code>), the inner one will not actually take effect; all ops still flow through the outer one. This is an <strong>intentional</strong> design choice (nested fakes have no sensible semantics), but easy to get wrong. <strong>Solution</strong>: don't nest FakeTensorMode; if you need "a local real operation inside fake," use <code>FakeTensorMode.disable()</code> to turn it off temporarily.</p>
 
 <h2 id="sec8">References</h2>
 
 <ul>
   <li>Sister article: <a href="pytorch-dispatcher.html">PyTorch Dispatcher: A Full-Stack Walkthrough</a></li>
-  <li><a href="https://dev-discuss.pytorch.org/t/what-and-why-of-torch-dispatch/557">"What and Why of <code>__torch_dispatch__</code>" — Chillee et al., PyTorch dev-discuss 2022</a></li>
-  <li><a href="https://github.com/albanD/subclass_zoo">albanD/subclass_zoo</a> — a collection of small <code>__torch_dispatch__</code> examples (LoggingTensor, NegativeTensor, etc.)</li>
-  <li><a href="https://github.com/pytorch/pytorch/pull/167051">PyTorch PR #167051 — DTensor C++ fast path</a></li>
+  <li><a href="https://dev-discuss.pytorch.org/t/what-and-why-of-torch-dispatch/557">"What and Why of <code>__torch_dispatch__</code>", Chillee et al., PyTorch dev-discuss 2022</a></li>
+  <li><a href="https://github.com/albanD/subclass_zoo">albanD/subclass_zoo</a>: a collection of small <code>__torch_dispatch__</code> examples (LoggingTensor, NegativeTensor, etc.)</li>
+  <li><a href="https://github.com/pytorch/pytorch/pull/167051">PyTorch PR #167051: DTensor C++ fast path</a></li>
   <li>Source:
     <ul>
       <li><a href="https://github.com/pytorch/pytorch/blob/main/c10/core/impl/PyInterpreter.h">c10/core/impl/PyInterpreter.h</a></li>

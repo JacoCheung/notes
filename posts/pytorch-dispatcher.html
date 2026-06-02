@@ -18,138 +18,10 @@
 <meta name="post:series_order" content="1">
 <meta name="post:summary"    content="从多维分派的需求出发,梳理 DispatchKey/BackendComponent 二维拆分、DispatchKeySet 优先级与 redispatch 机制;详解 schema 语法、native_functions.yaml 入口、TORCH_LIBRARY 全家桶宏;最后以 aten::add 在 CUDA 上的完整调用栈(Python → AutogradCUDA → CUDA → backward)串起 codegen、autograd 与 ufunc。">
 <meta name="post:summary_en" content="A code-grounded walkthrough of PyTorch's dispatcher: multi-dimensional dispatch motivation, the DispatchKey / BackendComponent split, DispatchKeySet priority and redispatch, schema syntax and the TORCH_LIBRARY macro family, and a complete Python-to-CUDA trace of aten::add (forward and backward) tying together codegen, autograd and ufunc.">
-<style>
-  :root {
-    --sidebar-w: 280px;
-    --fg: #1f2328;
-    --muted: #57606a;
-    --bg: #ffffff;
-    --panel: #f6f8fa;
-    --border: #d0d7de;
-    --accent: #0969da;
-    --accent-soft: #ddf4ff;
-    --code-bg: #f6f8fa;
-    --kw: #cf222e;
-    --cm: #6e7781;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --fg: #e6edf3;
-      --muted: #8b949e;
-      --bg: #0d1117;
-      --panel: #161b22;
-      --border: #30363d;
-      --accent: #58a6ff;
-      --accent-soft: #1f6feb33;
-      --code-bg: #161b22;
-      --kw: #ff7b72;
-      --cm: #8b949e;
-    }
-  }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
-                 "Hiragino Sans GB", "Microsoft YaHei", Roboto, "Helvetica Neue", Arial, sans-serif;
-    font-size: 16px; line-height: 1.7;
-    color: var(--fg); background: var(--bg);
-    -webkit-font-smoothing: antialiased;
-  }
-  .layout { display: flex; align-items: flex-start; min-height: 100vh; }
-  aside.toc {
-    position: sticky; top: 0; align-self: flex-start;
-    flex: 0 0 var(--sidebar-w); width: var(--sidebar-w);
-    max-height: 100vh; overflow-y: auto;
-    padding: 28px 18px 28px 28px;
-    border-right: 1px solid var(--border);
-    background: var(--panel);
-    font-size: 0.88rem;
-  }
-  aside.toc strong { display: block; margin-bottom: 10px; font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
-  aside.toc ul { list-style: none; padding-left: 0; margin: 0; }
-  aside.toc li { margin: 4px 0; }
-  aside.toc li ul { padding-left: 14px; margin: 4px 0; font-size: 0.84rem; }
-  aside.toc a { color: var(--fg); text-decoration: none; }
-  aside.toc a:hover { color: var(--accent); }
-
-  main.content {
-    flex: 1; min-width: 0;
-    max-width: 920px; margin: 0 auto;
-    padding: 36px 40px 80px;
-  }
-  h1 { font-size: 1.9rem; margin: 0 0 6px; letter-spacing: -0.01em; }
-  h2 { font-size: 1.4rem; margin: 36px 0 12px; padding-top: 12px; border-top: 1px solid var(--border); }
-  h3 { font-size: 1.15rem; margin: 24px 0 8px; }
-  h4 { font-size: 1.02rem; margin: 18px 0 6px; color: var(--muted); }
-  p { margin: 10px 0; }
-  a { color: var(--accent); text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  code {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-    font-size: 0.88em;
-    background: var(--code-bg);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 1px 5px;
-  }
-  pre.code, pre {
-    background: var(--code-bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 14px 16px;
-    overflow-x: auto;
-    font-size: 0.85rem;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-    line-height: 1.55;
-  }
-  pre code { background: transparent; border: 0; padding: 0; }
-  .kw { color: var(--kw); }
-  .cm { color: var(--cm); font-style: italic; }
-
-  table { border-collapse: collapse; margin: 14px 0; font-size: 0.92rem; width: 100%; }
-  th, td { border: 1px solid var(--border); padding: 7px 10px; vertical-align: top; text-align: left; }
-  th { background: var(--panel); font-weight: 600; }
-  td code { font-size: 0.85em; }
-
-  .callout {
-    background: var(--accent-soft);
-    border-left: 3px solid var(--accent);
-    padding: 12px 14px;
-    margin: 16px 0;
-    border-radius: 4px;
-    font-size: 0.94rem;
-  }
-  .callout.warn { background: #fff4e5; border-left-color: #d18616; }
-  .aside, .example, .practice {
-    margin: 18px 0; padding: 14px 16px; border-radius: 6px; font-size: 0.93rem;
-  }
-  .aside { background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--muted); }
-  .aside .label, .example .label, .practice .label {
-    display: inline-block; font-size: 0.72rem; font-weight: 700;
-    letter-spacing: 0.08em; text-transform: uppercase;
-    color: var(--muted); margin-bottom: 6px;
-  }
-  .example  { background: #f0f7ff; border: 1px solid #cfe2f3; border-left: 4px solid #0969da; }
-  .example .label  { color: #0969da; }
-  .practice { background: #fff9e6; border: 1px solid #f3e3a0; border-left: 4px solid #d18616; }
-  .practice .label { color: #b56500; }
-  .figure-caption { font-size: 0.85rem; color: var(--muted); text-align: center; margin: 4px 0 12px; font-style: italic; }
-  @media (prefers-color-scheme: dark) {
-    .example  { background: #0d2235; border-color: #214b73; }
-    .example .label { color: #58a6ff; }
-    .practice { background: #2d2210; border-color: #6b5520; }
-    .practice .label { color: #f0c674; }
-    .callout.warn { background: #2d2210; }
-  }
-  .small { font-size: 0.85rem; color: var(--muted); }
-  .tag { background: var(--accent-soft); color: var(--accent); border-radius: 10px; padding: 1px 8px; font-size: 0.72rem; vertical-align: middle; }
-
-  @media (max-width: 900px) {
-    .layout { flex-direction: column; }
-    aside.toc { position: static; flex: none; width: 100%; max-height: none; border-right: 0; border-bottom: 1px solid var(--border); }
-    main.content { padding: 24px 18px 60px; }
-  }
-</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
 </head>
 <body>
 <div class="layout">
@@ -444,7 +316,7 @@ Fake                 →  fake::add_meta_only
 </div>
 
 <div class="aside">
-<span class="label">边栏 1.2 — 为什么不用虚函数 / std::function</span>
+<span class="label">边栏 1.2:为什么不用虚函数 / std::function</span>
 你可能会想:这不就是 C++ 的虚函数表(vtable)吗?为什么不直接用语言原生机制?<br><br>
 差别在两点:<br>
 <strong>① vtable 的"动态类型"只来自一个对象</strong>(<code>this</code> 指针)。但 dispatcher 的动态类型来自<strong>所有输入张量的并集 + 一组线程局部状态</strong>。<code>torch.add(x, y)</code> 的实际行为既看 <code>x</code>,也看 <code>y</code>,还看是否在 autocast 里 —— 这是<strong>多分派</strong>(multiple dispatch),vtable 表达不了。<br>
@@ -541,7 +413,7 @@ AutogradHPU      <span class="cm">// autograd × Habana</span></pre>
 </div>
 
 <div class="aside">
-<span class="label">边栏 1.4 — drift 警告</span>
+<span class="label">边栏 1.4:drift 警告</span>
 ezyang 2019 年的 <a href="https://blog.ezyang.com/2019/05/pytorch-internals/">PyTorch internals</a> 没有 BackendComponent 这一层,2020 年的 dispatcher 文章也没有。本节描述的<strong>二维拆分是 2022+ 后的最新机制</strong>,看老文章时注意这点已经过期 —— 它们把 <code>SparseCUDA</code> 当作枚举里的一个具体值,在今天的代码里它实际是 <code>(Sparse, CUDABit)</code> 的组合。
 </div>
 
@@ -754,7 +626,7 @@ Tensor VariableType::add_Tensor(
 }</pre>
 
 <div class="example">
-<span class="label">小例 1.7 — 完整 redispatch 流程</span>
+<span class="label">小例 1.7:完整 redispatch 流程</span>
 跟着这段代码走一遍 <code>z = x + y</code>(<code>x, y</code> 在 CUDA、<code>requires_grad=True</code>):<br><br>
 <strong>(a)</strong> 顶层 <code>Dispatcher::call</code> 算出位图 = <code>{AutogradCUDA, CUDA}</code>,最高位 = <code>AutogradCUDA</code>,跳到 <code>VariableType::add_Tensor</code>。<br>
 <strong>(b)</strong> 函数体进入 RAII guard <code>AutoDispatchBelowADInplaceOrView</code>:TLS exclude 里加上所有 autograd 位 + ADInplaceOrView 位。<br>
@@ -832,7 +704,7 @@ Tensor VariableType::add_Tensor(
 </div>
 
 <div class="example">
-<span class="label">小例 2.1 — alias 注解的作用</span>
+<span class="label">小例 2.1:alias 注解的作用</span>
 看 <code>aten::transpose</code> 的 schema:
 <pre class="code">aten::transpose.int(Tensor(a) self, int dim0, int dim1) -&gt; Tensor(a)</pre>
 <code>Tensor(a)</code> 出现在 <strong>self</strong> 和返回值上 —— 它们共享同一个名为 <code>a</code> 的"内存位"。这告诉 dispatcher 下游:转置后的张量和原张量<strong>共享存储</strong>,改其中一个的元素另一个也变。<br><br>
@@ -875,7 +747,7 @@ Tensor VariableType::add_Tensor(
 </ol>
 
 <div class="example">
-<span class="label">小例 2.2 — 三个变体怎么共用实现</span>
+<span class="label">小例 2.2:三个变体怎么共用实现</span>
 虽然 schema 有三套,实际数学只写一次。底层用 <strong>structured kernel</strong> 模式:
 <pre class="code">add.out      :  写入预分配的 out tensor (核心实现)
 add.Tensor   :  分配一个新 out → 调 add.out → 返回 out
@@ -884,7 +756,7 @@ add_.Tensor  :  把 self 当成 out → 调 add.out → 返回 self</pre>
 </div>
 
 <div class="aside">
-<span class="label">边栏 2.2 — autogen 关键字</span>
+<span class="label">边栏 2.2:autogen 关键字</span>
 某些算子作者只写 functional 一份,告诉 codegen "请按规则补齐 in-place 和 out 变体":
 <pre class="code">- func: my_op(Tensor self) -&gt; Tensor
   autogen: my_op.out, my_op_</pre>
@@ -958,7 +830,7 @@ codegen 看到 <code>autogen:</code> 后会自动生成 <code>my_op.out</code> �
 <p>这里 <code>dispatch: CPU, CUDA: relu</code> 把同一个名字 <code>at::native::relu</code> 同时绑到 <code>(Dense, CPU)</code> 和 <code>(Dense, CUDA)</code>。具体实现是两个文件里的两个 overload(<code>aten/src/ATen/native/Activation.cpp</code> 给 CPU,<code>aten/src/ATen/native/cuda/Activation.cu</code> 给 CUDA),靠 link 时按 device 决定。这种<strong>非 structured</strong> 写法适合简单算子;但失去了 ufunc 自动生成的便利。</p>
 
 <div class="aside">
-<span class="label">边栏 2.3 — 为什么有 structured 这一层</span>
+<span class="label">边栏 2.3:为什么有 structured 这一层</span>
 PyTorch 早年(2018 之前)每个算子的 functional / inplace / out 三套实现都得作者手写,大量代码长这样:<code>add</code> 的 functional 分配输出 → 调 add_kernel;<code>add_</code> 把 self 当输出 → 调 add_kernel;<code>add_out</code> 检查 out shape → 调 add_kernel。这种重复代码每个算子要写 3 遍,每次 add 一个新算子都要写 ~100 行胶水。<br><br>
 2020 后引入的 <strong>structured kernel</strong> 模式标准化了这套胶水:作者只在 <code>.out</code> 变体上写实际数学(<code>impl()</code>),meta 阶段(算输出 shape/dtype)写在 <code>meta()</code>。codegen 自动生成 functional 和 inplace 变体作为 out 的包装。新算子只需要 ~10 行 yaml + 一份 impl,代码量降到原来的 1/5。
 </div>
@@ -995,7 +867,7 @@ PyTorch 早年(2018 之前)每个算子的 functional / inplace / out 三套实�
 </ol>
 
 <div class="example">
-<span class="label">小例 2.4 — derivatives.yaml 与生成代码的对应</span>
+<span class="label">小例 2.4:derivatives.yaml 与生成代码的对应</span>
 <code>derivatives.yaml</code> 里 <code>add</code> 的反向公式:
 <pre class="code">other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))</pre>
 被 codegen 翻译成 <code>AddBackward0::apply()</code> 里的:
@@ -1052,7 +924,7 @@ class Library {
 </table>
 
 <div class="example">
-<span class="label">小例 3.1 — 三种 Kind 的实际用例</span>
+<span class="label">小例 3.1:三种 Kind 的实际用例</span>
 你写一个 PyTorch 扩展 <code>my_extension</code>,它注册一个 <code>myops::custom_relu</code> 算子,在 CPU、CUDA 上各有实现。三个 .cpp 文件分工:<br><br>
 <code>register_schema.cpp</code> 用 <code>TORCH_LIBRARY(myops, m)</code> → <strong>DEF</strong>,声明 schema。这一行存在,<code>myops</code> 命名空间才"开"了。<br>
 <code>kernel_cpu.cpp</code> 用 <code>TORCH_LIBRARY_IMPL(myops, CPU, m)</code> → <strong>IMPL</strong>,给 CPU 注册实现。<br>
@@ -1061,7 +933,7 @@ class Library {
 </div>
 
 <div class="aside">
-<span class="label">边栏 3.1 — 为什么不是单一宏</span>
+<span class="label">边栏 3.1:为什么不是单一宏</span>
 你可能会问:既然底层都是构造 <code>Library</code> 对象,为什么不能合并成一个 <code>TORCH_LIBRARY(ns, kind, key, m)</code>?<br><br>
 有两个原因:<br>
 <strong>① 静态校验</strong>。<code>DEF</code> 不允许指定 DispatchKey(它声明 schema,不挂 kernel);<code>IMPL</code> 必须指定 DispatchKey。把它们做成三个独立宏,编译期就能阻止参数错乱(IDE 也能更好地补全)。<br>
@@ -1116,7 +988,7 @@ void TORCH_LIBRARY_init_myops(torch::Library&amp; m)
 <p>关键魔法在<strong>文件级 static 对象的初始化时机</strong>:C++ 标准保证 main() 调用之前所有 file-static 对象都已构造完。所以当 PyTorch 的 main / 用户的 Python 解释器启动时,<code>TorchLibraryInit</code> 的构造函数已经跑过、已经把这个 schema 塞进全局 dispatcher 表了。<strong>用户的注册代码"自动"在程序启动期生效</strong>,完全不需要手动调用。</p>
 
 <div class="example">
-<span class="label">小例 3.2 — 用法</span>
+<span class="label">小例 3.2:用法</span>
 <pre class="code"><span class="cm">// myops_register.cpp</span>
 #include &lt;torch/library.h&gt;
 
@@ -1155,7 +1027,7 @@ TORCH_LIBRARY(myops, m) {
 </ol>
 
 <div class="aside">
-<span class="label">边栏 3.3 — 为什么 aten 强制用 FRAGMENT</span>
+<span class="label">边栏 3.3:为什么 aten 强制用 FRAGMENT</span>
 你看 PyTorch codegen 出来的 <code>RegisterCPU.cpp</code> / <code>RegisterCUDA.cpp</code> / <code>RegisterSchema.cpp</code> 等几十个文件,<strong>开头全是 <code>TORCH_LIBRARY_FRAGMENT(aten, m)</code></strong>,没有一个 <code>TORCH_LIBRARY(aten, m)</code>。这不是巧合 ——torchgen 在 <a href="https://github.com/pytorch/pytorch/blob/main/torchgen/gen.py"><code>torchgen/gen.py</code></a> 里专门写了 special case:<br>
 <pre class="code"><span class="cm"># torchgen/gen.py 1761-1776 附近(简化)</span>
 if namespace == "aten":
@@ -1170,7 +1042,7 @@ else:
 </div>
 
 <div class="example">
-<span class="label">小例 3.3 — 同 namespace 跨文件的 fragment</span>
+<span class="label">小例 3.3:同 namespace 跨文件的 fragment</span>
 你想给 <code>myops</code> 命名空间下分模块注册算子(算子族 A 在 a.cpp,算子族 B 在 b.cpp):
 <pre class="code"><span class="cm">// myops_a.cpp</span>
 TORCH_LIBRARY_FRAGMENT(myops, m) {
@@ -1213,7 +1085,7 @@ TORCH_LIBRARY_FRAGMENT(myops, m) {
 </ul>
 
 <div class="example">
-<span class="label">小例 3.4 — 典型用法</span>
+<span class="label">小例 3.4:典型用法</span>
 <pre class="code"><span class="cm">// myops_cpu.cpp — 给 myops::* 在 CPU key 上注册 kernel</span>
 TORCH_LIBRARY_IMPL(myops, CPU, m) {
   m.impl("custom_add",  &amp;my_add_cpu);
@@ -1271,7 +1143,7 @@ m.impl("op_name", TORCH_FN(cpu_kernel));
 m.impl("op_name", torch::CppFunction::makeFromBoxedFunction&lt;&amp;boxed_fn&gt;());</pre>
 
 <div class="example">
-<span class="label">小例 3.5 — schema 类型不兼容</span>
+<span class="label">小例 3.5:schema 类型不兼容</span>
 你声明 schema:
 <pre class="code">m.def("custom_add(Tensor self, Tensor other) -&gt; Tensor");</pre>
 后来注册 kernel:
@@ -1302,7 +1174,7 @@ Tensor(const Tensor&amp;, int) — but the schema declares type Tensor(Tensor, T
 <p><code>TORCH_FN(fn)</code> 这个宏的作用是用模板提取 <code>fn</code> 的<strong>字面类型签名</strong>(在编译期),从而让 <code>KernelFunction</code> 可以<strong>同时</strong>存下 unboxed 路径(直接调用)和 boxed 路径(自动生成的 IValue 包装版本)。如果你写 <code>m.impl("name", &amp;fn)</code>(没 <code>TORCH_FN</code>),框架也能用 SFINAE 推断签名,但 <code>TORCH_FN</code> 写法更明确,签名错误能在编译期被发现。</p>
 
 <div class="aside">
-<span class="label">边栏 3.6 — m.impl_UNBOXED 的历史</span>
+<span class="label">边栏 3.6:m.impl_UNBOXED 的历史</span>
 PyTorch 早期(2019 前)有一个 <code>m.impl_UNBOXED("name", &amp;fn)</code> 接口,语义是"这个 kernel 只能 boxed 调用 —— 不要尝试生成 unboxed 路径"。当时是因为有些 kernel 的签名无法被模板推断(比如带 <code>c10::optional&lt;Tensor&gt;</code> 早期某些版本)。<br><br>
 现在这个 API 已被删除。等价写法是 <code>m.impl("name", torch::CppFunction::makeFromBoxedFunction&lt;&amp;fn&gt;())</code> —— 显式说"用这个 boxed 函数包装,不生成 unboxed 路径"。你在 2020 年前的博客里看到 <code>impl_UNBOXED</code>,知道它对应现在的什么就行。
 </div>
@@ -1445,7 +1317,7 @@ TORCH_LIBRARY_IMPL(myops, Autograd, m) {   <span class="cm">// Autograd 是 alia
     # → 计算梯度 → 传给 next_edges</span></pre>
 
 <div class="callout">
-<strong>更省事的写法 — CompositeImplicitAutograd</strong>:既然 <code>custom_relu</code> 的实现完全是 <code>at::*</code> op 的组合(<code>at::clamp_min</code>),且它的反向能完全靠 <code>clamp_min</code> 自己的反向来推 —— 你可以直接注册到 alias <code>CompositeImplicitAutograd</code>,<strong>一次注册同时覆盖所有 backend、所有 autograd</strong>:
+<strong>更省事的写法:CompositeImplicitAutograd</strong>:既然 <code>custom_relu</code> 的实现完全是 <code>at::*</code> op 的组合(<code>at::clamp_min</code>),且它的反向能完全靠 <code>clamp_min</code> 自己的反向来推 —— 你可以直接注册到 alias <code>CompositeImplicitAutograd</code>,<strong>一次注册同时覆盖所有 backend、所有 autograd</strong>:
 <pre class="code">at::Tensor custom_relu_composite(const at::Tensor&amp; self) {
   return at::clamp_min(self, 0);
 }
@@ -1545,7 +1417,7 @@ TORCH_LIBRARY_IMPL(myops, CompositeImplicitAutograd, m) {
 </table>
 
 <div class="example">
-<span class="label">小例 4.2 — 一个 yaml 条目的"扩展系数"</span>
+<span class="label">小例 4.2:一个 yaml 条目的"扩展系数"</span>
 看 <code>add.Tensor</code> 这一个 yaml 条目(2.3 节列过),展开后<strong>同时</strong>影响:<br>
 <strong>① C++ API</strong>:<code>at::add(...)</code>、<code>x.add(y)</code> 在 <code>Functions.h</code> + <code>TensorBody.h</code> 各加一行<br>
 <strong>② Operators.h</strong>:增加 <code>at::_ops::add_Tensor</code> 这个类型句柄<br>
@@ -1622,7 +1494,7 @@ z.sum().backward()</pre>
 </ol>
 
 <div class="aside">
-<span class="label">边栏 5.2 — 为什么需要这一层"包装/拆包"</span>
+<span class="label">边栏 5.2:为什么需要这一层"包装/拆包"</span>
 你可能会问:既然 <code>torch.Tensor</code> 和 <code>at::Tensor</code> 本质是同一个对象,为什么不直接传?<br><br>
 两个原因:<br>
 <strong>① Python 引用计数 vs C++ 智能指针</strong>。Python 的 <code>torch.Tensor</code> 用 CPython 引用计数(<code>Py_INCREF</code>/<code>Py_DECREF</code>),C++ 的 <code>at::Tensor</code> 用 <code>intrusive_ptr</code>。两套生命周期管理必须在边界精确转换,否则会 use-after-free。<br>
@@ -1651,7 +1523,7 @@ at::Tensor _ops::add_Tensor::call(const at::Tensor&amp; self, const at::Tensor&a
 <p><code>op.call</code> 最终调到 <code>c10::Dispatcher::call</code>(<a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/core/dispatch/Dispatcher.h"><code>Dispatcher.h:774-828</code></a>)—— 这就是 1.4 节里讲的 dispatcher 入口。从这一刻起,我们正式踏入 dispatcher 的位图魔法。</p>
 
 <div class="example">
-<span class="label">小例 5.3 — 这一层为什么需要单独存在</span>
+<span class="label">小例 5.3:这一层为什么需要单独存在</span>
 你可能会问:既然 <code>at::add</code> 只是个转发,为什么不直接让 <code>THPVariable_add</code> 调 <code>Dispatcher::call</code>?<br><br>
 两个原因:<br>
 <strong>① 它给了用户友好的 C++ API。</strong>第三方 C++ 代码不想知道 dispatcher 内部细节,只想写 <code>at::add(x, y)</code>。<br>
@@ -1765,7 +1637,7 @@ TORCH_LIBRARY_IMPL(aten, AutogradCUDA, m) {
 <p>所以 <code>add.Tensor</code>(functional)的实现 = "分配 out + 调 <code>add.out</code>"。这是 <code>structured_delegate: add.out</code> 在 codegen 端的具体落地 —— 三种变体共享同一份数学,只有内存分配策略不同。</p>
 
 <div class="example">
-<span class="label">小例 5.6 — 对比 in-place 变体的实现</span>
+<span class="label">小例 5.6:对比 in-place 变体的实现</span>
 对 <code>add_.Tensor</code>(in-place),codegen 会生成类似的 wrapper,但<strong>不分配新 out</strong>,而是把 <code>self</code> 当成 out 传给 <code>add.out</code>:
 <pre class="code">at::Tensor&amp; wrapper_CUDA_add__Tensor(
     at::Tensor&amp; self, const at::Tensor&amp; other, const at::Scalar&amp; alpha) {
@@ -1830,7 +1702,7 @@ C10_HOST_DEVICE C10_ALWAYS_INLINE T add(T self, T other, T alpha) {
 </div>
 
 <div class="example">
-<span class="label">小例 5.7 — 为什么 CPU 和 CUDA 共享同一个 <code>ufunc::add</code></span>
+<span class="label">小例 5.7:为什么 CPU 和 CUDA 共享同一个 <code>ufunc::add</code></span>
 <code>ufunc/add.h</code> 用 <code>C10_HOST_DEVICE</code> 注解,这是 PyTorch 包装 CUDA <code>__host__ __device__</code> 的宏,告诉 nvcc:"这个函数同时编译成 CPU 版和 GPU 版"。<br><br>
 CPU 端的 <code>UfuncCPU_add.cpp</code> 也 include 这同一个 <code>ufunc/add.h</code>,然后用 SIMD 矢量化的 <code>vectorized_loop2d</code> 而不是 <code>gpu_kernel</code> 来调它。<strong>数学定义只写一次,CPU/CUDA 用同一份。</strong> 加一个新后端(比如 MPS)只需要写新的"循环驱动"(怎么跑 lambda),数学函数不动。
 </div>
@@ -2148,9 +2020,9 @@ y = torch.ops.myops.custom_relu(torch.randn(3, device="cuda"))</pre>
 
 <p class="small">PyTorch source references in this article follow the <a href="https://github.com/pytorch/pytorch">pytorch/pytorch</a> <code>main</code> branch. All file:line citations are clickable and open the current source. The focus here is on the dispatcher data structures, the semantics of the registration macros, and the complete call stack of a native op from Python down to CUDA; quantization, distributed, inductor and other downstream topics are out of scope.</p>
 
-<h2 id="sec1">1. Dispatch Keys: Foundation of Runtime Multi-Dimensional Dispatch</h2>
+<h2 id="sec1">1. Dispatch keys: foundation of runtime multi-dimensional dispatch</h2>
 
-<p>This chapter builds up the dispatcher's runtime model from the bottom up. We start from the user's perspective — "why doesn't if/else work?" — which naturally leads us to the dispatcher's core idea: pull the "which path do we take" decision out of the code and turn it into <strong>a lookup table indexed by key</strong>. We then look at the data structures PyTorch uses to express this table (the <code>DispatchKey</code> enum, the <code>DispatchKeySet</code> bitmap), how it computes "which keys are active," how it decides "which layer to run first," and how a kernel <strong>hands off control to the next layer without falling into an infinite loop</strong>.</p>
+<p>This chapter builds up the dispatcher's runtime model from the bottom up. We start from the user's perspective ("why doesn't if/else work?"), which naturally leads to the dispatcher's core idea: pull the "which path do we take" decision out of the code and turn it into <strong>a lookup table indexed by key</strong>. We then look at the data structures PyTorch uses to express this table (the <code>DispatchKey</code> enum, the <code>DispatchKeySet</code> bitmap), how it computes "which keys are active," how it decides "which layer to run first," and how a kernel <strong>hands off control to the next layer without falling into an infinite loop</strong>.</p>
 
 <p>After this chapter, you should be able to mentally simulate every step that <code>z = x + y</code> goes through inside the dispatcher.</p>
 
@@ -2172,15 +2044,15 @@ Tensor add(const Tensor&amp; x, Scalar s) {
 
 <ul>
   <li>If <code>x.requires_grad == True</code>, before computing the addition we must first build an <code>AddBackward0</code> node and register <code>x</code> as its "upstream," so that <code>loss.backward()</code> can trace back later.</li>
-  <li>If the call is nested inside <code>with torch.autocast('cuda'):</code>, we must <strong>first convert the fp32 inputs to fp16</strong> before computing — that's how training gets the mixed-precision throughput benefit.</li>
-  <li>If nested inside <code>with FakeTensorMode():</code>, we <strong>must not actually compute</strong> — we can only "pretend" to compute, infer output shape/dtype, and return a tensor that "looks right but has no contents" (used during compilation/analysis).</li>
-  <li>If <code>x</code> is a sparse tensor (<code>torch.sparse_coo_tensor(...)</code>), the addition goes through a completely different algorithm — not an elementwise loop.</li>
+  <li>If the call is nested inside <code>with torch.autocast('cuda'):</code>, we must <strong>first convert the fp32 inputs to fp16</strong> before computing. That's how training gets the mixed-precision throughput benefit.</li>
+  <li>If nested inside <code>with FakeTensorMode():</code>, we <strong>must not actually compute</strong>. We can only "pretend" to compute, infer output shape/dtype, and return a tensor that "looks right but has no contents" (used during compilation/analysis).</li>
+  <li>If <code>x</code> is a sparse tensor (<code>torch.sparse_coo_tensor(...)</code>), the addition goes through a completely different algorithm, not an elementwise loop.</li>
   <li>If <code>x</code> has been through <code>torch.func.vmap(...)</code>, the addition has to broadcast over an <strong>extra batch dimension</strong>.</li>
 </ul>
 
-<p>What's worse, <strong>these conditions stack</strong>. A real training step may simultaneously have <code>requires_grad</code>, <code>autocast</code> and CUDA all active. Each "context" must be inserted into the call in <strong>the right order</strong> — autocast must come before autograd (otherwise the backward graph would record the wrong dtype); autograd must come before CUDA (otherwise the backward upstream wouldn't be recorded); FakeMode must be above everything (otherwise we'd actually compute).</p>
+<p>What's worse, <strong>these conditions stack</strong>. A real training step may simultaneously have <code>requires_grad</code>, <code>autocast</code> and CUDA all active. Each "context" must be inserted into the call in <strong>the right order</strong>: autocast must come before autograd (otherwise the backward graph would record the wrong dtype); autograd must come before CUDA (otherwise the backward upstream wouldn't be recorded); FakeMode must be above everything (otherwise we'd actually compute).</p>
 
-<p>Written with if/else, the code grows into something like the following — and you'd have to write it for <strong>every single</strong> operator:</p>
+<p>Written with if/else, the code grows into something like the following, and you'd have to write it for <strong>every single</strong> operator:</p>
 
 <pre class="code">Tensor add(const Tensor&amp; x, Scalar s) {
   <span class="cm">// FakeTensorMode intercept: only compute meta, no actual values</span>
@@ -2205,13 +2077,13 @@ Tensor add(const Tensor&amp; x, Scalar s) {
 <p>This style has two <strong>fatal defects</strong> that the PyTorch team cannot work around:</p>
 
 <ol>
-  <li><strong>Repetition.</strong> ATen (PyTorch's operator library) has ~2000 operators. Every single one would need this nested if/else duplicated. Forget <code>if (autocast_enabled())</code> in any one of them, and that operator silently runs at the wrong precision under autocast; miss <code>if (in_fake_mode())</code> in any one, and that operator actually computes during tracing — failure modes that are nearly impossible to catch.</li>
-  <li><strong>Closedness.</strong> If Habana / Apple Metal / Huawei Ascend wants to add a new backend to PyTorch today, they <strong>cannot modify PyTorch's source</strong> — they need to "insert" their own <code>is_my_backend()</code> branch from the outside. An if/else chain can't do that. Likewise, third-party autocast implementations, JIT tracers and new transforms (vmap/grad/jvp) can't cut across PyTorch ops.</li>
+  <li><strong>Repetition.</strong> ATen (PyTorch's operator library) has ~2000 operators. Every single one would need this nested if/else duplicated. Forget <code>if (autocast_enabled())</code> in any one of them, and that operator silently runs at the wrong precision under autocast; miss <code>if (in_fake_mode())</code> in any one, and that operator actually computes during tracing. Both failure modes are nearly impossible to catch.</li>
+  <li><strong>Closedness.</strong> If Habana / Apple Metal / Huawei Ascend wants to add a new backend to PyTorch today, they <strong>cannot modify PyTorch's source</strong>: they need to "insert" their own <code>is_my_backend()</code> branch from the outside. An if/else chain can't do that. Likewise, third-party autocast implementations, JIT tracers and new transforms (vmap/grad/jvp) can't cut across PyTorch ops.</li>
 </ol>
 
 <div class="example">
 <span class="label">Example 1.1</span>
-Imagine PyTorch wants to support a new backend <code>Foo</code>. Under the if/else scheme, you'd have to scroll through the source of every one of ~2000 operators and add <code>if (x.is_foo()) return add_foo(...)</code>. Then the next time PyTorch upgrades, you redo all your patches. Every merge conflict is a nightmare. That's the core reason the if/else scheme doesn't hold up in practice — not "ugly," but "extensibility bankrupt."
+Imagine PyTorch wants to support a new backend <code>Foo</code>. Under the if/else scheme, you'd have to scroll through the source of every one of ~2000 operators and add <code>if (x.is_foo()) return add_foo(...)</code>. Then the next time PyTorch upgrades, you redo all your patches. Every merge conflict is a nightmare. That's the core reason the if/else scheme doesn't hold up in practice: not "ugly," but "extensibility bankrupt."
 </div>
 
 <h3 id="sec1-2">1.2 The idea: a key-indexed function table</h3>
@@ -2246,9 +2118,9 @@ Fake                 →  fake::add_meta_only
   <li><strong>Jump.</strong> Look up the function pointer for <code>AutocastCUDA</code>, <code>autocast::add_cuda_wrapper</code>, and call it.</li>
 </ol>
 
-<p><strong>The key trick:</strong> after this <code>autocast</code> wrapper finishes its work (lowering inputs to fp16), it has to continue down to autograd → CUDA. It does <em>not</em> call <code>torch.add(...)</code> again to re-enter the top level — that would loop forever. Instead it does this: <strong>mask the <code>AutocastCUDA</code> bit out of the bitmap, then tell the dispatcher to recompute the highest-priority key</strong>. This time the highest priority becomes <code>AutogradCUDA</code>, jumping to the autograd wrapper; after the autograd wrapper records the backward graph, it masks <code>AutogradCUDA</code> out and falls to <code>CUDA</code>, which runs the real elementwise kernel.</p>
+<p><strong>The key trick:</strong> after this <code>autocast</code> wrapper finishes its work (lowering inputs to fp16), it has to continue down to autograd → CUDA. It does <em>not</em> call <code>torch.add(...)</code> again to re-enter the top level (that would loop forever). Instead it does this: <strong>mask the <code>AutocastCUDA</code> bit out of the bitmap, then tell the dispatcher to recompute the highest-priority key</strong>. This time the highest priority becomes <code>AutogradCUDA</code>, jumping to the autograd wrapper; after the autograd wrapper records the backward graph, it masks <code>AutogradCUDA</code> out and falls to <code>CUDA</code>, which runs the real elementwise kernel.</p>
 
-<p>The whole call chain is like peeling an onion — each layer does its bit, then "erases itself" so the next layer can take over. The figure below traces the full path for <code>with torch.autocast('cuda'): z = x + y</code> (with <code>x, y</code> on CUDA and <code>requires_grad=True</code>):</p>
+<p>The whole call chain is like peeling an onion: each layer does its bit, then "erases itself" so the next layer can take over. The figure below traces the full path for <code>with torch.autocast('cuda'): z = x + y</code> (with <code>x, y</code> on CUDA and <code>requires_grad=True</code>):</p>
 
 <div style="overflow-x:auto; margin:1em 0;">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 360" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
@@ -2300,9 +2172,9 @@ Fake                 →  fake::add_meta_only
   <g font-size="11" fill="#444">
     <text x="20" y="210" font-weight="600">Why is this better than if/else?</text>
     <text x="20" y="232">• <strong>Each kernel only manages its own layer</strong>. The CUDA kernel doesn't need to know autocast exists; autocast doesn't need to know autograd exists.</text>
-    <text x="20" y="252">• <strong>Extensible</strong>. A new backend just <strong>adds a row to every op's lookup table</strong> — call sites untouched. New mode decorators (like vmap) are just new keys.</text>
+    <text x="20" y="252">• <strong>Extensible</strong>. A new backend just <strong>adds a row to every op's lookup table</strong>; call sites untouched. New mode decorators (like vmap) are just new keys.</text>
     <text x="20" y="272">• <strong>Composable</strong>. The set of bits in the bitmap determines which layers are traversed; their order is determined by priority, fully decoupled from code.</text>
-    <text x="20" y="292">• <strong>Order guaranteed by design</strong>. "autocast must come before autograd" is encoded as the <strong>priority</strong> of the keys — no longer relying on every op author remembering it.</text>
+    <text x="20" y="292">• <strong>Order guaranteed by design</strong>. "autocast must come before autograd" is encoded as the <strong>priority</strong> of the keys, no longer relying on every op author remembering it.</text>
   </g>
 
   <!-- Bottom note -->
@@ -2311,12 +2183,12 @@ Fake                 →  fake::add_meta_only
 </div>
 
 <div class="aside">
-<span class="label">Aside 1.2 — Why not virtual functions / std::function</span>
+<span class="label">Aside 1.2: Why not virtual functions / std::function</span>
 You might wonder: isn't this just C++'s vtable? Why not use the language's native mechanism?<br><br>
 The differences are twofold:<br>
-<strong>① The vtable's "dynamic type" comes from a single object</strong> (the <code>this</code> pointer). But the dispatcher's dynamic type comes from <strong>the union of all input tensors plus a set of thread-local states</strong>. The actual behavior of <code>torch.add(x, y)</code> depends on <code>x</code>, on <code>y</code>, and on whether we are inside autocast — this is <strong>multiple dispatch</strong>, which a vtable cannot express.<br>
+<strong>① The vtable's "dynamic type" comes from a single object</strong> (the <code>this</code> pointer). But the dispatcher's dynamic type comes from <strong>the union of all input tensors plus a set of thread-local states</strong>. The actual behavior of <code>torch.add(x, y)</code> depends on <code>x</code>, on <code>y</code>, and on whether we are inside autocast. This is <strong>multiple dispatch</strong>, which a vtable cannot express.<br>
 <strong>② <code>std::function</code> can express multiple dispatch</strong>, but every call requires heap-allocating a type-erased closure. In a training scenario with millions of op calls per second, this overhead is unacceptable.<br><br>
-Hand-rolled bitmap plus array lookup, each dispatch costs about 5–10 ns — cheaper than a virtual call.
+Hand-rolled bitmap plus array lookup, each dispatch costs about 5 to 10 ns, cheaper than a virtual call.
 </div>
 
 <h3 id="sec1-3">1.3 The actual DispatchKey enum</h3>
@@ -2361,7 +2233,7 @@ enum class DispatchKey : uint16_t {
 
 <ul>
   <li><strong>The type is <code>uint16_t</code></strong> (16-bit unsigned). Soon we'll pack keys into a 64-bit bitmap, and a 16-bit index is enough to encode every possible key plus header bits.</li>
-  <li><strong>The enum is <strong>ordered</strong>.</strong> As we'll see, the "highest-priority key" is <strong>the enum value corresponding to the highest set bit in the bitmap</strong> — keys later in the enum have higher priority. That's why <code>Autocast*</code> comes after <code>Autograd*</code>, and <code>Autograd*</code> comes after <code>CPU/CUDA</code> — this is precisely the <strong>code-level translation</strong> of "autocast must happen before autograd" from §1.1. The designers encoded the "semantic layer ordering" directly into the enum's literal order.</li>
+  <li><strong>The enum is <strong>ordered</strong>.</strong> As we'll see, the "highest-priority key" is <strong>the enum value corresponding to the highest set bit in the bitmap</strong>: keys later in the enum have higher priority. That's why <code>Autocast*</code> comes after <code>Autograd*</code>, and <code>Autograd*</code> comes after <code>CPU/CUDA</code>. This is precisely the <strong>code-level translation</strong> of "autocast must happen before autograd" from §1.1. The designers encoded the "semantic layer ordering" directly into the enum's literal order.</li>
   <li><strong>About 60 keys</strong> (<code>NumDispatchKeys</code> sentinel). It sounds like a lot, but most of them are "mode-layer" keys (autocast / fake / functionalize / python, etc.) that aren't activated during normal calls; they only get pushed into the bitmap when the corresponding with-block is opened.</li>
 </ul>
 
@@ -2386,7 +2258,7 @@ AutogradHPU      <span class="cm">// autograd × Habana</span></pre>
 <p>The PyTorch team did a major refactor in 2022: split the enum into <strong>two orthogonal smaller enums</strong> and merge them into a single 64-bit bitmap (<a href="https://github.com/pytorch/pytorch/blob/main/c10/core/DispatchKey.h">DispatchKey.h</a>):</p>
 
 <ol>
-  <li><strong><code>BackendComponent</code></strong> — just "which backend." The current bits: <code>CPU / CUDA / HIP / XLA / MPS / IPU / XPU / HPU / VE / Lazy / MTIA / MAIA / PrivateUse1‑3 / Meta</code>. A <code>static_assert</code> caps the backend count at ≤ 16 (<code>DispatchKey.h</code> has an explicit 16-bit budget). <strong>Note that this alone doesn't form a dispatch level — it must combine with some functionality to be meaningful.</strong></li>
+  <li><strong><code>BackendComponent</code></strong>: just "which backend." The current bits: <code>CPU / CUDA / HIP / XLA / MPS / IPU / XPU / HPU / VE / Lazy / MTIA / MAIA / PrivateUse1‑3 / Meta</code>. A <code>static_assert</code> caps the backend count at ≤ 16 (<code>DispatchKey.h</code> has an explicit 16-bit budget). <strong>Note that this alone doesn't form a dispatch level; it must combine with some functionality to be meaningful.</strong></li>
   <li><strong><code>DispatchKey</code> (functionality).</strong> The vast majority of functionalities occupy a single slot (a globally unique handler); <strong>six are "per-backend"</strong> and need to combine with a <code>BackendComponent</code> to form a runtime key. The six are: <code>Dense</code>, <code>Quantized</code>, <code>Sparse</code>, <code>SparseCsr</code>, <code>NestedTensor</code>, <code>AutogradFunctionality</code>.</li>
 </ol>
 
@@ -2400,21 +2272,21 @@ AutogradHPU      <span class="cm">// autograd × Habana</span></pre>
 (Quantized,            CPUBit)   →  QuantizedCPU
 ...</pre>
 
-<p>In other words, <strong>when you write <code>TORCH_LIBRARY_IMPL(aten, CUDA, m)</code> you're actually registering at the two-dimensional coordinate <code>(Dense, CUDA)</code></strong>. At the source level you still see a single <code>CUDA</code> key — but the bitmap underneath encodes it as "the Dense functionality bit + the CUDA backend bit both set to 1." Adding a new backend (<code>HPU</code>)? Just add a bit to <code>BackendComponent</code> — the six per-backend functionalities <strong>automatically</strong> define six new combined keys for it, with no enum changes needed.</p>
+<p>In other words, <strong>when you write <code>TORCH_LIBRARY_IMPL(aten, CUDA, m)</code> you're actually registering at the two-dimensional coordinate <code>(Dense, CUDA)</code></strong>. At the source level you still see a single <code>CUDA</code> key, but the bitmap underneath encodes it as "the Dense functionality bit + the CUDA backend bit both set to 1." Adding a new backend (<code>HPU</code>)? Just add a bit to <code>BackendComponent</code>, and the six per-backend functionalities <strong>automatically</strong> define six new combined keys for it, with no enum changes needed.</p>
 
 <div class="example">
 <span class="label">Example 1.4</span>
-To add a Habana (HPU) backend "sparse" implementation to PyTorch: add an <code>HPU</code> bit to <code>BackendComponent</code> → instantly the combined key <code>(Sparse, HPU)</code> exists, and you can register the sparse kernel with <code>TORCH_LIBRARY_IMPL(aten, SparseHPU, m)</code>. Neither <code>SparseHPU</code> nor <code>AutogradHPU</code> needs to be added to <code>enum DispatchKey</code> — both are combined runtime keys.
+To add a Habana (HPU) backend "sparse" implementation to PyTorch: add an <code>HPU</code> bit to <code>BackendComponent</code> → instantly the combined key <code>(Sparse, HPU)</code> exists, and you can register the sparse kernel with <code>TORCH_LIBRARY_IMPL(aten, SparseHPU, m)</code>. Neither <code>SparseHPU</code> nor <code>AutogradHPU</code> needs to be added to <code>enum DispatchKey</code>; both are combined runtime keys.
 </div>
 
 <div class="aside">
-<span class="label">Aside 1.4 — drift warning</span>
-ezyang's 2019 <a href="https://blog.ezyang.com/2019/05/pytorch-internals/">PyTorch internals</a> does not have the BackendComponent layer, and neither does the 2020 dispatcher article. The <strong>two-dimensional split described in this section is the post-2022 mechanism</strong>; when reading older articles, note that this has shifted — they treat <code>SparseCUDA</code> as a concrete enum value, whereas in today's code it is the combination <code>(Sparse, CUDABit)</code>.
+<span class="label">Aside 1.4: drift warning</span>
+ezyang's 2019 <a href="https://blog.ezyang.com/2019/05/pytorch-internals/">PyTorch internals</a> does not have the BackendComponent layer, and neither does the 2020 dispatcher article. The <strong>two-dimensional split described in this section is the post-2022 mechanism</strong>; when reading older articles, note that this has shifted: they treat <code>SparseCUDA</code> as a concrete enum value, whereas in today's code it is the combination <code>(Sparse, CUDABit)</code>.
 </div>
 
 <h3 id="sec1-5">1.5 DispatchKeySet: a 64-bit bitmap</h3>
 
-<p>Now we have <code>DispatchKey</code> (~60 functionalities) and <code>BackendComponent</code> (16 backends). Pack them all into a <strong>64-bit integer</strong> (<code>uint64_t</code>), and you get <code>DispatchKeySet</code>. It is the core data structure of the dispatcher — what the dispatcher receives at every op call is exactly this 64-bit integer.</p>
+<p>Now we have <code>DispatchKey</code> (~60 functionalities) and <code>BackendComponent</code> (16 backends). Pack them all into a <strong>64-bit integer</strong> (<code>uint64_t</code>), and you get <code>DispatchKeySet</code>. It is the core data structure of the dispatcher: what the dispatcher receives at every op call is exactly this 64-bit integer.</p>
 
 <p>The bitmap layout (per the class comments in <a href="https://github.com/pytorch/pytorch/blob/main/c10/core/DispatchKeySet.h">DispatchKeySet.h</a>):</p>
 
@@ -2447,7 +2319,7 @@ ezyang's 2019 <a href="https://blog.ezyang.com/2019/05/pytorch-internals/">PyTor
   </g>
 
   <!-- Example annotated -->
-  <text x="40" y="200" font-weight="600">Example: a CUDA tensor, requires_grad=True, autocast on — the bitmap looks roughly like:</text>
+  <text x="40" y="200" font-weight="600">Example: a CUDA tensor, requires_grad=True, autocast on. The bitmap looks roughly like:</text>
   <g font-family="monospace" font-size="10">
     <text x="40" y="223" fill="#1f8a4d">CUDABit=1</text>
     <text x="40" y="238" font-size="9" fill="#666">(bit 1 set in the BackendComponent region)</text>
@@ -2466,12 +2338,12 @@ ezyang's 2019 <a href="https://blog.ezyang.com/2019/05/pytorch-internals/">PyTor
 <p>Where does this 64-bit integer come from? <strong>The union of three sources</strong>:</p>
 
 <ol>
-  <li><strong>The union of all input tensors' <code>TensorImpl::key_set_</code>.</strong> Each tensor's <code>TensorImpl</code> caches a <code>DispatchKeySet</code> that records "I'm on CUDA" + "I requires_grad" and so on. The dispatcher or's together the key_sets of all argument tensors — this is what implements "multiple dispatch" (any input being on CUDA activates the CUDA key).</li>
+  <li><strong>The union of all input tensors' <code>TensorImpl::key_set_</code>.</strong> Each tensor's <code>TensorImpl</code> caches a <code>DispatchKeySet</code> that records "I'm on CUDA" + "I requires_grad" and so on. The dispatcher or's together the key_sets of all argument tensors. This is what implements "multiple dispatch" (any input being on CUDA activates the CUDA key).</li>
   <li><strong>TLS local include</strong> (thread-local "add"): pushed by mode guards. For example, entering <code>with torch.autocast('cuda'):</code>, the with block's implementation pushes the <code>AutocastCUDA</code> bit into TLS; on every op call the dispatcher or's the TLS include into the bitmap.</li>
-  <li><strong>TLS local exclude</strong> (thread-local "remove"): used for redispatch. Inside an autograd kernel, <code>at::AutoDispatchBelowAutograd guard;</code> — this RAII object stuffs every autograd bit into TLS exclude. The dispatcher subtracts exclude from the bitmap, so the highest bit "naturally" falls to the next layer.</li>
+  <li><strong>TLS local exclude</strong> (thread-local "remove"): used for redispatch. Inside an autograd kernel, <code>at::AutoDispatchBelowAutograd guard;</code> stuffs every autograd bit into TLS exclude via an RAII object. The dispatcher subtracts exclude from the bitmap, so the highest bit "naturally" falls to the next layer.</li>
 </ol>
 
-<p>A fourth hidden factor: <strong>fallthrough mask</strong>. For each op, at registration time the dispatcher precomputes "which keys are fallthrough at this op (no concrete kernel registered, equivalent to 'this layer skips')." These keys are masked out of the bitmap as soon as it enters the dispatcher, achieving O(1) skip. This is the key reason the dispatcher can "support dozens of functionalities by default without paying runtime cost" — if your op doesn't register a kernel for <code>Conjugate</code>, the <code>Conjugate</code> bit is cleared directly by the fallthrough mask.</p>
+<p>A fourth hidden factor: <strong>fallthrough mask</strong>. For each op, at registration time the dispatcher precomputes "which keys are fallthrough at this op (no concrete kernel registered, equivalent to 'this layer skips')." These keys are masked out of the bitmap as soon as it enters the dispatcher, achieving O(1) skip. This is the key reason the dispatcher can "support dozens of functionalities by default without paying runtime cost": if your op doesn't register a kernel for <code>Conjugate</code>, the <code>Conjugate</code> bit is cleared directly by the fallthrough mask.</p>
 
 <p>Concretely, the core line lives in <a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/core/dispatch/DispatchKeyExtractor.h"><code>DispatchKeyExtractor.h:23-44</code></a>:</p>
 
@@ -2484,7 +2356,7 @@ inline DispatchKeySet computeDispatchKeySet(
   <span class="cm">//        ↑ add include  ↑ subtract exclude  ↑ apply fallthrough mask</span>
 }</pre>
 
-<p>That's all the "magic" of §1.5: three bit operations producing a final bitmap. Then <code>lookup()</code> finds the highest bit in this bitmap — unpacked in §1.6.</p>
+<p>That's all the "magic" of §1.5: three bit operations producing a final bitmap. Then <code>lookup()</code> finds the highest bit in this bitmap, unpacked in §1.6.</p>
 
 <div class="example">
 <span class="label">Example 1.5</span>
@@ -2493,12 +2365,12 @@ Let <code>x</code> be a CUDA fp32 tensor with <code>requires_grad=True</code>, a
 <strong>2.</strong> The autocast context pushed <code>AutocastCUDA</code> into TLS include.<br>
 <strong>3.</strong> No exclude, and no fallthrough mask removes these bits.<br>
 <strong>4.</strong> The final bitmap, after combining functionality + backend, is equivalent to the runtime key set <code>{AutocastCUDA, AutogradCUDA, CUDA}</code>.<br><br>
-Compare with the "peeling the onion" diagram in §1.2 — this is exactly that diagram's initial bitmap.
+Compare with the "peeling the onion" diagram in §1.2: this is exactly that diagram's initial bitmap.
 </div>
 
 <h3 id="sec1-6">1.6 The priority ladder</h3>
 
-<p>Given a 64-bit bitmap, the dispatcher uses <code>highestPriorityTypeId()</code> to take "the functionality corresponding to the highest 1 bit." "Highest" means the highest-numbered set bit — <strong>functionality bits are arranged by priority, with bit number = priority</strong>.</p>
+<p>Given a 64-bit bitmap, the dispatcher uses <code>highestPriorityTypeId()</code> to take "the functionality corresponding to the highest 1 bit." "Highest" means the highest-numbered set bit: <strong>functionality bits are arranged by priority, with bit number = priority</strong>.</p>
 
 <p>The figure below draws common functionalities by priority, from top (highest) to bottom (lowest):</p>
 
@@ -2549,26 +2421,26 @@ Compare with the "peeling the onion" diagram in §1.2 — this is exactly that d
     <text x="30" y="482">• <strong>Find a key</strong>: take the highest 1 bit → run that layer's kernel; if the kernel body calls at::redispatch(...), it carries a bitmap with the current key cleared, falling naturally to the next layer.</text>
     <text x="30" y="498">• <strong>autograd "above backend" is the soul of the design</strong>: it can intercept inputs before any number-crunching, attach next_edges, build the backward graph, then redispatch to run CUDA.</text>
     <text x="30" y="514">• <strong>autocast is above autograd</strong>: lowering input precision happens before autograd captures inputs, so the backward graph records the lower-precision dtype. This is the code-level translation of §1.1's "order constraint."</text>
-    <text x="30" y="530">• <strong>fallthrough kernel</strong> = "this layer does nothing, mask my bit before dispatching" — O(1) skip; most mode keys default to fallthrough.</text>
+    <text x="30" y="530">• <strong>fallthrough kernel</strong> = "this layer does nothing, mask my bit before dispatching" (O(1) skip); most mode keys default to fallthrough.</text>
   </g>
 </svg>
 </div>
 
-<p>The word "<strong>catchall</strong>" in dispatcher context refers to <strong>the fallback for alias keys</strong>. Alias keys aren't real functionalities — they are convenience syntax for "expand at registration time into multiple concrete keys":</p>
+<p>The word "<strong>catchall</strong>" in dispatcher context refers to <strong>the fallback for alias keys</strong>. Alias keys aren't real functionalities; they are convenience syntax for "expand at registration time into multiple concrete keys":</p>
 
 <ul>
-  <li><strong><code>Autograd</code></strong> (alias) = register to all <code>Autograd&lt;Backend&gt;</code> — when you write <code>TORCH_LIBRARY_IMPL(ns, Autograd, m)</code>, the registration is expanded into registering the same kernel for <code>AutogradCPU</code>, <code>AutogradCUDA</code>, etc.</li>
-  <li><strong><code>CompositeImplicitAutograd</code></strong> (alias) = active on all backends + all autograd keys — suitable for ops written as a composition of <code>at::*</code> calls (the internal ops re-enter the dispatcher and inherit autograd and backend-independence).</li>
-  <li><strong><code>CompositeExplicitAutograd</code></strong> (alias) = all backends (without autograd) — backend-agnostic implementations where the author handles autograd themselves.</li>
+  <li><strong><code>Autograd</code></strong> (alias) = register to all <code>Autograd&lt;Backend&gt;</code>. When you write <code>TORCH_LIBRARY_IMPL(ns, Autograd, m)</code>, the registration is expanded into registering the same kernel for <code>AutogradCPU</code>, <code>AutogradCUDA</code>, etc.</li>
+  <li><strong><code>CompositeImplicitAutograd</code></strong> (alias) = active on all backends + all autograd keys. Suitable for ops written as a composition of <code>at::*</code> calls (the internal ops re-enter the dispatcher and inherit autograd and backend-independence).</li>
+  <li><strong><code>CompositeExplicitAutograd</code></strong> (alias) = all backends (without autograd). Backend-agnostic implementations where the author handles autograd themselves.</li>
 </ul>
 
 <p>These three aliases give PyTorch a concise registration syntax for "one implementation covers all backends." Mechanically they are <strong>syntactic sugar for batched <code>m.impl</code></strong>. At runtime the dispatcher only sees concrete keys like <code>AutogradCUDA</code> or <code>CUDA</code>, never the <code>Autograd</code> alias itself.</p>
 
 <h3 id="sec1-7">1.7 redispatch: cycle-free inter-layer recursion</h3>
 
-<p>In §1.2 we built the mental model of "peeling the onion" — each layer does its work, masks itself, and lets the next layer take over. This section looks at how that is actually implemented.</p>
+<p>In §1.2 we built the mental model of "peeling the onion": each layer does its work, masks itself, and lets the next layer take over. This section looks at how that is actually implemented.</p>
 
-<p>The core question: <strong>after the autograd kernel finishes its bit (building grad_fn, recording next_edges), how does it "drop down to the backend kernel"?</strong> Calling <code>at::add(x, y)</code> directly won't work — that re-enters top-level <code>Dispatcher::call</code>, the highest bit is computed again as <code>AutogradCUDA</code>, we re-enter the autograd kernel, and we loop forever.</p>
+<p>The core question: <strong>after the autograd kernel finishes its bit (building grad_fn, recording next_edges), how does it "drop down to the backend kernel"?</strong> Calling <code>at::add(x, y)</code> directly won't work. That re-enters top-level <code>Dispatcher::call</code>, the highest bit is computed again as <code>AutogradCUDA</code>, we re-enter the autograd kernel, and we loop forever.</p>
 
 <p>The answer is <code>Dispatcher::redispatch</code> (<a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/core/dispatch/Dispatcher.h"><code>Dispatcher.h:833-848</code></a>):</p>
 
@@ -2584,13 +2456,13 @@ inline Return Dispatcher::redispatch(
   return kernel.template call&lt;Return, Args...&gt;(op, currentDispatchKeySet, ...);
 }</pre>
 
-<p>Compared to <code>Dispatcher::call</code> (the top-level entry): <code>call</code> recomputes the bitmap (or-ing input tensors' key_set + TLS processing); <code>redispatch</code> uses the bitmap passed in directly. This is <strong>deliberate</strong> — it gives the kernel the flexibility to say "I've decided where to jump next."</p>
+<p>Compared to <code>Dispatcher::call</code> (the top-level entry): <code>call</code> recomputes the bitmap (or-ing input tensors' key_set + TLS processing); <code>redispatch</code> uses the bitmap passed in directly. This is <strong>deliberate</strong>: it gives the kernel the flexibility to say "I've decided where to jump next."</p>
 
 <p>So how does one "mask out the current key"? Inside the autograd kernel, RAII guards flip TLS exclude:</p>
 
 <ul>
   <li><strong><code>at::AutoDispatchBelowAutograd</code></strong> (older name <code>AutoNonVariableTypeMode</code>, often seen in old blog posts): on construction it pushes <strong>every autograd functionality bit</strong> into TLS <code>excluded_</code>; on destruction it restores them. During its lifetime, every op call has its bitmap automatically stripped of the autograd bits.</li>
-  <li><strong><code>at::AutoDispatchBelowADInplaceOrView</code></strong>: additionally pushes <code>ADInplaceOrView</code> into exclude. This is the standard usage of the codegen-emitted <code>VariableType wrapper</code> — the autograd kernel uses it, then redispatch drops directly to the backend.</li>
+  <li><strong><code>at::AutoDispatchBelowADInplaceOrView</code></strong>: additionally pushes <code>ADInplaceOrView</code> into exclude. This is the standard usage of the codegen-emitted <code>VariableType wrapper</code>: the autograd kernel uses it, then redispatch drops directly to the backend.</li>
 </ul>
 
 <p>Stitching these mechanisms together, the skeleton of a real autograd kernel looks like this (simplified from the codegen output in <code>VariableType_*.cpp</code>):</p>
@@ -2621,7 +2493,7 @@ Tensor VariableType::add_Tensor(
 }</pre>
 
 <div class="example">
-<span class="label">Example 1.7 — full redispatch flow</span>
+<span class="label">Example 1.7: full redispatch flow</span>
 Walk through this code for <code>z = x + y</code> (with <code>x, y</code> on CUDA, <code>requires_grad=True</code>):<br><br>
 <strong>(a)</strong> Top-level <code>Dispatcher::call</code> computes the bitmap = <code>{AutogradCUDA, CUDA}</code>, highest bit = <code>AutogradCUDA</code>, jumps to <code>VariableType::add_Tensor</code>.<br>
 <strong>(b)</strong> The function body enters the RAII guard <code>AutoDispatchBelowADInplaceOrView</code>: TLS exclude now contains all autograd bits + the ADInplaceOrView bit.<br>
@@ -2633,14 +2505,14 @@ Walk through this code for <code>z = x + y</code> (with <code>x, y</code> on CUD
 </div>
 
 <div class="callout">
-<strong>Remember this mental model</strong>: the dispatcher is not "one jump," but "every jump may trigger the next jump — the kernel decides whether to redispatch." Mode decorators, autograd, and backends form a chain explicitly driven by redispatch. The chain's order is determined by the bit number of each functionality in the 64-bit bitmap; each layer uses an RAII guard to erase itself so that the next layer naturally becomes the new highest bit.
+<strong>Remember this mental model</strong>: the dispatcher is not "one jump," but "every jump may trigger the next jump"; the kernel decides whether to redispatch. Mode decorators, autograd, and backends form a chain explicitly driven by redispatch. The chain's order is determined by the bit number of each functionality in the 64-bit bitmap; each layer uses an RAII guard to erase itself so that the next layer naturally becomes the new highest bit.
 </div>
 
-<h2 id="sec2">2. Schema: The Operator Type Signature</h2>
+<h2 id="sec2">2. Schema: the operator type signature</h2>
 
-<p>Chapter 1 laid out the runtime mechanics of the dispatcher — but how does the dispatcher know what arguments "<code>aten::add.Tensor</code>" accepts? What it returns? Which arguments are mutated? The answer to these questions is the <strong>schema</strong>.</p>
+<p>Chapter 1 laid out the runtime mechanics of the dispatcher. But how does the dispatcher know what arguments "<code>aten::add.Tensor</code>" accepts? What it returns? Which arguments are mutated? The answer to these questions is the <strong>schema</strong>.</p>
 
-<p>The schema is the operator's <strong>interface contract</strong>. It is not just a string for documentation — it is <strong>read by the dispatcher, autograd, JIT, functionalization, and the Python binding layer at the same time</strong>, and each component extracts the information it cares about: the dispatcher learns how many tensor arguments there are (which determines the keyset); autograd learns which arguments are mutated (which determines view handling); the Python binding layer generates argument-parsing code from it. So getting one character wrong in the schema — for example writing <code>Tensor(a!)</code> as <code>Tensor(a)</code> — is not a documentation error but a <strong>correctness error</strong>: functionalization will believe this argument is not mutated and emit the wrong graph.</p>
+<p>The schema is the operator's <strong>interface contract</strong>. It is not just a string for documentation: it is <strong>read by the dispatcher, autograd, JIT, functionalization, and the Python binding layer at the same time</strong>, and each component extracts the information it cares about. The dispatcher learns how many tensor arguments there are (which determines the keyset); autograd learns which arguments are mutated (which determines view handling); the Python binding layer generates argument-parsing code from it. So getting one character wrong in the schema (for example writing <code>Tensor(a!)</code> as <code>Tensor(a)</code>) is not a documentation error but a <strong>correctness error</strong>: functionalization will believe this argument is not mutated and emit the wrong graph.</p>
 
 <p>This chapter unpacks the schema's string grammar, its variant naming rules, and its concrete realization in yaml.</p>
 
@@ -2660,9 +2532,9 @@ Walk through this code for <code>z = x + y</code> (with <code>x, y</code> on CUD
 <tr><td>1</td><td><code>aten</code></td><td><strong>Namespace.</strong> PyTorch's built-in ops live under <code>aten</code>; custom ops (extensions) live in their own namespace, e.g. <code>myops::foo</code>. The namespace isolates "which ops are findable" and determines which <code>TORCH_LIBRARY*</code> macro to register with (see chapter 3).</td></tr>
 <tr><td>2</td><td><code>::</code></td><td>Namespace separator, just like C++.</td></tr>
 <tr><td>3</td><td><code>add</code></td><td><strong>The op name.</strong> Multiple overloads can share the same name (like C++ function overloading).</td></tr>
-<tr><td>4</td><td><code>.Tensor</code></td><td><strong>The overload name.</strong> This is critical — <code>add</code> has both <code>add.Tensor</code> (adding two tensors) and <code>add.Scalar</code> (adding a tensor and a scalar). Omittable, equivalent to overload name <code>""</code> (empty string). The dispatcher uses the full string "<code>aten::add.Tensor</code>" as the key into the function table.</td></tr>
+<tr><td>4</td><td><code>.Tensor</code></td><td><strong>The overload name.</strong> This is critical: <code>add</code> has both <code>add.Tensor</code> (adding two tensors) and <code>add.Scalar</code> (adding a tensor and a scalar). Omittable, equivalent to overload name <code>""</code> (empty string). The dispatcher uses the full string "<code>aten::add.Tensor</code>" as the key into the function table.</td></tr>
 <tr><td>5</td><td><code>(...)</code></td><td>Argument list.</td></tr>
-<tr><td>6</td><td><code>Tensor self</code></td><td><strong>First positional argument</strong>, of type <code>Tensor</code>, named <code>self</code>. Convention: like Python method's self — autograd treats it as the "main" input.</td></tr>
+<tr><td>6</td><td><code>Tensor self</code></td><td><strong>First positional argument</strong>, of type <code>Tensor</code>, named <code>self</code>. Convention: like Python method's self, autograd treats it as the "main" input.</td></tr>
 <tr><td>7</td><td><code>Tensor other</code></td><td>Second positional argument, type <code>Tensor</code>.</td></tr>
 <tr><td>8</td><td><code>*</code></td><td><strong>Keyword separator.</strong> From here, subsequent arguments <strong>must be passed by keyword</strong> (<code>add(x, y, alpha=2)</code>), not positionally. Exactly the same as Python's <code>*</code> in function definitions.</td></tr>
 <tr><td>9</td><td><code>Scalar alpha=1</code></td><td>Keyword argument, type <code>Scalar</code>, default value <code>1</code>. When Python writes <code>torch.add(x, y, alpha=3)</code>, this value lands here.</td></tr>
@@ -2700,10 +2572,10 @@ Writing <code>(a)</code> as <code>(a!)</code> by mistake makes functionalization
 </div>
 
 <div class="example">
-<span class="label">Example 2.1 — what alias annotations do</span>
+<span class="label">Example 2.1: what alias annotations do</span>
 Look at <code>aten::transpose</code>'s schema:
 <pre class="code">aten::transpose.int(Tensor(a) self, int dim0, int dim1) -&gt; Tensor(a)</pre>
-<code>Tensor(a)</code> appears on both <strong>self</strong> and the return — they share the same memory slot named <code>a</code>. This tells the dispatcher's downstream: the transposed tensor and the original <strong>share storage</strong>; mutating one mutates the other.<br><br>
+<code>Tensor(a)</code> appears on both <strong>self</strong> and the return: they share the same memory slot named <code>a</code>. This tells the dispatcher's downstream: the transposed tensor and the original <strong>share storage</strong>; mutating one mutates the other.<br><br>
 Contrast with <code>aten::clone</code>:
 <pre class="code">aten::clone(Tensor self, *, MemoryFormat? memory_format=None) -&gt; Tensor</pre>
 The return <strong>has no</strong> alias annotation → it's a freshly allocated tensor; modifying it doesn't affect <code>self</code>.
@@ -2713,7 +2585,7 @@ The return <strong>has no</strong> alias annotation → it's a freshly allocated
 
 <h3 id="sec2-2">2.2 Three variants: functional / in-place / out</h3>
 
-<p>Many operators have "side-effect" capabilities (in-place mutation, writing into a preallocated out tensor). PyTorch gives such operators <strong>three schema variants simultaneously</strong> — functionally equivalent but with different interfaces. Look at the three variants of <code>add</code>:</p>
+<p>Many operators have "side-effect" capabilities (in-place mutation, writing into a preallocated out tensor). PyTorch gives such operators <strong>three schema variants simultaneously</strong>, functionally equivalent but with different interfaces. Look at the three variants of <code>add</code>:</p>
 
 <table>
 <thead>
@@ -2738,12 +2610,12 @@ The return <strong>has no</strong> alias annotation → it's a freshly allocated
 
 <ol>
   <li><strong>User-side variation.</strong> Python users want all three styles supported. Without functional, <code>x.add_(y)</code> wouldn't exist.</li>
-  <li><strong>Performance.</strong> Functional always allocates new memory; in-place and out can reuse — and the difference in peak training memory is significant.</li>
+  <li><strong>Performance.</strong> Functional always allocates new memory; in-place and out can reuse, and the difference in peak training memory is significant.</li>
   <li><strong>Autograd behavior.</strong> The three variants are handled completely differently by autograd: functional directly builds grad_fn; in-place must bump the version counter and may reject (<code>RuntimeError: a leaf Variable that requires grad...</code>); out is somewhere in between.</li>
 </ol>
 
 <div class="example">
-<span class="label">Example 2.2 — how the three variants share an implementation</span>
+<span class="label">Example 2.2: how the three variants share an implementation</span>
 Although the schema is in triplicate, the actual math is written once. Under the hood this uses the <strong>structured kernel</strong> pattern:
 <pre class="code">add.out      :  writes into the preallocated out tensor (core implementation)
 add.Tensor   :  allocates a new out → calls add.out → returns out
@@ -2752,11 +2624,11 @@ The "allocate out + call the out version" step is auto-generated by codegen (see
 </div>
 
 <div class="aside">
-<span class="label">Aside 2.2 — the autogen keyword</span>
+<span class="label">Aside 2.2: the autogen keyword</span>
 Some op authors only write the functional variant and tell codegen to "fill in the in-place and out variants by rule":
 <pre class="code">- func: my_op(Tensor self) -&gt; Tensor
   autogen: my_op.out, my_op_</pre>
-On seeing <code>autogen:</code>, codegen automatically generates schema registrations for <code>my_op.out</code> and <code>my_op_</code>, plus the "out wraps functional" implementations — without the author writing a single line. This is very labor-saving for purely functional ops (no in-place complexity).
+On seeing <code>autogen:</code>, codegen automatically generates schema registrations for <code>my_op.out</code> and <code>my_op_</code>, plus the "out wraps functional" implementations, without the author writing a single line. This is very labor-saving for purely functional ops (no in-place complexity).
 </div>
 
 <h3 id="sec2-3">2.3 native_functions.yaml: bulk declaration</h3>
@@ -2802,7 +2674,7 @@ On seeing <code>autogen:</code>, codegen automatically generates schema registra
 <tr><td><code>structured: True</code></td><td>Declares this is a structured kernel (standardized meta + impl two-phase implementation). Appears only on the <code>.out</code> variant</td><td>True / False</td></tr>
 <tr><td><code>structured_delegate</code></td><td>Delegate this variant's implementation to another structured variant. Appears on functional / inplace</td><td><code>add.out</code></td></tr>
 <tr><td><code>structured_inherits</code></td><td>Which base class the structured kernel inherits from (determines output allocation and broadcasting behavior)</td><td><code>TensorIteratorBase</code></td></tr>
-<tr><td><code>ufunc_inner_loop</code></td><td>Declares use of the generic elementwise pipeline — only requires a <code>scalar_t</code>-templated math function in a header; both CPU and CUDA loops are auto-generated</td><td>See above</td></tr>
+<tr><td><code>ufunc_inner_loop</code></td><td>Declares use of the generic elementwise pipeline; only requires a <code>scalar_t</code>-templated math function in a header, with both CPU and CUDA loops auto-generated</td><td>See above</td></tr>
 <tr><td><code>dispatch</code></td><td>Register different implementations for specific backends. <strong>Omitting CPU/CUDA</strong> means ufunc auto-codegen</td><td><code>SparseCUDA: add_sparse_cuda</code></td></tr>
 <tr><td><code>tags</code></td><td>Tags for compile-time passes, e.g. <code>pointwise</code> (fusable), <code>nondeterministic_seeded</code> (for RNG detection)</td><td><code>[core, pointwise]</code></td></tr>
 <tr><td><code>device_check</code></td><td>Whether to check all tensors on the same device at the call site. <code>NoCheck</code> is suitable for TensorIterator-style ops (which handle the cross-device "meta op" case themselves)</td><td><code>NoCheck</code> / <code>ExactSame</code></td></tr>
@@ -2810,7 +2682,7 @@ On seeing <code>autogen:</code>, codegen automatically generates schema registra
 </tbody>
 </table>
 
-<p>Contrast with a <strong>non-structured</strong> simple op — <code>relu</code>:</p>
+<p>Contrast with a <strong>non-structured</strong> simple op, <code>relu</code>:</p>
 
 <pre class="code"><span class="cm"># native_functions.yaml — relu (non-structured, direct dispatch)</span>
 - func: relu(Tensor self) -&gt; Tensor
@@ -2826,7 +2698,7 @@ On seeing <code>autogen:</code>, codegen automatically generates schema registra
 <p>Here <code>dispatch: CPU, CUDA: relu</code> binds the same name <code>at::native::relu</code> to both <code>(Dense, CPU)</code> and <code>(Dense, CUDA)</code>. The actual implementations are two overloads in two files (<code>aten/src/ATen/native/Activation.cpp</code> for CPU, <code>aten/src/ATen/native/cuda/Activation.cu</code> for CUDA), with the linker deciding by device. This <strong>non-structured</strong> style is fine for simple operators, but loses the convenience of ufunc auto-generation.</p>
 
 <div class="aside">
-<span class="label">Aside 2.3 — why structured exists</span>
+<span class="label">Aside 2.3: why structured exists</span>
 In early PyTorch (pre-2018), each operator's three variants (functional / inplace / out) had to be written by hand; vast amounts of code looked like this: <code>add</code>'s functional allocates output → calls add_kernel; <code>add_</code> treats self as output → calls add_kernel; <code>add_out</code> checks out shape → calls add_kernel. This boilerplate had to be written three times per op, and every new op meant ~100 lines of glue.<br><br>
 Introduced post-2020, the <strong>structured kernel</strong> pattern standardizes this glue: the author writes the actual math (<code>impl()</code>) only on the <code>.out</code> variant, and the meta phase (computing output shape/dtype) in <code>meta()</code>. Codegen auto-generates the functional and inplace variants as wrappers of out. A new op then needs only ~10 lines of yaml + a single impl, cutting code volume to one-fifth of before.
 </div>
@@ -2847,13 +2719,13 @@ Introduced post-2020, the <strong>structured kernel</strong> pattern standardize
 <p>Reading it field by field:</p>
 
 <ul>
-  <li><code>name:</code> must exactly match the schema in <code>native_functions.yaml</code> — this is the "primary key" matching the two sides.</li>
+  <li><code>name:</code> must exactly match the schema in <code>native_functions.yaml</code>: this is the "primary key" matching the two sides.</li>
   <li><code>self:</code>, <code>other:</code> are the <strong>input argument names</strong>; the value is an expression describing "if this input needs a gradient, the gradient = what." For example, <code>add</code>'s gradient for <code>other</code> = <code>grad * alpha.conj()</code> (wrapped with <code>maybe_multiply</code> as an optimization that skips the multiplication when <code>alpha == 1</code>). <code>grad</code> is a magic variable meaning "the upstream gradient passed in by this backward."</li>
   <li><code>result:</code> is the <strong>forward-mode (jvp / tangent) formula</strong>, used by <code>torch.func.jvp</code>. <code>self_t</code>, <code>other_t</code> are also magic variables meaning "the tangent vector of input self." If jvp support isn't needed, this line can be omitted.</li>
   <li><code>auto_element_wise</code> is a special tag that tells codegen "this is an elementwise op; auto-derive the jvp formula by rule."</li>
 </ul>
 
-<p>These formulas are not Python — they are a <strong>restricted DSL</strong> consumed by codegen — it supports calling other <code>at::*</code> ops (like <code>threshold_backward</code>), accessing input attributes (like <code>self.scalar_type()</code>), and using predefined variables like <code>grad</code>/<code>result</code>/<code>self_t</code>.</p>
+<p>These formulas are not Python; they are a <strong>restricted DSL</strong> consumed by codegen. It supports calling other <code>at::*</code> ops (like <code>threshold_backward</code>), accessing input attributes (like <code>self.scalar_type()</code>), and using predefined variables like <code>grad</code>/<code>result</code>/<code>self_t</code>.</p>
 
 <p>How does codegen use it? For each differentiable op, it generates two things:</p>
 
@@ -2863,7 +2735,7 @@ Introduced post-2020, the <strong>structured kernel</strong> pattern standardize
 </ol>
 
 <div class="example">
-<span class="label">Example 2.4 — the correspondence between derivatives.yaml and generated code</span>
+<span class="label">Example 2.4: the correspondence between derivatives.yaml and generated code</span>
 The backward formula for <code>add</code> in <code>derivatives.yaml</code>:
 <pre class="code">other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))</pre>
 gets translated by codegen into this code inside <code>AddBackward0::apply()</code>:
@@ -2878,16 +2750,16 @@ Almost one-to-one (the only addition is a "do we need this gradient" guard, sinc
 
 <div class="callout">
 <strong>Three mental models to take from this chapter</strong>:<br>
-① The schema is a contract <strong>read by many parties</strong> — dispatcher, autograd, JIT, functionalization, Python bindings all extract different information from the same string.<br>
-② The <code>(a!)</code> alias annotation is the "most dangerous" marker in the schema — getting it wrong directly affects the correctness of functionalization, autograd, and alias analysis.<br>
+① The schema is a contract <strong>read by many parties</strong>: dispatcher, autograd, JIT, functionalization, Python bindings all extract different information from the same string.<br>
+② The <code>(a!)</code> alias annotation is the "most dangerous" marker in the schema: getting it wrong directly affects the correctness of functionalization, autograd, and alias analysis.<br>
 ③ <code>native_functions.yaml</code> + <code>derivatives.yaml</code> are the <strong>input sources for all codegen</strong>; every generated C++ file that follows (dispatcher registration, autograd wrapper, Python bindings) sprouts from these two files.
 </div>
 
-<h2 id="sec3">3. The C++ Registration Interface: TORCH_LIBRARY Family</h2>
+<h2 id="sec3">3. The C++ registration interface: the TORCH_LIBRARY family</h2>
 
-<p>Chapter 2 showed that the schema is the contract. This chapter answers <strong>"who executes that contract"</strong> — PyTorch uses a family of macros (all defined in <a href="https://github.com/pytorch/pytorch/blob/main/torch/library.h"><code>torch/library.h</code></a>) to feed "this schema's implementation on backend X is this snippet of C++ code" to the dispatcher.</p>
+<p>Chapter 2 showed that the schema is the contract. This chapter answers <strong>"who executes that contract"</strong>: PyTorch uses a family of macros (all defined in <a href="https://github.com/pytorch/pytorch/blob/main/torch/library.h"><code>torch/library.h</code></a>) to feed "this schema's implementation on backend X is this snippet of C++ code" to the dispatcher.</p>
 
-<p>The family looks elaborate — <code>TORCH_LIBRARY</code>, <code>TORCH_LIBRARY_FRAGMENT</code>, <code>TORCH_LIBRARY_IMPL</code>, <code>m.def</code>, <code>m.impl</code>, <code>m.fallback</code>, <code>TORCH_FN</code>, <code>makeFromBoxedFunction</code> ...... but <strong>they all share the same underlying pattern</strong>:</p>
+<p>The family looks elaborate (<code>TORCH_LIBRARY</code>, <code>TORCH_LIBRARY_FRAGMENT</code>, <code>TORCH_LIBRARY_IMPL</code>, <code>m.def</code>, <code>m.impl</code>, <code>m.fallback</code>, <code>TORCH_FN</code>, <code>makeFromBoxedFunction</code> ......) but <strong>they all share the same underlying pattern</strong>:</p>
 
 <div class="callout">
 "<strong>Use a file-static object's constructor to stuff information into the global dispatcher before <code>main()</code>.</strong>"
@@ -2897,7 +2769,7 @@ Almost one-to-one (the only addition is a "do we need this gradient" guard, sinc
 
 <h3 id="sec3-1">3.1 The three identities of Library: DEF / FRAGMENT / IMPL</h3>
 
-<p>The core data structure for registration is the <code>torch::Library</code> object. Every time you write a <code>TORCH_LIBRARY*</code> macro, the expansion constructs a <code>Library</code> instance — but it has <strong>three identities</strong> (<a href="https://github.com/pytorch/pytorch/blob/main/torch/library.h"><code>torch/library.h:551-553</code></a>):</p>
+<p>The core data structure for registration is the <code>torch::Library</code> object. Every time you write a <code>TORCH_LIBRARY*</code> macro, the expansion constructs a <code>Library</code> instance, but it has <strong>three identities</strong> (<a href="https://github.com/pytorch/pytorch/blob/main/torch/library.h"><code>torch/library.h:551-553</code></a>):</p>
 
 <pre class="code"><span class="cm">// torch/library.h</span>
 class Library {
@@ -2920,16 +2792,16 @@ class Library {
 </table>
 
 <div class="example">
-<span class="label">Example 3.1 — practical uses for the three Kinds</span>
+<span class="label">Example 3.1: practical uses for the three Kinds</span>
 You write a PyTorch extension <code>my_extension</code> that registers an operator <code>myops::custom_relu</code> with implementations on both CPU and CUDA. The three .cpp files split as follows:<br><br>
 <code>register_schema.cpp</code> uses <code>TORCH_LIBRARY(myops, m)</code> → <strong>DEF</strong>, declares the schema. With this line in place, the <code>myops</code> namespace is "opened."<br>
 <code>kernel_cpu.cpp</code> uses <code>TORCH_LIBRARY_IMPL(myops, CPU, m)</code> → <strong>IMPL</strong>, registers the CPU implementation.<br>
 <code>kernel_cuda.cu</code> uses <code>TORCH_LIBRARY_IMPL(myops, CUDA, m)</code> → <strong>IMPL</strong>, registers the CUDA implementation.<br><br>
-If you write schema and CPU kernel in the same file (<code>TORCH_LIBRARY(myops, m) { m.def(...); m.impl(...); }</code>), that's also valid — but <code>m.impl</code> inside a DEF block can't specify a DispatchKey, and is treated as a "<strong>catch-all kernel</strong>" (all keys go through it). So for multi-backend scenarios, you <strong>must</strong> use IMPL to register different backends separately.
+If you write schema and CPU kernel in the same file (<code>TORCH_LIBRARY(myops, m) { m.def(...); m.impl(...); }</code>), that's also valid, but <code>m.impl</code> inside a DEF block can't specify a DispatchKey, and is treated as a "<strong>catch-all kernel</strong>" (all keys go through it). So for multi-backend scenarios, you <strong>must</strong> use IMPL to register different backends separately.
 </div>
 
 <div class="aside">
-<span class="label">Aside 3.1 — why not a single unified macro</span>
+<span class="label">Aside 3.1: why not a single unified macro</span>
 You might ask: since they all construct <code>Library</code> objects underneath, why not merge into a single <code>TORCH_LIBRARY(ns, kind, key, m)</code>?<br><br>
 Two reasons:<br>
 <strong>① Static validation</strong>. <code>DEF</code> is not allowed to specify a DispatchKey (it declares the schema, doesn't attach a kernel); <code>IMPL</code> must specify a DispatchKey. Splitting into three independent macros lets compile-time prevent argument confusion (and lets IDEs autocomplete more accurately).<br>
@@ -2953,17 +2825,17 @@ Two reasons:<br>
 <p>It looks scary, but breaks down into <strong>three declarations</strong>:</p>
 
 <ol>
-  <li><strong>Line 1</strong>: <code>static void TORCH_LIBRARY_init_##ns(torch::Library&amp;);</code> — forward-declares a function (<code>##ns</code> is token pasting; if <code>ns=myops</code>, this becomes <code>TORCH_LIBRARY_init_myops</code>).</li>
-  <li><strong>Lines 2–5</strong>: <code>static const torch::detail::TorchLibraryInit TORCH_LIBRARY_static_init_##ns(DEF, ...);</code> — constructs a file-static object. Its constructor receives:<br>
+  <li><strong>Line 1</strong>: <code>static void TORCH_LIBRARY_init_##ns(torch::Library&amp;);</code> forward-declares a function (<code>##ns</code> is token pasting; if <code>ns=myops</code>, this becomes <code>TORCH_LIBRARY_init_myops</code>).</li>
+  <li><strong>Lines 2 to 5</strong>: <code>static const torch::detail::TorchLibraryInit TORCH_LIBRARY_static_init_##ns(DEF, ...);</code> constructs a file-static object. Its constructor receives:<br>
     <ul>
-      <li><code>torch::Library::DEF</code> — identity marker; this is a DEF, not an IMPL.</li>
-      <li><code>&amp;TORCH_LIBRARY_init_##ns</code> — the user-provided "registration function" (declared on line 1); the constructor calls it.</li>
-      <li><code>C10_STRINGIZE(ns)</code> — namespace string literal ("myops").</li>
-      <li><code>std::nullopt</code> — DispatchKey, empty for DEF.</li>
-      <li><code>__FILE__</code>, <code>__LINE__</code> — location info for errors.</li>
+      <li><code>torch::Library::DEF</code>: identity marker; this is a DEF, not an IMPL.</li>
+      <li><code>&amp;TORCH_LIBRARY_init_##ns</code>: the user-provided "registration function" (declared on line 1); the constructor calls it.</li>
+      <li><code>C10_STRINGIZE(ns)</code>: namespace string literal ("myops").</li>
+      <li><code>std::nullopt</code>: DispatchKey, empty for DEF.</li>
+      <li><code>__FILE__</code>, <code>__LINE__</code>: location info for errors.</li>
     </ul>
   </li>
-  <li><strong>Line 6</strong>: <code>void TORCH_LIBRARY_init_##ns(torch::Library&amp; m)</code> — the function's <strong>definition header</strong>; <strong>the user's <code>{ ... }</code> follows immediately after the macro</strong> as the function body.</li>
+  <li><strong>Line 6</strong>: <code>void TORCH_LIBRARY_init_##ns(torch::Library&amp; m)</code> is the function's <strong>definition header</strong>; <strong>the user's <code>{ ... }</code> follows immediately after the macro</strong> as the function body.</li>
 </ol>
 
 <p>So the user's <code>TORCH_LIBRARY(myops, m) { m.def("..."); }</code> expands to:</p>
@@ -2984,7 +2856,7 @@ void TORCH_LIBRARY_init_myops(torch::Library&amp; m)
 <p>The key magic is <strong>the initialization timing of file-static objects</strong>: the C++ standard guarantees all file-static objects are constructed before main() runs. So by the time PyTorch's main / the user's Python interpreter starts, the constructor of <code>TorchLibraryInit</code> has already run and pushed this schema into the global dispatcher table. <strong>The user's registration code "automatically" takes effect during program startup</strong>, no manual call needed.</p>
 
 <div class="example">
-<span class="label">Example 3.2 — usage</span>
+<span class="label">Example 3.2: usage</span>
 <pre class="code"><span class="cm">// myops_register.cpp</span>
 #include &lt;torch/library.h&gt;
 
@@ -2992,7 +2864,7 @@ TORCH_LIBRARY(myops, m) {
   m.def("custom_add(Tensor self, Tensor other) -&gt; Tensor");
   m.def("custom_relu(Tensor self) -&gt; Tensor");
 }</pre>
-Once this is compiled and linked into the Python process, Python code can call <code>torch.ops.myops.custom_add(...)</code> and <code>torch.ops.myops.custom_relu(...)</code> — even <strong>without any backend kernel registered</strong>. Of course actually calling will produce "no kernel registered" errors; but the schema itself is in the dispatcher.
+Once this is compiled and linked into the Python process, Python code can call <code>torch.ops.myops.custom_add(...)</code> and <code>torch.ops.myops.custom_relu(...)</code>, even <strong>without any backend kernel registered</strong>. Of course actually calling will produce "no kernel registered" errors; but the schema itself is in the dispatcher.
 </div>
 
 <div class="callout warn">
@@ -3018,13 +2890,13 @@ Once this is compiled and linked into the Python process, Python code can call <
 <p>Compared with <code>TORCH_LIBRARY</code>, <strong>only two things differ</strong>:</p>
 
 <ol>
-  <li><strong><code>Kind</code> changes from <code>DEF</code> to <code>FRAGMENT</code></strong> — telling the <code>Library</code> constructor "don't abort on a duplicate namespace."</li>
+  <li><strong><code>Kind</code> changes from <code>DEF</code> to <code>FRAGMENT</code></strong>: telling the <code>Library</code> constructor "don't abort on a duplicate namespace."</li>
   <li><strong>Symbol names are uniquified with <code>C10_UID</code></strong>. <code>C10_UID</code> is PyTorch's internal "line-number + counter" macro, generating a different token at each expansion. So writing five <code>TORCH_LIBRARY_FRAGMENT(aten, m) { ... }</code> blocks in the same TU yields five non-conflicting init function names.</li>
 </ol>
 
 <div class="aside">
-<span class="label">Aside 3.3 — why aten is forced to use FRAGMENT</span>
-Look at the dozens of PyTorch codegen-generated files <code>RegisterCPU.cpp</code> / <code>RegisterCUDA.cpp</code> / <code>RegisterSchema.cpp</code> — <strong>they all start with <code>TORCH_LIBRARY_FRAGMENT(aten, m)</code></strong>, never <code>TORCH_LIBRARY(aten, m)</code>. This is not by accident — torchgen has a special case in <a href="https://github.com/pytorch/pytorch/blob/main/torchgen/gen.py"><code>torchgen/gen.py</code></a>:<br>
+<span class="label">Aside 3.3: why aten is forced to use FRAGMENT</span>
+Look at the dozens of PyTorch codegen-generated files <code>RegisterCPU.cpp</code> / <code>RegisterCUDA.cpp</code> / <code>RegisterSchema.cpp</code>: <strong>they all start with <code>TORCH_LIBRARY_FRAGMENT(aten, m)</code></strong>, never <code>TORCH_LIBRARY(aten, m)</code>. This is not by accident; torchgen has a special case in <a href="https://github.com/pytorch/pytorch/blob/main/torchgen/gen.py"><code>torchgen/gen.py</code></a>:<br>
 <pre class="code"><span class="cm"># torchgen/gen.py around 1761-1776 (simplified)</span>
 if namespace == "aten":
     aten_schema_registrations = schema_registrations_body
@@ -3038,7 +2910,7 @@ The reason is practical: the <code>aten</code> namespace has ~2000 ops, and each
 </div>
 
 <div class="example">
-<span class="label">Example 3.3 — fragments across files in the same namespace</span>
+<span class="label">Example 3.3: fragments across files in the same namespace</span>
 You want to register ops under the <code>myops</code> namespace by module (op family A in a.cpp, op family B in b.cpp):
 <pre class="code"><span class="cm">// myops_a.cpp</span>
 TORCH_LIBRARY_FRAGMENT(myops, m) {
@@ -3051,7 +2923,7 @@ TORCH_LIBRARY_FRAGMENT(myops, m) {
   m.def("op_b1(Tensor x) -&gt; Tensor");
 }</pre>
 Both files coexist; each <code>TorchLibraryInit</code> runs before main and adds the corresponding schemas into the <code>myops</code> namespace.<br><br>
-<strong>But note</strong>: the entire process <strong>still allows only one <code>TORCH_LIBRARY(myops, ...)</code></strong> (DEF). FRAGMENT cannot "open a new namespace itself" — it assumes the namespace has been created by some DEF. With only FRAGMENT and no DEF, you get a "namespace not found" error.<br><br>
+<strong>But note</strong>: the entire process <strong>still allows only one <code>TORCH_LIBRARY(myops, ...)</code></strong> (DEF). FRAGMENT cannot "open a new namespace itself"; it assumes the namespace has been created by some DEF. With only FRAGMENT and no DEF, you get a "namespace not found" error.<br><br>
 For the <code>aten</code> namespace, its DEF is actually created by PyTorch's internal init logic (not from any specific .cpp); so all codegen fragments can simply extend it.
 </div>
 
@@ -3081,7 +2953,7 @@ For the <code>aten</code> namespace, its DEF is actually created by PyTorch's in
 </ul>
 
 <div class="example">
-<span class="label">Example 3.4 — typical usage</span>
+<span class="label">Example 3.4: typical usage</span>
 <pre class="code"><span class="cm">// myops_cpu.cpp — register kernels for myops::* under the CPU key</span>
 TORCH_LIBRARY_IMPL(myops, CPU, m) {
   m.impl("custom_add",  &amp;my_add_cpu);
@@ -3107,7 +2979,7 @@ Once the three files are linked together, the dispatcher table for <code>myops::
 TORCH_LIBRARY_IMPL(_, AutogradCUDA, m) {
   m.fallback(autogradNotImplementedFallback());
 }</pre>
-Meaning: for <strong>any</strong> operator in any namespace, if no explicit kernel is registered for the <code>AutogradCUDA</code> key, this fallback runs. The fallback's behavior is "treat as CompositeImplicitAutograd — let the inner sub-ops walk through the dispatcher themselves" — this is the mechanism implementing PyTorch's "operators without explicit backward formulas can still auto-differentiate."
+Meaning: for <strong>any</strong> operator in any namespace, if no explicit kernel is registered for the <code>AutogradCUDA</code> key, this fallback runs. The fallback's behavior is "treat as CompositeImplicitAutograd, letting the inner sub-ops walk through the dispatcher themselves." This is the mechanism implementing PyTorch's "operators without explicit backward formulas can still auto-differentiate."
 </div>
 
 <h3 id="sec3-5">3.5 m.def vs m.impl semantics</h3>
@@ -3123,7 +2995,7 @@ Meaning: for <strong>any</strong> operator in any namespace, if no explicit kern
 <tr><td><strong>Purpose</strong></td><td><strong>Declare the schema</strong>: register a type signature for a new op name, putting it into the dispatcher table</td><td><strong>Attach a kernel to a declared op</strong>: register a concrete function pointer at <strong>the current block's DispatchKey</strong></td></tr>
 <tr><td><strong>Key argument</strong></td><td>The schema string (<code>"custom_add(Tensor self, Tensor other) -&gt; Tensor"</code>)</td><td>Op name (<code>"custom_add"</code>) + function pointer (<code>&amp;my_kernel</code>)</td></tr>
 <tr><td><strong>Schema validation</strong></td><td>The first <code>def</code> locks the signature; later ones cannot change it</td><td>The kernel's signature must be compatible with the parsed schema (otherwise registration aborts)</td></tr>
-<tr><td><strong>Can it also attach a kernel</strong></td><td>Yes (<code>m.def("schema", &amp;kernel)</code>), but this kernel has no DispatchKey and is treated as "catch-all" — all keys go through it</td><td>By design, attaches a kernel for the specific key</td></tr>
+<tr><td><strong>Can it also attach a kernel</strong></td><td>Yes (<code>m.def("schema", &amp;kernel)</code>), but this kernel has no DispatchKey and is treated as "catch-all" (all keys go through it)</td><td>By design, attaches a kernel for the specific key</td></tr>
 </tbody>
 </table>
 
@@ -3139,7 +3011,7 @@ m.impl("op_name", TORCH_FN(cpu_kernel));
 m.impl("op_name", torch::CppFunction::makeFromBoxedFunction&lt;&amp;boxed_fn&gt;());</pre>
 
 <div class="example">
-<span class="label">Example 3.5 — schema type incompatibility</span>
+<span class="label">Example 3.5: schema type incompatibility</span>
 You declare:
 <pre class="code">m.def("custom_add(Tensor self, Tensor other) -&gt; Tensor");</pre>
 Then register a kernel:
@@ -3162,17 +3034,17 @@ Tensor(const Tensor&amp;, int) — but the schema declares type Tensor(Tensor, T
 <tbody>
 <tr><td><strong>Function signature</strong></td><td>Native C++: <code>Tensor (*)(const Tensor&amp;, const Tensor&amp;, Scalar)</code></td><td>Uniform: <code>void (*)(const OperatorHandle&amp;, DispatchKeySet, Stack*)</code></td></tr>
 <tr><td><strong>Argument passing</strong></td><td>Templates expand directly, zero-copy, no type erasure</td><td>All arguments packed as <code>IValue</code>s pushed onto the <code>Stack</code> (<code>std::vector&lt;IValue&gt;</code>); the kernel pops them itself</td></tr>
-<tr><td><strong>Performance</strong></td><td>~5–10 ns per call</td><td>~50–100 ns extra (boxing/unboxing overhead)</td></tr>
-<tr><td><strong>When used</strong></td><td>User code, codegen-emitted wrappers — call site knows the signature</td><td>Fallback kernels, functorch interpreter, JIT runtime, profiler hooks — op-agnostic scenarios</td></tr>
+<tr><td><strong>Performance</strong></td><td>~5 to 10 ns per call</td><td>~50 to 100 ns extra (boxing/unboxing overhead)</td></tr>
+<tr><td><strong>When used</strong></td><td>User code, codegen-emitted wrappers (call site knows the signature)</td><td>Fallback kernels, functorch interpreter, JIT runtime, profiler hooks (op-agnostic scenarios)</td></tr>
 </tbody>
 </table>
 
 <p><code>TORCH_FN(fn)</code> uses templates to extract <code>fn</code>'s <strong>literal type signature</strong> (at compile time), enabling <code>KernelFunction</code> to <strong>simultaneously</strong> store the unboxed path (direct call) and the boxed path (auto-generated IValue-wrapped version). If you write <code>m.impl("name", &amp;fn)</code> (no <code>TORCH_FN</code>), the framework can still infer the signature via SFINAE, but the <code>TORCH_FN</code> form is more explicit, and signature errors can be detected at compile time.</p>
 
 <div class="aside">
-<span class="label">Aside 3.6 — the history of m.impl_UNBOXED</span>
-Early PyTorch (pre-2019) had an <code>m.impl_UNBOXED("name", &amp;fn)</code> API, meaning "this kernel can only be boxed-called — don't try to generate the unboxed path." This existed because some kernel signatures couldn't be deduced by templates (e.g. early versions of <code>c10::optional&lt;Tensor&gt;</code>).<br><br>
-This API has since been removed. The equivalent is <code>m.impl("name", torch::CppFunction::makeFromBoxedFunction&lt;&amp;fn&gt;())</code> — explicitly saying "wrap with this boxed function, don't generate the unboxed path." When you see <code>impl_UNBOXED</code> in pre-2020 blog posts, knowing what it maps to today is enough.
+<span class="label">Aside 3.6: the history of m.impl_UNBOXED</span>
+Early PyTorch (pre-2019) had an <code>m.impl_UNBOXED("name", &amp;fn)</code> API, meaning "this kernel can only be boxed-called; don't try to generate the unboxed path." This existed because some kernel signatures couldn't be deduced by templates (e.g. early versions of <code>c10::optional&lt;Tensor&gt;</code>).<br><br>
+This API has since been removed. The equivalent is <code>m.impl("name", torch::CppFunction::makeFromBoxedFunction&lt;&amp;fn&gt;())</code>, explicitly saying "wrap with this boxed function, don't generate the unboxed path." When you see <code>impl_UNBOXED</code> in pre-2020 blog posts, knowing what it maps to today is enough.
 </div>
 
 <h3 id="sec3-7">3.7 Fallback and fallthrough</h3>
@@ -3188,7 +3060,7 @@ This API has since been removed. The equivalent is <code>m.impl("name", torch::C
 m.fallback(torch::CppFunction::makeFromBoxedFunction&lt;&amp;my_boxed_fallback&gt;());
     <span class="cm">// Actually write a boxed kernel as a fallback, e.g. functorch's vmap interpreter</span></pre>
 
-<p><strong>Fallthrough is the key to the dispatcher's efficiency</strong>. It is not "skip at runtime" — it is "<strong>tell the dispatcher at registration time that this key is meaningless here; from now on, mask this bit out of the bitmap</strong>." Cost = 0.</p>
+<p><strong>Fallthrough is the key to the dispatcher's efficiency</strong>. It is not "skip at runtime"; it is "<strong>tell the dispatcher at registration time that this key is meaningless here; from now on, mask this bit out of the bitmap</strong>." Cost = 0.</p>
 
 <p>Typical fallthrough users:</p>
 
@@ -3199,7 +3071,7 @@ m.fallback(torch::CppFunction::makeFromBoxedFunction&lt;&amp;my_boxed_fallback&g
   <li><strong><code>Tracer</code></strong>: fallthrough when not in JIT trace mode.</li>
 </ul>
 
-<p>This is why the dispatcher "supports dozens of functionality layers" on paper — in practice 99% of op calls activate only two or three (backend + maybe autograd), with every other layer fallthrough; after the bitmap is computed, <strong>those bits aren't even set</strong>.</p>
+<p>This is why the dispatcher "supports dozens of functionality layers" on paper while in practice 99% of op calls activate only two or three (backend + maybe autograd), with every other layer fallthrough; after the bitmap is computed, <strong>those bits aren't even set</strong>.</p>
 
 <div class="callout">
 <strong>Design philosophy</strong>: the dispatcher's extensibility comes from "you don't pay for what you don't need." Declaring fallthrough at registration → that layer never slows down your call. When you <strong>do</strong> need a layer (turn on autocast, enable vmap), only that layer activates, others remain fallthrough. This is qualitatively different from "an if/else chain that walks through every check on every call."
@@ -3207,7 +3079,7 @@ m.fallback(torch::CppFunction::makeFromBoxedFunction&lt;&amp;my_boxed_fallback&g
 
 <h3 id="sec3-8">3.8 A complete custom op walkthrough</h3>
 
-<p>Now let's stitch §3.1–3.7 together with a complete custom operator. This is a "custom relu" with implementations on both CPU and CUDA, plus autograd support. It involves four .cpp files:</p>
+<p>Now let's stitch §3.1 through §3.7 together with a complete custom operator. This is a "custom relu" with implementations on both CPU and CUDA, plus autograd support. It involves four .cpp files:</p>
 
 <pre class="code"><span class="cm">// ============ myops_schema.cpp ============</span>
 <span class="cm">// (1) Use TORCH_LIBRARY to open DEF for the myops namespace and declare the schema once</span>
@@ -3232,7 +3104,7 @@ TORCH_LIBRARY_IMPL(myops, CPU, m) {
   m.impl("custom_relu", TORCH_FN(custom_relu_cpu));
 }</pre>
 
-<p><strong>This file:</strong> attaches a concrete kernel for <code>myops::custom_relu</code> under the <code>CPU</code> key (= the two-dimensional <code>(Dense, CPUBit)</code>). <code>TORCH_FN</code> exposes the unboxed signature to the dispatcher for fast runtime. Note the implementation uses <code>at::clamp_min</code> — itself a dispatched op that internally re-enters the dispatcher to call CPU's clamp_min.</p>
+<p><strong>This file:</strong> attaches a concrete kernel for <code>myops::custom_relu</code> under the <code>CPU</code> key (= the two-dimensional <code>(Dense, CPUBit)</code>). <code>TORCH_FN</code> exposes the unboxed signature to the dispatcher for fast runtime. Note the implementation uses <code>at::clamp_min</code>, itself a dispatched op that internally re-enters the dispatcher to call CPU's clamp_min.</p>
 
 <pre class="code"><span class="cm">// ============ myops_cuda.cu ============</span>
 <span class="cm">// (3) CUDA implementation + registration to (myops, CUDA)</span>
@@ -3294,8 +3166,8 @@ TORCH_LIBRARY_IMPL(myops, Autograd, m) {   <span class="cm">// Autograd is an al
 <ul>
   <li><strong><code>torch::autograd::Function</code></strong>: a PyTorch-provided CRTP template base class; subclasses define <code>forward</code> and <code>backward</code>. <code>apply()</code> is the base-class-generated entry that automatically handles grad_fn construction, next_edges collection, and context management.</li>
   <li><strong><code>at::AutoDispatchBelowADInplaceOrView guard;</code></strong>: an RAII object that pushes all autograd functionality bits + the <code>ADInplaceOrView</code> bit into TLS exclude. Throughout the <code>forward</code> body, the dispatcher won't revisit the <code>AutogradCUDA</code> layer.</li>
-  <li><strong>Use <code>c10::Dispatcher::singleton().findSchemaOrThrow</code></strong> to look up the schema, then <code>typed&lt;...&gt;().call(...)</code> to run it. This is PyTorch's recommended form for "calling custom ops in C++" — equivalent to Python's <code>torch.ops.myops.custom_relu(self)</code>.</li>
-  <li><strong>Register to the <code>Autograd</code> alias</strong>: rather than specific <code>AutogradCPU</code>/<code>AutogradCUDA</code>, use the alias <code>Autograd</code> — it auto-expands to every concrete autograd key, covering autograd cases for all backends in one line.</li>
+  <li><strong>Use <code>c10::Dispatcher::singleton().findSchemaOrThrow</code></strong> to look up the schema, then <code>typed&lt;...&gt;().call(...)</code> to run it. This is PyTorch's recommended form for "calling custom ops in C++", equivalent to Python's <code>torch.ops.myops.custom_relu(self)</code>.</li>
+  <li><strong>Register to the <code>Autograd</code> alias</strong>: rather than specific <code>AutogradCPU</code>/<code>AutogradCUDA</code>, use the alias <code>Autograd</code>. It auto-expands to every concrete autograd key, covering autograd cases for all backends in one line.</li>
 </ul>
 
 <p>With the four files linked together, the Python side:</p>
@@ -3313,7 +3185,7 @@ TORCH_LIBRARY_IMPL(myops, Autograd, m) {   <span class="cm">// Autograd is an al
     # → computes gradient → passes through next_edges</span></pre>
 
 <div class="callout">
-<strong>A more economical form — CompositeImplicitAutograd</strong>: since <code>custom_relu</code>'s implementation is entirely a composition of <code>at::*</code> ops (<code>at::clamp_min</code>), and its backward can be derived entirely from <code>clamp_min</code>'s own backward, you can register directly to the alias <code>CompositeImplicitAutograd</code> and <strong>cover all backends and all autograd at once</strong>:
+<strong>A more economical form: CompositeImplicitAutograd</strong>. Since <code>custom_relu</code>'s implementation is entirely a composition of <code>at::*</code> ops (<code>at::clamp_min</code>), and its backward can be derived entirely from <code>clamp_min</code>'s own backward, you can register directly to the alias <code>CompositeImplicitAutograd</code> and <strong>cover all backends and all autograd at once</strong>:
 <pre class="code">at::Tensor custom_relu_composite(const at::Tensor&amp; self) {
   return at::clamp_min(self, 0);
 }
@@ -3321,10 +3193,10 @@ TORCH_LIBRARY_IMPL(myops, Autograd, m) {   <span class="cm">// Autograd is an al
 TORCH_LIBRARY_IMPL(myops, CompositeImplicitAutograd, m) {
   m.impl("custom_relu", &amp;custom_relu_composite);
 }</pre>
-Just one .cpp file — none of the three previous IMPL blocks are needed — because the inner <code>at::clamp_min</code> goes through the dispatcher itself, gaining both backend routing and autograd benefits. <strong>For operators "built from existing ops," this is the preferred form.</strong> Only when your implementation is truly "native" (directly writing a CUDA kernel, not an at::* composition) do you need the full four-file pattern of §3.8.
+Just one .cpp file (none of the three previous IMPL blocks are needed), because the inner <code>at::clamp_min</code> goes through the dispatcher itself, gaining both backend routing and autograd benefits. <strong>For operators "built from existing ops," this is the preferred form.</strong> Only when your implementation is truly "native" (directly writing a CUDA kernel, not an at::* composition) do you need the full four-file pattern of §3.8.
 </div>
 
-<h2 id="sec4">4. Build-Time Automation: torchgen</h2>
+<h2 id="sec4">4. Build-time automation: torchgen</h2>
 
 <p>Chapter 3 showed that a custom operator may require four .cpp files: one schema, one CPU kernel, one CUDA kernel, one autograd wrapper. <strong>For the ATen namespace's ~2000 in-tree operators, writing all of this by hand would mean tens of thousands of lines of repetitive glue code.</strong></p>
 
@@ -3345,32 +3217,32 @@ Just one .cpp file — none of the three previous IMPL blocks are needed — bec
 </tbody>
 </table>
 
-<p>For each op, torchgen joins these three sources: schema from the first, backward formula from the third, tags via the second. Then the <strong>expansion</strong> begins — one yaml entry corresponds to dozens of generated artifacts.</p>
+<p>For each op, torchgen joins these three sources: schema from the first, backward formula from the third, tags via the second. Then the <strong>expansion</strong> begins: one yaml entry corresponds to dozens of generated artifacts.</p>
 
 <h3 id="sec4-2">4.2 Output inventory and corresponding macros</h3>
 
 <p>All generated files land in <code>build/aten/src/ATen/</code> and <code>build/.../torch/csrc/autograd/generated/</code> (exact paths depend on your build dir). Grouped by purpose:</p>
 
-<h4>(a) C++ API layer — called by users and by kernels internally</h4>
+<h4>(a) C++ API layer: called by users and by kernels internally</h4>
 
 <table>
 <thead><tr><th>Artifact</th><th>Content</th></tr></thead>
 <tbody>
 <tr><td><code>Operators.h</code> / <code>.cpp</code></td><td>One <code>at::_ops::add_Tensor::call(...)</code> type-handle per overload; internally fetches the <code>TypedOperatorHandle</code> and calls <code>Dispatcher::call</code></td></tr>
-<tr><td><code>Functions.h</code> / <code>.cpp</code></td><td>User-friendly <code>at::add(self, other, alpha)</code> entry, inline-forwarded to <code>_ops::add_Tensor::call</code> — the form you call when writing C++</td></tr>
+<tr><td><code>Functions.h</code> / <code>.cpp</code></td><td>User-friendly <code>at::add(self, other, alpha)</code> entry, inline-forwarded to <code>_ops::add_Tensor::call</code>; the form you call when writing C++</td></tr>
 <tr><td><code>RedispatchFunctions.h</code></td><td><code>at::redispatch::add(currentKeySet, ...)</code>, used by kernels for redispatch (the <code>at::redispatch::add</code> in §1.7)</td></tr>
 <tr><td><code>TensorBody.h</code></td><td><code>Tensor::add(...)</code> method form (for <code>x.add(y)</code>)</td></tr>
 <tr><td><code>NativeFunctions.h</code></td><td>Declarations of all hand-written <code>at::native::*</code> functions (those op authors write in <code>aten/src/ATen/native/</code>)</td></tr>
 </tbody>
 </table>
 
-<h4>(b) Dispatcher registration — the key artifacts that feed schemas and kernels to the dispatcher</h4>
+<h4>(b) Dispatcher registration: the artifacts that feed schemas and kernels to the dispatcher</h4>
 
 <table>
 <thead><tr><th>Artifact</th><th>Macro used</th><th>What's registered</th></tr></thead>
 <tbody>
 <tr><td><code>RegisterSchema.cpp</code></td><td><code>TORCH_LIBRARY_FRAGMENT(aten, m)</code></td><td>One line per op like <code>m.def("add.Tensor(...) -&gt; Tensor", {at::Tag::core, at::Tag::pointwise});</code></td></tr>
-<tr><td><code>RegisterCPU.cpp</code></td><td><code>TORCH_LIBRARY_IMPL(aten, CPU, m)</code></td><td><code>m.impl("add.out", TORCH_FN(wrapper_CPU_add_out));</code> — wrappers handle device guard and call <code>at::native::*</code></td></tr>
+<tr><td><code>RegisterCPU.cpp</code></td><td><code>TORCH_LIBRARY_IMPL(aten, CPU, m)</code></td><td><code>m.impl("add.out", TORCH_FN(wrapper_CPU_add_out));</code>. Wrappers handle device guard and call <code>at::native::*</code></td></tr>
 <tr><td><code>RegisterCUDA.cpp</code></td><td><code>TORCH_LIBRARY_IMPL(aten, CUDA, m)</code></td><td>Same as above, bound to the CUDA backend</td></tr>
 <tr><td><code>RegisterMPS.cpp</code>, <code>RegisterXPU.cpp</code>, ...</td><td><code>TORCH_LIBRARY_IMPL(aten, MPS/XPU, m)</code></td><td>One per backend</td></tr>
 <tr><td><code>RegisterCompositeImplicitAutograd.cpp</code></td><td><code>TORCH_LIBRARY_IMPL(aten, CompositeImplicitAutograd, m)</code></td><td>Registers the alias's "composite implementations" (can be auto-differentiated by autograd)</td></tr>
@@ -3389,7 +3261,7 @@ Just one .cpp file — none of the three previous IMPL blocks are needed — bec
 </tbody>
 </table>
 
-<h4>(d) Autograd — backward-related</h4>
+<h4>(d) Autograd: backward-related</h4>
 
 <table>
 <thead><tr><th>Artifact</th><th>Macro used</th><th>Content</th></tr></thead>
@@ -3413,7 +3285,7 @@ Just one .cpp file — none of the three previous IMPL blocks are needed — bec
 </table>
 
 <div class="example">
-<span class="label">Example 4.2 — the "expansion ratio" of a yaml entry</span>
+<span class="label">Example 4.2: the "expansion ratio" of a yaml entry</span>
 Take the single yaml entry for <code>add.Tensor</code> (listed in §2.3); after expansion it <strong>simultaneously</strong> affects:<br>
 <strong>① C++ API</strong>: one line each in <code>Functions.h</code> + <code>TensorBody.h</code> for <code>at::add(...)</code> and <code>x.add(y)</code><br>
 <strong>② Operators.h</strong>: adds the <code>at::_ops::add_Tensor</code> type handle<br>
@@ -3427,12 +3299,12 @@ One yaml line → <strong>8 places of generated code</strong>. For ~2000 operato
 </div>
 
 <div class="callout">
-<strong>So the registration macros from Chapter 3 — 99% of their users are torchgen itself.</strong> Regular engineers writing custom ops manually use <code>TORCH_LIBRARY_IMPL</code>; PyTorch's own ops all rely on torchgen auto-generating the same form of <code>TORCH_LIBRARY_FRAGMENT</code> / <code>TORCH_LIBRARY_IMPL</code> calls — both paths share the same macros and the same dispatcher. This means the registration mechanism from Chapter 3 is <strong>identical for internal and external users</strong>.
+<strong>So for the registration macros from Chapter 3, 99% of their users are torchgen itself.</strong> Regular engineers writing custom ops manually use <code>TORCH_LIBRARY_IMPL</code>; PyTorch's own ops all rely on torchgen auto-generating the same form of <code>TORCH_LIBRARY_FRAGMENT</code> / <code>TORCH_LIBRARY_IMPL</code> calls. Both paths share the same macros and the same dispatcher. This means the registration mechanism from Chapter 3 is <strong>identical for internal and external users</strong>.
 </div>
 
 <p>The next chapter walks through this pile of generated artifacts along the actual call path of <code>aten::add</code>, showing <strong>when</strong> each generated piece is hit.</p>
 
-<h2 id="sec5">5. End-to-End Trace: <code>aten::add</code> on CUDA</h2>
+<h2 id="sec5">5. End-to-end trace: <code>aten::add</code> on CUDA</h2>
 
 <p>The previous four chapters built up the dispatcher's conceptual model (§1), the schema's interface contract (§2), the registration macros (§3), and build-time codegen (§4). This chapter stitches them together by picking <strong>one concrete scenario</strong> and walking through the entire call chain:</p>
 
@@ -3443,7 +3315,7 @@ z.sum().backward()</pre>
 We want to answer: what C++ / CUDA functions actually run for these two lines of Python?
 </div>
 
-<p>The call chain enters from Python, descends layer by layer along the dispatcher's priority ladder, and lands at the CUDA elementwise kernel; backward then returns to the autograd engine to call <code>AddBackward0::apply</code>. The nine subsections below proceed in order — each pins one layer, clarifies what it does, which generated artifact it corresponds to, which source line is involved, and what to watch for.</p>
+<p>The call chain enters from Python, descends layer by layer along the dispatcher's priority ladder, and lands at the CUDA elementwise kernel; backward then returns to the autograd engine to call <code>AddBackward0::apply</code>. The nine subsections below proceed in order; each pins one layer, clarifies what it does, which generated artifact it corresponds to, which source line is involved, and what to watch for.</p>
 
 <h3 id="sec5-1">5.1 Starting point: two lines of yaml + the backward formula</h3>
 
@@ -3490,11 +3362,11 @@ We want to answer: what C++ / CUDA functions actually run for these two lines of
 </ol>
 
 <div class="aside">
-<span class="label">Aside 5.2 — why we need this wrap/unwrap layer</span>
+<span class="label">Aside 5.2: why we need this wrap/unwrap layer</span>
 You may ask: since <code>torch.Tensor</code> and <code>at::Tensor</code> are essentially the same object, why not pass it directly?<br><br>
 Two reasons:<br>
 <strong>① Python reference counting vs C++ smart pointers</strong>. Python's <code>torch.Tensor</code> uses CPython refcounting (<code>Py_INCREF</code>/<code>Py_DECREF</code>); C++'s <code>at::Tensor</code> uses <code>intrusive_ptr</code>. The two lifetime-management systems must be converted precisely at the boundary, or you get use-after-free.<br>
-<strong>② Parsing polymorphic Python arguments</strong>. A Python user can pass either <code>(Tensor, Tensor)</code> or <code>(Tensor, Scalar)</code> to the same <code>torch.add</code> — which overload (<code>add.Tensor</code> vs <code>add.Scalar</code>) to pick is decided by <strong>this layer</strong>. The C++ function itself accepts only static signatures, so Python-side overload resolution must happen first.
+<strong>② Parsing polymorphic Python arguments</strong>. A Python user can pass either <code>(Tensor, Tensor)</code> or <code>(Tensor, Scalar)</code> to the same <code>torch.add</code>; which overload (<code>add.Tensor</code> vs <code>add.Scalar</code>) to pick is decided by <strong>this layer</strong>. The C++ function itself accepts only static signatures, so Python-side overload resolution must happen first.
 </div>
 
 <h3 id="sec5-3">5.3 C++ API and Dispatcher::call</h3>
@@ -3514,15 +3386,15 @@ at::Tensor _ops::add_Tensor::call(const at::Tensor&amp; self, const at::Tensor&a
   return op.call(self, other, alpha);                  <span class="cm">// Hand off to Dispatcher::call</span>
 }</pre>
 
-<p>This layer's job is <strong>"find the op's TypedOperatorHandle"</strong>. <code>TypedOperatorHandle</code> is the dispatcher's internal "handle" — it points to <strong>the row</strong> for <code>aten::add.Tensor</code> in the dispatcher's table. The <code>static</code> ensures this lookup runs only on the first call; subsequent calls hit the cache.</p>
+<p>This layer's job is <strong>"find the op's TypedOperatorHandle"</strong>. <code>TypedOperatorHandle</code> is the dispatcher's internal "handle": it points to <strong>the row</strong> for <code>aten::add.Tensor</code> in the dispatcher's table. The <code>static</code> ensures this lookup runs only on the first call; subsequent calls hit the cache.</p>
 
-<p><code>op.call</code> eventually invokes <code>c10::Dispatcher::call</code> (<a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/core/dispatch/Dispatcher.h"><code>Dispatcher.h:774-828</code></a>) — the dispatcher entry from §1.4. From this point on, we officially step into the dispatcher's bitmap magic.</p>
+<p><code>op.call</code> eventually invokes <code>c10::Dispatcher::call</code> (<a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/core/dispatch/Dispatcher.h"><code>Dispatcher.h:774-828</code></a>), the dispatcher entry from §1.4. From this point on, we officially step into the dispatcher's bitmap magic.</p>
 
 <div class="example">
-<span class="label">Example 5.3 — why this layer exists separately</span>
+<span class="label">Example 5.3: why this layer exists separately</span>
 You may ask: since <code>at::add</code> is just a forwarder, why not have <code>THPVariable_add</code> call <code>Dispatcher::call</code> directly?<br><br>
 Two reasons:<br>
-<strong>① It provides a user-friendly C++ API.</strong> Third-party C++ code doesn't want to know dispatcher internals — it just wants to write <code>at::add(x, y)</code>.<br>
+<strong>① It provides a user-friendly C++ API.</strong> Third-party C++ code doesn't want to know dispatcher internals: it just wants to write <code>at::add(x, y)</code>.<br>
 <strong>② It hides the schema-lookup cache.</strong> <code>at::_ops::add_Tensor::call</code> looks up the schema on the first call (<code>create_add_Tensor_typed_handle()</code>) and caches it. If every call went straight to <code>Dispatcher::call</code> and had to look up the schema each time, performance would degrade significantly.
 </div>
 
@@ -3541,8 +3413,8 @@ return kernel.template call&lt;Return, Args...&gt;(op, dispatchKeySet, ...);</pr
 
 <ol>
   <li><strong>Initial bitmap value</strong>: each input tensor's <code>TensorImpl::key_set_</code> (<code>self</code>, <code>other</code>). Both are CUDA tensors that require grad, so <code>key_set_ = {AutogradFunctionality, Dense, CUDABit}</code> (using §1.4's two-dim split). Or'ing the two tensors keeps the same three bits set. The runtime translation is <code>{AutogradCUDA, CUDA}</code>.</li>
-  <li><strong>TLS local include</strong>: autocast off, not in functorch — include is empty.</li>
-  <li><strong>TLS local exclude</strong>: first time entering the dispatcher — exclude is empty too.</li>
+  <li><strong>TLS local include</strong>: autocast off, not in functorch, so include is empty.</li>
+  <li><strong>TLS local exclude</strong>: first time entering the dispatcher, so exclude is empty too.</li>
   <li><strong>Fallthrough mask</strong>: each op's dispatch table precomputed its fallthrough_mask at registration. For <code>add</code>, bits like <code>BackendSelect</code>, <code>Named</code>, <code>Conjugate</code> are masked out. The bitmap stays at <code>{AutogradCUDA, CUDA}</code>.</li>
   <li><strong>highestPriorityTypeId()</strong>: among the remaining bits, the highest functionality bit is <code>AutogradFunctionality</code> (corresponding to runtime <code>AutogradCUDA</code>), since it sits after <code>Dense</code> in the enum (a higher bit).</li>
 </ol>
@@ -3596,14 +3468,14 @@ TORCH_LIBRARY_IMPL(aten, AutogradCUDA, m) {
 
 <ol>
   <li><strong><code>compute_requires_grad(self, other)</code></strong>: checks whether any input tensor requires_grad and we're not under <code>torch.no_grad()</code>. In our scenario both inputs require grad → true.</li>
-  <li><strong>Build the <code>AddBackward0</code> node</strong>: this is a codegen-generated <code>Node</code> subclass (its <code>apply()</code> shown in §5.8). <code>set_next_edges</code> sets <code>self.grad_fn</code> and <code>other.grad_fn</code> as the <strong>downstream edges</strong> of <code>AddBackward0</code> — backward propagates gradients out along these two edges. <code>alpha</code>, <code>self_scalar_type</code>, <code>other_scalar_type</code> are the "context" needed by the backward formula, stored on the node.</li>
-  <li><strong><code>at::AutoDispatchBelowADInplaceOrView guard;</code></strong>: an RAII object that on construction <strong>modifies TLS</strong> — pushing all autograd functionality bits + the <code>ADInplaceOrView</code> bit into the exclude set. From this line until guard destruction, no dispatcher call goes through the autograd layer.</li>
+  <li><strong>Build the <code>AddBackward0</code> node</strong>: this is a codegen-generated <code>Node</code> subclass (its <code>apply()</code> shown in §5.8). <code>set_next_edges</code> sets <code>self.grad_fn</code> and <code>other.grad_fn</code> as the <strong>downstream edges</strong> of <code>AddBackward0</code>; backward propagates gradients out along these two edges. <code>alpha</code>, <code>self_scalar_type</code>, <code>other_scalar_type</code> are the "context" needed by the backward formula, stored on the node.</li>
+  <li><strong><code>at::AutoDispatchBelowADInplaceOrView guard;</code></strong>: an RAII object that on construction <strong>modifies TLS</strong>, pushing all autograd functionality bits + the <code>ADInplaceOrView</code> bit into the exclude set. From this line until guard destruction, no dispatcher call goes through the autograd layer.</li>
   <li><strong><code>at::redispatch::add(ks &amp; c10::after_autograd_keyset, ...)</code></strong>: <code>at::redispatch::add</code> is another codegen-generated entry (in <code>RedispatchFunctions.h</code>), differing from <code>at::add</code> only in taking an extra <code>DispatchKeySet</code> argument that it forwards to <code>Dispatcher::redispatch</code>. <code>after_autograd_keyset</code> is a precompiled constant mask that "clears all autograd-and-above bits." Equivalently, it <strong>explicitly tells the dispatcher: jump to backend next</strong>.</li>
   <li><strong><code>set_history(result, grad_fn)</code></strong>: sets the freshly computed <code>result</code> tensor's <code>.grad_fn</code> field to the <code>AddBackward0</code> node we built. This way <code>result.backward()</code> will find this node via the autograd engine.</li>
 </ol>
 
 <div class="callout">
-<strong>The key concept of this section</strong>: the autograd kernel <strong>does no arithmetic at all</strong>. It only does three things: ① prepare the backward node; ② hand control off to the backend kernel (via guard + redispatch); ③ attach the result to the backward graph. All <strong>numerical computation</strong> is done by the downstream CUDA kernel. This "wrapper layer" pattern fully decouples autograd from any specific backend — the same autograd wrapper works for CPU, CUDA, MPS, etc.
+<strong>The key concept of this section</strong>: the autograd kernel <strong>does no arithmetic at all</strong>. It only does three things: ① prepare the backward node; ② hand control off to the backend kernel (via guard + redispatch); ③ attach the result to the backward graph. All <strong>numerical computation</strong> is done by the downstream CUDA kernel. This "wrapper layer" pattern fully decouples autograd from any specific backend; the same autograd wrapper works for CPU, CUDA, MPS, etc.
 </div>
 
 <h3 id="sec5-6">5.6 The CUDA backend wrapper</h3>
@@ -3619,7 +3491,7 @@ TORCH_LIBRARY_IMPL(aten, AutogradCUDA, m) {
   ...
 }</pre>
 
-<p>Jump to <code>wrapper_CUDA_add_Tensor</code> (note: this is <strong>not</strong> the real number-crunching CUDA kernel — just functional → out forwarding, because yaml declares <code>structured_delegate: add.out</code>):</p>
+<p>Jump to <code>wrapper_CUDA_add_Tensor</code> (note: this is <strong>not</strong> the real number-crunching CUDA kernel; just functional → out forwarding, because yaml declares <code>structured_delegate: add.out</code>):</p>
 
 <pre class="code">at::Tensor wrapper_CUDA_add_Tensor(
     const at::Tensor&amp; self, const at::Tensor&amp; other, const at::Scalar&amp; alpha) {
@@ -3630,10 +3502,10 @@ TORCH_LIBRARY_IMPL(aten, AutogradCUDA, m) {
   return wrapper_CUDA_add_out_out(self, other, alpha, out);
 }</pre>
 
-<p>So <code>add.Tensor</code> (functional)'s implementation = "allocate out + call <code>add.out</code>." This is exactly how <code>structured_delegate: add.out</code> materializes in codegen — the three variants share the same math, differing only in memory-allocation strategy.</p>
+<p>So <code>add.Tensor</code> (functional)'s implementation = "allocate out + call <code>add.out</code>." This is exactly how <code>structured_delegate: add.out</code> materializes in codegen: the three variants share the same math, differing only in memory-allocation strategy.</p>
 
 <div class="example">
-<span class="label">Example 5.6 — contrast with the in-place variant</span>
+<span class="label">Example 5.6: contrast with the in-place variant</span>
 For <code>add_.Tensor</code> (in-place), codegen produces a similar wrapper, but <strong>without allocating a new out</strong>; instead, <code>self</code> is passed as out to <code>add.out</code>:
 <pre class="code">at::Tensor&amp; wrapper_CUDA_add__Tensor(
     at::Tensor&amp; self, const at::Tensor&amp; other, const at::Scalar&amp; alpha) {
@@ -3681,7 +3553,7 @@ void structured_add_out_out::impl(
 <p>There are <strong>two layers of dispatch</strong> here:</p>
 
 <ol>
-  <li><strong><code>AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4</code></strong>: this is <strong>compile-time dispatch</strong> (<code>aten/src/ATen/Dispatch.h</code>), expanding into a <code>switch (scalar_type)</code> on <code>iter.common_dtype()</code> and instantiating the lambda once per dtype (<code>float</code>, <code>double</code>, <code>int8</code>, <code>kHalf</code>, ...). <strong>This layer does not enter the dispatcher table</strong> — dtype is not a DispatchKey, just a C++ template parameter.</li>
+  <li><strong><code>AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4</code></strong>: this is <strong>compile-time dispatch</strong> (<code>aten/src/ATen/Dispatch.h</code>), expanding into a <code>switch (scalar_type)</code> on <code>iter.common_dtype()</code> and instantiating the lambda once per dtype (<code>float</code>, <code>double</code>, <code>int8</code>, <code>kHalf</code>, ...). <strong>This layer does not enter the dispatcher table</strong>: dtype is not a DispatchKey, just a C++ template parameter.</li>
   <li><strong><code>gpu_kernel(iter, lambda)</code></strong>: this is <strong>launching a CUDA kernel</strong> (<code>aten/src/ATen/native/cuda/CUDALoops.cuh</code>). It takes a <code>TensorIterator</code> (describing the elementwise traversal plan) + a user lambda, and expands into <code>vectorized_elementwise_kernel&lt;...&gt;&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(...)</code>. Each CUDA thread runs the user lambda once.</li>
 </ol>
 
@@ -3698,8 +3570,8 @@ C10_HOST_DEVICE C10_ALWAYS_INLINE T add(T self, T other, T alpha) {
 </div>
 
 <div class="example">
-<span class="label">Example 5.7 — why CPU and CUDA share the same <code>ufunc::add</code></span>
-<code>ufunc/add.h</code> uses the <code>C10_HOST_DEVICE</code> annotation — PyTorch's wrapper for CUDA's <code>__host__ __device__</code> — telling nvcc: "compile this function for both CPU and GPU."<br><br>
+<span class="label">Example 5.7: why CPU and CUDA share the same <code>ufunc::add</code></span>
+<code>ufunc/add.h</code> uses the <code>C10_HOST_DEVICE</code> annotation (PyTorch's wrapper for CUDA's <code>__host__ __device__</code>), telling nvcc: "compile this function for both CPU and GPU."<br><br>
 The CPU-side <code>UfuncCPU_add.cpp</code> includes the same <code>ufunc/add.h</code>, then drives it with SIMD-vectorized <code>vectorized_loop2d</code> rather than <code>gpu_kernel</code>. <strong>The math is written once; CPU/CUDA share the same definition.</strong> Adding a new backend (say MPS) needs only a new "loop driver" (how to run the lambda); the math function is unchanged.
 </div>
 
@@ -3749,22 +3621,22 @@ The CPU-side <code>UfuncCPU_add.cpp</code> includes the same <code>ufunc/add.h</
 <pre class="code">self:  handle_r_to_c(self.scalar_type(),  grad)
 other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))</pre>
 
-<p><strong>This is a character-by-character translation.</strong> Codegen turns the yaml expressions directly into C++ code — that is why the PyTorch team makes the "backward formula DSL" restricted: it must mechanically translate to C++.</p>
+<p><strong>This is a character-by-character translation.</strong> Codegen turns the yaml expressions directly into C++ code. That is why the PyTorch team makes the "backward formula DSL" restricted: it must mechanically translate to C++.</p>
 
 <p>Note a few details:</p>
 
 <ul>
-  <li><strong><code>should_compute_output(i)</code></strong>: the autograd engine knows <strong>which</strong> leaf tensors actually require grad. If <code>other</code> is a constant (doesn't require grad), <code>grad_inputs[1]</code> isn't computed at all — a performance optimization.</li>
-  <li><strong><code>maybe_multiply(grad, alpha.conj())</code></strong>: <code>maybe_multiply</code> is a small optimization — when <code>alpha == 1</code>, it returns <code>grad</code> directly, skipping the float multiply. Codegen automatically inserts this "woodpecker."</li>
+  <li><strong><code>should_compute_output(i)</code></strong>: the autograd engine knows <strong>which</strong> leaf tensors actually require grad. If <code>other</code> is a constant (doesn't require grad), <code>grad_inputs[1]</code> isn't computed at all (a performance optimization).</li>
+  <li><strong><code>maybe_multiply(grad, alpha.conj())</code></strong>: <code>maybe_multiply</code> is a small optimization. When <code>alpha == 1</code>, it returns <code>grad</code> directly, skipping the float multiply. Codegen automatically inserts this "woodpecker."</li>
   <li><strong><code>handle_r_to_c</code></strong>: handles the "real tensor → complex grad" edge case (projects to the real part); for real arithmetic this is essentially a no-op.</li>
-  <li><strong>No <code>at::redispatch</code></strong>: sub-operations in the backward formula (e.g. <code>at::mul</code> inside <code>maybe_multiply</code>) directly use the <strong>top-level <code>at::*</code> API</strong> — they themselves traverse the full dispatcher, gaining "run on CUDA, record in backward graph" capabilities. This means <strong>the backward automatically supports higher-order derivatives</strong>: differentiating <code>AddBackward0::apply</code> a second time has the inner <code>at::mul</code> build a new <code>MulBackward0</code>.</li>
+  <li><strong>No <code>at::redispatch</code></strong>: sub-operations in the backward formula (e.g. <code>at::mul</code> inside <code>maybe_multiply</code>) directly use the <strong>top-level <code>at::*</code> API</strong>. They themselves traverse the full dispatcher, gaining "run on CUDA, record in backward graph" capabilities. This means <strong>the backward automatically supports higher-order derivatives</strong>: differentiating <code>AddBackward0::apply</code> a second time has the inner <code>at::mul</code> build a new <code>MulBackward0</code>.</li>
 </ul>
 
 <p>After returning <code>grad_inputs</code>, the engine propagates them along <code>next_edges</code> to upstream (<code>x.grad_fn</code> and <code>y.grad_fn</code>, if any). If <code>x</code>, <code>y</code> are leaf tensors (no <code>grad_fn</code>), the gradients accumulate directly into <code>x.grad</code>, <code>y.grad</code>. Backward complete.</p>
 
 <h3 id="sec5-9">5.9 The complete call stack at a glance</h3>
 
-<p>Stitching §5.1–5.8 together, the figure below is the "god's-eye view." Forward on the left (blue → orange → red → green), backward on the right (red):</p>
+<p>Stitching §5.1 through §5.8 together, the figure below is the "god's-eye view." Forward on the left (blue → orange → red → green), backward on the right (red):</p>
 
 <div style="overflow-x:auto; margin:1em 0;">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
@@ -3773,7 +3645,7 @@ other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))</p
       <path d="M0,0 L10,5 L0,10 z" fill="#444"/>
     </marker>
   </defs>
-  <text x="600" y="22" text-anchor="middle" font-size="13" font-weight="700">aten::add(x, y) — full call stack (x, y both on CUDA, requires_grad=True)</text>
+  <text x="600" y="22" text-anchor="middle" font-size="13" font-weight="700">aten::add(x, y): full call stack (x, y both on CUDA, requires_grad=True)</text>
 
   <!-- Left column: forward stack -->
   <text x="320" y="50" text-anchor="middle" font-weight="700" fill="#0b6cc4">Forward</text>
@@ -3795,7 +3667,7 @@ other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))</p
 
     <rect x="90"  y="214" width="460" height="38" fill="#fef0d8" stroke="#b96b1a" stroke-width="1.4" rx="4"/>
     <text x="320" y="232" text-anchor="middle" font-weight="600">Dispatcher::call(op, ...)</text>
-    <text x="320" y="246" text-anchor="middle" font-size="10" fill="#444">Dispatcher.h:774 — compute keyset → lookup → kernel.call</text>
+    <text x="320" y="246" text-anchor="middle" font-size="10" fill="#444">Dispatcher.h:774: compute keyset → lookup → kernel.call</text>
 
     <rect x="90"  y="262" width="460" height="48" fill="#fbe5e5" stroke="#cf222e" stroke-width="1.5" rx="4"/>
     <text x="320" y="278" text-anchor="middle" font-weight="700" fill="#cf222e">VariableType::add_Tensor  [AutogradCUDA kernel]</text>
@@ -3818,7 +3690,7 @@ other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))</p
 
     <rect x="90"  y="478" width="460" height="56" fill="#eaf3ec" stroke="#1f8a4d" stroke-width="1.4" rx="4"/>
     <text x="320" y="495" text-anchor="middle" font-weight="600">vectorized_elementwise_kernel&lt;...&gt;&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;</text>
-    <text x="320" y="510" text-anchor="middle" font-size="10" fill="#444">CUDALoops.cuh — each thread runs lambda</text>
+    <text x="320" y="510" text-anchor="middle" font-size="10" fill="#444">CUDALoops.cuh: each thread runs lambda</text>
     <text x="320" y="524" text-anchor="middle" font-family="monospace" font-size="10" fill="#1f6f3a">return self + alpha * other;   // ufunc::add (ufunc/add.h)</text>
   </g>
 
@@ -3842,11 +3714,11 @@ other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))</p
 
     <rect x="670" y="118" width="460" height="38" fill="#fbe5e5" stroke="#cf222e" stroke-width="1.4" rx="4"/>
     <text x="900" y="136" text-anchor="middle" font-weight="600">Engine::execute(...)</text>
-    <text x="900" y="150" text-anchor="middle" font-size="10" fill="#444">torch/csrc/autograd/engine.cpp — topological grad_fn traversal</text>
+    <text x="900" y="150" text-anchor="middle" font-size="10" fill="#444">torch/csrc/autograd/engine.cpp: topological grad_fn traversal</text>
 
     <rect x="670" y="166" width="460" height="38" fill="#fbe5e5" stroke="#cf222e" stroke-width="1.4" rx="4"/>
     <text x="900" y="184" text-anchor="middle" font-weight="600">AddBackward0::apply(grads)</text>
-    <text x="900" y="198" text-anchor="middle" font-size="10" fill="#444">generated/Functions.cpp — templated from derivatives.yaml</text>
+    <text x="900" y="198" text-anchor="middle" font-size="10" fill="#444">generated/Functions.cpp: templated from derivatives.yaml</text>
 
     <rect x="670" y="214" width="460" height="48" fill="#fbe5e5" stroke="#cf222e" stroke-width="1.4" rx="4"/>
     <text x="900" y="230" text-anchor="middle" font-size="10" fill="#444">grad_inputs[0] = handle_r_to_c(self_scalar_type, grad)</text>
@@ -3871,18 +3743,18 @@ other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))</p
     <text x="40" y="578">① Autograd "wraps" backend: the autograd kernel does no math, only builds the graph + redispatches.</text>
     <text x="40" y="594">② Structured kernels split "allocate output + compute" into meta()/impl(), letting the functional / out / inplace schemas share the same math.</text>
     <text x="40" y="610">③ ufunc lets CPU and CUDA share the scalar function (ufunc::add); only gpu_kernel vs CPU loop differs; the same .h is called from both sides.</text>
-    <text x="40" y="626">④ AT_DISPATCH_* leaves the dtype dimension's dispatch to a C++ switch + template instantiation — no dispatcher table entry, since dtype is not a DispatchKey.</text>
-    <text x="40" y="642">⑤ backward has no "AutogradCUDA kernel" layer — grad_fn::apply calls at::* directly (full dispatcher), so grad computation is naturally differentiable (higher-order derivatives).</text>
-    <text x="40" y="660">⑥ There's no if (device == ...) anywhere on the chain — everything is settled at compile/registration time by DispatchKeySet.</text>
-    <text x="40" y="678">⑦ Running the same add(x, y) on CPU with requires_grad=False, the highest-priority bit is CPU, skipping the entire AutogradCUDA wrapper — "you pay only for what you use."</text>
-    <text x="40" y="700">⑧ If x is a FakeTensor (under FakeTensorMode), the highest priority is Python/Fake — the kernel layer doesn't run at all; only meta and shape are computed.</text>
+    <text x="40" y="626">④ AT_DISPATCH_* leaves the dtype dimension's dispatch to a C++ switch + template instantiation: no dispatcher table entry, since dtype is not a DispatchKey.</text>
+    <text x="40" y="642">⑤ backward has no "AutogradCUDA kernel" layer; grad_fn::apply calls at::* directly (full dispatcher), so grad computation is naturally differentiable (higher-order derivatives).</text>
+    <text x="40" y="660">⑥ There's no if (device == ...) anywhere on the chain; everything is settled at compile/registration time by DispatchKeySet.</text>
+    <text x="40" y="678">⑦ Running the same add(x, y) on CPU with requires_grad=False, the highest-priority bit is CPU, skipping the entire AutogradCUDA wrapper: "you pay only for what you use."</text>
+    <text x="40" y="700">⑧ If x is a FakeTensor (under FakeTensorMode), the highest priority is Python/Fake; the kernel layer doesn't run at all; only meta and shape are computed.</text>
   </g>
 </svg>
 </div>
 
-<h2 id="sec6">6. Debugging and Verification</h2>
+<h2 id="sec6">6. Debugging and verification</h2>
 
-<p>By now you have mentally reconstructed the dispatcher. This chapter gives you a few tools to <strong>verify each layer on your own machine</strong> — they double as debugging tools and learning aids: seeing the output of <code>TORCH_SHOW_DISPATCH_TRACE</code> for the first time, you'll realize "wow, it really does walk through that many layers."</p>
+<p>By now you have mentally reconstructed the dispatcher. This chapter gives you a few tools to <strong>verify each layer on your own machine</strong>; they double as debugging tools and learning aids. Seeing the output of <code>TORCH_SHOW_DISPATCH_TRACE</code> for the first time, you'll realize "wow, it really does walk through that many layers."</p>
 
 <h3>6.1 See the dispatch chain: <code>TORCH_SHOW_DISPATCH_TRACE</code></h3>
 
@@ -3928,11 +3800,11 @@ aten::abs ...
 aten::add ...
 ... (hundreds more)</pre>
 
-<p>Use case: after loading your custom extension, verify it is <strong>actually</strong> registered to the intended key — many bugs come from typos in macros, misspelled key names, or link order causing static initialization to be skipped.</p>
+<p>Use case: after loading your custom extension, verify it is <strong>actually</strong> registered to the intended key. Many bugs come from typos in macros, misspelled key names, or link order causing static initialization to be skipped.</p>
 
 <h3>6.3 Step through with Python: <code>torch._dispatch.python_dispatcher</code></h3>
 
-<p>PyTorch exposes a <strong>Python-side dispatcher simulator</strong> that lets you step through the dispatcher's flow to see what each layer does. Good for teaching or deep debugging. It matches the C++ dispatcher's behavior exactly — many <code>torch.compile</code> implementations borrow it as well.</p>
+<p>PyTorch exposes a <strong>Python-side dispatcher simulator</strong> that lets you step through the dispatcher's flow to see what each layer does. Good for teaching or deep debugging. It matches the C++ dispatcher's behavior exactly; many <code>torch.compile</code> implementations borrow it as well.</p>
 
 <h3>6.4 GDB: enter the C++ debugger</h3>
 
@@ -3951,7 +3823,7 @@ aten::add ...
 
 <h3>6.5 Register an op in Python with <code>torch.library</code></h3>
 
-<p>Don't want to compile C++? <code>torch.library</code> provides an equivalent Python API — good for tests or for verifying the mechanism:</p>
+<p>Don't want to compile C++? <code>torch.library</code> provides an equivalent Python API, good for tests or for verifying the mechanism:</p>
 
 <pre class="code">import torch
 
@@ -3969,11 +3841,11 @@ def _impl_cuda(self):
 # usage:
 y = torch.ops.myops.custom_relu(torch.randn(3, device="cuda"))</pre>
 
-<p>Semantically equivalent to the C++ macros from Chapter 3 — internally they go through the same dispatcher. The only difference is "which language you write it in." <strong>For developing a custom op, prototype the flow in Python first, then translate to C++.</strong></p>
+<p>Semantically equivalent to the C++ macros from Chapter 3; internally they go through the same dispatcher. The only difference is "which language you write it in." <strong>For developing a custom op, prototype the flow in Python first, then translate to C++.</strong></p>
 
-<h2 id="sec7">7. Compatibility Notes for Older References</h2>
+<h2 id="sec7">7. Compatibility notes for older references</h2>
 
-<p>PyTorch's dispatcher has been heavily refactored over the past few years. Several widely cited resources (including the official tutorial) reference <strong>already-outdated API names</strong> — reading old articles in isolation can be confusing. This section is a compatibility table mapping "old names" to "today's equivalents."</p>
+<p>PyTorch's dispatcher has been heavily refactored over the past few years. Several widely cited resources (including the official tutorial) reference <strong>already-outdated API names</strong>, so reading old articles in isolation can be confusing. This section is a compatibility table mapping "old names" to "today's equivalents."</p>
 
 <table>
 <thead>
@@ -3998,9 +3870,9 @@ y = torch.ops.myops.custom_relu(torch.randn(3, device="cuda"))</pre>
 <h2 id="sec8">References</h2>
 
 <ul>
-  <li><a href="https://pytorch.org/tutorials/advanced/dispatcher.html">Registering a Dispatched Operator in C++ — official tutorial</a></li>
-  <li><a href="https://blog.ezyang.com/2020/09/lets-talk-about-the-pytorch-dispatcher/">Ezyang — Let's talk about the PyTorch Dispatcher (2020)</a></li>
-  <li><a href="https://blog.ezyang.com/2019/05/pytorch-internals/">Ezyang — PyTorch internals (2019, partially drifted)</a></li>
+  <li><a href="https://pytorch.org/tutorials/advanced/dispatcher.html">Registering a Dispatched Operator in C++ (official tutorial)</a></li>
+  <li><a href="https://blog.ezyang.com/2020/09/lets-talk-about-the-pytorch-dispatcher/">Ezyang: Let's talk about the PyTorch Dispatcher (2020)</a></li>
+  <li><a href="https://blog.ezyang.com/2019/05/pytorch-internals/">Ezyang: PyTorch internals (2019, partially drifted)</a></li>
   <li><a href="https://github.com/pytorch/pytorch/wiki/PyTorch-dispatcher-walkthrough">PyTorch dispatcher walkthrough (wiki)</a></li>
   <li><a href="https://github.com/pytorch/pytorch/wiki/Codegen-and-Structured-Kernels">Codegen and Structured Kernels (wiki)</a></li>
   <li>Source: <a href="https://github.com/pytorch/pytorch/blob/main/c10/core/DispatchKey.h">DispatchKey.h</a> · <a href="https://github.com/pytorch/pytorch/blob/main/c10/core/DispatchKeySet.h">DispatchKeySet.h</a> · <a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/core/dispatch/Dispatcher.h">Dispatcher.h</a> · <a href="https://github.com/pytorch/pytorch/blob/main/torch/library.h">library.h</a></li>
