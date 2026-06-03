@@ -1,0 +1,1296 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PyTorch 共享库结构: 源码目录 → .so → torch._C</title>
+<meta name="post:title"           content="PyTorch 共享库结构: 源码目录 → .so → torch._C">
+<meta name="post:title_en"        content="PyTorch Shared Library Structure: Source Trees, .so Files, and torch._C">
+<meta name="post:slug"            content="pytorch-shared-libs">
+<meta name="post:date"            content="2026-06-03">
+<meta name="post:tags"            content="PyTorch, 系统设计, C++, 构建">
+<meta name="post:tags_en"         content="PyTorch, Systems Design, C++, Build">
+<meta name="post:reading"         content="25 分钟">
+<meta name="post:reading_en"      content="25 min">
+<meta name="post:summary"         content="PyTorch CUDA wheel 里所有 .so 的源码目录映射与链接依赖,对照上游 CMake 考据 + 交互式 D3 图。 涉及 libtorch.so 为何是空 aggregator、libtorch_python.so 即 torch._C、libtorch_global_deps 的 RTLD_GLOBAL 预加载等关键机制。">
+<meta name="post:summary_en"      content="How every .so in a CUDA PyTorch wheel maps to source-tree directories and links to one another, grounded in upstream CMake, with an interactive D3 dependency graph. Highlights why libtorch.so is empty, why libtorch_python.so is torch._C, and how libtorch_global_deps gets RTLD_GLOBAL-preloaded.">
+<meta name="post:series"          content="pytorch-internals">
+<meta name="post:series_title"    content="PyTorch 内部机制">
+<meta name="post:series_title_en" content="PyTorch Internals">
+<meta name="post:series_order"    content="3">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js" defer></script>
+<script src="../lang-toggle.js" defer></script>
+<style>
+  /* page-specific: widen article column for the dependency graph */
+  main.content { max-width: 1200px; padding: 56px 32px 96px; }
+  @media (max-width: 1100px) { main.content { padding: 48px 24px 80px; } }
+
+  .graph-frame {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    margin: 18px 0 24px;
+    padding: 14px;
+    overflow: hidden;
+  }
+  .graph-frame .graph-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--fg-subtle);
+    margin-bottom: 8px;
+  }
+  .graph-frame .graph-actions { display: flex; gap: 6px; }
+  .graph-frame button {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg);
+    color: var(--fg-muted);
+    cursor: pointer;
+  }
+  .graph-frame button:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--fg-muted);
+    padding: 6px 0 4px;
+  }
+  .legend .swatch {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    vertical-align: -2px;
+    margin-right: 4px;
+  }
+  .legend .swatch.lib { background: var(--accent); }
+  .legend .swatch.src { background: #f6e58d; border: 1px solid #ddc850; }
+  .legend .swatch.dummy { background: var(--bg); border: 1px dashed var(--border-strong); }
+
+  /* Two-pane layout: graph on the left, detail panel on the right. */
+  .graph-body {
+    display: flex;
+    gap: 14px;
+    align-items: stretch;
+  }
+  .graph-host {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .detail-panel {
+    flex: 0 0 320px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg);
+    padding: 14px 16px;
+    font-size: 13px;
+    line-height: 1.55;
+    max-height: 680px;
+    overflow-y: auto;
+  }
+  .detail-panel .detail-empty {
+    color: var(--fg-subtle);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.5;
+  }
+  .detail-panel h4 {
+    margin: 0 0 4px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--fg);
+    letter-spacing: -0.01em;
+  }
+  .detail-panel .detail-sub {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--fg-subtle);
+    margin-bottom: 12px;
+  }
+  .detail-panel .detail-block {
+    margin: 10px 0 14px;
+  }
+  .detail-panel .detail-block .detail-label {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-subtle);
+    margin-bottom: 4px;
+  }
+  .detail-panel ul.detail-list {
+    margin: 0;
+    padding-left: 14px;
+  }
+  .detail-panel ul.detail-list li {
+    margin: 2px 0;
+    font-size: 12.5px;
+    color: var(--fg);
+  }
+  .detail-panel code {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    background: var(--bg-subtle);
+    border: 1px solid var(--border);
+    padding: 0 4px;
+    border-radius: 3px;
+  }
+  .detail-panel .detail-note {
+    font-size: 12.5px;
+    color: var(--fg-muted);
+    line-height: 1.55;
+    margin: 8px 0 0;
+  }
+  @media (max-width: 900px) {
+    .graph-body { flex-direction: column; }
+    .detail-panel { flex: 0 0 auto; max-height: 360px; }
+  }
+
+  .graph-svg { width: 100%; display: block; height: 680px; background: var(--bg); }
+  .graph-svg text {
+    font-family: var(--font-mono);
+    fill: var(--fg);
+    cursor: pointer;
+    font-size: 11.5px;
+    pointer-events: none;
+  }
+  .graph-svg .node-lib rect {
+    fill: var(--bg);
+    stroke: var(--accent);
+    stroke-width: 1.6;
+    rx: 4;
+  }
+  .graph-svg .node-lib.dummy rect {
+    fill: var(--bg);
+    stroke: var(--border-strong);
+    stroke-width: 1.4;
+    stroke-dasharray: 4 3;
+  }
+  .graph-svg .node-lib.selected rect {
+    stroke-width: 3;
+    fill: var(--accent-tint);
+  }
+  .graph-svg .node-src rect {
+    fill: #fef3a6;
+    stroke: #d4b94d;
+    stroke-width: 1.2;
+    rx: 8;
+  }
+  .graph-svg .node-src text { fill: #5b4a0e; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .graph-svg .node-src rect {
+      fill: #3a3110;
+      stroke: #7a6420;
+    }
+    :root:not([data-theme="light"]) .graph-svg .node-src text { fill: #f0d97a; }
+  }
+  :root[data-theme="dark"] .graph-svg .node-src rect {
+    fill: #3a3110;
+    stroke: #7a6420;
+  }
+  :root[data-theme="dark"] .graph-svg .node-src text { fill: #f0d97a; }
+  .graph-svg .node:hover rect {
+    stroke: var(--accent);
+    stroke-width: 2.4;
+  }
+  .graph-svg .edge.link {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 1.4;
+    stroke-opacity: 0.75;
+  }
+  .graph-svg .edge.compile {
+    fill: none;
+    stroke: var(--fg-subtle);
+    stroke-width: 1.2;
+    stroke-dasharray: 4 3;
+    stroke-opacity: 0.65;
+  }
+  .graph-svg .edge.preload {
+    fill: none;
+    stroke: #d97706;
+    stroke-width: 1.4;
+    stroke-dasharray: 1 3;
+    stroke-opacity: 0.85;
+  }
+  .tooltip {
+    position: fixed;
+    pointer-events: none;
+    background: var(--fg);
+    color: var(--bg);
+    font-family: var(--font-sans);
+    font-size: 12.5px;
+    line-height: 1.45;
+    padding: 7px 11px;
+    border-radius: var(--radius-sm);
+    max-width: 360px;
+    box-shadow: var(--shadow-md);
+    z-index: 200;
+    opacity: 0;
+    transition: opacity 0.12s;
+    letter-spacing: -0.005em;
+  }
+  .tooltip.show { opacity: 1; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录 · TOC</div>
+    <div class="lang-zh">
+    <ul>
+      <li><a href="#zh-1">1. 起点:`import torch` 加载了哪些 .so</a></li>
+      <li><a href="#zh-2">2. 依赖图(交互主体)</a></li>
+      <li><a href="#zh-3">3. 每个库的源码目录详解</a>
+        <ul>
+          <li><a href="#zh-3-1">3.1 libc10</a></li>
+          <li><a href="#zh-3-2">3.2 libc10_cuda</a></li>
+          <li><a href="#zh-3-3">3.3 libtorch_cpu</a></li>
+          <li><a href="#zh-3-4">3.4 libtorch_cuda</a></li>
+          <li><a href="#zh-3-5">3.5 libtorch(空 aggregator)</a></li>
+          <li><a href="#zh-3-6">3.6 libtorch_python</a></li>
+          <li><a href="#zh-3-7">3.7 libtorch_global_deps</a></li>
+          <li><a href="#zh-3-8">3.8 libshm 等</a></li>
+        </ul>
+      </li>
+      <li><a href="#zh-4">4. torch._C 是什么</a></li>
+      <li><a href="#zh-5">5. 几个反直觉的点</a></li>
+      <li><a href="#zh-refs">参考资料</a></li>
+    </ul>
+    </div>
+    <div class="lang-en">
+    <ul>
+      <li><a href="#en-1">1. Start: which .so files import torch loads</a></li>
+      <li><a href="#en-2">2. The interactive dependency graph</a></li>
+      <li><a href="#en-3">3. Source directories per library</a>
+        <ul>
+          <li><a href="#en-3-1">3.1 libc10</a></li>
+          <li><a href="#en-3-2">3.2 libc10_cuda</a></li>
+          <li><a href="#en-3-3">3.3 libtorch_cpu</a></li>
+          <li><a href="#en-3-4">3.4 libtorch_cuda</a></li>
+          <li><a href="#en-3-5">3.5 libtorch (empty aggregator)</a></li>
+          <li><a href="#en-3-6">3.6 libtorch_python</a></li>
+          <li><a href="#en-3-7">3.7 libtorch_global_deps</a></li>
+          <li><a href="#en-3-8">3.8 libshm and others</a></li>
+        </ul>
+      </li>
+      <li><a href="#en-4">4. What torch._C actually is</a></li>
+      <li><a href="#en-5">A few counterintuitive points</a></li>
+      <li><a href="#en-refs">References</a></li>
+    </ul>
+    </div>
+  </aside>
+
+<main class="content">
+
+<!-- ============================= 中文版 ============================= -->
+<div class="lang-zh">
+
+<h1>PyTorch 共享库结构: 源码目录 → .so → torch._C</h1>
+
+<h2 id="zh-1">1. 起点:<code>import torch</code> 到底加载了哪些 .so</h2>
+
+<p>装一份 CUDA 版 PyTorch wheel,看 <code>torch/lib/</code> 下面是这样:</p>
+
+<pre class="code"><span class="cm">$ ls torch/lib/*.so</span>
+torch/lib/libc10.so
+torch/lib/libc10_cuda.so
+torch/lib/libtorch.so
+torch/lib/libtorch_cpu.so
+torch/lib/libtorch_cuda.so
+torch/lib/libtorch_python.so
+torch/lib/libtorch_global_deps.so
+torch/lib/libshm.so
+torch/lib/libcaffe2_nvrtc.so
+torch/lib/libnnapi_backend.so
+<span class="cm"># 可选(BUILD_LAZY_CUDA_LINALG=ON):</span>
+torch/lib/libtorch_cuda_linalg.so
+<span class="cm"># 可选(USE_NVSHMEM):</span>
+torch/lib/libtorch_nvshmem.so</pre>
+
+<p>这一篇要回答的问题就两个:</p>
+
+<ol>
+  <li>每个 <code>.so</code> 是从源码树<strong>哪个目录</strong>编出来的?</li>
+  <li>它们之间的<strong>链接依赖</strong>是怎样的?</li>
+</ol>
+
+<p>顺手把一个反直觉的事实先放在这儿:<strong><code>libtorch.so</code> 是一个空文件</strong>。它只是个 aggregator,把 <code>libtorch_cpu.so</code> 和 <code>libtorch_cuda.so</code> 打成一个对外引用,使得"链 libtorch 就同时有 CPU 和 CUDA"。 下面的依赖图直接给出全貌,§3 再展开每个库的细节。</p>
+
+<h2 id="zh-2">2. 依赖图(交互主体)</h2>
+
+<p>下面这张图把每个 .so 与它的源码目录和链接关系全展开。<strong>点击任意 <code>lib*.so</code> 节点</strong>,右侧面板会显示它的 CMake target、源码目录清单、链接依赖。 节点也可<strong>拖动</strong>(d3-force 自动重新布局),hover 出一句话定义。</p>
+
+<p>两类边:<strong>蓝色</strong>是 link-time 依赖("A → B" 意为 A 链 B),<strong>橙色虚点</strong>是 <code>libtorch_global_deps</code> 那条"不被链、被 dlopen"的特殊路径。 每个库具体由哪些源码目录编出来的,点节点看右侧 panel。</p>
+
+</div>
+
+<div class="lang-en">
+
+<h1>PyTorch Shared Library Structure: Source Trees, .so Files, and torch._C</h1>
+
+<h2 id="en-1">1. Start: which .so files <code>import torch</code> loads</h2>
+
+<p>Install a CUDA-enabled PyTorch wheel and <code>torch/lib/</code> looks like this:</p>
+
+<pre class="code"><span class="cm">$ ls torch/lib/*.so</span>
+torch/lib/libc10.so
+torch/lib/libc10_cuda.so
+torch/lib/libtorch.so
+torch/lib/libtorch_cpu.so
+torch/lib/libtorch_cuda.so
+torch/lib/libtorch_python.so
+torch/lib/libtorch_global_deps.so
+torch/lib/libshm.so
+torch/lib/libcaffe2_nvrtc.so
+torch/lib/libnnapi_backend.so
+<span class="cm"># optional (BUILD_LAZY_CUDA_LINALG=ON):</span>
+torch/lib/libtorch_cuda_linalg.so
+<span class="cm"># optional (USE_NVSHMEM):</span>
+torch/lib/libtorch_nvshmem.so</pre>
+
+<p>This article answers two questions:</p>
+
+<ol>
+  <li>Which <strong>source-tree directory</strong> does each <code>.so</code> compile from?</li>
+  <li>How do they <strong>link</strong> to each other?</li>
+</ol>
+
+<p>One counterintuitive fact up front: <strong><code>libtorch.so</code> is an empty file</strong>. It is an aggregator that bundles <code>libtorch_cpu.so</code> and <code>libtorch_cuda.so</code> behind one name, so that "link libtorch and you get both CPU and CUDA" stays a stable API. The graph below shows the full picture; §3 expands each library individually.</p>
+
+<h2 id="en-2">2. The interactive dependency graph</h2>
+
+<p>The graph below lays out every <code>.so</code> with its source directories and link relationships. <strong>Click any <code>lib*.so</code> node</strong> and the side panel shows that library's CMake target, the source directories it is compiled from, and its link dependencies. Nodes are <strong>draggable</strong> (d3-force re-lays out automatically); hover for a one-line definition.</p>
+
+<p>Two kinds of edges: <strong>blue</strong> = link-time dependency ("A → B" means A links B); <strong>orange dotted</strong> = the special "not linked, dlopened by Python" path for <code>libtorch_global_deps</code>. For the per-library source-directory breakdown, click a node and read the side panel.</p>
+
+</div>
+
+<!-- shared graph frame ===================================================== -->
+<div class="graph-frame">
+  <div class="graph-meta">
+    <span><span class="lang-zh">libtorch 共享库依赖图</span><span class="lang-en">libtorch shared library graph</span></span>
+    <span class="graph-actions">
+      <button onclick="restartSim()">
+        <span class="lang-zh">重新布局</span><span class="lang-en">Re-layout</span>
+      </button>
+    </span>
+  </div>
+  <div class="legend">
+    <span><span class="swatch lib"></span><span class="lang-zh">蓝框 = 共享库(.so)</span><span class="lang-en">blue box = shared library (.so)</span></span>
+    <span><span class="swatch dummy"></span><span class="lang-zh">虚框 = 空 / stub 库</span><span class="lang-en">dashed = empty / stub library</span></span>
+    <span><span style="display:inline-block;width:28px;height:0;border-top:2px solid var(--accent);vertical-align:3px"></span> <span class="lang-zh">链接依赖</span><span class="lang-en">link-time dep</span></span>
+    <span><span style="display:inline-block;width:28px;height:0;border-top:1.4px dotted #d97706;vertical-align:3px"></span> <span class="lang-zh">RTLD_GLOBAL 预加载</span><span class="lang-en">RTLD_GLOBAL preload</span></span>
+  </div>
+  <div class="graph-body">
+    <div id="graph-host" class="graph-host"></div>
+    <aside id="detail-panel" class="detail-panel">
+      <div class="detail-empty">
+        <span class="lang-zh">点击图中任意 <code>lib*.so</code> 节点,这里会显示它的 CMake target、源码目录与链接依赖。</span>
+        <span class="lang-en">Click any <code>lib*.so</code> node in the graph to see its CMake target, source directories, and link-time deps here.</span>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<!-- ZH §5, §6 etc. ========================================================= -->
+
+
+<!-- ===== §3 detail (relocated to follow the graph) ===== -->
+<div class="lang-zh">
+
+<h2 id="zh-3">3. 每个库的源码目录详解</h2>
+
+<p>下面这一节是侧栏 detail 面板的展开版本 —— 同样的信息加上 prose 和表格上下文,适合通读。</p>
+
+<h3 id="zh-3-1">3.1 <code>libc10</code>: Core Tensor 抽象</h3>
+
+<p><strong>源码</strong>: <code>c10/CMakeLists.txt</code> 用 GLOB 收:</p>
+
+<pre class="code">file(GLOB C10_SRCS
+  *.cpp
+  core/*.cpp
+  core/impl/*.cpp
+  mobile/*.cpp
+  macros/*.cpp
+  util/*.cpp)
+<span class="cm"># 显式排除 c10/cuda/、c10/hip/</span></pre>
+
+<p>包含:<code>TensorImpl</code>、<code>Storage</code>、<code>Device</code>、<code>DispatchKey</code>、<code>Allocator</code>、<code>intrusive_ptr</code>、<code>TypeMeta</code>、所有 <code>c10::util</code> 工具(<code>Optional</code>、<code>SmallVector</code>、<code>ArrayRef</code>、错误处理宏)。 是整个 PyTorch C++ API 最底层、没有任何 CUDA / Python / ATen 依赖的一层。</p>
+
+<p><strong>链接</strong>:fmt、nlohmann_json、moodycamel(concurrent queue),可选 gflags / glog / cpuinfo。</p>
+
+<h3 id="zh-3-2">3.2 <code>libc10_cuda</code>: CUDA 基础设施</h3>
+
+<p><strong>源码</strong>: <code>c10/cuda/CMakeLists.txt</code> 显式列出(不用 glob):</p>
+
+<pre class="code">add_library(c10_cuda
+  CUDAAllocatorConfig.cpp
+  CUDACachingAllocator.cpp
+  CUDAFunctions.cpp
+  CUDAStream.cpp
+  driver_api.cpp
+  impl/CUDAGuardImpl.cpp
+  ...)</pre>
+
+<p>包含:CUDA 流(<code>CUDAStream</code>)、CUDA caching allocator(<strong>这就是 <code>torch.cuda.empty_cache()</code> 操作的对象</strong>)、<code>CUDAGuard</code>、CUDA device assertion、driver API 包装。 这是 PyTorch CUDA 路径的"底座"。</p>
+
+<p><strong>链接</strong>:<code>c10</code> PUBLIC + <code>torch::cudart</code> PUBLIC。</p>
+
+<h3 id="zh-3-3">3.3 <code>libtorch_cpu</code>: 主 CPU 库(算子 + autograd + JIT)</h3>
+
+<p><strong>这是体积最大的一个 .so</strong>(GB 量级)。源码由 <code>caffe2/CMakeLists.txt</code> 里 <code>${Caffe2_CPU_SRCS}</code> 这个大变量收集,主要包含:</p>
+
+<table>
+  <thead><tr><th>来源</th><th>具体路径</th><th>负责什么</th></tr></thead>
+  <tbody>
+    <tr><td><code>${ATen_CPU_SRCS}</code></td><td><code>aten/src/ATen/</code>(非 CUDA 子目录)</td><td>ATen 核心:Tensor、dispatcher、native_functions.yaml 生成的入口函数</td></tr>
+    <tr><td></td><td><code>aten/src/ATen/native/</code></td><td>所有 CPU 算子的 host 端实现</td></tr>
+    <tr><td></td><td><code>aten/src/ATen/native/mkl/</code> + <code>mkldnn/</code></td><td>Intel MKL / MKLDNN 后端</td></tr>
+    <tr><td></td><td><code>aten/src/ATen/native/quantized/</code></td><td>量化算子</td></tr>
+    <tr><td></td><td><code>aten/src/ATen/native/sparse/</code></td><td>稀疏算子(CPU 部分)</td></tr>
+    <tr><td></td><td><code>aten/src/ATen/native/nested/</code></td><td>NestedTensor</td></tr>
+    <tr><td></td><td><code>aten/src/ATen/native/transformers/</code></td><td>融合的 SDPA / FlashAttention 等</td></tr>
+    <tr><td><code>${TORCH_SRCS}</code></td><td><code>torch/csrc/api/src/</code></td><td>C++ Frontend(<code>torch::nn::Module</code> 等)</td></tr>
+    <tr><td></td><td><code>torch/csrc/autograd/</code>(非 Python 部分)</td><td>Autograd 引擎、Function/Node、saved tensors</td></tr>
+    <tr><td></td><td><code>torch/csrc/jit/</code>(C++ 部分)</td><td>TorchScript IR、解释器、passes</td></tr>
+    <tr><td></td><td><code>torch/csrc/distributed/c10d/</code>(CPU 部分)</td><td>ProcessGroup、Gloo backend</td></tr>
+    <tr><td></td><td><code>torch/csrc/lazy/</code></td><td>Lazy Tensor 框架</td></tr>
+    <tr><td></td><td><code>torch/csrc/inductor/</code>(CPU 部分)</td><td>Inductor 的 C++ runtime 部分</td></tr>
+    <tr><td></td><td><code>torch/csrc/profiler/</code></td><td>profiler 后端</td></tr>
+    <tr><td>caffe2 残留</td><td><code>caffe2/serialize/</code> 等</td><td>序列化工具,Caffe2 残留</td></tr>
+  </tbody>
+</table>
+
+<p>具体的源文件列表用 Bazel 风格的 <code>append_filelist()</code> 从 <code>build_variables.bzl</code> 读出 —— 这个 <code>.bzl</code> 是 PyTorch 的"源码列表事实唯一来源",Bazel 和 CMake 共用。</p>
+
+<p><strong>链接</strong>:<code>c10</code> PUBLIC + MKL / MKLDNN / Sleef / protobuf / flatbuffers / OpenMP 等。</p>
+
+<h3 id="zh-3-4">3.4 <code>libtorch_cuda</code>: CUDA 算子库</h3>
+
+<p>源码 <code>${Caffe2_GPU_SRCS} + ${Caffe2_GPU_CU_SRCS}</code>:</p>
+
+<table>
+  <thead><tr><th>路径</th><th>负责什么</th></tr></thead>
+  <tbody>
+    <tr><td><code>aten/src/ATen/cuda/</code></td><td>CUDA 上下文、context 管理、CUDAEvent</td></tr>
+    <tr><td><code>aten/src/ATen/native/cuda/</code></td><td><strong>所有 CUDA 算子内核(.cu 文件)</strong></td></tr>
+    <tr><td><code>aten/src/ATen/native/sparse/cuda/</code></td><td>稀疏 CUDA</td></tr>
+    <tr><td><code>aten/src/ATen/native/quantized/cuda/</code></td><td>量化 CUDA</td></tr>
+    <tr><td><code>aten/src/ATen/native/transformers/cuda/</code></td><td>SDPA / FlashAttention 的 CUDA 实现</td></tr>
+    <tr><td><code>aten/src/ATen/native/nested/cuda/</code></td><td>NestedTensor CUDA</td></tr>
+    <tr><td><code>aten/src/ATen/cudnn/</code></td><td>cuDNN .cpp 包装层</td></tr>
+    <tr><td><code>torch/csrc/cuda/</code>(部分,非 python)</td><td>CUDA host-side 工具</td></tr>
+    <tr><td><code>torch/csrc/distributed/c10d/</code>(CUDA 部分)</td><td>NCCL backend、IntraNodeComm</td></tr>
+  </tbody>
+</table>
+
+<p><strong>链接</strong>:<code>c10_cuda</code> PUBLIC <strong>+ <code>torch_cpu</code> PUBLIC</strong>(CUDA 算子需要 ATen 的 dispatcher 和 native 函数注册机制),plus <code>torch::cudart</code>、可选 NCCL / cuFile / cuSPARSELt / cuDSS / NVTX / NVSHMEM。</p>
+
+<h3 id="zh-3-5">3.5 <code>libtorch</code>: 空的 aggregator</h3>
+
+<p>这是最魔幻的一个:</p>
+
+<pre class="code"><span class="cm"># caffe2/CMakeLists.txt:923</span>
+<span class="cm"># Wrapper library for people who link against torch and expect</span>
+<span class="cm"># both CPU and CUDA support. Contains 'torch_cpu' and 'torch_cuda'.</span>
+add_library(torch ${DUMMY_EMPTY_FILE})
+target_link_libraries(torch PUBLIC torch_cpu_library)
+<span class="kw">if</span> (USE_CUDA)
+  target_link_libraries(torch PUBLIC torch_cuda_library)
+<span class="kw">endif</span>()</pre>
+
+<p>它编出的 <code>libtorch.so</code> 几乎没有自己的代码 —— 只有一个空 <code>.cpp</code> 占位符。它存在的全部理由是:让用户写 <code>target_link_libraries(my_app torch)</code> 就同时能拿到 CPU 和 CUDA。 它是 PyTorch 工程对"链 libtorch 就够了"这个 API 承诺的实现机制。</p>
+
+<p>在 <code>BUILD_LIBTORCHLESS</code> split-build 模式下,<code>torch</code> 会被 <code>find_library()</code> 找到一个已安装的外部 <code>libtorch.so</code>,但概念不变。</p>
+
+<h3 id="zh-3-6">3.6 <code>libtorch_python</code>: Python 绑定</h3>
+
+<p>源码在 <code>torch/CMakeLists.txt</code>,源文件列表来自 <code>build_variables.bzl</code> 里的 <code>libtorch_python_core_sources</code>:</p>
+
+<table>
+  <thead><tr><th>路径</th><th>内容</th></tr></thead>
+  <tbody>
+    <tr><td><code>torch/csrc/Module.cpp</code></td><td><strong>Python 模块入口,定义 <code>PyInit__C</code></strong></td></tr>
+    <tr><td><code>torch/csrc/autograd/python_*.cpp</code></td><td>Autograd 的 Python binding(<code>python_function.cpp</code>、<code>python_variable.cpp</code>、<code>python_engine.cpp</code> 等)</td></tr>
+    <tr><td><code>torch/csrc/jit/python/*.cpp</code></td><td>TorchScript 的 Python 接口</td></tr>
+    <tr><td><code>torch/csrc/api/python/</code></td><td>C++ Frontend 的 pybind 包装</td></tr>
+    <tr><td><code>torch/csrc/tensor/python_tensor.cpp</code></td><td>Tensor 类型在 Python 端的对象</td></tr>
+    <tr><td><code>torch/csrc/dynamo/*</code></td><td>Dynamo / TorchDynamo 的 C++ 桥</td></tr>
+    <tr><td><code>torch/csrc/inductor/*python*</code></td><td>Inductor 的 Python 桥</td></tr>
+    <tr><td><code>torch/csrc/distributed/*/init.cpp</code></td><td>distributed 的 Python init</td></tr>
+    <tr><td><code>libtorch_python_cuda_core_sources</code></td><td>CUDA 专属:<code>torch/csrc/cuda/Module.cpp</code>、<code>Stream.cpp</code>、<code>Event.cpp</code>、<code>python_comm.cpp</code>、<code>shared/cudart.cpp</code>、<code>shared/nvtx.cpp</code></td></tr>
+    <tr><td>生成的</td><td><code>${GENERATED_CXX_PYTHON}</code> —— 由 <code>tools/autograd/</code> codegen 出来的 Python 绑定</td></tr>
+  </tbody>
+</table>
+
+<p><strong>链接</strong>:<code>${TORCH_LIB}</code> PRIVATE,这个变量在标准 build 里就是空 aggregator <code>torch</code> —— <strong>所以 <code>libtorch_python</code> 链接的是空壳 <code>libtorch.so</code>,通过它间接拿到 CPU 和 CUDA</strong>。 另外链 <code>Python::Module</code>、pybind11、<code>shm</code>、cuDNN / cuSPARSELt / cuFile / NVTX(可选)、UCC / NumPy。</p>
+
+<h3 id="zh-3-7">3.7 <code>libtorch_global_deps</code>: RTLD_GLOBAL 预加载技巧</h3>
+
+<p>这是另一个反直觉的库:</p>
+
+<pre class="code">add_library(torch_global_deps SHARED <span class="cm">torch/csrc/empty.c</span>)
+target_link_libraries(torch_global_deps PRIVATE
+  ${MPI_LIBRARIES}
+  ${MKL_LIBRARIES}
+  CUDA::cudart
+  CUDA::nvToolsExt
+  ...)</pre>
+
+<p>它的 C 代码本身是空的(只有一个 <code>empty.c</code> 占位符),但它<strong>链接了 MPI / MKL / cudart / nvToolsExt 这些"想要进全局符号空间"的库</strong>。 关键事实:<strong>没有任何其它 PyTorch 库链接它</strong>。 它的存在目的不是被链,而是被 Python 启动时手动 <code>dlopen</code> 进 <code>RTLD_GLOBAL</code>:</p>
+
+<pre class="code"><span class="cm"># torch/__init__.py (节选)</span>
+<span class="kw">def</span> _load_global_deps():
+    here = os.path.abspath(__file__)
+    lib_path = os.path.join(os.path.dirname(here), <span class="cm">"lib"</span>, <span class="cm">"libtorch_global_deps.so"</span>)
+    ctypes.CDLL(lib_path, mode=ctypes.RTLD_GLOBAL)
+<span class="cm"># ... 然后:</span>
+<span class="kw">from</span> torch._C <span class="kw">import</span> *</pre>
+
+<p>为什么要这么搞:MKL、MPI、cudart 等依赖里有"必须被多个 .so 共享同一个 OpenMP / CUDA runtime 实例"的痛点。 如果 Python 用默认 <code>RTLD_LOCAL</code> 加载 <code>libtorch_python.so</code>,这些 runtime 符号会被局部隔离,可能跟用户 numpy / scipy 里加载的 MKL 撞符号或拿到不同实例。 把它们的符号通过 <code>libtorch_global_deps</code> 提前 <code>RTLD_GLOBAL</code> 进进程,后续所有 .so 都共享同一份。</p>
+
+<h3 id="zh-3-8">3.8 其它的</h3>
+
+<ul>
+  <li><strong><code>libshm.so</code></strong>:<code>torch/lib/libshm/</code>,跨进程共享内存 Tensor 的 manager。 link <code>torch_cpu</code> PRIVATE。 配套还有 <code>torch_shm_manager</code> 可执行文件。</li>
+  <li><strong><code>libcaffe2_nvrtc.so</code></strong>:<code>aten/src/ATen/cuda/nvrtc_stub/ATenNVRTC.cpp</code>,这是个<strong>延迟绑定 stub</strong> —— libtorch 不直接链 NVRTC,而是用 dlopen 这个 stub 间接调,这样没装 NVRTC 的环境也不会一加载就崩。</li>
+  <li><strong><code>libtorch_cuda_linalg.so</code></strong>:可选(<code>BUILD_LAZY_CUDA_LINALG=ON</code>),把 MAGMA / cusolver 相关的 linalg 算子从 <code>libtorch_cuda.so</code> 里拆出来 lazy load,主库不必硬链 MAGMA。</li>
+  <li><strong><code>libnnapi_backend.so</code></strong>:<code>torch/csrc/jit/backends/nnapi/</code>,Android NNAPI 的 TorchScript backend。 Linux 上居然也无条件 ship —— 历史遗留。</li>
+  <li><strong><code>libtorch_nvshmem.so</code></strong>:可选(<code>USE_NVSHMEM</code>),用 NVSHMEM 做集体通信。</li>
+</ul>
+
+</div>
+
+<div class="lang-en">
+
+<h2 id="en-3">3. Source directories per library</h2>
+
+<p>This section is the long-form version of the side-panel summary, with prose context and full tables.</p>
+
+<h3 id="en-3-1">3.1 <code>libc10</code>: the core tensor abstraction</h3>
+
+<p><strong>Sources</strong>: <code>c10/CMakeLists.txt</code> collects with a GLOB:</p>
+
+<pre class="code">file(GLOB C10_SRCS
+  *.cpp
+  core/*.cpp
+  core/impl/*.cpp
+  mobile/*.cpp
+  macros/*.cpp
+  util/*.cpp)
+<span class="cm"># explicitly excludes c10/cuda/ and c10/hip/</span></pre>
+
+<p>Contains: <code>TensorImpl</code>, <code>Storage</code>, <code>Device</code>, <code>DispatchKey</code>, <code>Allocator</code>, <code>intrusive_ptr</code>, <code>TypeMeta</code>, the entire <code>c10::util</code> toolkit (<code>Optional</code>, <code>SmallVector</code>, <code>ArrayRef</code>, error-handling macros). The lowest layer of the PyTorch C++ API, with no CUDA, Python, or ATen dependencies.</p>
+
+<p><strong>Links</strong>: fmt, nlohmann_json, moodycamel (concurrent queue), optionally gflags / glog / cpuinfo.</p>
+
+<h3 id="en-3-2">3.2 <code>libc10_cuda</code>: CUDA infrastructure</h3>
+
+<p><strong>Sources</strong>: <code>c10/cuda/CMakeLists.txt</code> lists files explicitly (no GLOB):</p>
+
+<pre class="code">add_library(c10_cuda
+  CUDAAllocatorConfig.cpp
+  CUDACachingAllocator.cpp
+  CUDAFunctions.cpp
+  CUDAStream.cpp
+  driver_api.cpp
+  impl/CUDAGuardImpl.cpp
+  ...)</pre>
+
+<p>Contains: CUDA streams (<code>CUDAStream</code>), the CUDA caching allocator (<strong>this is what <code>torch.cuda.empty_cache()</code> operates on</strong>), <code>CUDAGuard</code>, CUDA device assertions, driver-API wrappers. The CUDA foundation for the rest of PyTorch.</p>
+
+<p><strong>Links</strong>: <code>c10</code> PUBLIC + <code>torch::cudart</code> PUBLIC.</p>
+
+<h3 id="en-3-3">3.3 <code>libtorch_cpu</code>: the main CPU library (ops, autograd, JIT)</h3>
+
+<p><strong>The largest single <code>.so</code> in the wheel</strong> (GB-scale). Sources come from <code>${Caffe2_CPU_SRCS}</code> in <code>caffe2/CMakeLists.txt</code>:</p>
+
+<table>
+  <thead><tr><th>Source variable</th><th>Path</th><th>Responsibility</th></tr></thead>
+  <tbody>
+    <tr><td><code>${ATen_CPU_SRCS}</code></td><td><code>aten/src/ATen/</code> (non-CUDA subdirs)</td><td>ATen core: Tensor, dispatcher, generated entry points from <code>native_functions.yaml</code></td></tr>
+    <tr><td></td><td><code>aten/src/ATen/native/</code></td><td>host-side implementations of every CPU op</td></tr>
+    <tr><td></td><td><code>aten/src/ATen/native/mkl/</code> + <code>mkldnn/</code></td><td>Intel MKL / MKLDNN backends</td></tr>
+    <tr><td></td><td><code>aten/src/ATen/native/quantized/</code></td><td>quantised ops</td></tr>
+    <tr><td></td><td><code>aten/src/ATen/native/sparse/</code></td><td>sparse ops (CPU)</td></tr>
+    <tr><td></td><td><code>aten/src/ATen/native/nested/</code></td><td>NestedTensor</td></tr>
+    <tr><td></td><td><code>aten/src/ATen/native/transformers/</code></td><td>fused SDPA / FlashAttention etc.</td></tr>
+    <tr><td><code>${TORCH_SRCS}</code></td><td><code>torch/csrc/api/src/</code></td><td>C++ Frontend (<code>torch::nn::Module</code> etc.)</td></tr>
+    <tr><td></td><td><code>torch/csrc/autograd/</code> (non-Python)</td><td>autograd engine, Function / Node, saved tensors</td></tr>
+    <tr><td></td><td><code>torch/csrc/jit/</code> (C++)</td><td>TorchScript IR, interpreter, passes</td></tr>
+    <tr><td></td><td><code>torch/csrc/distributed/c10d/</code> (CPU)</td><td>ProcessGroup, Gloo backend</td></tr>
+    <tr><td></td><td><code>torch/csrc/lazy/</code></td><td>Lazy Tensor framework</td></tr>
+    <tr><td></td><td><code>torch/csrc/inductor/</code> (CPU)</td><td>Inductor's C++ runtime</td></tr>
+    <tr><td></td><td><code>torch/csrc/profiler/</code></td><td>profiler backend</td></tr>
+    <tr><td>caffe2 leftovers</td><td><code>caffe2/serialize/</code> etc.</td><td>serialisation utilities; historical residue</td></tr>
+  </tbody>
+</table>
+
+<p>The concrete source-file lists live in <code>build_variables.bzl</code> and are pulled in by <code>append_filelist()</code>. This <code>.bzl</code> file is the single source of truth for source lists, shared by Bazel and CMake.</p>
+
+<p><strong>Links</strong>: <code>c10</code> PUBLIC plus MKL / MKLDNN / Sleef / protobuf / flatbuffers / OpenMP.</p>
+
+<h3 id="en-3-4">3.4 <code>libtorch_cuda</code>: the CUDA op library</h3>
+
+<p>Sources: <code>${Caffe2_GPU_SRCS} + ${Caffe2_GPU_CU_SRCS}</code>:</p>
+
+<table>
+  <thead><tr><th>Path</th><th>Responsibility</th></tr></thead>
+  <tbody>
+    <tr><td><code>aten/src/ATen/cuda/</code></td><td>CUDA context management, CUDAEvent</td></tr>
+    <tr><td><code>aten/src/ATen/native/cuda/</code></td><td><strong>every CUDA op kernel (<code>.cu</code> files)</strong></td></tr>
+    <tr><td><code>aten/src/ATen/native/sparse/cuda/</code></td><td>sparse CUDA</td></tr>
+    <tr><td><code>aten/src/ATen/native/quantized/cuda/</code></td><td>quantised CUDA</td></tr>
+    <tr><td><code>aten/src/ATen/native/transformers/cuda/</code></td><td>CUDA implementations of SDPA / FlashAttention</td></tr>
+    <tr><td><code>aten/src/ATen/native/nested/cuda/</code></td><td>NestedTensor CUDA</td></tr>
+    <tr><td><code>aten/src/ATen/cudnn/</code></td><td>cuDNN C++ wrappers</td></tr>
+    <tr><td><code>torch/csrc/cuda/</code> (parts, non-Python)</td><td>CUDA host-side helpers</td></tr>
+    <tr><td><code>torch/csrc/distributed/c10d/</code> (CUDA)</td><td>NCCL backend, IntraNodeComm</td></tr>
+  </tbody>
+</table>
+
+<p><strong>Links</strong>: <code>c10_cuda</code> PUBLIC <strong>and <code>torch_cpu</code> PUBLIC</strong> (CUDA ops need ATen's dispatcher and native-function registration), plus <code>torch::cudart</code>, optional NCCL / cuFile / cuSPARSELt / cuDSS / NVTX / NVSHMEM.</p>
+
+<h3 id="en-3-5">3.5 <code>libtorch</code>: the empty aggregator</h3>
+
+<p>The most surprising entry:</p>
+
+<pre class="code"><span class="cm"># caffe2/CMakeLists.txt:923</span>
+<span class="cm"># Wrapper library for people who link against torch and expect</span>
+<span class="cm"># both CPU and CUDA support. Contains 'torch_cpu' and 'torch_cuda'.</span>
+add_library(torch ${DUMMY_EMPTY_FILE})
+target_link_libraries(torch PUBLIC torch_cpu_library)
+<span class="kw">if</span> (USE_CUDA)
+  target_link_libraries(torch PUBLIC torch_cuda_library)
+<span class="kw">endif</span>()</pre>
+
+<p>The resulting <code>libtorch.so</code> contains almost no code of its own: just one empty <code>.cpp</code>. Its entire purpose is to give users a single name to link against: <code>target_link_libraries(my_app torch)</code> transitively pulls both CPU and CUDA. It is the implementation of PyTorch's "link libtorch and that is all you need" API contract.</p>
+
+<p>In <code>BUILD_LIBTORCHLESS</code> split-build mode, <code>torch</code> is resolved by <code>find_library()</code> against an externally installed <code>libtorch.so</code>, but the concept is identical.</p>
+
+<h3 id="en-3-6">3.6 <code>libtorch_python</code>: the Python bindings</h3>
+
+<p>Defined in <code>torch/CMakeLists.txt</code>; its source list comes from <code>libtorch_python_core_sources</code> in <code>build_variables.bzl</code>:</p>
+
+<table>
+  <thead><tr><th>Path</th><th>Content</th></tr></thead>
+  <tbody>
+    <tr><td><code>torch/csrc/Module.cpp</code></td><td><strong>Python module entry, defines <code>PyInit__C</code></strong></td></tr>
+    <tr><td><code>torch/csrc/autograd/python_*.cpp</code></td><td>Autograd Python bindings (<code>python_function.cpp</code>, <code>python_variable.cpp</code>, <code>python_engine.cpp</code>)</td></tr>
+    <tr><td><code>torch/csrc/jit/python/*.cpp</code></td><td>TorchScript Python interface</td></tr>
+    <tr><td><code>torch/csrc/api/python/</code></td><td>pybind wrappers for the C++ Frontend</td></tr>
+    <tr><td><code>torch/csrc/tensor/python_tensor.cpp</code></td><td>Tensor type as seen from Python</td></tr>
+    <tr><td><code>torch/csrc/dynamo/*</code></td><td>Dynamo / TorchDynamo C++ bridge</td></tr>
+    <tr><td><code>torch/csrc/inductor/*python*</code></td><td>Inductor Python bridge</td></tr>
+    <tr><td><code>torch/csrc/distributed/*/init.cpp</code></td><td>distributed Python init</td></tr>
+    <tr><td><code>libtorch_python_cuda_core_sources</code></td><td>CUDA: <code>torch/csrc/cuda/Module.cpp</code>, <code>Stream.cpp</code>, <code>Event.cpp</code>, <code>python_comm.cpp</code>, <code>shared/cudart.cpp</code>, <code>shared/nvtx.cpp</code></td></tr>
+    <tr><td>generated</td><td><code>${GENERATED_CXX_PYTHON}</code>: Python bindings produced by the <code>tools/autograd/</code> codegen</td></tr>
+  </tbody>
+</table>
+
+<p><strong>Links</strong>: <code>${TORCH_LIB}</code> PRIVATE, which in the standard build is the empty aggregator <code>torch</code>. <strong>So <code>libtorch_python</code> links the hollow <code>libtorch.so</code> and acquires CPU and CUDA only transitively.</strong> Other links: <code>Python::Module</code>, pybind11, <code>shm</code>, cuDNN / cuSPARSELt / cuFile / NVTX (optional), UCC / NumPy.</p>
+
+<h3 id="en-3-7">3.7 <code>libtorch_global_deps</code>: the RTLD_GLOBAL preload trick</h3>
+
+<p>Another counterintuitive library:</p>
+
+<pre class="code">add_library(torch_global_deps SHARED <span class="cm">torch/csrc/empty.c</span>)
+target_link_libraries(torch_global_deps PRIVATE
+  ${MPI_LIBRARIES}
+  ${MKL_LIBRARIES}
+  CUDA::cudart
+  CUDA::nvToolsExt
+  ...)</pre>
+
+<p>The C code is empty (one placeholder <code>empty.c</code>), but the library links <strong>MPI, MKL, cudart, nvToolsExt, all the runtimes that want a single global instance</strong>. The key fact: <strong>no other PyTorch library links it.</strong> Its purpose is not to be linked but to be manually <code>dlopen</code>ed with <code>RTLD_GLOBAL</code> at Python startup:</p>
+
+<pre class="code"><span class="cm"># torch/__init__.py (abridged)</span>
+<span class="kw">def</span> _load_global_deps():
+    here = os.path.abspath(__file__)
+    lib_path = os.path.join(os.path.dirname(here), <span class="cm">"lib"</span>, <span class="cm">"libtorch_global_deps.so"</span>)
+    ctypes.CDLL(lib_path, mode=ctypes.RTLD_GLOBAL)
+<span class="cm"># ... then:</span>
+<span class="kw">from</span> torch._C <span class="kw">import</span> *</pre>
+
+<p>Why: MKL, MPI, cudart, and similar runtimes require "all shared libraries see the same instance" semantics. If Python loads <code>libtorch_python.so</code> with the default <code>RTLD_LOCAL</code>, those runtime symbols become locally scoped and may collide with, or be a different instance from, the MKL already loaded by the user's numpy or scipy. Pre-dlopen-ing them with <code>RTLD_GLOBAL</code> through <code>libtorch_global_deps</code> ensures every later <code>.so</code> shares one instance.</p>
+
+<h3 id="en-3-8">3.8 The smaller libraries</h3>
+
+<ul>
+  <li><strong><code>libshm.so</code></strong>: under <code>torch/lib/libshm/</code>, the shared-memory manager for cross-process tensors; links <code>torch_cpu</code> PRIVATE. Ships alongside the <code>torch_shm_manager</code> executable.</li>
+  <li><strong><code>libcaffe2_nvrtc.so</code></strong>: <code>aten/src/ATen/cuda/nvrtc_stub/ATenNVRTC.cpp</code>. A <strong>lazy-binding stub</strong>: libtorch never links NVRTC directly; it dlopens this stub at runtime, so environments without NVRTC do not crash on import.</li>
+  <li><strong><code>libtorch_cuda_linalg.so</code></strong>: optional (<code>BUILD_LAZY_CUDA_LINALG=ON</code>); splits MAGMA / cusolver linalg kernels out of <code>libtorch_cuda.so</code> so the main library does not have to hard-link MAGMA.</li>
+  <li><strong><code>libnnapi_backend.so</code></strong>: <code>torch/csrc/jit/backends/nnapi/</code>, the Android NNAPI TorchScript backend. Surprisingly ships unconditionally on Linux.</li>
+  <li><strong><code>libtorch_nvshmem.so</code></strong>: optional (<code>USE_NVSHMEM</code>), NVSHMEM-based collective communication.</li>
+</ul>
+
+</div>
+
+<div class="lang-zh">
+
+<h2 id="zh-4">4. <code>torch._C</code> 到底是什么</h2>
+
+<p>把它拆开:</p>
+
+<ol>
+  <li><code>torch._C</code> 是个 Python 模块,但模块对象本身<strong>就是 <code>libtorch_python.so</code></strong>。</li>
+  <li><code>libtorch_python.so</code> 是按 CPython 扩展模块的接口编出来的(链 <code>Python::Module</code>),装时落在 <code>torch/lib/libtorch_python.so</code>。</li>
+  <li>它的 Python 入口符号是 <code>PyInit__C</code>,定义在 <code>torch/csrc/Module.cpp</code> —— 这个名字告诉 CPython 它是 <code>_C</code> 这个名字的扩展模块,而 setuptools 把它注册到 <code>torch._C</code> 这个完整路径下。</li>
+  <li>Python 端 <code>from torch._C import *</code> 触发动态链接器加载 <code>libtorch_python.so</code> → 它的 NEEDED 项把 <code>libtorch.so</code> 拖进来 → 再把 <code>libtorch_cpu.so</code> 和 <code>libtorch_cuda.so</code> 拖进来 → 再底下是 <code>libc10.so</code> 和 <code>libc10_cuda.so</code>。</li>
+</ol>
+
+<p>所以从 Python 角度看的 <code>torch._C</code>,从 C++ 角度看就是 <code>libtorch_python.so</code> 这一个文件;再底下一连串 .so 是动态链接器的工作。</p>
+
+<p><code>torch/__init__.py</code> 的实际启动流程:</p>
+
+<pre class="code"><span class="cm"># 1. 先用 RTLD_GLOBAL dlopen libtorch_global_deps,把 MKL/cudart 等全局化</span>
+_load_global_deps()
+
+<span class="cm"># 2. 加载 _C(即 libtorch_python),触发整条 .so 加载链</span>
+<span class="kw">from</span> torch._C <span class="kw">import</span> *
+
+<span class="cm"># 3. 显式 init ATen / c10 的全局状态</span>
+_C._initExtension(_manager_path())</pre>
+
+<h2 id="zh-5">5. 几个反直觉的点</h2>
+
+<ol>
+  <li><strong><code>libtorch.so</code> 是空的</strong>。 你 <code>nm libtorch.so</code> 看不到几个符号,它只是个链接 manifest。</li>
+  <li><strong>定义 <code>torch_cpu</code> 和 <code>torch_cuda</code> 的 CMake 在 <code>caffe2/CMakeLists.txt</code> 里</strong>。 看见 caffe2 别犯怵,这不是给 Caffe2 框架用的,是真 libtorch 的家。</li>
+  <li><strong><code>libtorch_python</code> 不直接链 <code>libtorch_cpu</code> 或 <code>libtorch_cuda</code></strong>。 它链空壳 <code>libtorch</code>,通过 aggregator 间接拿到。 在 split-build 模式下这一抽象层让 build 还能切换到外部安装的 libtorch。</li>
+  <li><strong><code>libtorch_global_deps</code> 没有任何库链它</strong>。 它的存在是为了被 <code>ctypes.CDLL(..., RTLD_GLOBAL)</code> 单独 dlopen,做 MKL / cudart 等的全局符号预加载。</li>
+  <li><strong><code>libcaffe2_nvrtc</code> 也是个 stub</strong>。 它的意义在于 lazy bind NVRTC,这样运行时不带 NVRTC 的环境也能 <code>import torch</code> 而不是直接挂掉。 想真用 NVRTC 时 PyTorch 会再 dlopen 进来。</li>
+  <li><strong><code>libnnapi_backend.so</code> 在 Linux 上也无条件 ship</strong>。 这是 Android NNAPI 的 TorchScript backend,Linux 上其实没人用,纯历史遗留。</li>
+  <li><strong>源文件列表的"事实唯一来源"是 <code>build_variables.bzl</code></strong>。 CMake 和 Bazel 都从这个 <code>.bzl</code> 读 <code>libtorch_python_core_sources</code> / <code>libtorch_python_cuda_core_sources</code> / <code>libtorch_cuda_distributed_*_sources</code> 等列表。 想加 / 移源文件,改这里就行。</li>
+</ol>
+
+<h2 id="zh-refs">参考资料</h2>
+
+<p>本文的源码事实全部对照 <a href="https://github.com/pytorch/pytorch" target="_blank" rel="noopener">pytorch/pytorch</a> 的 <code>main</code> 分支(2026-06 抓取)。 关键 CMake 文件:</p>
+
+<ul>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/CMakeLists.txt" target="_blank" rel="noopener">CMakeLists.txt</a>(顶层,USE_OBSERVERS / USE_CUDA / BUILD_LAZY_CUDA_LINALG 等开关)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/c10/CMakeLists.txt" target="_blank" rel="noopener">c10/CMakeLists.txt</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/c10/cuda/CMakeLists.txt" target="_blank" rel="noopener">c10/cuda/CMakeLists.txt</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/CMakeLists.txt" target="_blank" rel="noopener">aten/src/ATen/CMakeLists.txt</a>(<code>ATen_CPU_SRCS</code> / <code>ATen_CUDA_CPP_SRCS</code> / <code>ATen_CUDA_CU_SRCS</code> 的拼装)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/caffe2/CMakeLists.txt" target="_blank" rel="noopener">caffe2/CMakeLists.txt</a>(<code>torch_cpu</code> / <code>torch_cuda</code> / <code>torch</code> / <code>torch_global_deps</code> / <code>caffe2_nvrtc</code> 的真正定义所在)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/CMakeLists.txt" target="_blank" rel="noopener">torch/CMakeLists.txt</a>(<code>torch_python</code> 与 <code>nnapi_backend</code>)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/lib/libshm/CMakeLists.txt" target="_blank" rel="noopener">torch/lib/libshm/CMakeLists.txt</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/build_variables.bzl" target="_blank" rel="noopener">build_variables.bzl</a>(<code>libtorch_python_core_sources</code> 等源文件清单)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/__init__.py" target="_blank" rel="noopener">torch/__init__.py</a>(<code>_load_global_deps</code> 与 <code>from torch._C import *</code>)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/csrc/Module.cpp" target="_blank" rel="noopener">torch/csrc/Module.cpp</a>(<code>PyInit__C</code>)</li>
+</ul>
+
+<hr>
+
+</div>
+
+<div class="lang-en">
+
+<h2 id="en-4">4. What <code>torch._C</code> actually is</h2>
+
+<p>Breaking it down:</p>
+
+<ol>
+  <li><code>torch._C</code> is a Python module, and the module object <strong>is <code>libtorch_python.so</code></strong>.</li>
+  <li><code>libtorch_python.so</code> is built as a CPython extension (links <code>Python::Module</code>) and installed to <code>torch/lib/libtorch_python.so</code>.</li>
+  <li>Its Python entry symbol is <code>PyInit__C</code>, defined in <code>torch/csrc/Module.cpp</code>. The name tells CPython this is the <code>_C</code> extension; setuptools registers it under the full path <code>torch._C</code>.</li>
+  <li>On the Python side, <code>from torch._C import *</code> triggers the dynamic linker to load <code>libtorch_python.so</code>; its NEEDED entries drag in <code>libtorch.so</code>; the aggregator drags in <code>libtorch_cpu.so</code> and <code>libtorch_cuda.so</code>; and those drag in <code>libc10.so</code> and <code>libc10_cuda.so</code>.</li>
+</ol>
+
+<p>So <code>torch._C</code> from Python's perspective is exactly <code>libtorch_python.so</code> from the C++ perspective; the rest of the chain is the dynamic linker doing its job.</p>
+
+<p>The startup sequence in <code>torch/__init__.py</code>:</p>
+
+<pre class="code"><span class="cm"># 1. dlopen libtorch_global_deps with RTLD_GLOBAL so MKL/cudart symbols are global</span>
+_load_global_deps()
+
+<span class="cm"># 2. load _C (i.e. libtorch_python), which triggers the full .so chain</span>
+<span class="kw">from</span> torch._C <span class="kw">import</span> *
+
+<span class="cm"># 3. explicitly init ATen / c10 global state</span>
+_C._initExtension(_manager_path())</pre>
+
+<h2 id="en-5">5. A few counterintuitive points</h2>
+
+<ol>
+  <li><strong><code>libtorch.so</code> is empty.</strong> <code>nm libtorch.so</code> finds almost nothing; it is a linker manifest.</li>
+  <li><strong>The CMake that defines <code>torch_cpu</code> and <code>torch_cuda</code> lives in <code>caffe2/CMakeLists.txt</code>.</strong> Do not be confused by the directory name; it is the actual home of libtorch, not anything to do with the historical Caffe2 framework.</li>
+  <li><strong><code>libtorch_python</code> does not link <code>libtorch_cpu</code> or <code>libtorch_cuda</code> directly.</strong> It links the empty <code>libtorch</code> aggregator and gets both halves transitively. This indirection is what lets split-build mode swap in an externally installed libtorch.</li>
+  <li><strong>Nothing links <code>libtorch_global_deps</code>.</strong> It exists solely to be loaded by <code>ctypes.CDLL(..., RTLD_GLOBAL)</code> for MKL / cudart symbol preloading.</li>
+  <li><strong><code>libcaffe2_nvrtc</code> is a stub.</strong> Its purpose is to defer NVRTC binding, so environments without NVRTC can still <code>import torch</code> without crashing. PyTorch dlopens NVRTC through this stub only when the user actually needs it.</li>
+  <li><strong><code>libnnapi_backend.so</code> ships unconditionally on Linux.</strong> It is the Android NNAPI TorchScript backend; no one uses it on Linux. Historical artefact.</li>
+  <li><strong>The single source of truth for source-file lists is <code>build_variables.bzl</code>.</strong> Both CMake and Bazel read <code>libtorch_python_core_sources</code>, <code>libtorch_python_cuda_core_sources</code>, <code>libtorch_cuda_distributed_*_sources</code>, and friends from this <code>.bzl</code>. Adding or removing source files happens here.</li>
+</ol>
+
+<h2 id="en-refs">References</h2>
+
+<p>All source-tree facts in this article are checked against the <code>main</code> branch of <a href="https://github.com/pytorch/pytorch" target="_blank" rel="noopener">pytorch/pytorch</a> (fetched 2026-06). Key CMake files:</p>
+
+<ul>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/CMakeLists.txt" target="_blank" rel="noopener">CMakeLists.txt</a> (top-level; <code>USE_OBSERVERS</code>, <code>USE_CUDA</code>, <code>BUILD_LAZY_CUDA_LINALG</code>, etc.)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/c10/CMakeLists.txt" target="_blank" rel="noopener">c10/CMakeLists.txt</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/c10/cuda/CMakeLists.txt" target="_blank" rel="noopener">c10/cuda/CMakeLists.txt</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/CMakeLists.txt" target="_blank" rel="noopener">aten/src/ATen/CMakeLists.txt</a> (assembly of <code>ATen_CPU_SRCS</code>, <code>ATen_CUDA_CPP_SRCS</code>, <code>ATen_CUDA_CU_SRCS</code>)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/caffe2/CMakeLists.txt" target="_blank" rel="noopener">caffe2/CMakeLists.txt</a> (the actual definitions of <code>torch_cpu</code>, <code>torch_cuda</code>, <code>torch</code>, <code>torch_global_deps</code>, <code>caffe2_nvrtc</code>)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/CMakeLists.txt" target="_blank" rel="noopener">torch/CMakeLists.txt</a> (<code>torch_python</code> and <code>nnapi_backend</code>)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/lib/libshm/CMakeLists.txt" target="_blank" rel="noopener">torch/lib/libshm/CMakeLists.txt</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/build_variables.bzl" target="_blank" rel="noopener">build_variables.bzl</a> (canonical source-file lists)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/__init__.py" target="_blank" rel="noopener">torch/__init__.py</a> (<code>_load_global_deps</code> and <code>from torch._C import *</code>)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/csrc/Module.cpp" target="_blank" rel="noopener">torch/csrc/Module.cpp</a> (<code>PyInit__C</code>)</li>
+</ul>
+
+<hr>
+
+</div>
+</main>
+</div>
+
+<div id="tooltip" class="tooltip"></div>
+
+<script>
+// ===========================================================================
+// D3 force-directed graph: PyTorch shared-library dependency graph
+// ===========================================================================
+
+// kind: 'lib' (real shared library, blue rect)
+//       'lib-dummy' (empty / stub library, dashed rect)
+//       'src' (source-tree directory, yellow rounded rect)
+const NODES = [
+  // ---- libraries
+  { id: 'libc10', kind: 'lib', label: 'libc10.so',
+    desc: { zh: 'Core Tensor 抽象;TensorImpl / Storage / DispatchKey / intrusive_ptr',
+            en: 'Core tensor abstraction: TensorImpl / Storage / DispatchKey / intrusive_ptr' },
+    detail: {
+      target: 'c10',
+      cmake: 'c10/CMakeLists.txt',
+      sources: ['c10/*.cpp', 'c10/core/*.cpp', 'c10/core/impl/*.cpp', 'c10/mobile/*.cpp', 'c10/macros/*.cpp', 'c10/util/*.cpp', '(excludes c10/cuda/, c10/hip/)'],
+      links: ['fmt', 'nlohmann_json', 'moodycamel', '(optional) gflags / glog / cpuinfo'],
+      note: { zh: 'TensorImpl / Storage / DispatchKey / Allocator / intrusive_ptr / TypeMeta / 全套 c10::util 工具。 整个 PyTorch C++ API 最底层。',
+              en: 'TensorImpl / Storage / DispatchKey / Allocator / intrusive_ptr / TypeMeta / all of c10::util. The lowest layer of the PyTorch C++ API.' },
+    } },
+  { id: 'libc10_cuda', kind: 'lib', label: 'libc10_cuda.so',
+    desc: { zh: 'CUDA 基础设施;CUDAStream, CUDA caching allocator, CUDAGuard',
+            en: 'CUDA infrastructure: streams, caching allocator, CUDAGuard' },
+    detail: {
+      target: 'c10_cuda',
+      cmake: 'c10/cuda/CMakeLists.txt',
+      sources: [
+        'c10/cuda/*.cpp',
+        'c10/cuda/impl/*.cpp',
+      ],
+      links: ['c10 (PUBLIC)', 'torch::cudart (PUBLIC)'],
+      note: { zh: 'CUDA 流、CUDA caching allocator(torch.cuda.empty_cache() 操作的对象)、CUDAGuard、设备断言、P2P 访问。 PyTorch CUDA 路径的底座。 CMake 显式列出 12 个 .cpp,不用 GLOB。',
+              en: 'CUDA streams, the caching allocator (target of torch.cuda.empty_cache()), CUDAGuard, device assertions, P2P access. The CUDA foundation. CMake lists all 12 .cpp explicitly (no GLOB).' },
+    } },
+  { id: 'libtorch_cpu', kind: 'lib', label: 'libtorch_cpu.so',
+    desc: { zh: 'ATen + autograd + JIT 的 CPU 主体;wheel 里最大的 .so',
+            en: 'ATen + autograd + JIT, CPU side; the largest .so in the wheel' },
+    detail: {
+      target: 'torch_cpu',
+      cmake: 'caffe2/CMakeLists.txt (历史名)',
+      sources: ['aten/src/ATen/ (CPU 子目录)', 'aten/src/ATen/native/ + native/{mkl,mkldnn,quantized,sparse,nested,transformers}/', 'torch/csrc/api/src/', 'torch/csrc/autograd/ (非 Python)', 'torch/csrc/jit/ (C++)', 'torch/csrc/distributed/c10d/ (CPU)', 'torch/csrc/lazy/', 'torch/csrc/inductor/ (CPU)', 'torch/csrc/profiler/', 'caffe2/serialize/ (历史残留)'],
+      links: ['c10 (PUBLIC)', 'MKL / MKLDNN / Sleef', 'protobuf / flatbuffers', 'OpenMP'],
+      note: { zh: '源文件清单来自 build_variables.bzl 里的 libtorch_python_core_sources 等(append_filelist)。',
+              en: 'Source list comes from libtorch_python_core_sources etc. in build_variables.bzl (append_filelist).' },
+    } },
+  { id: 'libtorch_cuda', kind: 'lib', label: 'libtorch_cuda.so',
+    desc: { zh: '所有 CUDA 算子内核(.cu),链 torch_cpu 拿 dispatcher',
+            en: 'All CUDA op kernels (.cu); links torch_cpu for the dispatcher' },
+    detail: {
+      target: 'torch_cuda',
+      cmake: 'caffe2/CMakeLists.txt:974/984',
+      sources: [
+        '— ATen CUDA / cuDNN —',
+        'aten/src/ATen/{cuda, cudnn}/**',
+        'aten/src/ATen/native/{cuda, cudnn}/**',
+        'aten/src/ATen/native/{sparse, quantized, nested, transformers}/cuda/**',
+        'aten/src/ATen/native/quantized/cudnn/**',
+        'aten/src/ATen/native/cuda/linalg/** (除非 BUILD_LAZY_CUDA_LINALG)',
+        'aten/src/ATen/native/miopen/** (源在列表,内容 #ifdef USE_ROCM 保护)',
+        '— torch/csrc CUDA host —',
+        'torch/csrc/cuda/*.cpp (host 侧,non-Python)',
+        'torch/csrc/CudaIPCTypes.cpp',
+        'torch/csrc/inductor/aoti_*/** (CUDA shim / runner / inductor_ops_gpu)',
+        'torch/csrc/jit/{codegen/fuser/cuda, runtime, tensorexpr, passes}/*cuda*.cpp',
+        'torch/csrc/autograd/functions/comm.cpp',
+        'torch/csrc/profiler/stubs/cuda.cpp',
+        '— torch/csrc distributed CUDA —',
+        'torch/csrc/distributed/c10d/*{cuda,NCCL,UCC,Cuda}*.cpp',
+        'torch/csrc/distributed/c10d/{cuda, symm_mem, quantization}/**',
+        'torch/csrc/distributed/rpc/tensorpipe_cuda.cpp',
+        '— generated —',
+        'torch/csrc/inductor/aoti_torch/generated/c_shim_cuda.cpp',
+      ],
+      links: ['c10_cuda (PUBLIC)', 'torch_cpu (PUBLIC)', 'torch::cudart', '(optional) NCCL / cuFile / cuSPARSELt / cuDSS / NVTX / NVSHMEM / UCC'],
+      note: { zh: '链 torch_cpu 是因为 CUDA 算子需要 ATen 的 dispatcher 和 native 函数注册机制。 ATen 源文件来自 ATen_CUDA_CPP_SRCS + ATen_CUDA_CU_SRCS,torch/csrc 源文件来自 build_variables.bzl 的 libtorch_cuda_core_sources 与 libtorch_cuda_distributed_{base,extra}_sources。',
+              en: 'Links torch_cpu because CUDA ops need ATen\'s dispatcher and native-function registration. ATen sources come from ATen_CUDA_CPP_SRCS + ATen_CUDA_CU_SRCS; torch/csrc sources come from libtorch_cuda_core_sources and libtorch_cuda_distributed_{base,extra}_sources in build_variables.bzl.' },
+    } },
+  { id: 'libtorch', kind: 'lib-dummy', label: 'libtorch.so',
+    desc: { zh: '空 aggregator,从一个空 .cpp 编出来,只为让 "link libtorch" 同时拿到 cpu 和 cuda',
+            en: 'Empty aggregator from one empty .cpp; lets "link libtorch" pull both cpu and cuda transitively' },
+    detail: {
+      target: 'torch (DUMMY_EMPTY_FILE)',
+      cmake: 'caffe2/CMakeLists.txt:923',
+      sources: ['(一个空 .cpp 占位符)', '(no real code)'],
+      links: ['torch_cpu_library (PUBLIC)', 'torch_cuda_library (PUBLIC, if USE_CUDA)'],
+      note: { zh: '存在的全部理由:让用户写 target_link_libraries(my_app torch) 就同时拿到 CPU 和 CUDA。 split-build 模式下会被 find_library 找到外部 libtorch.so,概念不变。',
+              en: 'Sole purpose: let users write target_link_libraries(my_app torch) and transitively get both CPU and CUDA. In split-build mode, find_library locates an external libtorch.so; same concept.' },
+    } },
+  { id: 'libtorch_python', kind: 'lib', label: 'libtorch_python.so',
+    desc: { zh: 'Python 扩展模块,PyInit__C 入口,Python 端的 torch._C 就是这个 .so',
+            en: 'CPython extension; PyInit__C; this .so IS torch._C from Python' },
+    detail: {
+      target: 'torch_python',
+      cmake: 'torch/CMakeLists.txt',
+      sources: [
+        '— libtorch_python_core_sources (build_variables.bzl:913+) —',
+        'torch/csrc/Module.cpp (PyInit__C)',
+        'torch/csrc/autograd/python_*.cpp',
+        'torch/csrc/jit/python/**',
+        'torch/csrc/jit/passes/onnx*.cpp',
+        'torch/csrc/api/src/python/**',
+        'torch/csrc/dynamo/**',
+        'torch/csrc/inductor/**python**',
+        'torch/csrc/tensor/python_tensor.cpp',
+        'torch/csrc/utils/**',
+        'torch/csrc/{Device,Dtype,Layout,MemoryFormat,Storage,Stream,Event,Generator}.cpp',
+        'torch/csrc/{mps,mtia,functorch,functionalization,monitor,onnx,multiprocessing,fx,nativert/python}/**',
+        '— libtorch_python_cuda_core_sources —',
+        'torch/csrc/cuda/*.cpp (Python 桥:Module / Stream / Event / Graph / MemPool / GreenContext / GdsFile / ...)',
+        'torch/csrc/cuda/shared/{cudart,nvtx}.cpp',
+        '— libtorch_python_distributed_sources —',
+        'torch/csrc/distributed/c10d/{init, python_comm_hook, python_callback_work}.cpp',
+        'torch/csrc/distributed/{autograd,rpc}/**',
+        '— generated —',
+        '${GENERATED_CXX_PYTHON}: python_torch_functions_* / python_variable_methods / python_nn_functions / ...',
+      ],
+      links: ['${TORCH_LIB} (PRIVATE) = aggregator torch', 'Python::Module', 'pybind11', 'shm', '(optional) cuDNN / cuSPARSELt / cuFile / NVTX / UCC / NumPy'],
+      note: { zh: '关键:链的是空壳 libtorch.so(aggregator),而不是直接 libtorch_cpu / libtorch_cuda。 split-build 模式下这一抽象层不变。',
+              en: 'Key: it links the empty aggregator libtorch.so, not torch_cpu / torch_cuda directly. The indirection is preserved in split-build mode.' },
+    } },
+  { id: 'libtorch_global_deps', kind: 'lib-dummy', label: 'libtorch_global_deps.so',
+    desc: { zh: '没人链它;Python 启动时 ctypes.CDLL(RTLD_GLOBAL) 单独 dlopen,预加载 MKL / cudart 等',
+            en: 'No library links it; Python dlopens it with RTLD_GLOBAL to preload MKL / cudart symbols globally' },
+    detail: {
+      target: 'torch_global_deps',
+      cmake: 'caffe2/CMakeLists.txt:1806',
+      sources: ['torch/csrc/empty.c (一个空 C 文件)'],
+      links: ['MPI_LIBRARIES (PRIVATE)', 'MKL_LIBRARIES (PRIVATE)', 'CUDA::cudart (PRIVATE)', 'CUDA::nvToolsExt (PRIVATE)'],
+      note: { zh: '没有任何 PyTorch 库链接它。 Python 启动时 torch/__init__.py 用 ctypes.CDLL(..., RTLD_GLOBAL) 显式预加载,目的是把 MKL / cudart 等的符号提前进全局符号空间,避免与用户其它依赖(numpy/scipy 自带的 MKL)撞符号或拿到不同实例。',
+              en: 'No PyTorch library links it. At Python startup, torch/__init__.py preloads it via ctypes.CDLL(..., RTLD_GLOBAL) to push MKL / cudart symbols into the global symbol space and avoid clashes (or instance mismatch) with the user\'s other dependencies (e.g. the MKL inside numpy / scipy).' },
+    } },
+  { id: 'libshm', kind: 'lib', label: 'libshm.so',
+    desc: { zh: '跨进程共享内存 Tensor 的 manager;链 torch_cpu',
+            en: 'Cross-process shared-memory tensor manager; links torch_cpu' },
+    detail: {
+      target: 'shm',
+      cmake: 'torch/lib/libshm/CMakeLists.txt:10',
+      sources: ['torch/lib/libshm/core.cpp'],
+      links: ['torch_cpu (PRIVATE)'],
+      note: { zh: '只一个 .cpp。 配套 torch_shm_manager 可执行文件(独立 target,从 manager.cpp 编)落在 torch/bin/。 用于 multiprocessing 共享 Tensor 时的协调进程。',
+              en: 'Single .cpp. Ships alongside the torch_shm_manager executable (separate target, built from manager.cpp) in torch/bin/. Coordinates shared tensors across multiprocessing workers.' },
+    } },
+  { id: 'libcaffe2_nvrtc', kind: 'lib-dummy', label: 'libcaffe2_nvrtc.so',
+    desc: { zh: 'NVRTC 延迟绑定 stub;libtorch 不直接链 NVRTC,通过 dlopen 这层间接调',
+            en: 'NVRTC lazy-binding stub; libtorch dlopens through it instead of hard-linking NVRTC' },
+    detail: {
+      target: 'caffe2_nvrtc',
+      cmake: 'caffe2/CMakeLists.txt:554',
+      sources: ['aten/src/ATen/cuda/nvrtc_stub/*.cpp (essentially ATenNVRTC.cpp)'],
+      links: ['caffe2::nvrtc + delay-load flags', '(deliberately no link to torch_*)'],
+      note: { zh: '故意不被 libtorch 直接链。 运行时由 PyTorch dlopen 进来,这样没装 NVRTC 的环境也能 import torch 不挂掉。',
+              en: 'Deliberately not linked into libtorch directly; PyTorch dlopens it at runtime so environments without NVRTC can still import torch without crashing.' },
+    } },
+  { id: 'libnnapi_backend', kind: 'lib', label: 'libnnapi_backend.so',
+    desc: { zh: 'Android NNAPI 的 TorchScript backend;Linux 上也无条件 ship,历史遗留',
+            en: 'Android NNAPI TorchScript backend; ships unconditionally on Linux, a historical artefact' },
+    detail: {
+      target: 'nnapi_backend',
+      cmake: 'torch/CMakeLists.txt:462',
+      sources: [
+        'torch/csrc/jit/backends/nnapi/nnapi_backend_lib.cpp',
+        'torch/csrc/jit/backends/nnapi/nnapi_backend_preprocess.cpp',
+      ],
+      links: ['torch (aggregator)', 'torch_python'],
+      note: { zh: '只在 NOT Darwin 时 build,Linux 上无条件 ship。 实际只在 Android NNAPI 设备上有意义,桌面环境基本没人调。',
+              en: 'Built whenever not on Darwin; ships unconditionally on Linux. Only meaningful on Android NNAPI devices; effectively unused in desktop deployments.' },
+    } },
+  { id: 'libtorch_cuda_linalg', kind: 'lib', label: 'libtorch_cuda_linalg.so',
+    desc: { zh: '可选;把 MAGMA / cusolver 的 linalg 内核拆出来 lazy load,主库不必硬链 MAGMA',
+            en: 'Optional; splits MAGMA / cusolver linalg kernels into a lazy-loaded library so the main lib does not have to hard-link MAGMA' },
+    detail: {
+      target: 'torch_cuda_linalg',
+      cmake: 'caffe2/CMakeLists.txt:1098 (BUILD_LAZY_CUDA_LINALG)',
+      sources: ['aten/src/ATen/native/cuda/linalg/*.cpp (= native_cuda_linalg_cpp)'],
+      links: ['torch_cpu', 'torch_cuda', 'MAGMA', 'cusolver'],
+      note: { zh: 'BUILD_LAZY_CUDA_LINALG 在新版 build 默认 ON。 把 MAGMA / cusolver 从 libtorch_cuda.so 里拆出来 dlopen 加载,避免主库强依赖这些可选 backend。',
+              en: 'BUILD_LAZY_CUDA_LINALG defaults ON in newer builds. Splits MAGMA / cusolver out of libtorch_cuda.so to be dlopened lazily, removing the hard dependency from the main library.' },
+    } },
+  { id: 'libtorch_nvshmem', kind: 'lib', label: 'libtorch_nvshmem.so',
+    desc: { zh: '可选;NVSHMEM 后端的集体通信',
+            en: 'Optional; NVSHMEM-backed collective communication' },
+    detail: {
+      target: 'torch_nvshmem',
+      cmake: 'caffe2/CMakeLists.txt:1049 (USE_NVSHMEM)',
+      sources: [
+        'torch/csrc/distributed/c10d/cuda/utils.cpp',
+        'torch/csrc/distributed/c10d/symm_mem/nvshmem_extension.cu',
+        'torch/csrc/distributed/c10d/symm_mem/NVSHMEMSymmetricMemory.cpp',
+        'torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemoryUtils.cpp',
+      ],
+      links: ['torch_cuda', 'NVSHMEM'],
+      note: { zh: '仅当 USE_NVSHMEM=ON 时 build。 提供基于 NVSHMEM 的 ProcessGroup backend,跟 NCCL 并行。',
+              en: 'Built only when USE_NVSHMEM=ON. Provides an NVSHMEM-based ProcessGroup backend, parallel to NCCL.' },
+    } },
+
+  // (Source-tree directory nodes were removed: the same info now lives in the
+  //  detail panel that opens when a lib node is clicked.)
+];
+
+// kind: 'link' (link-time dep), 'preload' (RTLD_GLOBAL dlopen)
+const LINKS = [
+  // ---- link-time (A links B)
+  { source: 'libc10_cuda',    target: 'libc10',         kind: 'link' },
+  { source: 'libtorch_cpu',   target: 'libc10',         kind: 'link' },
+  { source: 'libtorch_cuda',  target: 'libtorch_cpu',   kind: 'link' },
+  { source: 'libtorch_cuda',  target: 'libc10_cuda',    kind: 'link' },
+  { source: 'libtorch',       target: 'libtorch_cpu',   kind: 'link' },
+  { source: 'libtorch',       target: 'libtorch_cuda',  kind: 'link' },
+  { source: 'libtorch_python',target: 'libtorch',       kind: 'link' },
+  { source: 'libshm',         target: 'libtorch_cpu',   kind: 'link' },
+  { source: 'libnnapi_backend',    target: 'libtorch',         kind: 'link' },
+  { source: 'libnnapi_backend',    target: 'libtorch_python',  kind: 'link' },
+  { source: 'libtorch_cuda_linalg', target: 'libtorch_cpu',    kind: 'link' },
+  { source: 'libtorch_cuda_linalg', target: 'libtorch_cuda',   kind: 'link' },
+  { source: 'libtorch_nvshmem',    target: 'libtorch_cuda',    kind: 'link' },
+
+  // ---- runtime-only preload by Python
+  { source: 'libtorch_global_deps', target: 'libtorch_python', kind: 'preload' },
+];
+
+// ===========================================================================
+// Render
+// ===========================================================================
+
+function ensureD3() {
+  return new Promise(r => {
+    if (window.d3) return r();
+    const t = setInterval(() => { if (window.d3) { clearInterval(t); r(); } }, 30);
+  });
+}
+
+const tipEl = document.getElementById('tooltip');
+function tipFor(d) {
+  const lang = (document.documentElement.lang || 'zh-CN').toLowerCase().startsWith('en') ? 'en' : 'zh';
+  return (d.desc && (d.desc[lang] || d.desc.zh || d.desc.en)) || '';
+}
+
+let SIM = null;
+let SVG = null;
+
+// Update the side detail-panel based on a clicked lib node.
+function showDetail(node) {
+  const panel = document.getElementById('detail-panel');
+  if (!panel) return;
+  const lang = (document.documentElement.lang || 'zh-CN').toLowerCase().startsWith('en') ? 'en' : 'zh';
+  const labels = {
+    zh: { cmake: 'CMake', src: '源码目录', links: '链接依赖', note: '说明' },
+    en: { cmake: 'CMake', src: 'Source directories', links: 'Link-time deps', note: 'Note' },
+  }[lang];
+  if (!node || !node.detail) {
+    panel.innerHTML = `<div class="detail-empty">${
+      lang === 'en'
+        ? 'Click any <code>lib*.so</code> node in the graph to see its CMake target, source directories, and link-time deps here.'
+        : '点击图中任意 <code>lib*.so</code> 节点,这里会显示它的 CMake target、源码目录与链接依赖。'
+    }</div>`;
+    return;
+  }
+  const d = node.detail;
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;' }[c]));
+  const ul = arr => '<ul class="detail-list">' + arr.map(x => `<li><code>${esc(x)}</code></li>`).join('') + '</ul>';
+  const noteText = (d.note && (d.note[lang] || d.note.zh || d.note.en)) || '';
+  panel.innerHTML = `
+    <h4>${esc(node.label)}</h4>
+    <div class="detail-sub">target <code>${esc(d.target)}</code> · <code>${esc(d.cmake)}</code></div>
+    <div class="detail-block">
+      <div class="detail-label">${labels.src}</div>
+      ${ul(d.sources)}
+    </div>
+    <div class="detail-block">
+      <div class="detail-label">${labels.links}</div>
+      ${ul(d.links)}
+    </div>
+    ${noteText ? `<div class="detail-block"><div class="detail-label">${labels.note}</div><p class="detail-note">${esc(noteText)}</p></div>` : ''}
+  `;
+}
+
+async function renderGraph() {
+  await ensureD3();
+  const host = document.getElementById('graph-host');
+  host.innerHTML = '';
+
+  const width = Math.min(host.clientWidth || 700, 1100);
+  const height = 680;
+
+  const svg = d3.select(host).append('svg')
+    .attr('class', 'graph-svg')
+    .attr('viewBox', [0, 0, width, height])
+    .attr('preserveAspectRatio', 'xMidYMid meet');
+  SVG = svg;
+
+  // arrow markers
+  const defs = svg.append('defs');
+  const markers = [
+    { id: 'a-link',    color: 'var(--accent)' },
+    { id: 'a-compile', color: 'var(--fg-subtle)' },
+    { id: 'a-preload', color: '#d97706' },
+  ];
+  markers.forEach(m => {
+    defs.append('marker')
+      .attr('id', m.id)
+      .attr('viewBox', '-2 -4 8 8')
+      .attr('refX', 6)
+      .attr('refY', 0)
+      .attr('markerWidth', 6)
+      .attr('markerHeight', 6)
+      .attr('orient', 'auto')
+      .append('path')
+      .attr('d', 'M-2,-4 L6,0 L-2,4 z')
+      .attr('fill', m.color);
+  });
+
+  const gEdges = svg.append('g').attr('class', 'edges');
+  const gNodes = svg.append('g').attr('class', 'nodes');
+
+  function build() {
+    const nodes = NODES.map(n => ({ ...n }));
+    const ids = new Set(nodes.map(n => n.id));
+    const links = LINKS
+      .filter(l => ids.has(l.source) && ids.has(l.target))
+      .map(l => ({ ...l }));
+
+    const linkClass = d => 'edge ' + d.kind;
+    const markerFor = d => d.kind === 'link' ? 'url(#a-link)'
+                          : d.kind === 'preload' ? 'url(#a-preload)'
+                          : 'url(#a-compile)';
+
+    gEdges.selectAll('*').remove();
+    gNodes.selectAll('*').remove();
+
+    const link = gEdges.selectAll('line')
+      .data(links).enter().append('line')
+      .attr('class', linkClass)
+      .attr('marker-end', markerFor);
+
+    let selectedId = null;
+    function applySelectedClass() {
+      gNodes.selectAll('g.node').classed('selected', d => d.id === selectedId);
+    }
+
+    const node = gNodes.selectAll('g.node')
+      .data(nodes, d => d.id)
+      .enter().append('g')
+      .attr('class', d => 'node ' + (d.kind === 'src' ? 'node-src' : 'node-lib') + (d.kind === 'lib-dummy' ? ' dummy' : ''))
+      .on('mouseenter', (e, d) => { tipEl.textContent = tipFor(d); tipEl.classList.add('show'); positionTip(e); })
+      .on('mousemove', positionTip)
+      .on('mouseleave', () => tipEl.classList.remove('show'))
+      .on('click', (e, d) => {
+        if (!d.detail) return;                    // src nodes have no detail panel
+        selectedId = (selectedId === d.id) ? null : d.id;
+        applySelectedClass();
+        showDetail(selectedId ? d : null);
+      })
+      .call(d3.drag()
+        .on('start', (e, d) => { if (!e.active) SIM.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+        .on('drag',  (e, d) => { d.fx = e.x; d.fy = e.y; })
+        .on('end',   (e, d) => { if (!e.active) SIM.alphaTarget(0); /* keep pinned: leave fx/fy set */ }));
+
+    // sizing per node
+    nodes.forEach(n => {
+      n._w = Math.max(80, n.label.length * 6.5 + 16);
+      n._h = n.kind === 'src' ? 22 : 26;
+    });
+
+    node.append('rect')
+      .attr('x', d => -d._w / 2)
+      .attr('y', d => -d._h / 2)
+      .attr('width', d => d._w)
+      .attr('height', d => d._h);
+
+    node.append('text')
+      .attr('dy', '0.32em')
+      .attr('text-anchor', 'middle')
+      .text(d => d.label);
+
+    const PAD = 18;
+    SIM = d3.forceSimulation(nodes)
+      .force('link', d3.forceLink(links).id(d => d.id).distance(d => d.kind === 'compile' ? 100 : 80).strength(0.85))
+      .force('charge', d3.forceManyBody().strength(-220))
+      .force('x', d3.forceX(width / 2).strength(0.06))
+      .force('y', d3.forceY(height / 2).strength(0.10))
+      .force('collide', d3.forceCollide().radius(d => d._w / 2 + 14).strength(0.95))
+      .on('tick', () => {
+        // Clamp positions to keep nodes inside the canvas.
+        nodes.forEach(d => {
+          d.x = Math.max(d._w / 2 + PAD, Math.min(width  - d._w / 2 - PAD, d.x));
+          d.y = Math.max(d._h / 2 + PAD, Math.min(height - d._h / 2 - PAD, d.y));
+        });
+        link
+          .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+          .attr('x2', d => {
+            const dx = d.target.x - d.source.x, dy = d.target.y - d.source.y;
+            const a = Math.atan2(dy, dx);
+            return d.target.x - Math.cos(a) * (d.target._w / 2 + 4);
+          })
+          .attr('y2', d => {
+            const dx = d.target.x - d.source.x, dy = d.target.y - d.source.y;
+            const a = Math.atan2(dy, dx);
+            return d.target.y - Math.sin(a) * (d.target._h / 2 + 4);
+          });
+        node.attr('transform', d => `translate(${d.x},${d.y})`);
+      });
+  }
+
+  function positionTip(event) {
+    const pad = 14, tw = tipEl.offsetWidth, th = tipEl.offsetHeight;
+    let x = event.clientX + pad, y = event.clientY + pad;
+    if (x + tw > window.innerWidth - 8)  x = event.clientX - tw - pad;
+    if (y + th > window.innerHeight - 8) y = event.clientY - th - pad;
+    tipEl.style.left = x + 'px';
+    tipEl.style.top  = y + 'px';
+  }
+
+  build();
+
+  window.restartSim = () => {
+    NODES.forEach(n => { delete n.fx; delete n.fy; });
+    build();
+  };
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', renderGraph);
+} else {
+  renderGraph();
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,1049 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LLM Attention 变体 Zoo: 可点击的家族树</title>
+<meta name="post:title"           content="LLM Attention 变体 Zoo: 可点击的家族树">
+<meta name="post:title_en"        content="LLM Attention Variant Zoo: A Clickable Family Tree">
+<meta name="post:slug"            content="llm-attention-zoo">
+<meta name="post:date"            content="2026-06-03">
+<meta name="post:tags"            content="LLM, Attention, 架构">
+<meta name="post:tags_en"         content="LLM, Attention, Architecture">
+<meta name="post:reading"         content="15 分钟">
+<meta name="post:reading_en"      content="15 min">
+<meta name="post:summary"         content="按计算形式 × KV head 结构整理现代 LLM 的 attention 变体(dense softmax / sparse / linear / SSM / mLSTM 五大主支),每分支挂到具体模型与开源实现,另含正交件辅助树(QK-Norm、PE 变体、Gated Attention 等)。">
+<meta name="post:summary_en"      content="A family-tree inventory of modern LLM attention variants, organised by computation form (dense softmax / sparse / linear / SSM / mLSTM) and KV-head structure, with concrete models and open-source implementations under each branch. Plus an orthogonal-building-blocks tree (QK-Norm, positional encoding variants, gated attention).">
+<meta name="post:series"          content="llm-arch">
+<meta name="post:series_title"    content="LLM Attention 与实现">
+<meta name="post:series_title_en" content="LLM Attention and Implementations">
+<meta name="post:series_order"    content="1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js" defer></script>
+<script src="../lang-toggle.js" defer></script>
+<style>
+  /* page-specific: widen article column for the trees */
+  main.content { max-width: 1280px; padding: 56px 32px 96px; }
+  @media (max-width: 1280px) { main.content { padding: 48px 24px 80px; } }
+  .tree-frame {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    margin: 18px 0 24px;
+    padding: 12px 14px 16px;
+    overflow: hidden;
+  }
+  .tree-frame .tree-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--fg-subtle);
+    margin-bottom: 6px;
+    letter-spacing: 0;
+  }
+  .tree-frame .tree-actions { display: flex; gap: 6px; }
+  .tree-frame .tree-actions button {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg);
+    color: var(--fg-muted);
+    cursor: pointer;
+    transition: all var(--dur-fast) var(--ease-out);
+  }
+  .tree-frame .tree-actions button:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .tree-svg { width: 100%; display: block; }
+  .tree-svg text {
+    font-family: var(--font-mono);
+    fill: var(--fg);
+    cursor: pointer;
+  }
+  .tree-svg .node--leaf text { fill: var(--fg-muted); }
+  .tree-svg .node--root text { font-weight: 600; fill: var(--fg); }
+  .tree-svg .node--branch text { font-weight: 500; fill: var(--fg); }
+  .tree-svg .link {
+    fill: none;
+    stroke: var(--border-strong);
+    stroke-opacity: 0.7;
+    stroke-width: 1.2;
+  }
+  .tree-svg .node circle { stroke-width: 0; }
+  .tree-svg .node--branch circle { fill: var(--accent); }
+  .tree-svg .node--branch.collapsed circle { fill: var(--accent); stroke: var(--accent-tint); stroke-width: 4; }
+  .tree-svg .node--leaf circle { fill: var(--fg-subtle); }
+  .tree-svg .node:hover circle { stroke: var(--accent-tint); stroke-width: 6; }
+  .tooltip {
+    position: fixed;
+    pointer-events: none;
+    background: var(--fg);
+    color: var(--bg);
+    font-family: var(--font-sans);
+    font-size: 12.5px;
+    line-height: 1.45;
+    padding: 7px 11px;
+    border-radius: var(--radius-sm);
+    max-width: 320px;
+    box-shadow: var(--shadow-md);
+    z-index: 200;
+    opacity: 0;
+    transition: opacity 0.12s;
+    letter-spacing: -0.005em;
+  }
+  .tooltip.show { opacity: 1; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录 · TOC</div>
+    <div class="lang-zh">
+    <ul>
+      <li><a href="#zh-intro">引子</a></li>
+      <li><a href="#zh-howto">怎么读这棵树</a></li>
+      <li><a href="#zh-main">主树:Attention 形式 × KV head</a></li>
+      <li><a href="#zh-aux">辅助树:正交维度</a></li>
+      <li><a href="#zh-notes">几点注释</a></li>
+      <li><a href="#zh-impl">实现 / 库</a></li>
+      <li><a href="#zh-refs">参考资料</a></li>
+    </ul>
+    </div>
+    <div class="lang-en">
+    <ul>
+      <li><a href="#en-intro">Intro</a></li>
+      <li><a href="#en-howto">How to read it</a></li>
+      <li><a href="#en-main">Main tree</a></li>
+      <li><a href="#en-aux">Auxiliary tree</a></li>
+      <li><a href="#en-notes">Notes</a></li>
+      <li><a href="#en-impl">Implementations</a></li>
+      <li><a href="#en-refs">References</a></li>
+    </ul>
+    </div>
+  </aside>
+
+<main class="content">
+
+<!-- ===== INTRO + HOW-TO + MAIN-TREE INTRO (bilingual prose) ===== -->
+<div class="lang-zh">
+
+<h1>LLM Attention 变体 Zoo: 可点击的家族树</h1>
+
+<h2 id="zh-intro">引子</h2>
+
+<p>现代 LLM 的 attention 沿几个相对独立的轴在演化:KV head 结构(MHA / MQA / GQA / MLA / CCA)、计算形式(dense softmax / sparse / linear / SSM / mLSTM)、稀疏模式(SWA / NSA / DSA / MoBA)、混合架构(KDA+MLA、Lightning+MLA、Mamba+Attn)、正交件(QK-Norm、Partial RoPE、NoPE、Gated Attention)。 静态表格能塞下信息但读起来累,纯描述容易丢全局。</p>
+
+<p>这篇把它们放进一棵 <strong>可点击展开的家族树</strong>:</p>
+<ul>
+  <li>第一层按 attention <strong>计算形式</strong>分大类。</li>
+  <li>第二层按 <strong>KV head 结构</strong>或<strong>子家族</strong>。</li>
+  <li>叶节点是具体<strong>模型/论文</strong>。</li>
+  <li>点击节点展开/折叠它的子树,hover 显示一句话定义。</li>
+</ul>
+
+<h2 id="zh-howto">怎么读这棵树</h2>
+
+<ul>
+  <li><strong>圆点是蓝的</strong>:这个节点有可展开的子节点(branch)。点一下展开 / 收起。</li>
+  <li><strong>圆点是灰的</strong>:叶节点(具体模型)。</li>
+  <li><strong>hover 任意节点</strong>:鼠标旁弹出一句话定义。</li>
+  <li>右上角两个按钮可以一键<strong>全部展开</strong>或<strong>仅留第 1 层</strong>。</li>
+  <li>所有节点都是同一个语义层。 Hybrid 混合架构归到它<strong>占主导</strong>的那一支(比如 Kimi Linear 走 linear,即使 25% 的层是 MLA 全注意)。</li>
+</ul>
+
+<h2 id="zh-main">主树:Attention 形式 × KV head × 模型</h2>
+
+<p>第一层是 attention 的<strong>计算形式</strong>(决定复杂度数量级),第二层是 <strong>KV head 结构</strong>或子家族,叶节点是具体模型。</p>
+
+</div>
+
+<div class="lang-en">
+
+<h1>LLM Attention Variant Zoo: A Clickable Family Tree</h1>
+
+<h2 id="en-intro">Intro</h2>
+
+<p>Modern LLM attention evolves along several mostly independent axes: KV-head structure (MHA / MQA / GQA / MLA / CCA), computation form (dense softmax / sparse / linear / SSM / mLSTM), sparsity pattern (SWA / NSA / DSA / MoBA), hybrid architectures (KDA+MLA, Lightning+MLA, Mamba+Attn), and orthogonal building blocks (QK-Norm, Partial RoPE, NoPE, Gated Attention). A static table fits the information but reads dryly, and a pure narrative loses the global shape.</p>
+
+<p>This article puts them into a <strong>clickable family tree</strong>:</p>
+<ul>
+  <li>Top level by <strong>computation form</strong>.</li>
+  <li>Middle level by <strong>KV-head structure</strong> or <strong>sub-family</strong>.</li>
+  <li>Leaves are specific <strong>models / papers</strong>.</li>
+  <li>Click a node to expand or collapse its subtree; hover for a one-line definition.</li>
+</ul>
+
+<h2 id="en-howto">How to read it</h2>
+
+<ul>
+  <li><strong>Blue dot</strong>: branch node with children. Click to expand or collapse.</li>
+  <li><strong>Grey dot</strong>: leaf node (a specific model).</li>
+  <li><strong>Hover any node</strong>: a tooltip appears with a one-line definition.</li>
+  <li>Top-right buttons toggle <strong>expand-all</strong> or <strong>collapse to depth 1</strong>.</li>
+  <li>Every node sits in exactly one place. Hybrid architectures are filed under the <strong>dominant</strong> branch (for example Kimi Linear sits under linear attention even though 25% of its layers are full MLA).</li>
+</ul>
+
+<h2 id="en-main">Main tree: attention form × KV head × models</h2>
+
+<p>Top level is the <strong>computation form</strong> (which sets the asymptotic compute and memory class); middle level is the <strong>KV-head structure</strong> or sub-family; leaves are concrete models.</p>
+
+</div>
+
+<!-- ===== MAIN TREE (shared, outside lang divs) ===== -->
+<div class="tree-frame">
+  <div class="tree-meta">
+    <span><span class="lang-zh">主树 · main attention tree</span><span class="lang-en">Main attention tree</span></span>
+    <span class="tree-actions">
+      <button onclick="expandAll('tree-main')">
+        <span class="lang-zh">全部展开</span><span class="lang-en">Expand all</span>
+      </button>
+      <button onclick="collapseAll('tree-main')">
+        <span class="lang-zh">仅第 1 层</span><span class="lang-en">Depth 1 only</span>
+      </button>
+    </span>
+  </div>
+  <div id="tree-main"></div>
+</div>
+
+<!-- ===== AUX TREE INTRO (bilingual prose) ===== -->
+<div class="lang-zh">
+
+<h2 id="zh-aux">辅助树:正交维度</h2>
+
+<p>下面这些维度<strong>跟主树正交</strong>:同一个模型可以在主树里走 GQA + dense softmax,同时在这棵辅助树里挂上 QK-Norm + Partial RoPE + Gated Attention。</p>
+
+</div>
+
+<div class="lang-en">
+
+<h2 id="en-aux">Auxiliary tree: orthogonal dimensions</h2>
+
+<p>These dimensions are <strong>orthogonal</strong> to the main tree: a single model can sit under GQA + dense softmax in the main tree while also carrying QK-Norm + Partial RoPE + Gated Attention in this auxiliary tree.</p>
+
+</div>
+
+<!-- ===== AUX TREE (shared) ===== -->
+<div class="tree-frame">
+  <div class="tree-meta">
+    <span><span class="lang-zh">辅助树 · orthogonal dimensions</span><span class="lang-en">Auxiliary tree (orthogonal building blocks)</span></span>
+    <span class="tree-actions">
+      <button onclick="expandAll('tree-aux')">
+        <span class="lang-zh">全部展开</span><span class="lang-en">Expand all</span>
+      </button>
+      <button onclick="collapseAll('tree-aux')">
+        <span class="lang-zh">仅第 1 层</span><span class="lang-en">Depth 1 only</span>
+      </button>
+    </span>
+  </div>
+  <div id="tree-aux"></div>
+</div>
+
+<!-- ===== NOTES (bilingual prose) ===== -->
+<div class="lang-zh">
+
+<h2 id="zh-notes">几点注释</h2>
+
+<ol>
+  <li><strong>Hybrid 模型的归属</strong>:层间混合(layer-interleave)的模型按"占多数的那一支"归类。比如 Kimi Linear 的 KDA:MLA = 3:1,主支是 KDA,所以挂在 linear 这一支;它在 MLA 那一支也会被提到,但只作为引用。</li>
+  <li><strong>"no KV / stateful"</strong>:这一支<strong>放弃了显式 KV cache</strong>,改用一个固定大小的 state(矩阵或向量)替代。它在树里跟 MHA / GQA / MLA 同层,但所在的概念空间不一样,既不是 KV-head 结构的延伸,也不是稀疏化路线的延伸。</li>
+  <li><strong>DeepSeek V4 家族(CCA / CSA / HCA / mHC)</strong>:挂在 sparse 一支下,但实际上跨多个轴(KV 压缩 + sparse + hyper-connection)。 2026 年新东西,公开材料有限,树里只放占位,具体语义建议直接读 V4 技术报告。</li>
+  <li><strong>把每一支单独写成深度笔记</strong>是这个系列接下来要做的事:KV head 演进(MHA → MLA)、Linear attention 家族数学推导、Sparse attention(NSA / MoBA / DSA)的硬件对齐、SSM 与 attention 的等价性。</li>
+</ol>
+
+<h2 id="zh-impl">实现 / 库</h2>
+
+<p>按主树分支整理对应的开源实现。仓库 URL 不完全确定的标 <code>(?)</code>。</p>
+
+<h3>通用底层工具(DSL / 模板,跨多个变体)</h3>
+
+<table>
+  <thead>
+    <tr><th>项目</th><th>链接</th><th>覆盖</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>CUTLASS / CuTe</strong>(NVIDIA)</td><td><a href="https://github.com/NVIDIA/cutlass" target="_blank" rel="noopener">NVIDIA/cutlass</a></td><td>C++ 模板;Hopper 上的 FlashAttention v3、WGMMA、TMA 参考实现在 <code>examples/</code></td></tr>
+    <tr><td><strong>Triton</strong>(OpenAI)</td><td><a href="https://github.com/triton-lang/triton" target="_blank" rel="noopener">triton-lang/triton</a></td><td>GPU DSL;FLA 与大半学界都用它写 attention</td></tr>
+    <tr><td><strong>ThunderKittens</strong>(Stanford HazyResearch)</td><td><a href="https://github.com/HazyResearch/ThunderKittens" target="_blank" rel="noopener">HazyResearch/ThunderKittens</a></td><td>low-level CUDA DSL;attention / GEMM 例子完整,Hopper 适配</td></tr>
+    <tr><td><strong>TileLang</strong></td><td><a href="https://github.com/tile-ai/tilelang" target="_blank" rel="noopener">tile-ai/tilelang</a></td><td>新一代 tile-level DSL,带 attention demo</td></tr>
+    <tr><td><strong>TransformerEngine</strong>(NVIDIA)</td><td><a href="https://github.com/NVIDIA/TransformerEngine" target="_blank" rel="noopener">NVIDIA/TransformerEngine</a></td><td>FP8 fused attention(<code>DotProductAttention</code>),GQA / SWA</td></tr>
+  </tbody>
+</table>
+
+<h3>Dense softmax(MHA / MQA / GQA)</h3>
+
+<table>
+  <thead><tr><th>项目</th><th>链接</th><th>备注</th></tr></thead>
+  <tbody>
+    <tr><td><strong>FlashAttention v1 / v2 / v3</strong></td><td><a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noopener">Dao-AILab/flash-attention</a></td><td>默认支持 GQA / MQA,v3 是 Hopper-only(TMA + WGMMA)</td></tr>
+    <tr><td><strong>xformers</strong>(Meta)</td><td><a href="https://github.com/facebookresearch/xformers" target="_blank" rel="noopener">facebookresearch/xformers</a></td><td><code>memory_efficient_attention</code>,有 block-sparse / SWA / causal mask 等多分支</td></tr>
+    <tr><td><strong>PyTorch SDPA</strong></td><td>内置 <code>torch.nn.functional.scaled_dot_product_attention</code></td><td>math / mem-eff / FA backend 自动选,Hopper 上下发 cuDNN 或 FA</td></tr>
+    <tr><td><strong>cuDNN attention</strong></td><td>NVIDIA(闭源,SDPA / TE / TRT-LLM 调用)</td><td>sm_90+ 的最优 SDPA fallback 路径</td></tr>
+    <tr><td><strong>SageAttention</strong></td><td><a href="https://github.com/thu-ml/SageAttention" target="_blank" rel="noopener">thu-ml/SageAttention</a></td><td>INT8 / INT4 量化 attention(图像 / 视频生成常用)</td></tr>
+  </tbody>
+</table>
+
+<h3>MLA(latent KV)</h3>
+
+<table>
+  <thead><tr><th>项目</th><th>链接</th><th>备注</th></tr></thead>
+  <tbody>
+    <tr><td><strong>FlashMLA</strong>(DeepSeek)</td><td><a href="https://github.com/deepseek-ai/FlashMLA" target="_blank" rel="noopener">deepseek-ai/FlashMLA</a></td><td>Hopper MLA 的官方内核实现,Paged KV</td></tr>
+    <tr><td><strong>FlashInfer</strong></td><td><a href="https://github.com/flashinfer-ai/flashinfer" target="_blank" rel="noopener">flashinfer-ai/flashinfer</a></td><td>推理用 attention 总集;MLA / Paged / Speculative 都有,vLLM 与 SGLang 都依赖它</td></tr>
+    <tr><td><strong>vLLM</strong>(MLA backend)</td><td><a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a></td><td>DeepSeek V2 / V3 推理的产品级路径</td></tr>
+    <tr><td><strong>SGLang</strong>(MLA backend)</td><td><a href="https://github.com/sgl-project/sglang" target="_blank" rel="noopener">sgl-project/sglang</a></td><td>自带 MLA 实现,长上下文友好</td></tr>
+    <tr><td><strong>TensorRT-LLM</strong></td><td><a href="https://github.com/NVIDIA/TensorRT-LLM" target="_blank" rel="noopener">NVIDIA/TensorRT-LLM</a></td><td>NVIDIA backend,MLA + FA 全套</td></tr>
+  </tbody>
+</table>
+
+<h3>Sparse softmax / SWA / Block-sparse</h3>
+
+<table>
+  <thead><tr><th>项目</th><th>链接</th><th>备注</th></tr></thead>
+  <tbody>
+    <tr><td><strong>vLLM SWA</strong></td><td><a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a></td><td>Mistral / Gemma 的 sliding window 推理</td></tr>
+    <tr><td><strong>xformers BlockSparseAttention</strong></td><td><a href="https://github.com/facebookresearch/xformers" target="_blank" rel="noopener">facebookresearch/xformers</a></td><td>block-sparse mask</td></tr>
+    <tr><td><strong>local-attention</strong></td><td><a href="https://github.com/lucidrains/local-attention" target="_blank" rel="noopener">lucidrains/local-attention</a></td><td>sliding window 简洁参考</td></tr>
+    <tr><td><strong>HuggingFace transformers</strong></td><td><a href="https://github.com/huggingface/transformers" target="_blank" rel="noopener">huggingface/transformers</a></td><td>Longformer / BigBird / Reformer 都在里面</td></tr>
+  </tbody>
+</table>
+
+<h4>Native sparse(2025+,训练原生)</h4>
+
+<table>
+  <thead><tr><th>项目</th><th>链接</th><th>备注</th></tr></thead>
+  <tbody>
+    <tr><td><strong>NSA</strong>(DeepSeek)</td><td><a href="https://github.com/deepseek-ai/Native-Sparse-Attention" target="_blank" rel="noopener">deepseek-ai/Native-Sparse-Attention</a> <code>(?)</code></td><td>官方代码,仓库名约 80% 把握;FLA 也已有 NSA 实现</td></tr>
+    <tr><td><strong>MoBA</strong>(Moonshot)</td><td><a href="https://github.com/MoonshotAI/MoBA" target="_blank" rel="noopener">MoonshotAI/MoBA</a></td><td>Moonshot 官方 reference</td></tr>
+    <tr><td><strong>DSA / DeepSeek V3.2</strong></td><td>应在 <a href="https://github.com/deepseek-ai/DeepSeek-V3" target="_blank" rel="noopener">deepseek-ai/DeepSeek-V3</a> 或 V3.2 仓库 <code>(?)</code></td><td>产品版 NSA</td></tr>
+  </tbody>
+</table>
+
+<h4>Inference-time sparse(动态 top-k)</h4>
+
+<table>
+  <thead><tr><th>项目</th><th>链接</th><th>备注</th></tr></thead>
+  <tbody>
+    <tr><td><strong>MInference</strong>(Microsoft)</td><td><a href="https://github.com/microsoft/MInference" target="_blank" rel="noopener">microsoft/MInference</a></td><td>长上下文动态选 KV</td></tr>
+    <tr><td><strong>DuoAttention</strong>(MIT-HAN)</td><td><a href="https://github.com/mit-han-lab/duo-attention" target="_blank" rel="noopener">mit-han-lab/duo-attention</a></td><td>head 分 retrieval / streaming</td></tr>
+    <tr><td><strong>Quest</strong>(MIT-HAN)</td><td><a href="https://github.com/mit-han-lab/Quest" target="_blank" rel="noopener">mit-han-lab/Quest</a></td><td>query-aware KV pruning</td></tr>
+  </tbody>
+</table>
+
+<h3>Linear / kernelized:几乎都集中在 FLA 一个仓库</h3>
+
+<table>
+  <thead><tr><th>项目</th><th>链接</th><th>备注</th></tr></thead>
+  <tbody>
+    <tr><td><strong>flash-linear-attention(FLA)</strong></td><td><a href="https://github.com/fla-org/flash-linear-attention" target="_blank" rel="noopener">fla-org/flash-linear-attention</a></td><td>linear-attention 家族的共享代码库,Songlin Yang 团队维护;覆盖 Linear Attn / Performer / Linformer / cosFormer / RetNet / GLA / DeltaNet / Gated DeltaNet / Mamba-1 / Mamba-2 / RWKV-4 ~ 7 / ABC / HGRN / Lightning Attention / GSA / Based 等;Triton 内核,可直接 import</td></tr>
+    <tr><td><strong>Lightning Attention</strong>(单独)</td><td>MiniMax 未单开仓库</td><td>等价实现在 FLA 里</td></tr>
+    <tr><td><strong>Kimi Delta Attention(KDA)</strong></td><td>Moonshot Kimi Linear 配套 / FLA <code>(?)</code></td><td>最新</td></tr>
+    <tr><td><strong>RWKV</strong>(官方)</td><td><a href="https://github.com/BlinkDL/RWKV-LM" target="_blank" rel="noopener">BlinkDL/RWKV-LM</a></td><td>RWKV 系列源头</td></tr>
+    <tr><td><strong>RetNet 原实现</strong></td><td><a href="https://github.com/microsoft/torchscale" target="_blank" rel="noopener">microsoft/torchscale</a></td><td>Microsoft 的 RetNet 官方</td></tr>
+  </tbody>
+</table>
+
+<h3>SSM(State Space Models)</h3>
+
+<table>
+  <thead><tr><th>项目</th><th>链接</th><th>备注</th></tr></thead>
+  <tbody>
+    <tr><td><strong>mamba</strong>(state-spaces)</td><td><a href="https://github.com/state-spaces/mamba" target="_blank" rel="noopener">state-spaces/mamba</a></td><td>Mamba-1 / Mamba-2 官方实现 + CUDA kernel</td></tr>
+    <tr><td><strong>causal-conv1d</strong></td><td><a href="https://github.com/Dao-AILab/causal-conv1d" target="_blank" rel="noopener">Dao-AILab/causal-conv1d</a></td><td>Mamba 的依赖,fused 1D 卷积</td></tr>
+    <tr><td><strong>S4 / S5(历史)</strong></td><td><a href="https://github.com/state-spaces/s4" target="_blank" rel="noopener">state-spaces/s4</a></td><td>早期参考</td></tr>
+  </tbody>
+</table>
+
+<h3>mLSTM / matrix RNN</h3>
+
+<table>
+  <thead><tr><th>项目</th><th>链接</th><th>备注</th></tr></thead>
+  <tbody>
+    <tr><td><strong>xLSTM</strong></td><td><a href="https://github.com/NX-AI/xlstm" target="_blank" rel="noopener">NX-AI/xlstm</a></td><td>Beck et al. 官方,sLSTM + mLSTM block + Triton kernel</td></tr>
+    <tr><td><strong>mlstm_kernels</strong></td><td><a href="https://github.com/NX-AI/mlstm_kernels" target="_blank" rel="noopener">NX-AI/mlstm_kernels</a></td><td>单独抽出来的 mLSTM 内核</td></tr>
+  </tbody>
+</table>
+
+<h3>推理框架(集成多个 attention 变体)</h3>
+
+<table>
+  <thead><tr><th>框架</th><th>链接</th><th>覆盖</th></tr></thead>
+  <tbody>
+    <tr><td><strong>vLLM</strong></td><td><a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a></td><td>PagedAttention + GQA / MQA / MLA + SWA + Spec</td></tr>
+    <tr><td><strong>SGLang</strong></td><td><a href="https://github.com/sgl-project/sglang" target="_blank" rel="noopener">sgl-project/sglang</a></td><td>RadixAttention + MLA + Paged + Spec</td></tr>
+    <tr><td><strong>TensorRT-LLM</strong></td><td><a href="https://github.com/NVIDIA/TensorRT-LLM" target="_blank" rel="noopener">NVIDIA/TensorRT-LLM</a></td><td>NVIDIA 优化版,Hopper 全套</td></tr>
+    <tr><td><strong>TGI</strong>(HuggingFace)</td><td><a href="https://github.com/huggingface/text-generation-inference" target="_blank" rel="noopener">huggingface/text-generation-inference</a></td><td>多 backend</td></tr>
+    <tr><td><strong>llama.cpp</strong></td><td><a href="https://github.com/ggerganov/llama.cpp" target="_blank" rel="noopener">ggerganov/llama.cpp</a></td><td>CPU / GPU 通用,GQA / MQA</td></tr>
+    <tr><td><strong>ExLlamaV2</strong></td><td><a href="https://github.com/turboderp/exllamav2" target="_blank" rel="noopener">turboderp/exllamav2</a></td><td>量化推理</td></tr>
+  </tbody>
+</table>
+
+<h3>训练框架(自带 attention 实现)</h3>
+
+<table>
+  <thead><tr><th>框架</th><th>链接</th><th>备注</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Megatron-LM / Megatron-Core</strong></td><td><a href="https://github.com/NVIDIA/Megatron-LM" target="_blank" rel="noopener">NVIDIA/Megatron-LM</a></td><td>FA + GQA + MLA + Mamba backbone,生产级训练</td></tr>
+    <tr><td><strong>DeepSpeed</strong></td><td><a href="https://github.com/microsoft/DeepSpeed" target="_blank" rel="noopener">microsoft/DeepSpeed</a></td><td>Ulysses 序列并行 + sparse attention + Triton kernel</td></tr>
+    <tr><td><strong>OLMo</strong></td><td><a href="https://github.com/allenai/OLMo" target="_blank" rel="noopener">allenai/OLMo</a></td><td>开源训练栈,带 QK-Norm</td></tr>
+    <tr><td><strong>litgpt</strong></td><td><a href="https://github.com/Lightning-AI/litgpt" target="_blank" rel="noopener">Lightning-AI/litgpt</a></td><td>简洁参考实现</td></tr>
+  </tbody>
+</table>
+
+<h2 id="zh-refs">参考资料</h2>
+
+<p>模型清单与一部分分类思路参考自下面的 LLM Architecture Gallery,有调整的分支按本文重新归类:</p>
+
+<ul>
+  <li>Sebastian Raschka, <strong>LLM Architecture Gallery</strong>: <a href="https://sebastianraschka.com/llm-architecture-gallery/" target="_blank" rel="noopener">sebastianraschka.com/llm-architecture-gallery</a>。逐模型逐组件梳理 2023-2026 主流 LLM 的架构卡片,涵盖 attention 变体、PE、normalization、KV 优化等。本文主树的 KV head / sparse / linear / SSM / mLSTM 五分以及辅助树的"正交件"分类直接受这页启发。</li>
+</ul>
+
+<p>各分支对应的原始工作(粗略,按主树顺序):</p>
+
+<ul>
+  <li><strong>MHA</strong>: Vaswani et al., <em>Attention Is All You Need</em>, NeurIPS 2017</li>
+  <li><strong>MQA</strong>: Shazeer, <em>Fast Transformer Decoding: One Write-Head is All You Need</em>, 2019</li>
+  <li><strong>GQA</strong>: Ainslie et al., <em>GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</em>, EMNLP 2023</li>
+  <li><strong>MLA</strong>: DeepSeek-AI, <em>DeepSeek-V2 Technical Report</em>, 2024</li>
+  <li><strong>NSA</strong>: Yuan et al. (DeepSeek-AI), <em>Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention</em>, 2025</li>
+  <li><strong>MoBA</strong>: Moonshot AI, <em>Mixture of Block Attention for Long-Context LLMs</em>, 2025</li>
+  <li><strong>Kimi Delta Attention (KDA)</strong> &amp; Kimi Linear: Moonshot AI, 2025</li>
+  <li><strong>Lightning Attention</strong>: MiniMax, <em>MiniMax-M1 Technical Report</em>, 2024-2025</li>
+  <li><strong>Linear Attention</strong>: Katharopoulos et al., <em>Transformers are RNNs</em>, ICML 2020</li>
+  <li><strong>Performer / FAVOR+</strong>: Choromanski et al., <em>Rethinking Attention with Performers</em>, ICLR 2021</li>
+  <li><strong>RetNet</strong>: Sun et al., <em>Retentive Network</em>, 2023</li>
+  <li><strong>GLA</strong>: Yang et al., <em>Gated Linear Attention Transformers with Hardware-Efficient Training</em>, 2023</li>
+  <li><strong>DeltaNet</strong>: Schlag et al. 起源,Yang 等在 LLM 尺度上的复活,2024-2025</li>
+  <li><strong>Mamba / Mamba-2</strong>: Gu &amp; Dao, 2023-2024;Mamba-2 来自 <em>Transformers are SSMs</em>, 2024</li>
+  <li><strong>Jamba</strong>: AI21 Labs, <em>Jamba: A Hybrid Transformer-Mamba Language Model</em>, 2024</li>
+  <li><strong>xLSTM</strong>: Beck et al., <em>xLSTM: Extended Long Short-Term Memory</em>, 2024</li>
+  <li><strong>FlashAttention v1/v2/v3</strong>: Dao 等,2022-2024(本文未深入,但所有 dense softmax 实现都在它之上)</li>
+  <li><strong>DeepSeek V4 系列(CCA / CSA / HCA / mHC)</strong>: DeepSeek-AI 2026 技术报告。公开材料较少,本文只挂占位</li>
+</ul>
+
+<hr>
+
+</div>
+
+<div class="lang-en">
+
+<h2 id="en-notes">A few notes</h2>
+
+<ol>
+  <li><strong>Where hybrids live</strong>: layer-interleave models are placed under the dominant branch. Kimi Linear's KDA:MLA = 3:1 puts it under linear attention; it also appears as a cross-reference under MLA but only as a pointer.</li>
+  <li><strong>The "no KV / stateful" branch</strong>: this family gives up the explicit KV cache entirely and stores a fixed-size state (matrix or vector) instead. It sits at the same tree level as MHA / GQA / MLA but in a different conceptual space, separate from both the KV-head axis and the sparsity axis.</li>
+  <li><strong>The DeepSeek V4 cluster (CCA / CSA / HCA / mHC)</strong> is filed under sparse but actually spans multiple axes (KV compression, sparsity, hyper-connections). These are 2026 entries with limited public detail; the tree carries placeholders, and the V4 technical report is the authoritative reference.</li>
+  <li><strong>Each major branch deserves its own deep-dive post</strong>, which is the plan for the rest of this series: KV-head evolution (MHA → MLA), the math of the linear-attention family, sparse-attention hardware alignment (NSA / MoBA / DSA), the equivalence between SSM and linear attention.</li>
+</ol>
+
+<h2 id="en-impl">Implementations / libraries</h2>
+
+<p>Grouped by main-tree branch; <code>(?)</code> marks entries where the repository URL is not fully confirmed.</p>
+
+<h3>General-purpose toolkits (DSL / templates, span multiple variants)</h3>
+
+<table>
+  <thead><tr><th>Project</th><th>Link</th><th>Coverage</th></tr></thead>
+  <tbody>
+    <tr><td><strong>CUTLASS / CuTe</strong> (NVIDIA)</td><td><a href="https://github.com/NVIDIA/cutlass" target="_blank" rel="noopener">NVIDIA/cutlass</a></td><td>C++ templates; Hopper-side FlashAttention v3 / WGMMA / TMA reference in <code>examples/</code></td></tr>
+    <tr><td><strong>Triton</strong> (OpenAI)</td><td><a href="https://github.com/triton-lang/triton" target="_blank" rel="noopener">triton-lang/triton</a></td><td>GPU DSL; the FLA stack and most academic kernels are written in it</td></tr>
+    <tr><td><strong>ThunderKittens</strong> (Stanford HazyResearch)</td><td><a href="https://github.com/HazyResearch/ThunderKittens" target="_blank" rel="noopener">HazyResearch/ThunderKittens</a></td><td>low-level CUDA DSL; complete attention / GEMM examples, Hopper-ready</td></tr>
+    <tr><td><strong>TileLang</strong></td><td><a href="https://github.com/tile-ai/tilelang" target="_blank" rel="noopener">tile-ai/tilelang</a></td><td>newer tile-level DSL with attention demos</td></tr>
+    <tr><td><strong>TransformerEngine</strong> (NVIDIA)</td><td><a href="https://github.com/NVIDIA/TransformerEngine" target="_blank" rel="noopener">NVIDIA/TransformerEngine</a></td><td>FP8 fused attention (<code>DotProductAttention</code>); covers GQA and SWA</td></tr>
+  </tbody>
+</table>
+
+<h3>Dense softmax (MHA / MQA / GQA)</h3>
+
+<table>
+  <thead><tr><th>Project</th><th>Link</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><strong>FlashAttention v1 / v2 / v3</strong></td><td><a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noopener">Dao-AILab/flash-attention</a></td><td>GQA / MQA out of the box; v3 is Hopper-only (TMA + WGMMA)</td></tr>
+    <tr><td><strong>xformers</strong> (Meta)</td><td><a href="https://github.com/facebookresearch/xformers" target="_blank" rel="noopener">facebookresearch/xformers</a></td><td><code>memory_efficient_attention</code> with block-sparse, SWA, causal-mask paths</td></tr>
+    <tr><td><strong>PyTorch SDPA</strong></td><td>built-in <code>torch.nn.functional.scaled_dot_product_attention</code></td><td>math / mem-eff / FA backend autoselected; on Hopper dispatches to cuDNN or FA</td></tr>
+    <tr><td><strong>cuDNN attention</strong></td><td>NVIDIA (closed source, used via SDPA / TE / TRT-LLM)</td><td>the optimal SDPA fallback path on sm_90+</td></tr>
+    <tr><td><strong>SageAttention</strong></td><td><a href="https://github.com/thu-ml/SageAttention" target="_blank" rel="noopener">thu-ml/SageAttention</a></td><td>INT8 / INT4 quantised attention (common in image / video generation)</td></tr>
+  </tbody>
+</table>
+
+<h3>MLA (latent KV)</h3>
+
+<table>
+  <thead><tr><th>Project</th><th>Link</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><strong>FlashMLA</strong> (DeepSeek)</td><td><a href="https://github.com/deepseek-ai/FlashMLA" target="_blank" rel="noopener">deepseek-ai/FlashMLA</a></td><td>the official MLA kernel implementation for Hopper, with Paged KV</td></tr>
+    <tr><td><strong>FlashInfer</strong></td><td><a href="https://github.com/flashinfer-ai/flashinfer" target="_blank" rel="noopener">flashinfer-ai/flashinfer</a></td><td>inference-side attention hub; MLA, Paged, Speculative all supported; both vLLM and SGLang depend on it</td></tr>
+    <tr><td><strong>vLLM</strong> (MLA backend)</td><td><a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a></td><td>production inference path for DeepSeek V2 / V3</td></tr>
+    <tr><td><strong>SGLang</strong> (MLA backend)</td><td><a href="https://github.com/sgl-project/sglang" target="_blank" rel="noopener">sgl-project/sglang</a></td><td>own MLA impl; long-context friendly</td></tr>
+    <tr><td><strong>TensorRT-LLM</strong></td><td><a href="https://github.com/NVIDIA/TensorRT-LLM" target="_blank" rel="noopener">NVIDIA/TensorRT-LLM</a></td><td>NVIDIA backend; MLA + FA full stack</td></tr>
+  </tbody>
+</table>
+
+<h3>Sparse softmax / SWA / Block-sparse</h3>
+
+<table>
+  <thead><tr><th>Project</th><th>Link</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><strong>vLLM SWA</strong></td><td><a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a></td><td>sliding window inference for Mistral / Gemma</td></tr>
+    <tr><td><strong>xformers BlockSparseAttention</strong></td><td><a href="https://github.com/facebookresearch/xformers" target="_blank" rel="noopener">facebookresearch/xformers</a></td><td>block-sparse mask</td></tr>
+    <tr><td><strong>local-attention</strong></td><td><a href="https://github.com/lucidrains/local-attention" target="_blank" rel="noopener">lucidrains/local-attention</a></td><td>compact sliding-window reference</td></tr>
+    <tr><td><strong>HuggingFace transformers</strong></td><td><a href="https://github.com/huggingface/transformers" target="_blank" rel="noopener">huggingface/transformers</a></td><td>Longformer / BigBird / Reformer all included</td></tr>
+  </tbody>
+</table>
+
+<h4>Native sparse (2025+, trained from scratch)</h4>
+
+<table>
+  <thead><tr><th>Project</th><th>Link</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><strong>NSA</strong> (DeepSeek)</td><td><a href="https://github.com/deepseek-ai/Native-Sparse-Attention" target="_blank" rel="noopener">deepseek-ai/Native-Sparse-Attention</a> <code>(?)</code></td><td>official code; about 80% confidence on the repo name; FLA also carries an NSA impl</td></tr>
+    <tr><td><strong>MoBA</strong> (Moonshot)</td><td><a href="https://github.com/MoonshotAI/MoBA" target="_blank" rel="noopener">MoonshotAI/MoBA</a></td><td>Moonshot's official reference</td></tr>
+    <tr><td><strong>DSA / DeepSeek V3.2</strong></td><td>likely in <a href="https://github.com/deepseek-ai/DeepSeek-V3" target="_blank" rel="noopener">deepseek-ai/DeepSeek-V3</a> or a V3.2 repo <code>(?)</code></td><td>NSA productionised</td></tr>
+  </tbody>
+</table>
+
+<h4>Inference-time sparse (dynamic top-k)</h4>
+
+<table>
+  <thead><tr><th>Project</th><th>Link</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><strong>MInference</strong> (Microsoft)</td><td><a href="https://github.com/microsoft/MInference" target="_blank" rel="noopener">microsoft/MInference</a></td><td>dynamic KV selection for long context</td></tr>
+    <tr><td><strong>DuoAttention</strong> (MIT-HAN)</td><td><a href="https://github.com/mit-han-lab/duo-attention" target="_blank" rel="noopener">mit-han-lab/duo-attention</a></td><td>splits heads into retrieval and streaming</td></tr>
+    <tr><td><strong>Quest</strong> (MIT-HAN)</td><td><a href="https://github.com/mit-han-lab/Quest" target="_blank" rel="noopener">mit-han-lab/Quest</a></td><td>query-aware KV pruning</td></tr>
+  </tbody>
+</table>
+
+<h3>Linear / kernelized: mostly concentrated in FLA</h3>
+
+<table>
+  <thead><tr><th>Project</th><th>Link</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><strong>flash-linear-attention (FLA)</strong></td><td><a href="https://github.com/fla-org/flash-linear-attention" target="_blank" rel="noopener">fla-org/flash-linear-attention</a></td><td>the shared codebase for the linear-attention family, maintained by Songlin Yang's group; covers Linear Attn, Performer, Linformer, cosFormer, RetNet, GLA, DeltaNet, Gated DeltaNet, Mamba-1, Mamba-2, RWKV-4 to 7, ABC, HGRN, Lightning Attention, GSA, Based, and more; Triton kernels you can import directly</td></tr>
+    <tr><td><strong>Lightning Attention</strong> (standalone)</td><td>MiniMax has not opened a dedicated repo</td><td>equivalent impl lives in FLA</td></tr>
+    <tr><td><strong>Kimi Delta Attention (KDA)</strong></td><td>Moonshot Kimi Linear release / FLA <code>(?)</code></td><td>most recent</td></tr>
+    <tr><td><strong>RWKV</strong> (official)</td><td><a href="https://github.com/BlinkDL/RWKV-LM" target="_blank" rel="noopener">BlinkDL/RWKV-LM</a></td><td>source of the RWKV series</td></tr>
+    <tr><td><strong>RetNet original impl</strong></td><td><a href="https://github.com/microsoft/torchscale" target="_blank" rel="noopener">microsoft/torchscale</a></td><td>Microsoft's RetNet</td></tr>
+  </tbody>
+</table>
+
+<h3>SSM (state space models)</h3>
+
+<table>
+  <thead><tr><th>Project</th><th>Link</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><strong>mamba</strong> (state-spaces)</td><td><a href="https://github.com/state-spaces/mamba" target="_blank" rel="noopener">state-spaces/mamba</a></td><td>official Mamba-1 / Mamba-2 implementation + CUDA kernels</td></tr>
+    <tr><td><strong>causal-conv1d</strong></td><td><a href="https://github.com/Dao-AILab/causal-conv1d" target="_blank" rel="noopener">Dao-AILab/causal-conv1d</a></td><td>Mamba dependency: fused 1D causal convolution</td></tr>
+    <tr><td><strong>S4 / S5 (historical)</strong></td><td><a href="https://github.com/state-spaces/s4" target="_blank" rel="noopener">state-spaces/s4</a></td><td>early reference</td></tr>
+  </tbody>
+</table>
+
+<h3>mLSTM / matrix RNN</h3>
+
+<table>
+  <thead><tr><th>Project</th><th>Link</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><strong>xLSTM</strong></td><td><a href="https://github.com/NX-AI/xlstm" target="_blank" rel="noopener">NX-AI/xlstm</a></td><td>official Beck et al. release; sLSTM + mLSTM blocks + Triton kernels</td></tr>
+    <tr><td><strong>mlstm_kernels</strong></td><td><a href="https://github.com/NX-AI/mlstm_kernels" target="_blank" rel="noopener">NX-AI/mlstm_kernels</a></td><td>standalone mLSTM kernel package</td></tr>
+  </tbody>
+</table>
+
+<h3>Inference frameworks (integrate many variants)</h3>
+
+<table>
+  <thead><tr><th>Framework</th><th>Link</th><th>Coverage</th></tr></thead>
+  <tbody>
+    <tr><td><strong>vLLM</strong></td><td><a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a></td><td>PagedAttention + GQA / MQA / MLA + SWA + speculative</td></tr>
+    <tr><td><strong>SGLang</strong></td><td><a href="https://github.com/sgl-project/sglang" target="_blank" rel="noopener">sgl-project/sglang</a></td><td>RadixAttention + MLA + Paged + speculative</td></tr>
+    <tr><td><strong>TensorRT-LLM</strong></td><td><a href="https://github.com/NVIDIA/TensorRT-LLM" target="_blank" rel="noopener">NVIDIA/TensorRT-LLM</a></td><td>NVIDIA-optimised, full Hopper stack</td></tr>
+    <tr><td><strong>TGI</strong> (HuggingFace)</td><td><a href="https://github.com/huggingface/text-generation-inference" target="_blank" rel="noopener">huggingface/text-generation-inference</a></td><td>multi-backend</td></tr>
+    <tr><td><strong>llama.cpp</strong></td><td><a href="https://github.com/ggerganov/llama.cpp" target="_blank" rel="noopener">ggerganov/llama.cpp</a></td><td>CPU / GPU portable; GQA / MQA</td></tr>
+    <tr><td><strong>ExLlamaV2</strong></td><td><a href="https://github.com/turboderp/exllamav2" target="_blank" rel="noopener">turboderp/exllamav2</a></td><td>quantised inference</td></tr>
+  </tbody>
+</table>
+
+<h3>Training frameworks (carry their own attention impls)</h3>
+
+<table>
+  <thead><tr><th>Framework</th><th>Link</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Megatron-LM / Megatron-Core</strong></td><td><a href="https://github.com/NVIDIA/Megatron-LM" target="_blank" rel="noopener">NVIDIA/Megatron-LM</a></td><td>FA + GQA + MLA + Mamba backbone; production-grade training</td></tr>
+    <tr><td><strong>DeepSpeed</strong></td><td><a href="https://github.com/microsoft/DeepSpeed" target="_blank" rel="noopener">microsoft/DeepSpeed</a></td><td>Ulysses sequence parallelism + sparse attention + Triton kernels</td></tr>
+    <tr><td><strong>OLMo</strong></td><td><a href="https://github.com/allenai/OLMo" target="_blank" rel="noopener">allenai/OLMo</a></td><td>open training stack; ships QK-Norm</td></tr>
+    <tr><td><strong>litgpt</strong></td><td><a href="https://github.com/Lightning-AI/litgpt" target="_blank" rel="noopener">Lightning-AI/litgpt</a></td><td>compact reference implementations</td></tr>
+  </tbody>
+</table>
+
+<h2 id="en-refs">References</h2>
+
+<p>The model roster and parts of the classification scheme follow the LLM Architecture Gallery below; branches that differ are re-grouped to match the taxonomy used here:</p>
+
+<ul>
+  <li>Sebastian Raschka, <strong>LLM Architecture Gallery</strong>: <a href="https://sebastianraschka.com/llm-architecture-gallery/" target="_blank" rel="noopener">sebastianraschka.com/llm-architecture-gallery</a>. A model-by-model, component-by-component card view of mainstream 2023-2026 LLM architectures, covering attention variants, positional encoding, normalization, and KV optimisations. The main-tree split into KV-head / sparse / linear / SSM / mLSTM and the orthogonal building-blocks tree both take their cue from this page.</li>
+</ul>
+
+<p>Original papers behind each branch (roughly, in main-tree order):</p>
+
+<ul>
+  <li><strong>MHA</strong>: Vaswani et al., <em>Attention Is All You Need</em>, NeurIPS 2017</li>
+  <li><strong>MQA</strong>: Shazeer, <em>Fast Transformer Decoding: One Write-Head is All You Need</em>, 2019</li>
+  <li><strong>GQA</strong>: Ainslie et al., <em>GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</em>, EMNLP 2023</li>
+  <li><strong>MLA</strong>: DeepSeek-AI, <em>DeepSeek-V2 Technical Report</em>, 2024</li>
+  <li><strong>NSA</strong>: Yuan et al. (DeepSeek-AI), <em>Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention</em>, 2025</li>
+  <li><strong>MoBA</strong>: Moonshot AI, <em>Mixture of Block Attention for Long-Context LLMs</em>, 2025</li>
+  <li><strong>Kimi Delta Attention (KDA)</strong> and Kimi Linear: Moonshot AI, 2025</li>
+  <li><strong>Lightning Attention</strong>: MiniMax, <em>MiniMax-M1 Technical Report</em>, 2024-2025</li>
+  <li><strong>Linear Attention</strong>: Katharopoulos et al., <em>Transformers are RNNs</em>, ICML 2020</li>
+  <li><strong>Performer / FAVOR+</strong>: Choromanski et al., <em>Rethinking Attention with Performers</em>, ICLR 2021</li>
+  <li><strong>RetNet</strong>: Sun et al., <em>Retentive Network</em>, 2023</li>
+  <li><strong>GLA</strong>: Yang et al., <em>Gated Linear Attention Transformers with Hardware-Efficient Training</em>, 2023</li>
+  <li><strong>DeltaNet</strong>: Schlag et al. (original line), revived at LLM scale by Yang et al., 2024-2025</li>
+  <li><strong>Mamba / Mamba-2</strong>: Gu and Dao, 2023-2024; Mamba-2 from <em>Transformers are SSMs</em>, 2024</li>
+  <li><strong>Jamba</strong>: AI21 Labs, <em>Jamba: A Hybrid Transformer-Mamba Language Model</em>, 2024</li>
+  <li><strong>xLSTM</strong>: Beck et al., <em>xLSTM: Extended Long Short-Term Memory</em>, 2024</li>
+  <li><strong>FlashAttention v1 / v2 / v3</strong>: Dao et al., 2022-2024 (not deep-dived here, but every dense-softmax implementation sits on top of it)</li>
+  <li><strong>DeepSeek V4 family (CCA / CSA / HCA / mHC)</strong>: DeepSeek-AI 2026 technical report. Public material is limited; this article carries placeholders only.</li>
+</ul>
+
+<hr>
+
+</div>
+
+</main>
+</div>
+
+<div id="tooltip" class="tooltip"></div>
+
+<script>
+// =================================================================
+// DATA — single tree, descriptions are bilingual { zh, en }
+// =================================================================
+
+const ATTENTION_TREE = {
+  name: "Attention",
+  desc: { zh: "Vaswani 2017 提出的原始 attention,现代 LLM 的起点", en: "Original attention from Vaswani 2017, the starting point of modern LLMs" },
+  children: [
+    {
+      name: "Dense softmax  ·  O(n²·d)",
+      desc: { zh: "原始 softmax(QK^T)V,二次复杂度,全 KV cache", en: "Original softmax(QK^T)V, quadratic, full KV cache" },
+      children: [
+        {
+          name: "MHA  ·  h_kv = h_q",
+          desc: { zh: "每个 query head 配独立 K/V head,表达力最强,KV cache 最大", en: "Each query head gets its own K/V, max expressivity, max KV cache" },
+          children: [
+            { name: "GPT-2 / GPT-3", desc: { zh: "经典 decoder-only,定义了一代", en: "Classic decoder-only, defined a generation" } },
+            { name: "OLMo 2 / OLMo 3", desc: { zh: "开源参考实现,加 QK-Norm", en: "Open reference impl, adds QK-Norm" } },
+            { name: "BERT / encoder-decoder 早期", desc: { zh: "双向 attention,encoder/decoder 用同款 MHA", en: "Bidirectional attention; encoder-decoder used same MHA" } },
+          ],
+        },
+        {
+          name: "MQA  ·  h_kv = 1",
+          desc: { zh: "Shazeer 2019,所有 query head 共享一份 K/V,KV cache 缩小 h_q 倍,质量掉一点", en: "Shazeer 2019; all query heads share one K/V; KV shrinks by h_q, slight quality drop" },
+          children: [
+            { name: "PaLM", desc: { zh: "Google 早期生产部署", en: "Google's early production deployment" } },
+            { name: "Gemma 3 (270M)", desc: { zh: "小尺寸 Gemma 用 MQA", en: "Smallest Gemma uses MQA" } },
+            { name: "Tiny Aya", desc: { zh: "Cohere 小尺寸模型", en: "Cohere small model" } },
+          ],
+        },
+        {
+          name: "GQA  ·  h_kv = G",
+          desc: { zh: "Ainslie 2023,分 G 组共享 K/V,MHA 与 MQA 的折中,LLM 默认配置", en: "Ainslie 2023; G groups share K/V; the MHA/MQA midpoint and current default" },
+          children: [
+            { name: "Llama 2 / 3 / 3.2", desc: { zh: "GQA 的代表性大规模部署", en: "Flagship GQA deployment" } },
+            { name: "Qwen 2.5 / Qwen3 (含 32B/4B/8B)", desc: { zh: "GQA + QK-Norm 默认", en: "GQA + QK-Norm by default" } },
+            { name: "Phi-4", desc: { zh: "Microsoft 小模型", en: "Microsoft small model" } },
+            { name: "Mixtral / Mistral Small 3.1", desc: { zh: "Mixtral 也用 GQA + sliding window", en: "Mixtral uses GQA plus sliding window" } },
+            { name: "GPT-OSS (20B/120B)", desc: { zh: "OpenAI 开源系列", en: "OpenAI open-source line" } },
+          ],
+        },
+        {
+          name: "MLA  ·  latent KV",
+          desc: { zh: "DeepSeek-V2 2024,把 KV 压缩到低秩潜变量,KV cache 比 GQA 小 4-10×,质量更好", en: "DeepSeek-V2 2024; KV compressed into low-rank latent; 4-10x smaller cache than GQA, equal or better quality" },
+          children: [
+            { name: "DeepSeek V2 / V3 / R1", desc: { zh: "MLA 的诞生与主线", en: "Where MLA was first introduced and developed" } },
+            { name: "Kimi K2 / K2.5", desc: { zh: "Moonshot 大模型,MLA + dense softmax", en: "Moonshot's flagship; MLA + dense softmax" } },
+            { name: "GLM-4.5 / 4.7 / 5", desc: { zh: "智谱沿用 MLA", en: "Zhipu adopts MLA across its lineup" } },
+            { name: "Mistral Large 3", desc: { zh: "Mistral 也切到 MLA", en: "Mistral switched to MLA in v3" } },
+            { name: "LongCat-Flash-Lite", desc: { zh: "美团团队的 MLA 实践", en: "Meituan's MLA experiment" } },
+            { name: "Sarvam (105B)", desc: { zh: "印度团队的多语言 MLA 模型", en: "India-built multilingual MLA model" } },
+            { name: "→ 也是 Kimi Linear / Ling 2.5 hybrid 的局部分支", desc: { zh: "hybrid 模型里的 full attention 那一份通常是 MLA", en: "The full-attention share of hybrid models is usually MLA" } },
+          ],
+        },
+        {
+          name: "CCA  ·  V4 的下一代 latent",
+          desc: { zh: "Compressed Convolutional Attention,DeepSeek V4(2026)的 latent KV 升级版,公开细节有限", en: "Compressed Convolutional Attention; DeepSeek V4's next-gen latent KV (2026); public detail limited" },
+          children: [
+            { name: "DeepSeek V4-Flash / V4-Pro", desc: { zh: "CCA 主力,搭 CSA/HCA/mHC", en: "Lead CCA models, paired with CSA / HCA / mHC" } },
+            { name: "ZAYA1-8B", desc: { zh: "也走 4:1 GQA 结构 + CCA", en: "Uses 4:1 GQA + CCA" } },
+          ],
+        },
+      ],
+    },
+
+    {
+      name: "Sparse softmax  ·  O(n·k·d)",
+      desc: { zh: "保留 softmax,但只对一部分 KV 做 attention(k << n)", en: "Keep softmax, but only attend to a subset of KV (k << n)" },
+      children: [
+        {
+          name: "Static sparse patterns (早期)",
+          desc: { zh: "预定义的稀疏 mask,2019-2020 年代的探索", en: "Pre-defined sparse masks, 2019-2020 exploration era" },
+          children: [
+            { name: "Sparse Transformer (Child 2019)", desc: { zh: "固定 stride + local 模式", en: "Fixed stride + local pattern" } },
+            { name: "Longformer", desc: { zh: "sliding window + 少量 global token", en: "Sliding window + a few global tokens" } },
+            { name: "BigBird", desc: { zh: "window + global + random,理论上 universal approximator", en: "Window + global + random; theoretically a universal approximator" } },
+            { name: "Reformer (LSH)", desc: { zh: "Locality-Sensitive Hashing 决定 attention bucket", en: "Locality-sensitive hashing picks attention buckets" } },
+            { name: "Routing Transformer", desc: { zh: "k-means 聚类决定路由", en: "k-means clustering decides routing" } },
+          ],
+        },
+        {
+          name: "Sliding Window Attention (SWA)",
+          desc: { zh: "只看最近 w 个 token,通常与少量 global 层混合", en: "Look only at the last w tokens, usually mixed with a few global layers" },
+          children: [
+            { name: "Mistral 7B", desc: { zh: "纯 SWA,靠堆叠产生隐式 receptive field", en: "Pure SWA; stacks layers to grow receptive field implicitly" } },
+            { name: "Gemma 3 / Gemma 4  (SWA:Global = 5:1)", desc: { zh: "5 层 SWA 配 1 层 global,层间混合的代表", en: "5 SWA layers per 1 global layer; the canonical layer-interleave pattern" } },
+            { name: "GPT-OSS (20B / 120B)", desc: { zh: "也走 SWA + 少量 full", en: "Also SWA plus a few full-attention layers" } },
+            { name: "Mistral Small 3.1 / Step 3.5 Flash", desc: { zh: "SWA 在新一代 Mistral 沿用", en: "SWA continues in newer Mistral families" } },
+          ],
+        },
+        {
+          name: "Native sparse (训练原生)",
+          desc: { zh: "2025+ 训练阶段就用稀疏 pattern,不是 inference 后加的", en: "From 2025: sparse from pretraining itself, not retrofitted at inference" },
+          children: [
+            { name: "NSA (DeepSeek 2025)", desc: { zh: "三路并行: compression + selection(top-k block)+ sliding window, gated mixture", en: "Three parallel paths: compression + selection (top-k block) + sliding window, gated mixture" } },
+            { name: "DSA (DeepSeek V3.2)", desc: { zh: "NSA 的产品化版本, GLM-5 / 5.1 也接同套", en: "NSA productionised; GLM-5 / 5.1 adopt the same recipe" } },
+            { name: "MoBA (Moonshot)", desc: { zh: "block-sparse + routing, 跟 NSA 平行的思路", en: "Block-sparse + routing; parallel idea to NSA" } },
+          ],
+        },
+        {
+          name: "Compressed / hyper-connection (V4, 2026)",
+          desc: { zh: "DeepSeek V4 的下一代 sparse + KV 压缩 + hyper-connection 复合体", en: "DeepSeek V4 cluster combining sparsity, KV compression, and hyper-connections" },
+          children: [
+            { name: "CSA / HCA  (DeepSeek V4-Flash/Pro)", desc: { zh: "Compressed Sparse / Hyper-Connection Attention, hash 路由的稀疏 KV cache", en: "Compressed Sparse / Hyper-Connection Attention; hash-routed sparse KV cache" } },
+            { name: "mHC  (DeepSeek V4-Flash/Pro)", desc: { zh: "Manifold-Constrained Hyper-Connections, 面向百万级 token 上下文", en: "Manifold-Constrained Hyper-Connections targeting million-token context" } },
+          ],
+        },
+        {
+          name: "Inference-time sparse (动态 top-k)",
+          desc: { zh: "训练用 dense, inference 时按 query 动态选 top-k KV", en: "Dense at training, top-k KV selection per query at inference" },
+          children: [
+            { name: "MInference", desc: { zh: "Microsoft 的长上下文动态选 KV", en: "Microsoft's dynamic KV selection for long context" } },
+            { name: "DuoAttention", desc: { zh: "把 head 分成 retrieval head 与 streaming head", en: "Splits heads into retrieval heads and streaming heads" } },
+            { name: "Quest", desc: { zh: "query-aware sparse KV", en: "Query-aware sparse KV" } },
+          ],
+        },
+      ],
+    },
+
+    {
+      name: "Linear / kernelized  ·  O(n·d²)",
+      desc: { zh: "把 softmax 换成 φ(Q)(φ(K)^T V), 没有显式 KV cache, 改存固定大小的 state 矩阵", en: "Replace softmax with phi(Q)(phi(K)^T V); no explicit KV cache, only a fixed-size state matrix" },
+      children: [
+        {
+          name: "Pure linear attention",
+          desc: { zh: "用核分解或低秩近似把 softmax 替换掉", en: "Replace softmax with a kernel decomposition or low-rank approximation" },
+          children: [
+            { name: "Linear Attention (Katharopoulos 2020)", desc: { zh: "开山作, phi = ELU + 1", en: "The original; phi = ELU + 1" } },
+            { name: "Performer / FAVOR+", desc: { zh: "正交随机特征近似 softmax 核, 无偏估计", en: "Positive orthogonal random features approximate softmax kernel, unbiased" } },
+            { name: "Linformer", desc: { zh: "把 K, V 投影到长度 k, O(n·k)", en: "Project K, V to length k; O(n·k) compute" } },
+            { name: "cosFormer", desc: { zh: "ReLU + cosine 核", en: "ReLU + cosine kernel" } },
+            { name: "RetNet (Sun 2023)", desc: { zh: "Retention = linear attention + 衰减, 有 parallel / recurrent / chunkwise 三套等价形式", en: "Retention = linear attention + decay; parallel / recurrent / chunkwise equivalent forms" } },
+          ],
+        },
+        {
+          name: "Delta-rule family",
+          desc: { zh: "associative memory + Hebbian 更新规则, recall 比 vanilla linear attention 强", en: "Associative memory + Hebbian update rule; stronger recall than vanilla linear" },
+          children: [
+            { name: "DeltaNet", desc: { zh: "S_t = S_{t-1} - beta_t(S_{t-1} k_t - v_t) k_t^T, 误差驱动更新", en: "S_t = S_{t-1} - beta_t(S_{t-1} k_t - v_t) k_t^T, error-driven update" } },
+            { name: "Gated DeltaNet", desc: { zh: "DeltaNet + 门控, Qwen3 Next 在用", en: "Gated DeltaNet; Qwen3 Next adopts it" } },
+            { name: "GLA  (Gated Linear Attention)", desc: { zh: "Yang 2023, Linear attention + gate, 跟 SSM 形式接近", en: "Yang 2023; linear attention + gate; close in form to SSM" } },
+            { name: "Kimi Delta Attention (KDA)", desc: { zh: "Moonshot 2025, delta rule linear attention + sliding window full, Kimi Linear 在用", en: "Moonshot 2025; delta rule linear + sliding window full; used by Kimi Linear" } },
+          ],
+        },
+        {
+          name: "IO-aware linear (生产级)",
+          desc: { zh: "线性 attention 的 IO-aware 实现, 等价于 FlashAttention 之于 softmax", en: "IO-aware implementations of linear attention; the FlashAttention-equivalent for linear" },
+          children: [
+            { name: "Lightning Attention", desc: { zh: "MiniMax-M1 / Ling 2.5 在用, chunkwise 并行 + 寄存器友好", en: "Used by MiniMax-M1 / Ling 2.5; chunkwise parallel and register-friendly" } },
+          ],
+        },
+        {
+          name: "Layer-interleave hybrids (linear + softmax)",
+          desc: { zh: "层间混合: 多数层走 linear, 少数层走 full attention 补 recall", en: "Layer-interleave: most layers go linear, a minority go full attention to restore recall" },
+          children: [
+            { name: "Kimi Linear  (KDA + MLA, 3:1)", desc: { zh: "每 4 层 1 层 MLA, 其它 KDA + sliding window", en: "1 MLA layer every 4; the other 3 are KDA + sliding window" } },
+            { name: "Ling 2.5  (Lightning + MLA, 7:1)", desc: { zh: "每 8 层 1 层 MLA, 其它 Lightning Attention", en: "1 MLA layer every 8; the other 7 are Lightning Attention" } },
+            { name: "MiniMax-M1  (Lightning + softmax, 7:1)", desc: { zh: "MiniMax 的 hybrid 配方, QK-Norm + partial RoPE", en: "MiniMax hybrid recipe; QK-Norm + partial RoPE" } },
+            { name: "Qwen3 Next / Qwen3.5  (Gated DeltaNet + Gated Attn, 3:1)", desc: { zh: "Qwen 团队的混合配方, linear + gated full", en: "Qwen team's hybrid; linear + gated full attention" } },
+          ],
+        },
+      ],
+    },
+
+    {
+      name: "SSM (State Space Models)  ·  O(n·d²)",
+      desc: { zh: "一阶状态空间, 跟 linear attention 思想接近但更激进: 没有 attention 形式, 直接是循环状态", en: "First-order state space; conceptually close to linear attention but more radical: no attention form at all, pure recurrence" },
+      children: [
+        {
+          name: "Pure SSM",
+          desc: { zh: "全 SSM, 没有 attention 块", en: "All SSM, no attention block" },
+          children: [
+            { name: "S4 / S5 / S6", desc: { zh: "State-space 序列模型的早期工作", en: "Early state-space sequence modelling" } },
+            { name: "Mamba", desc: { zh: "Selective SSM, O(n) 训练 / O(1) 解码", en: "Selective SSM; O(n) training / O(1) decode" } },
+            { name: "Mamba-2", desc: { zh: "Mamba + duality, 跟 linear attention 等价 chunkwise", en: "Mamba + duality; chunkwise-equivalent to linear attention" } },
+            { name: "Hyena (早期, 已被取代)", desc: { zh: "长卷积 + element-wise gate", en: "Long convolution + element-wise gate; mostly superseded" } },
+          ],
+        },
+        {
+          name: "Layer-interleave hybrids (SSM + attention)",
+          desc: { zh: "层间混合 Mamba 与 attention, SSM 主导", en: "Layer-interleave Mamba with attention; SSM dominant" },
+          children: [
+            { name: "Jamba (AI21)  ·  Mamba : Attn = 7:1", desc: { zh: "每 8 层 1 层 full attention, 其它 Mamba", en: "1 full-attention layer every 8; the other 7 are Mamba" } },
+            { name: "Nemotron 3 Nano / Super (Mamba-2 + GQA)", desc: { zh: "NVIDIA hybrid, Mamba-2 主导, 少量 GQA 层", en: "NVIDIA hybrid; mostly Mamba-2 with a few GQA layers" } },
+          ],
+        },
+      ],
+    },
+
+    {
+      name: "mLSTM / matrix RNN  ·  O(n·d²)",
+      desc: { zh: "把经典 LSTM 改造成 matrix memory + GPU-friendly 形式, 跟 attention 不同源但同位置", en: "Reworks classic LSTM into a matrix-memory, GPU-friendly form; different lineage but occupies the same slot as attention" },
+      children: [
+        { name: "xLSTM (7B)", desc: { zh: "xLSTM 论文, sLSTM + mLSTM 块替换 self-attention", en: "xLSTM paper; sLSTM + mLSTM blocks replace self-attention" } },
+        { name: "(historical: vanilla RNN / LSTM / GRU)", desc: { zh: "前 transformer 时代的序列模型, 只为对比", en: "Pre-transformer sequence models, here only for contrast" } },
+      ],
+    },
+  ],
+};
+
+// =================================================================
+// AUX TREE — orthogonal building blocks
+// =================================================================
+
+const AUX_TREE = {
+  name: "Orthogonal building blocks",
+  desc: { zh: "与主树的 attention 形式正交, 可与任意主树节点叠加", en: "Orthogonal to the main tree; can stack on any main-tree node" },
+  children: [
+    {
+      name: "Normalization in attention",
+      desc: { zh: "稳定 attention 路径的归一化技术", en: "Normalisations that stabilise the attention path" },
+      children: [
+        { name: "QK-Norm  (OLMo 2/3, Qwen3, Gemma 3/4, MiniMax M2, GLM-4.5)", desc: { zh: "在 Q、K 投影后做 RMSNorm, 防长训 logits spike, 2025 年新模型几乎默认", en: "RMSNorm after Q, K projection; prevents logit spikes in long training; near-default in 2025" } },
+        { name: "Per-Layer Embeddings (PLE)  (Gemma 4 E2B/E4B)", desc: { zh: "每层加一份层特化 token embedding", en: "Per-layer token embeddings added at each layer" } },
+      ],
+    },
+    {
+      name: "KV cache 进一步压缩",
+      desc: { zh: "在 MLA 之外进一步缩 KV cache 的小招", en: "Extra tricks to shrink KV cache beyond MLA" },
+      children: [
+        { name: "KV sharing across layers  (Gemma 4 E2B/E4B)", desc: { zh: "连续几层共用同一份 KV cache, 跨层复用而非层内压缩", en: "Adjacent layers share the same KV cache; cross-layer reuse, not intra-layer compression" } },
+        { name: "Unified K/V on global layers  (Gemma 4)", desc: { zh: "global 层把 K、V head 合一份", en: "Global attention layers merge K and V into one head" } },
+        { name: "Attention budgeting  (Laguna XS.2)", desc: { zh: "不同层不同 query head 数, 深浅层异构", en: "Different layers use different query-head counts; depth-asymmetric attention" } },
+      ],
+    },
+    {
+      name: "Gating",
+      desc: { zh: "在 attention 输出后加门控, 让信号有选择地通过", en: "Add a gate after the attention output to let signal pass selectively" },
+      children: [
+        { name: "Gated Attention  (Qwen3 Next, Qwen3.5, Arcee Trinity, Laguna XS.2)", desc: { zh: "学习一个 gate 门控 attention 输出", en: "Learn a gate over the attention output" } },
+      ],
+    },
+    {
+      name: "Position encoding",
+      desc: { zh: "位置编码的家族; 同一个 attention 配不同 PE 表现差很多", en: "Positional encoding family; same attention with different PE behaves very differently" },
+      children: [
+        { name: "RoPE", desc: { zh: "Rotary Position Embedding, 2025 年绝对主流", en: "Rotary Position Embedding; 2025 default" } },
+        { name: "Partial RoPE  (Gemma 4, MiniMax M2, MLA 内部)", desc: { zh: "RoPE 只作用在部分 channel / 部分层", en: "RoPE applied to part of the channels or layers only" } },
+        { name: "NoPE  (SmolLM3, Tiny Aya, Kimi Linear, Arcee Trinity)", desc: { zh: "完全不放位置编码, 靠 attention 自己学", en: "No positional encoding at all; attention learns it from data" } },
+        { name: "NoPE 周期化  (every 4th layer)", desc: { zh: "每 4 层省一次 RoPE, NoPE 与 RoPE 交替", en: "Every 4th layer omits RoPE; alternates with RoPE-equipped layers" } },
+        { name: "YaRN  (OLMo 3)", desc: { zh: "RoPE 频率缩放, 长上下文扩展用", en: "RoPE frequency scaling for long-context extension" } },
+      ],
+    },
+    {
+      name: "Hybrid 层间比例 (layer-interleave ratios)",
+      desc: { zh: "把 N 层模型按某个比例混 dominant 与 secondary, 是 2025 年最稳定的混合范式", en: "Mix a dominant and a secondary mechanism by a fixed ratio across layers; the stable hybrid recipe of 2025" },
+      children: [
+        { name: "3:1  (Kimi Linear, Qwen3 Next)", desc: { zh: "每 4 层 1 层 full attention", en: "1 full-attention layer in every 4" } },
+        { name: "5:1  (Gemma 3 / 4: SWA + global)", desc: { zh: "每 6 层 1 层 global", en: "1 global-attention layer in every 6" } },
+        { name: "7:1  (Ling 2.5, MiniMax-M1, Jamba)", desc: { zh: "每 8 层 1 层 full / softmax / MLA", en: "1 full / softmax / MLA layer in every 8" } },
+      ],
+    },
+  ],
+};
+
+// =================================================================
+// D3 collapsible tree (left-to-right, click to toggle)
+// =================================================================
+
+function ensureD3() {
+  return new Promise((resolve) => {
+    if (window.d3) return resolve();
+    const i = setInterval(() => { if (window.d3) { clearInterval(i); resolve(); } }, 30);
+  });
+}
+
+const tooltipEl = document.getElementById('tooltip');
+function tipHTML(d) {
+  const lang = (document.documentElement.lang || 'zh-CN').toLowerCase().startsWith('en') ? 'en' : 'zh';
+  if (!d.data.desc) return '';
+  return d.data.desc[lang] || d.data.desc.zh || d.data.desc.en || '';
+}
+function showTip(event, d) {
+  const html = tipHTML(d);
+  if (!html) return;
+  tooltipEl.textContent = html;
+  tooltipEl.classList.add('show');
+  moveTip(event);
+}
+function moveTip(event) {
+  const pad = 14;
+  let x = event.clientX + pad;
+  let y = event.clientY + pad;
+  const tw = tooltipEl.offsetWidth, th = tooltipEl.offsetHeight;
+  if (x + tw > window.innerWidth - 8)  x = event.clientX - tw - pad;
+  if (y + th > window.innerHeight - 8) y = event.clientY - th - pad;
+  tooltipEl.style.left = x + 'px';
+  tooltipEl.style.top  = y + 'px';
+}
+function hideTip() { tooltipEl.classList.remove('show'); }
+
+const TREES = {};
+
+function buildTree(containerId, data) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.innerHTML = '';
+
+  const root = d3.hierarchy(data);
+  root.x0 = 0; root.y0 = 0;
+  let nextId = 0;
+  root.eachBefore(d => { d.id = ++nextId; d._children = d.children; });
+
+  root.eachBefore(d => { if (d.depth >= 1 && d.children) d.children = null; });
+  root.children = root._children;
+
+  const dx = 22;
+  const width = Math.min(container.clientWidth || 1000, 1800);
+  const dy = Math.max(180, Math.min(260, (width - 100) / Math.max(1, root.height + 1)));
+  const tree = d3.tree().nodeSize([dx, dy]);
+  const diagonal = d3.linkHorizontal().x(d => d.y).y(d => d.x);
+
+  const LEFT_PAD = 240;
+  const svg = d3.select(container).append('svg')
+    .attr('class', 'tree-svg')
+    .attr('viewBox', [-LEFT_PAD, -dx, width + LEFT_PAD, dx]);
+
+  const gLink = svg.append('g').attr('class', 'links');
+  const gNode = svg.append('g').attr('class', 'nodes');
+
+  function update(source) {
+    const dur = 240;
+    tree(root);
+
+    let left = root, right = root;
+    root.eachBefore(d => {
+      if (d.x < left.x) left = d;
+      if (d.x > right.x) right = d;
+    });
+    const height = right.x - left.x + dx * 2;
+
+    svg.transition().duration(dur)
+       .attr('viewBox', [-LEFT_PAD, left.x - dx, width + LEFT_PAD, height])
+       .attr('height', height);
+
+    const node = gNode.selectAll('g.node').data(root.descendants(), d => d.id);
+
+    const nodeEnter = node.enter().append('g')
+      .attr('class', d => 'node ' + (d.depth === 0 ? 'node--root' : (d._children ? 'node--branch' : 'node--leaf')) + (d._children && !d.children ? ' collapsed' : ''))
+      .attr('transform', _ => `translate(${source.y0},${source.x0})`)
+      .attr('fill-opacity', 0)
+      .attr('stroke-opacity', 0)
+      .on('click', (event, d) => {
+        if (!d._children) return;
+        d.children = d.children ? null : d._children;
+        update(d);
+      })
+      .on('mouseenter', (event, d) => showTip(event, d))
+      .on('mousemove', moveTip)
+      .on('mouseleave', hideTip);
+
+    nodeEnter.append('circle').attr('r', 4);
+
+    nodeEnter.append('text')
+      .attr('dy', '0.32em')
+      .attr('x',  d => d.children ? -10 : 10)
+      .attr('text-anchor', d => d.children ? 'end' : 'start')
+      .style('font-size', d => d.depth === 0 ? '13px' : (d.depth === 1 ? '12.5px' : '12px'))
+      .text(d => d.data.name);
+
+    const merged = node.merge(nodeEnter);
+    merged
+      .attr('class', d => 'node ' + (d.depth === 0 ? 'node--root' : (d._children ? 'node--branch' : 'node--leaf')) + (d._children && !d.children ? ' collapsed' : ''))
+      .transition().duration(dur)
+      .attr('transform', d => `translate(${d.y},${d.x})`)
+      .attr('fill-opacity', 1)
+      .attr('stroke-opacity', 1);
+    merged.select('text')
+      .attr('x', d => d.children ? -10 : 10)
+      .attr('text-anchor', d => d.children ? 'end' : 'start');
+
+    node.exit().transition().duration(dur).remove()
+      .attr('transform', _ => `translate(${source.y},${source.x})`)
+      .attr('fill-opacity', 0)
+      .attr('stroke-opacity', 0);
+
+    const link = gLink.selectAll('path.link').data(root.links(), d => d.target.id);
+
+    const linkEnter = link.enter().append('path')
+      .attr('class', 'link')
+      .attr('d', _ => {
+        const o = { x: source.x0, y: source.y0 };
+        return diagonal({ source: o, target: o });
+      });
+
+    link.merge(linkEnter).transition().duration(dur).attr('d', diagonal);
+
+    link.exit().transition().duration(dur).remove()
+      .attr('d', _ => {
+        const o = { x: source.x, y: source.y };
+        return diagonal({ source: o, target: o });
+      });
+
+    root.eachBefore(d => { d.x0 = d.x; d.y0 = d.y; });
+  }
+
+  TREES[containerId] = { root, update, container };
+  update(root);
+}
+
+window.expandAll = function (id) {
+  const T = TREES[id]; if (!T) return;
+  T.root.eachBefore(d => { if (d._children) d.children = d._children; });
+  T.update(T.root);
+};
+window.collapseAll = function (id) {
+  const T = TREES[id]; if (!T) return;
+  T.root.eachBefore(d => { if (d.depth >= 1 && d._children) d.children = null; });
+  T.root.children = T.root._children;
+  T.update(T.root);
+};
+
+async function renderAll() {
+  await ensureD3();
+  buildTree('tree-main', ATTENTION_TREE);
+  buildTree('tree-aux',  AUX_TREE);
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', renderAll);
+} else {
+  renderAll();
+}
+</script>
+</body>
+</html>
