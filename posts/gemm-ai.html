@@ -577,6 +577,127 @@
 
   <hr>
 
+  <h2>八、训练里的三种 GEMM:fwd / dgrad / wgrad</h2>
+
+  <p>训练一个 linear 层 $Y = X W^\top$ 会拆成<strong>三个独立 GEMM</strong>:前向、对输入的反向(dgrad)、对权重的反向(wgrad)。三者的 FLOPs 和总访存字节数完全相同,但<strong>实际跑出来的 achieved TFLOPS 几乎从不相同</strong>,而且 wgrad 通常最低。这一节用前面建立的 AI / 调度 / tile 框架来解释为什么。</p>
+
+  <h3>1. 三个 GEMM 的形状对照</h3>
+
+  <p>设 $M = B \cdot S$(batch × seq)、$K = d_\text{in}$、$N = d_\text{out}$,记 cuBLAS layout 为 TN/NN/NT(A 是否转置 / B 是否转置)。</p>
+
+  <table>
+    <thead>
+      <tr><th>GEMM</th><th>矩阵乘式</th><th>$M$</th><th>$N$</th><th>$K$(归约维)</th><th>cuBLAS layout</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>fwd</td><td>$Y = X \cdot W^\top$</td><td>$B \cdot S$</td><td>$d_\text{out}$</td><td>$d_\text{in}$</td><td><strong>TN</strong></td></tr>
+      <tr><td>dgrad</td><td>$dX = dY \cdot W$</td><td>$B \cdot S$</td><td>$d_\text{in}$</td><td>$d_\text{out}$</td><td><strong>NN</strong></td></tr>
+      <tr><td>wgrad</td><td>$dW = dY^\top \cdot X$</td><td>$d_\text{out}$</td><td>$d_\text{in}$</td><td>$B \cdot S$</td><td><strong>TN</strong>(归约维 = batch)</td></tr>
+    </tbody>
+  </table>
+
+  <p>三者的 $2 M N K$ 相同,$MK + KN + MN$ 总访存字节数也相同(只是各 operand 扮演的角色互换)。但下面四个因素让实测 TFLOPS 分化。</p>
+
+  <h3>2. Tensor Core 偏好 TN,不偏好 NN(影响 dgrad)</h3>
+
+  <p>TC 指令(<code>mma.sync</code> / <code>wgmma</code>)在汇编层规定了 fragment 布局:<strong>A 沿 $M$ 维连续 + B 沿 $N$ 维连续(即 TN)</strong>是 cuBLAS / CUTLASS 上的原生最快路径,fragment 直接从 smem 读取,不需再做一次 smem 转置。</p>
+
+  <ul>
+    <li><strong>fwd 是天然 TN</strong>。</li>
+    <li><strong>dgrad 是 NN</strong>($dY$ 和 $W$ 都不转置)。两条出路:走 NN-原生 kernel(性能略低,因为 mma.sync 的 K-major 路径吞吐不及 TN),或先在 smem 转置 $W$ 再走 TN(多一次 smem 往返)。CUTLASS / cuBLAS 在 H100 上通常会用前者。</li>
+    <li><strong>wgrad 是 TN</strong>,布局这一项没吃亏。</li>
+  </ul>
+
+  <p>这一项让 dgrad 相比 fwd 慢约 <strong>5–15%</strong>(H100 BF16 实测,主要来自 NN MMA path 的 issue rate 略低)。</p>
+
+  <h3>3. wgrad 的归约维 = batch × seq:这是 wgrad 慢的头号原因</h3>
+
+  <p>这是 §六.1 调度算法表里"$MN$ 小 / $K$ 大"那一行典型场景:</p>
+
+  <table>
+    <thead><tr><th>GEMM</th><th>归约维 $K$</th><th>典型量级(LLM 训练)</th></tr></thead>
+    <tbody>
+      <tr><td>fwd</td><td>$d_\text{in}$</td><td>$4096$–$16384$</td></tr>
+      <tr><td>dgrad</td><td>$d_\text{out}$</td><td>$4096$–$16384$</td></tr>
+      <tr><td>wgrad</td><td><strong>$B \cdot S$</strong></td><td><strong>$32\text{K}$–$256\text{K}$</strong>(常常 $\ge$ fwd 的 $K$ 10 倍)</td></tr>
+    </tbody>
+  </table>
+
+  <p>而 wgrad 的输出 $dW$ 形状是 $d_\text{out} \times d_\text{in}$(可能 $4096 \times 4096$):<strong>output tile 数远少于 SM 数</strong>。这正是 §六 调度算法表中 Split-K / Stream-K 的典型适用场景,带三条连带代价:</p>
+
+  <ol>
+    <li><strong>output tile 数不足以填满 SM</strong>。$d_\text{out} \cdot d_\text{in} / (M_t N_t)$ 在 $128 \times 128$ tile 下只有 $32 \times 32 = 1024$ 个 tile,撑死打满 H100 的 132 SM 但每个 SM 只跑 ~8 个 tile,流水线很短。</li>
+    <li><strong>强制 Split-K / Stream-K</strong>。CUTLASS / cuBLAS 在这种 skinny output + 长 K 形状上会切 $K$,每个 CTA 只算一段 $K$,最后做一次跨 CTA 的 reduction:
+      <ul>
+        <li><strong>Split-K(atomic 路径)</strong>:FP32 atomic add 串行化严重,GA100/H100 上 atomic 吞吐受 L2 partition 限制;</li>
+        <li><strong>Split-K(workspace 路径)</strong>:写出 $S$ 份 $M_t \times N_t$ 中间结果到 DRAM,再起一个 reduction kernel 读回。访存比 $\frac{2MNK}{(MK + KN + 2 S MN) \cdot b}$,$S$ 越大 AI 掉得越快;</li>
+        <li><strong>Stream-K</strong>:Stream-K 把 reduction 量摊到 SM 数水平的少量 fix-up,代价比 Split-K 小得多。<strong>现代 CUTLASS / cuBLAS 的 wgrad 默认走 Stream-K</strong>。</li>
+      </ul>
+    </li>
+    <li><strong>FP32 累加器必需</strong>。$K = $ batch × seq 长到 32K+,BF16/FP16 累加误差累计严重,TC 必须用 FP32 accum。H100 BF16 + FP32 accum 的 TC 吞吐是 FP16-accum 的一半(SM_90 之前是 1/4)。所以 wgrad 的<strong>名义峰值就先低一截</strong>。</li>
+  </ol>
+
+  <p>这三项加起来,wgrad 在 LLM 训练里的 achieved TFLOPS 通常比 fwd 低 <strong>20–40%</strong>。</p>
+
+  <h3>4. 访存 stride 不一样(影响 wgrad 的 DRAM 路径)</h3>
+
+  <p>总字节数虽然相同,但每个 operand 的"连续方向"决定能否做 128-bit / 256-bit 向量化加载,以及 L2 命中率。</p>
+
+  <table>
+    <thead><tr><th>GEMM</th><th>读 A 的方向</th><th>读 B 的方向</th><th>访存关键点</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>fwd</td>
+        <td>$X$ 沿 $K$ 连续(每行一个 token)</td>
+        <td>$W$ 沿 $K$ 连续(权重以 (out, in) 存)</td>
+        <td>两个 operand 都按其 K 维连续,L2 跨 CTA 复用度高(同一 $W$ 行被多个 $X$ 行用)</td>
+      </tr>
+      <tr>
+        <td>dgrad</td>
+        <td>$dY$ 沿 $N=d_\text{in}$ 连续</td>
+        <td>$W$ 沿 $K=d_\text{out}$ 连续</td>
+        <td>NN layout 下 $W$ 的访问方向跟 fwd 反向,smem 转置开销在;但 $dY$ / $W$ 都能向量化加载</td>
+      </tr>
+      <tr>
+        <td>wgrad</td>
+        <td>$dY^\top$:沿 $K = B \cdot S$ 访问 $dY$(<strong>非连续维</strong>)</td>
+        <td>$X$:沿 $K = B \cdot S$ 访问(<strong>非连续维</strong>)</td>
+        <td>两个 operand 的归约维都是 stride 维,kernel 需要 smem 大块转置;Hopper 上 TMA 的 swizzle 模式专门为这种 strided load 设计</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>wgrad 的访存模式天然不友好:$dY$ 和 $X$ 都需要"沿 stride 方向跨 batch 取列",L1 miss 和 smem bank conflict 都会上升。Hopper 引入 TMA + tensor-memory-layout swizzle 主要就是为这种 case 兜底,但相比 fwd 的全连续 load 仍然要差。</p>
+
+  <h3>5. 寄存器压力与 occupancy(连带影响)</h3>
+
+  <ul>
+    <li>FP32 accumulator 占的寄存器是 BF16/FP16 accum 的 2 倍。wgrad 的 FP32 accum 把 $M_t N_t$ 累加器变重,挤压 occupancy。</li>
+    <li>长 $K$ 的 wgrad 需要更深的 $K$-block 多缓冲才能摊薄外层循环开销(§六.2 表里的 stages 项),又进一步抢寄存器和 SMEM。</li>
+    <li>实测 wgrad kernel 经常掉到 1 warp/SM 的 occupancy,而 fwd 能跑 2 warp/SM。<strong>occupancy 一掉,memory latency 没法被隐藏</strong>,achieved DRAM 带宽随之下降,这又反过来让 split-K 的写出更慢。</li>
+  </ul>
+
+  <h3>6. 经验 ranking 与可操作的优化</h3>
+
+  <p>H100 BF16,典型 LLM 训练 hidden $= 4096$、$B \cdot S = 32\text{K}$,实测分布:</p>
+
+  <pre class="code">fwd     ~ 0.85 – 0.92 × peak TC      (TN + 短 K + tile 数够)
+dgrad   ~ 0.78 – 0.86 × peak TC      (NN + 短 K)
+wgrad   ~ 0.60 – 0.75 × peak TC      (TN + 长 K + split-K + FP32 accum)</pre>
+
+  <p>可调的杠杆:</p>
+
+  <ul>
+    <li><strong>Split-K factor 单独 tune</strong>。Megatron / cuBLASLt 对 wgrad 的 split-K 都是独立 sweep,跟 fwd / dgrad 不共享 config。</li>
+    <li><strong>batch 切小不一定提升整体吞吐</strong>。把 $B \cdot S$ 切小可以缩短 wgrad 的 $K$,但 fwd / dgrad 也会同步变 skinny,得不偿失;实务中靠 gradient accumulation 调有效 batch,但单次 micro-batch 不为了 wgrad 单独缩小。</li>
+    <li><strong>Hopper 上启 TMA + Cluster</strong>。wgrad 的 strided load 是 TMA 的主要受益场景之一;Cluster 让多个 CTA 共享同一段 $dY$ / $X$ 面板,把 split-K 的 DRAM 压力削掉一些。</li>
+    <li><strong>FP8 训练里 wgrad 的相对劣势更大</strong>。FP8 fwd / dgrad 享受 2× TC 吞吐,但 wgrad 仍需 FP32 accum(精度要求),收益不及 fwd / dgrad,fwd:wgrad 比例进一步拉开。</li>
+  </ul>
+
+  <p class="callout"><strong>对照前面章节</strong>:fwd / dgrad / wgrad 三个 GEMM 是 §六 调度算法表的"三种 $K$ 分布"的最干净例证。 fwd / dgrad 是 §六 的"Data-Parallel 主线",wgrad 是 §六 的"Split-K / Stream-K 主线"。它们在同一个训练 step 里同时出现,所以 LLM 训练性能调优本质是在<strong>同时优化这三条互相约束的 path</strong>。</p>
+
+  <hr>
+
   <h2 id="tldr">TL;DR</h2>
   <ul>
     <li>方阵 tile：$\text{AI} = T / b$，随 $T$ 线性增长，受 cache 容量的平方根限制。</li>
@@ -588,6 +709,7 @@
     <li>工程选型：$K_t$ = MMA atom × 3–6 stages；$M_t \times N_t$ 方形优先受寄存器约束；$M_o \times N_o$（swizzle group）拟合 $\sim 0.5 \cdot M_{L2}$。</li>
     <li>任何一侧被问题固有地压小（GEMV、batched MoE、LLM decode），都会从根本上变 memory-bound——这是算法层面（拼 $M$、FlashDecoding）而非 kernel 层面的问题。</li>
     <li><strong>B2B GEMM</strong>：$D = (A B) C$ 融合可消除中间张量 $2MN$ 的 DRAM 读写，提升 $= 1 + 2MN / (MK+KN+NL+ML)$。Attention 是最大受益场景（$\text{AI}_\text{naive}$ 卡在 $(K+L)/b$，融合后 $\text{AI} \approx N / 2$ 随 seq 线性增长）；方阵 B2B 收益固定 $1.5\times$；瘦中间近乎无收益。</li>
+    <li><strong>训练里的 fwd / dgrad / wgrad</strong>:FLOPs 与总字节数相同,但 achieved TFLOPS 几乎从不相同。fwd $&gt;$ dgrad $&gt;$ wgrad 的根因:fwd 是 TN + 短 $K$;dgrad 是 NN($\sim 5$–$15\%$ 罚);wgrad 的 $K = B \cdot S$ 大 10×、output tile 少、强制 Split-K / Stream-K、必需 FP32 accumulator,叠加起来通常比 fwd 慢 $20$–$40\%$。</li>
   </ul>
 
   <hr>
@@ -1130,6 +1252,127 @@
 
   <hr>
 
+  <h2>8. Training-time GEMMs: fwd / dgrad / wgrad</h2>
+
+  <p>Training one linear layer $Y = X W^\top$ decomposes into <strong>three independent GEMMs</strong>: forward, the gradient w.r.t. input (dgrad), and the gradient w.r.t. the weight (wgrad). All three carry the same FLOP count and the same total memory traffic, yet <strong>their achieved TFLOPS are almost never equal</strong>, and wgrad is usually the lowest. This section uses the AI / scheduling / tile framework built earlier to explain why.</p>
+
+  <h3>1. Shape comparison</h3>
+
+  <p>Let $M = B \cdot S$ (batch &times; seq), $K = d_\text{in}$, $N = d_\text{out}$, and label the cuBLAS layout as TN/NN/NT (whether A and B are transposed).</p>
+
+  <table>
+    <thead>
+      <tr><th>GEMM</th><th>Form</th><th>$M$</th><th>$N$</th><th>$K$ (reduction)</th><th>cuBLAS layout</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>fwd</td><td>$Y = X \cdot W^\top$</td><td>$B \cdot S$</td><td>$d_\text{out}$</td><td>$d_\text{in}$</td><td><strong>TN</strong></td></tr>
+      <tr><td>dgrad</td><td>$dX = dY \cdot W$</td><td>$B \cdot S$</td><td>$d_\text{in}$</td><td>$d_\text{out}$</td><td><strong>NN</strong></td></tr>
+      <tr><td>wgrad</td><td>$dW = dY^\top \cdot X$</td><td>$d_\text{out}$</td><td>$d_\text{in}$</td><td>$B \cdot S$</td><td><strong>TN</strong> (reduction = batch)</td></tr>
+    </tbody>
+  </table>
+
+  <p>$2 M N K$ is identical across the three, as is the total byte count $MK + KN + MN$ (only the role each operand plays differs). The next four factors are what split their achieved TFLOPS.</p>
+
+  <h3>2. Tensor cores prefer TN, not NN (penalizes dgrad)</h3>
+
+  <p>The TC instructions (<code>mma.sync</code> / <code>wgmma</code>) fix the fragment layout at the assembly level. <strong>A contiguous along $M$ + B contiguous along $N$ (i.e. TN)</strong> is the native fast path in cuBLAS / CUTLASS: fragments are read directly from smem with no extra smem transpose.</p>
+
+  <ul>
+    <li><strong>fwd is naturally TN.</strong></li>
+    <li><strong>dgrad is NN</strong> (neither $dY$ nor $W$ is transposed). Two options: use the NN-native kernel (slightly slower because the K-major mma.sync path has a lower issue rate than TN), or transpose $W$ in smem first and switch to TN (an extra smem round-trip). CUTLASS / cuBLAS on H100 typically picks the former.</li>
+    <li><strong>wgrad is TN</strong>, so it does not pay this cost.</li>
+  </ul>
+
+  <p>This term alone makes dgrad about <strong>5 to 15% slower</strong> than fwd on H100 BF16, mostly from the lower NN MMA issue rate.</p>
+
+  <h3>3. wgrad's reduction dim = batch &times; seq: the dominant reason wgrad is slow</h3>
+
+  <p>This is the textbook "$MN$ small / $K$ large" case from the scheduling table in §6.1:</p>
+
+  <table>
+    <thead><tr><th>GEMM</th><th>Reduction dim $K$</th><th>Typical scale (LLM training)</th></tr></thead>
+    <tbody>
+      <tr><td>fwd</td><td>$d_\text{in}$</td><td>$4096$ to $16384$</td></tr>
+      <tr><td>dgrad</td><td>$d_\text{out}$</td><td>$4096$ to $16384$</td></tr>
+      <tr><td>wgrad</td><td><strong>$B \cdot S$</strong></td><td><strong>$32\text{K}$ to $256\text{K}$</strong> (often 10&times; fwd's $K$)</td></tr>
+    </tbody>
+  </table>
+
+  <p>Meanwhile wgrad's output $dW$ has shape $d_\text{out} \times d_\text{in}$ (often $4096 \times 4096$): <strong>tile count far below SM count</strong>. This is precisely the regime where the scheduling table in §6 calls for Split-K / Stream-K, with three knock-on costs:</p>
+
+  <ol>
+    <li><strong>Output tile count is too small to fill the SMs.</strong> $d_\text{out} \cdot d_\text{in} / (M_t N_t)$ with $128 \times 128$ tiles is just $32 \times 32 = 1024$ tiles, enough to fill H100's 132 SMs only $\sim 8\times$ over, so the pipeline is short.</li>
+    <li><strong>Split-K / Stream-K is forced.</strong> On this skinny-output, long-$K$ shape, CUTLASS / cuBLAS slice $K$, each CTA computes a slice, then a cross-CTA reduction merges:
+      <ul>
+        <li><strong>Split-K (atomic variant)</strong>: FP32 atomic adds serialize aggressively; atomic throughput on GA100/H100 is bounded by L2 partition count.</li>
+        <li><strong>Split-K (workspace variant)</strong>: write $S$ partial $M_t \times N_t$ tiles to DRAM, then launch a reduction kernel to read them back. AI becomes $\frac{2MNK}{(MK + KN + 2 S MN) \cdot b}$; larger $S$ collapses AI quickly.</li>
+        <li><strong>Stream-K</strong>: amortizes the reduction down to SM-count-sized fix-ups, far cheaper than Split-K. <strong>Modern CUTLASS / cuBLAS run wgrad on Stream-K by default.</strong></li>
+      </ul>
+    </li>
+    <li><strong>FP32 accumulator is mandatory.</strong> With $K$ = batch &times; seq running to 32K+, BF16/FP16 accumulation error grows past tolerance, so TC must use the FP32 accumulator. The H100 BF16 + FP32-accum TC peak is half the FP16-accum peak (a quarter pre-SM_90). wgrad therefore <strong>starts from a lower nominal peak</strong> before any other effect kicks in.</li>
+  </ol>
+
+  <p>Stacked together, wgrad's achieved TFLOPS in LLM training typically runs <strong>20 to 40% lower</strong> than fwd.</p>
+
+  <h3>4. Memory stride differs (hurts wgrad's DRAM path)</h3>
+
+  <p>The total byte count is identical, but each operand's "contiguous direction" determines whether 128-bit / 256-bit vectorized loads are possible, and how well L2 is reused.</p>
+
+  <table>
+    <thead><tr><th>GEMM</th><th>A read direction</th><th>B read direction</th><th>Memory pattern</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>fwd</td>
+        <td>$X$ contiguous along $K$ (one row per token)</td>
+        <td>$W$ contiguous along $K$ (weights stored as (out, in))</td>
+        <td>Both operands stride along their K dim; high L2 reuse across CTAs (a $W$ row is shared by many $X$ rows)</td>
+      </tr>
+      <tr>
+        <td>dgrad</td>
+        <td>$dY$ contiguous along $N = d_\text{in}$</td>
+        <td>$W$ contiguous along $K = d_\text{out}$</td>
+        <td>Under NN, $W$ is accessed opposite to fwd, paying an smem transpose; both $dY$ and $W$ still vectorize</td>
+      </tr>
+      <tr>
+        <td>wgrad</td>
+        <td>$dY^\top$: access $dY$ along $K = B \cdot S$ (<strong>the strided dim</strong>)</td>
+        <td>$X$: access along $K = B \cdot S$ (<strong>the strided dim</strong>)</td>
+        <td>Both operands reduce along the strided dim; the kernel needs heavy smem transposing. Hopper's TMA swizzle modes are designed for exactly this strided-load pattern.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>wgrad's memory pattern is intrinsically unfriendly: both $dY$ and $X$ require "column-walks across batch." L1 misses and smem bank conflicts both rise. Hopper added TMA + tensor-memory-layout swizzle largely to bail this case out, but compared to fwd's fully-contiguous loads it still loses ground.</p>
+
+  <h3>5. Register pressure and occupancy (downstream effects)</h3>
+
+  <ul>
+    <li>The FP32 accumulator uses 2&times; the registers of a BF16/FP16 accumulator. wgrad's FP32 accum bloats the $M_t N_t$ register footprint and squeezes occupancy.</li>
+    <li>Long-$K$ wgrad needs deeper $K$-block multi-buffering (the stages row in §6.2) to amortize the outer-loop overhead, which competes for the same registers and SMEM.</li>
+    <li>Empirically wgrad kernels often drop to 1 warp/SM occupancy while fwd holds 2 warps/SM. <strong>When occupancy drops, memory latency can no longer be hidden</strong>, achieved DRAM bandwidth falls, and split-K's write-out becomes slower in turn.</li>
+  </ul>
+
+  <h3>6. Empirical ranking and actionable optimizations</h3>
+
+  <p>H100 BF16, typical LLM training with hidden $= 4096$ and $B \cdot S = 32\text{K}$:</p>
+
+  <pre class="code">fwd     ~ 0.85 – 0.92 × peak TC      (TN + short K + plenty of tiles)
+dgrad   ~ 0.78 – 0.86 × peak TC      (NN + short K)
+wgrad   ~ 0.60 – 0.75 × peak TC      (TN + long K + split-K + FP32 accum)</pre>
+
+  <p>Levers worth pulling:</p>
+
+  <ul>
+    <li><strong>Tune Split-K factor separately.</strong> Megatron / cuBLASLt sweep wgrad's split-K independently. It does not share config with fwd / dgrad.</li>
+    <li><strong>Shrinking batch is rarely a net win.</strong> Cutting $B \cdot S$ shortens wgrad's $K$, but fwd / dgrad get skinny at the same time. In practice gradient accumulation tunes the effective batch; do not shrink the micro-batch for wgrad alone.</li>
+    <li><strong>Enable TMA + Cluster on Hopper.</strong> wgrad's strided loads are one of TMA's marquee use cases; Cluster lets multiple CTAs share the same $dY$ / $X$ panels, taking some load off split-K's DRAM pressure.</li>
+    <li><strong>FP8 training widens the gap.</strong> Under FP8, fwd / dgrad get the 2&times; TC throughput boost; wgrad still needs an FP32 accumulator for precision and does not get the same speedup. The fwd:wgrad ratio widens further.</li>
+  </ul>
+
+  <p class="callout"><strong>Cross-reference</strong>: fwd / dgrad / wgrad are the cleanest example of the "three $K$ distributions" laid out in the §6 scheduling table. fwd / dgrad sit on the Data-Parallel main line; wgrad sits on the Split-K / Stream-K main line. They coexist in the same training step, so tuning LLM training performance is fundamentally about <strong>optimizing these three mutually-constrained paths together</strong>.</p>
+
+  <hr>
+
   <h2 id="en-tldr">TL;DR</h2>
   <ul>
     <li>Square tile: $\text{AI} = T / b$, linear in $T$, capped by the square root of the cache capacity.</li>
@@ -1141,6 +1384,7 @@
     <li>Engineering picks: $K_t$ = MMA atom &times; 3 to 6 stages; $M_t \times N_t$ prefers square subject to register file; $M_o \times N_o$ (swizzle group) fits $\sim 0.5 \cdot M_{L2}$.</li>
     <li>If either side is intrinsically small (GEMV, batched MoE, LLM decode), the workload becomes fundamentally memory-bound. That is an algorithm-level problem (stitch $M$, FlashDecoding), not a kernel-level one.</li>
     <li><strong>B2B GEMM</strong>: fusing $D = (A B) C$ removes the $2MN$ DRAM round-trip of the intermediate tensor; speedup $= 1 + 2MN / (MK+KN+NL+ML)$. Attention is the marquee beneficiary ($\text{AI}_\text{naive}$ caps at $(K+L)/b$ regardless of seq, fused $\text{AI} \approx N / 2$ grows linearly with seq). Square B2B is fixed at $1.5\times$. Skinny middle gives essentially no benefit.</li>
+    <li><strong>Training-time fwd / dgrad / wgrad</strong>: same FLOPs and same total bytes, but achieved TFLOPS are almost never equal. fwd $&gt;$ dgrad $&gt;$ wgrad because fwd is TN with short $K$; dgrad pays $\sim 5$ to $15\%$ for NN; wgrad's $K = B \cdot S$ is 10&times; longer, its output tile count is small, it is forced onto Split-K / Stream-K, and it requires an FP32 accumulator. Together those typically cost wgrad $20$ to $40\%$ versus fwd.</li>
   </ul>
 
   <hr>
