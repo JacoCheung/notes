@@ -12,8 +12,8 @@
 <meta name="post:tags_en"         content="PyTorch, Systems Design, C++, Build">
 <meta name="post:reading"         content="25 分钟">
 <meta name="post:reading_en"      content="25 min">
-<meta name="post:summary"         content="PyTorch CUDA wheel 里所有 .so 的源码目录映射与链接依赖,对照上游 CMake 考据 + 交互式 D3 图。 涉及 libtorch.so 为何是空 aggregator、libtorch_python.so 即 torch._C、libtorch_global_deps 的 RTLD_GLOBAL 预加载等关键机制。">
-<meta name="post:summary_en"      content="How every .so in a CUDA PyTorch wheel maps to source-tree directories and links to one another, grounded in upstream CMake, with an interactive D3 dependency graph. Highlights why libtorch.so is empty, why libtorch_python.so is torch._C, and how libtorch_global_deps gets RTLD_GLOBAL-preloaded.">
+<meta name="post:summary"         content="PyTorch Linux CUDA wheel 里主要 .so 的源码目录映射与链接依赖,对照上游 CMake 考据 + 交互式 D3 图。 涉及 libtorch.so 为何是空 aggregator、libtorch_python.so 与 torch._C 的关系、libtorch_global_deps 的 RTLD_GLOBAL 预加载等机制。">
+<meta name="post:summary_en"      content="How the main .so files in a Linux CUDA PyTorch wheel map to source-tree directories and link to one another, grounded in upstream CMake, with an interactive D3 dependency graph. Covers why libtorch.so is empty, how libtorch_python.so relates to torch._C, and how libtorch_global_deps gets RTLD_GLOBAL-preloaded.">
 <meta name="post:series"          content="pytorch-internals">
 <meta name="post:series_title"    content="PyTorch 内部机制">
 <meta name="post:series_title_en" content="PyTorch Internals">
@@ -304,6 +304,8 @@
 
 <h1>PyTorch 共享库结构: 源码目录 → .so → torch._C</h1>
 
+<p><strong>范围说明</strong>:本文按 Linux CUDA wheel 与 PyTorch <code>v2.12.0</code> 源码来写。macOS、Windows、ROCm、CPU-only wheel 和本地源码编译的文件名、可选库、链接方式可能不同;遇到差异时,以你安装包里的 <code>torch/lib/</code> 和对应版本源码为准。</p>
+
 <h2 id="zh-1">1. 起点:<code>import torch</code> 到底加载了哪些 .so</h2>
 
 <p>装一份 CUDA 版 PyTorch wheel,看 <code>torch/lib/</code> 下面是这样:</p>
@@ -344,6 +346,8 @@ torch/lib/libtorch_nvshmem.so</pre>
 <div class="lang-en">
 
 <h1>PyTorch Shared Library Structure: Source Trees, .so Files, and torch._C</h1>
+
+<p><strong>Scope</strong>: this article describes the Linux CUDA wheel and PyTorch <code>v2.12.0</code> source. macOS, Windows, ROCm, CPU-only wheels, and local source builds can differ in file names, optional libraries, and link structure. If your install disagrees with this post, trust your own <code>torch/lib/</code> directory and the matching source tag.</p>
 
 <h2 id="en-1">1. Start: which .so files <code>import torch</code> loads</h2>
 
@@ -750,13 +754,13 @@ target_link_libraries(torch_global_deps PRIVATE
 <p>把它拆开:</p>
 
 <ol>
-  <li><code>torch._C</code> 是个 Python 模块,但模块对象本身<strong>就是 <code>libtorch_python.so</code></strong>。</li>
-  <li><code>libtorch_python.so</code> 是按 CPython 扩展模块的接口编出来的(链 <code>Python::Module</code>),装时落在 <code>torch/lib/libtorch_python.so</code>。</li>
+  <li><code>torch._C</code> 是个 Python 扩展模块;在本文这个 Linux CUDA wheel 布局里,它由 <code>libtorch_python.so</code> 提供。</li>
+  <li><code>libtorch_python.so</code> 是按 CPython 扩展模块的接口编出来的(链 <code>Python::Module</code>),在这个 wheel 里落在 <code>torch/lib/libtorch_python.so</code>。其它平台或构建方式可能换文件名或安装位置。</li>
   <li>它的 Python 入口符号是 <code>PyInit__C</code>,定义在 <code>torch/csrc/Module.cpp</code> —— 这个名字告诉 CPython 它是 <code>_C</code> 这个名字的扩展模块,而 setuptools 把它注册到 <code>torch._C</code> 这个完整路径下。</li>
   <li>Python 端 <code>from torch._C import *</code> 触发动态链接器加载 <code>libtorch_python.so</code> → 它的 NEEDED 项把 <code>libtorch.so</code> 拖进来 → 再把 <code>libtorch_cpu.so</code> 和 <code>libtorch_cuda.so</code> 拖进来 → 再底下是 <code>libc10.so</code> 和 <code>libc10_cuda.so</code>。</li>
 </ol>
 
-<p>所以从 Python 角度看的 <code>torch._C</code>,从 C++ 角度看就是 <code>libtorch_python.so</code> 这一个文件;再底下一连串 .so 是动态链接器的工作。</p>
+<p>所以在这个 Linux wheel 语境下,Python 角度看的 <code>torch._C</code>,从 C++ / 动态链接器角度看主要落到 <code>libtorch_python.so</code> 这个扩展模块;再底下一连串 .so 是动态链接器的工作。</p>
 
 <p><code>torch/__init__.py</code> 的实际启动流程:</p>
 
@@ -783,19 +787,19 @@ _C._initExtension(_manager_path())</pre>
 
 <h2 id="zh-refs">参考资料</h2>
 
-<p>本文的源码事实全部对照 <a href="https://github.com/pytorch/pytorch" target="_blank" rel="noopener">pytorch/pytorch</a> 的 <code>main</code> 分支(2026-06 抓取)。 关键 CMake 文件:</p>
+<p>本文的源码事实按 <a href="https://github.com/pytorch/pytorch" target="_blank" rel="noopener">pytorch/pytorch</a> 的 <code>v2.12.0</code> tag 核对。关键 CMake 文件:</p>
 
 <ul>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/CMakeLists.txt" target="_blank" rel="noopener">CMakeLists.txt</a>(顶层,USE_OBSERVERS / USE_CUDA / BUILD_LAZY_CUDA_LINALG 等开关)</li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/c10/CMakeLists.txt" target="_blank" rel="noopener">c10/CMakeLists.txt</a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/c10/cuda/CMakeLists.txt" target="_blank" rel="noopener">c10/cuda/CMakeLists.txt</a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/CMakeLists.txt" target="_blank" rel="noopener">aten/src/ATen/CMakeLists.txt</a>(<code>ATen_CPU_SRCS</code> / <code>ATen_CUDA_CPP_SRCS</code> / <code>ATen_CUDA_CU_SRCS</code> 的拼装)</li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/caffe2/CMakeLists.txt" target="_blank" rel="noopener">caffe2/CMakeLists.txt</a>(<code>torch_cpu</code> / <code>torch_cuda</code> / <code>torch</code> / <code>torch_global_deps</code> / <code>caffe2_nvrtc</code> 的真正定义所在)</li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/CMakeLists.txt" target="_blank" rel="noopener">torch/CMakeLists.txt</a>(<code>torch_python</code> 与 <code>nnapi_backend</code>)</li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/lib/libshm/CMakeLists.txt" target="_blank" rel="noopener">torch/lib/libshm/CMakeLists.txt</a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/build_variables.bzl" target="_blank" rel="noopener">build_variables.bzl</a>(<code>libtorch_python_core_sources</code> 等源文件清单)</li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/__init__.py" target="_blank" rel="noopener">torch/__init__.py</a>(<code>_load_global_deps</code> 与 <code>from torch._C import *</code>)</li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/csrc/Module.cpp" target="_blank" rel="noopener">torch/csrc/Module.cpp</a>(<code>PyInit__C</code>)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/CMakeLists.txt" target="_blank" rel="noopener">CMakeLists.txt</a>(顶层,USE_OBSERVERS / USE_CUDA / BUILD_LAZY_CUDA_LINALG 等开关)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/c10/CMakeLists.txt" target="_blank" rel="noopener">c10/CMakeLists.txt</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/c10/cuda/CMakeLists.txt" target="_blank" rel="noopener">c10/cuda/CMakeLists.txt</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/CMakeLists.txt" target="_blank" rel="noopener">aten/src/ATen/CMakeLists.txt</a>(<code>ATen_CPU_SRCS</code> / <code>ATen_CUDA_CPP_SRCS</code> / <code>ATen_CUDA_CU_SRCS</code> 的拼装)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/caffe2/CMakeLists.txt" target="_blank" rel="noopener">caffe2/CMakeLists.txt</a>(<code>torch_cpu</code> / <code>torch_cuda</code> / <code>torch</code> / <code>torch_global_deps</code> / <code>caffe2_nvrtc</code> 的真正定义所在)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/CMakeLists.txt" target="_blank" rel="noopener">torch/CMakeLists.txt</a>(<code>torch_python</code> 与 <code>nnapi_backend</code>)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/lib/libshm/CMakeLists.txt" target="_blank" rel="noopener">torch/lib/libshm/CMakeLists.txt</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/build_variables.bzl" target="_blank" rel="noopener">build_variables.bzl</a>(<code>libtorch_python_core_sources</code> 等源文件清单)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/__init__.py" target="_blank" rel="noopener">torch/__init__.py</a>(<code>_load_global_deps</code> 与 <code>from torch._C import *</code>)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/Module.cpp" target="_blank" rel="noopener">torch/csrc/Module.cpp</a>(<code>PyInit__C</code>)</li>
 </ul>
 
 <hr>
@@ -809,13 +813,13 @@ _C._initExtension(_manager_path())</pre>
 <p>Breaking it down:</p>
 
 <ol>
-  <li><code>torch._C</code> is a Python module, and the module object <strong>is <code>libtorch_python.so</code></strong>.</li>
-  <li><code>libtorch_python.so</code> is built as a CPython extension (links <code>Python::Module</code>) and installed to <code>torch/lib/libtorch_python.so</code>.</li>
+  <li><code>torch._C</code> is a Python extension module; in the Linux CUDA wheel layout discussed here, it is provided by <code>libtorch_python.so</code>.</li>
+  <li><code>libtorch_python.so</code> is built as a CPython extension (links <code>Python::Module</code>) and installed to <code>torch/lib/libtorch_python.so</code> in this wheel. Other platforms or build modes may use different file names or install locations.</li>
   <li>Its Python entry symbol is <code>PyInit__C</code>, defined in <code>torch/csrc/Module.cpp</code>. The name tells CPython this is the <code>_C</code> extension; setuptools registers it under the full path <code>torch._C</code>.</li>
   <li>On the Python side, <code>from torch._C import *</code> triggers the dynamic linker to load <code>libtorch_python.so</code>; its NEEDED entries drag in <code>libtorch.so</code>; the aggregator drags in <code>libtorch_cpu.so</code> and <code>libtorch_cuda.so</code>; and those drag in <code>libc10.so</code> and <code>libc10_cuda.so</code>.</li>
 </ol>
 
-<p>So <code>torch._C</code> from Python's perspective is exactly <code>libtorch_python.so</code> from the C++ perspective; the rest of the chain is the dynamic linker doing its job.</p>
+<p>So, in this Linux wheel context, <code>torch._C</code> from Python's perspective mostly lands on the <code>libtorch_python.so</code> extension module from the C++ / dynamic-linker perspective; the rest of the chain is the dynamic linker doing its job.</p>
 
 <p>The startup sequence in <code>torch/__init__.py</code>:</p>
 
@@ -842,19 +846,19 @@ _C._initExtension(_manager_path())</pre>
 
 <h2 id="en-refs">References</h2>
 
-<p>All source-tree facts in this article are checked against the <code>main</code> branch of <a href="https://github.com/pytorch/pytorch" target="_blank" rel="noopener">pytorch/pytorch</a> (fetched 2026-06). Key CMake files:</p>
+<p>All source-tree facts in this article are checked against the <code>v2.12.0</code> tag of <a href="https://github.com/pytorch/pytorch" target="_blank" rel="noopener">pytorch/pytorch</a>. Key CMake files:</p>
 
 <ul>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/CMakeLists.txt" target="_blank" rel="noopener">CMakeLists.txt</a> (top-level; <code>USE_OBSERVERS</code>, <code>USE_CUDA</code>, <code>BUILD_LAZY_CUDA_LINALG</code>, etc.)</li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/c10/CMakeLists.txt" target="_blank" rel="noopener">c10/CMakeLists.txt</a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/c10/cuda/CMakeLists.txt" target="_blank" rel="noopener">c10/cuda/CMakeLists.txt</a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/CMakeLists.txt" target="_blank" rel="noopener">aten/src/ATen/CMakeLists.txt</a> (assembly of <code>ATen_CPU_SRCS</code>, <code>ATen_CUDA_CPP_SRCS</code>, <code>ATen_CUDA_CU_SRCS</code>)</li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/caffe2/CMakeLists.txt" target="_blank" rel="noopener">caffe2/CMakeLists.txt</a> (the actual definitions of <code>torch_cpu</code>, <code>torch_cuda</code>, <code>torch</code>, <code>torch_global_deps</code>, <code>caffe2_nvrtc</code>)</li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/CMakeLists.txt" target="_blank" rel="noopener">torch/CMakeLists.txt</a> (<code>torch_python</code> and <code>nnapi_backend</code>)</li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/lib/libshm/CMakeLists.txt" target="_blank" rel="noopener">torch/lib/libshm/CMakeLists.txt</a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/build_variables.bzl" target="_blank" rel="noopener">build_variables.bzl</a> (canonical source-file lists)</li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/__init__.py" target="_blank" rel="noopener">torch/__init__.py</a> (<code>_load_global_deps</code> and <code>from torch._C import *</code>)</li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/main/torch/csrc/Module.cpp" target="_blank" rel="noopener">torch/csrc/Module.cpp</a> (<code>PyInit__C</code>)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/CMakeLists.txt" target="_blank" rel="noopener">CMakeLists.txt</a> (top-level; <code>USE_OBSERVERS</code>, <code>USE_CUDA</code>, <code>BUILD_LAZY_CUDA_LINALG</code>, etc.)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/c10/CMakeLists.txt" target="_blank" rel="noopener">c10/CMakeLists.txt</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/c10/cuda/CMakeLists.txt" target="_blank" rel="noopener">c10/cuda/CMakeLists.txt</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/CMakeLists.txt" target="_blank" rel="noopener">aten/src/ATen/CMakeLists.txt</a> (assembly of <code>ATen_CPU_SRCS</code>, <code>ATen_CUDA_CPP_SRCS</code>, <code>ATen_CUDA_CU_SRCS</code>)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/caffe2/CMakeLists.txt" target="_blank" rel="noopener">caffe2/CMakeLists.txt</a> (the actual definitions of <code>torch_cpu</code>, <code>torch_cuda</code>, <code>torch</code>, <code>torch_global_deps</code>, <code>caffe2_nvrtc</code>)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/CMakeLists.txt" target="_blank" rel="noopener">torch/CMakeLists.txt</a> (<code>torch_python</code> and <code>nnapi_backend</code>)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/lib/libshm/CMakeLists.txt" target="_blank" rel="noopener">torch/lib/libshm/CMakeLists.txt</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/build_variables.bzl" target="_blank" rel="noopener">build_variables.bzl</a> (canonical source-file lists)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/__init__.py" target="_blank" rel="noopener">torch/__init__.py</a> (<code>_load_global_deps</code> and <code>from torch._C import *</code>)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/Module.cpp" target="_blank" rel="noopener">torch/csrc/Module.cpp</a> (<code>PyInit__C</code>)</li>
 </ul>
 
 <hr>
@@ -955,8 +959,8 @@ const NODES = [
               en: 'Sole purpose: let users write target_link_libraries(my_app torch) and transitively get both CPU and CUDA. In split-build mode, find_library locates an external libtorch.so; same concept.' },
     } },
   { id: 'libtorch_python', kind: 'lib', label: 'libtorch_python.so',
-    desc: { zh: 'Python 扩展模块,PyInit__C 入口,Python 端的 torch._C 就是这个 .so',
-            en: 'CPython extension; PyInit__C; this .so IS torch._C from Python' },
+    desc: { zh: 'Python 扩展模块,PyInit__C 入口;在本文 wheel 布局里提供 torch._C',
+            en: 'CPython extension; PyInit__C; provides torch._C in this wheel layout' },
     detail: {
       target: 'torch_python',
       cmake: 'torch/CMakeLists.txt',
