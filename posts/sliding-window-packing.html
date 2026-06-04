@@ -1,0 +1,821 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sliding Window 的 packing 陷阱</title>
+<meta name="post:title"           content="Sliding Window 的 packing 陷阱">
+<meta name="post:title_en"        content="Sliding Window's Packing Trap">
+<meta name="post:slug"            content="sliding-window-packing">
+<meta name="post:date"            content="2026-06-04">
+<meta name="post:tags"            content="LLM, Attention, 训练, FlashAttention">
+<meta name="post:tags_en"         content="LLM, Attention, Training, FlashAttention">
+<meta name="post:reading"         content="12 分钟">
+<meta name="post:reading_en"      content="12 min">
+<meta name="post:summary"         content="Sliding window attention 的单层感受野只看 W 个 token,但 L 层叠加后实际感受野 ≈ L·(W-1)+1。这一点直接决定:把多条训练样本拼成长序列后,只靠 SWA 不能保证跨样本隔离,必须用 document mask / cu_seqlens。本文用两层 / 6-token diagram 把这件事讲透,并给出 FlashAttention 的正确 API。">
+<meta name="post:summary_en"      content="A single SWA layer only sees W tokens, but L stacked layers reach an effective receptive field of L·(W-1)+1. Consequence: packing multiple training samples into one sequence is NOT safe under SWA alone, you need a document mask via cu_seqlens. This note walks through a 2-layer, 6-token diagram and gives the right FlashAttention API.">
+<meta name="post:series"          content="llm-arch">
+<meta name="post:series_title"    content="LLM Attention 与实现">
+<meta name="post:series_title_en" content="LLM Attention and Implementations">
+<meta name="post:series_order"    content="2">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body, {
+    delimiters: [
+      {left: '$$', right: '$$', display: true},
+      {left: '\\[', right: '\\]', display: true},
+      {left: '$',  right: '$',  display: false},
+      {left: '\\(', right: '\\)', display: false}
+    ],
+    throwOnError: false
+  });"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="../lang-toggle.js" defer></script>
+<style>
+  main.content { max-width: 920px; padding: 56px 32px 96px; }
+  @media (max-width: 920px) { main.content { padding: 48px 20px 80px; } }
+
+  .swa-fig {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    margin: 22px 0;
+    padding: 18px 14px 14px;
+  }
+  .swa-fig svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+  .swa-fig figcaption {
+    text-align: center;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--fg-subtle);
+    margin-top: 10px;
+    letter-spacing: 0;
+  }
+  .swa-fig .cell rect { fill: var(--bg); stroke: var(--border-strong); stroke-width: 1.6; }
+  .swa-fig .cell text { font-family: var(--font-mono); font-size: 17px; fill: var(--fg); font-weight: 500; }
+  .swa-fig .cell.direct rect { fill: var(--accent-tint); stroke: var(--accent); stroke-width: 2; }
+  .swa-fig .cell.indirect rect { fill: var(--accent-tint); fill-opacity: 0.45; stroke: var(--accent); stroke-width: 1.4; stroke-dasharray: 4 3; }
+  .swa-fig .cell.target rect { fill: var(--accent); stroke: var(--accent); stroke-width: 2; }
+  .swa-fig .cell.target text { fill: var(--accent-fg); font-weight: 700; }
+  .swa-fig .cell.bad rect { fill: rgba(239,68,68,0.18); stroke: #ef4444; stroke-width: 1.6; }
+  .swa-fig .cell.bad text { fill: #ef4444; font-weight: 600; }
+  .swa-fig .cell.sep rect { fill: rgba(239,68,68,0.04); stroke: #ef4444; stroke-width: 1; stroke-dasharray: 3 3; }
+  .swa-fig .cell.faded rect { fill: var(--bg); stroke: var(--border); opacity: 0.6; }
+  .swa-fig .cell.faded text { fill: var(--fg-subtle); opacity: 0.7; }
+  .swa-fig .col-label {
+    font-family: var(--font-mono); font-size: 13px;
+    fill: var(--fg-muted); text-anchor: middle; font-weight: 500;
+  }
+  .swa-fig .arrow {
+    fill: none; stroke: var(--accent); stroke-width: 1.6;
+    marker-end: url(#sw-arrow);
+  }
+  .swa-fig .arrow.indirect {
+    stroke-dasharray: 4 3;
+    stroke-width: 1.3;
+    opacity: 0.78;
+  }
+  .swa-fig .arrow.bad {
+    stroke: #ef4444; stroke-width: 1.6;
+    marker-end: url(#sw-arrow-bad);
+  }
+  .swa-fig .arrow.bad.indirect {
+    stroke-dasharray: 4 3;
+    opacity: 0.8;
+  }
+  .swa-fig .legend-text {
+    font-family: var(--font-mono); font-size: 11.5px; fill: var(--fg-muted);
+  }
+  .swa-fig .legend-text.bad { fill: #ef4444; }
+  .swa-fig .sample-label {
+    font-family: var(--font-mono); font-size: 11px;
+    fill: var(--fg-subtle); font-weight: 600;
+    text-anchor: end;
+  }
+  /* attention mask matrix cells */
+  .swa-fig .mc { stroke-width: 1; }
+  .swa-fig .mc.allow  { fill: var(--accent); stroke: rgba(255, 255, 255, 0.55); }
+  .swa-fig .mc.causal { fill: var(--bg);     stroke: var(--border-strong); }
+  .swa-fig .mc.window { fill: rgba(239, 68, 68, 0.15); stroke: #ef4444; stroke-dasharray: 3 2; stroke-opacity: 0.75; }
+  .swa-fig .mask-axis text { font-family: var(--font-mono); font-size: 14px; fill: var(--fg-muted); }
+
+  table.swa-table { border-collapse: collapse; margin: 16px 0; font-size: 13.5px; width: 100%; }
+  table.swa-table th, table.swa-table td {
+    border: 1px solid var(--border); padding: 7px 12px; text-align: left;
+  }
+  table.swa-table th { background: var(--bg-elevated); font-weight: 600; }
+  table.swa-table code { font-size: 12.5px; }
+
+  pre.code { font-size: 12.5px; }
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-tint);
+    padding: 10px 14px;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    margin: 14px 0;
+    font-size: 14px;
+  }
+  .callout.bad {
+    border-left-color: #ef4444;
+    background: rgba(239, 68, 68, 0.08);
+  }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 28px 0; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录 · TOC</div>
+    <div class="lang-zh">
+    <ul>
+      <li><a href="#zh-intro">1. 引言</a></li>
+      <li><a href="#zh-single">2. 单层 SWA:直接感受野</a></li>
+      <li><a href="#zh-multi">3. 两层 SWA:实际感受野扩大</a></li>
+      <li><a href="#zh-formula">4. 通用公式</a></li>
+      <li><a href="#zh-packing">5. Packing 训练:跨样本污染</a></li>
+      <li><a href="#zh-docmask">6. 正确做法:document mask</a></li>
+      <li><a href="#zh-check">7. 实操 checklist</a></li>
+      <li><a href="#zh-refs">参考资料</a></li>
+    </ul>
+    </div>
+    <div class="lang-en">
+    <ul>
+      <li><a href="#en-intro">1. Intro</a></li>
+      <li><a href="#en-single">2. Single-layer SWA</a></li>
+      <li><a href="#en-multi">3. Two-layer SWA</a></li>
+      <li><a href="#en-formula">4. The general formula</a></li>
+      <li><a href="#en-packing">5. Packed training: cross-sample contamination</a></li>
+      <li><a href="#en-docmask">6. The fix: document mask</a></li>
+      <li><a href="#en-check">7. Practical checklist</a></li>
+      <li><a href="#en-refs">References</a></li>
+    </ul>
+    </div>
+  </aside>
+
+<main class="content">
+
+<!-- ===== Shared SVG defs (referenced by all figures) ===== -->
+<svg width="0" height="0" style="position:absolute;">
+  <defs>
+    <marker id="sw-arrow" viewBox="0 -5 10 10" refX="8" refY="0"
+            markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,-4L8,0L0,4z" fill="currentColor" style="fill: var(--accent);"/>
+    </marker>
+    <marker id="sw-arrow-bad" viewBox="0 -5 10 10" refX="8" refY="0"
+            markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,-4L8,0L0,4z" fill="#ef4444"/>
+    </marker>
+  </defs>
+</svg>
+
+<!-- ===================== ZH ===================== -->
+<div class="lang-zh">
+
+<h1>Sliding Window 的 packing 陷阱</h1>
+
+<p style="color: var(--fg-muted); font-style: italic;">LLM Attention 与实现 · Part 2</p>
+
+<h2 id="zh-intro">1. 引言</h2>
+
+<p>Sliding Window Attention(SWA)单层只让每个 token 看自己前 $W-1$ 个 token,接口干净:Mistral、Gemma、Phi-3 都靠它把训练序列推到 32K+。但和另一个常见做法 <strong>sequence packing</strong>(多条短样本拼成一条长序列以省 padding)组合后,会出现一个不易察觉的等价性陷阱:</p>
+
+<p class="callout bad"><strong>只靠 SWA "自然分隔"不同样本不安全。</strong> 多层 attention 的实际感受野会越过窗口,把别的样本信息混入当前样本。数学上不再等价于独立训练。</p>
+
+<p>下面用 6 token、2 层、$W=3$ 的最小例子拆开这件事,再给出实际可用的修复:FlashAttention 的 <code>cu_seqlens</code> / document mask。</p>
+
+</div>
+
+<!-- ===================== EN ===================== -->
+<div class="lang-en">
+
+<h1>Sliding Window's Packing Trap</h1>
+
+<p style="color: var(--fg-muted); font-style: italic;">LLM Attention and Implementations · Part 2</p>
+
+<h2 id="en-intro">1. Intro</h2>
+
+<p>Sliding Window Attention (SWA) limits each token to its previous $W-1$ neighbors per layer. The interface is clean, and Mistral, Gemma, and Phi-3 all use it to push training context to 32K+. Combined with the other common practice of <strong>sequence packing</strong> (concatenating short samples into one long sequence to save padding), it has a subtle equivalence trap:</p>
+
+<p class="callout bad"><strong>SWA alone does not "naturally separate" samples.</strong> The multi-layer effective receptive field reaches past the window and silently mixes information across samples. Mathematically, the result is no longer equivalent to training each sample independently.</p>
+
+<p>The smallest example that exposes the issue uses 6 tokens, 2 layers, and $W=3$. The fix that holds up in practice is FlashAttention's <code>cu_seqlens</code> / document mask.</p>
+
+</div>
+
+<hr>
+
+<!-- ===================== ZH ===================== -->
+<div class="lang-zh">
+
+<h2 id="zh-single">2. 单层 SWA:直接感受野</h2>
+
+<p>设序列 <code>abcdef</code>,窗口 $W = 3$,因果 mask(只看自己 + 前 2 个)。一层 SWA 把 <code>act₀</code>(输入 activation)变成 <code>act₁</code>。 对位置 4 的 <code>d</code> 而言,直接 attend 的 K/V 来自 <code>act₀</code> 中索引 [d-2, d] = $\{b, c, d\}$:</p>
+
+</div>
+
+<div class="lang-en">
+
+<h2 id="en-single">2. Single-layer SWA: the direct receptive field</h2>
+
+<p>Take sequence <code>abcdef</code> with window $W = 3$ and a causal mask (self + 2 previous). One SWA layer maps <code>act₀</code> to <code>act₁</code>. For position 4 (<code>d</code>), the K/V it directly attends to come from indices [d-2, d] in <code>act₀</code>, i.e. $\{b, c, d\}$:</p>
+
+</div>
+
+<!-- ===== Figure 1: single-layer SWA ===== -->
+<figure class="swa-fig">
+<svg viewBox="0 0 540 360" width="100%" style="max-width:540px;">
+  <!-- column labels -->
+  <text x="120" y="28" class="col-label">act₀ (input)</text>
+  <text x="420" y="28" class="col-label">act₁ (after 1 layer)</text>
+
+  <!-- act0 column at x=80, cells from y=44 -->
+  <g transform="translate(80, 44)">
+    <g class="cell"        transform="translate(0,   0)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">a</text></g>
+    <g class="cell direct" transform="translate(0,  44)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">b</text></g>
+    <g class="cell direct" transform="translate(0,  88)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">c</text></g>
+    <g class="cell direct" transform="translate(0, 132)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">d</text></g>
+    <g class="cell"        transform="translate(0, 176)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">e</text></g>
+    <g class="cell"        transform="translate(0, 220)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">f</text></g>
+  </g>
+
+  <!-- act1 column at x=380 -->
+  <g transform="translate(380, 44)">
+    <g class="cell faded"  transform="translate(0,   0)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">a</text></g>
+    <g class="cell faded"  transform="translate(0,  44)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">b</text></g>
+    <g class="cell faded"  transform="translate(0,  88)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">c</text></g>
+    <g class="cell target" transform="translate(0, 132)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">d</text></g>
+    <g class="cell faded"  transform="translate(0, 176)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">e</text></g>
+    <g class="cell faded"  transform="translate(0, 220)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">f</text></g>
+  </g>
+
+  <!-- arrows from b,c,d in act0 to d in act1 -->
+  <!-- d in act1 center = (380+80=460-ish for left edge... target center y = 44+132+22 = 198 -->
+  <!-- b in act0: right edge at x=160, center y = 44+44+22 = 110 -->
+  <path class="arrow" d="M 160 110 C 230 110, 310 198, 380 198"/>
+  <path class="arrow" d="M 160 154 C 230 154, 310 198, 380 198"/>
+  <path class="arrow" d="M 160 198 L 380 198"/>
+
+  <text x="270" y="320" class="legend-text" text-anchor="middle">
+    d 在 act₁ 直接 attend 到 act₀ 的 {b, c, d}(窗口 W=3,因果)
+  </text>
+</svg>
+<figcaption>Fig 1 · 单层 SWA · d 在 act₁ 的直接感受野是 act₀ 的 {b, c, d}</figcaption>
+</figure>
+
+<!-- ===================== ZH ===================== -->
+<div class="lang-zh">
+
+<p>同一个窗口约束放进 attention mask 矩阵看(行 $= Q$,列 $= K$,允许 attend 的格子打亮):SWA + 因果合起来是一条<strong>沿对角线、宽度为 $W$ 的下三角带</strong>。 对角线之上是因果 mask;对角线下方超过 $W-1$ 行的位置是窗口 mask:</p>
+
+</div>
+
+<div class="lang-en">
+
+<p>The same window constraint, viewed as the attention mask matrix (rows $= Q$, cols $= K$, allowed cells filled): SWA combined with causal forms a <strong>lower-triangular band of width $W$ along the diagonal</strong>. Above the diagonal is the causal mask; more than $W-1$ rows below the diagonal is the window mask:</p>
+
+</div>
+
+<!-- ===== Figure 2: attention mask matrix ===== -->
+<figure class="swa-fig">
+<svg viewBox="0 0 500 400" width="100%" style="max-width:500px;">
+  <!-- K axis label -->
+  <text x="212" y="32" class="legend-text" text-anchor="middle" style="font-weight:500;">K (key) →</text>
+
+  <!-- column letter labels -->
+  <g class="mask-axis">
+    <text x="102" y="58" text-anchor="middle">a</text>
+    <text x="146" y="58" text-anchor="middle">b</text>
+    <text x="190" y="58" text-anchor="middle">c</text>
+    <text x="234" y="58" text-anchor="middle">d</text>
+    <text x="278" y="58" text-anchor="middle">e</text>
+    <text x="322" y="58" text-anchor="middle">f</text>
+  </g>
+
+  <!-- Q axis label (rotated) -->
+  <text x="32" y="208" class="legend-text" transform="rotate(-90 32 208)" text-anchor="middle" style="font-weight:500;">Q (query) ↓</text>
+
+  <!-- row letter labels -->
+  <g class="mask-axis">
+    <text x="72" y="94"  text-anchor="end" alignment-baseline="middle">a</text>
+    <text x="72" y="138" text-anchor="end" alignment-baseline="middle">b</text>
+    <text x="72" y="182" text-anchor="end" alignment-baseline="middle">c</text>
+    <text x="72" y="226" text-anchor="end" alignment-baseline="middle">d</text>
+    <text x="72" y="270" text-anchor="end" alignment-baseline="middle">e</text>
+    <text x="72" y="314" text-anchor="end" alignment-baseline="middle">f</text>
+  </g>
+
+  <!-- 6x6 grid at translate(80, 72), each cell 44x44.
+       Cell (r, c) allowed iff (c <= r) and (r - c < W=3). -->
+  <g transform="translate(80, 72)">
+    <!-- row 0 (q=a) -->
+    <rect class="mc allow"  x="0"   y="0"   width="44" height="44"/>
+    <rect class="mc causal" x="44"  y="0"   width="44" height="44"/>
+    <rect class="mc causal" x="88"  y="0"   width="44" height="44"/>
+    <rect class="mc causal" x="132" y="0"   width="44" height="44"/>
+    <rect class="mc causal" x="176" y="0"   width="44" height="44"/>
+    <rect class="mc causal" x="220" y="0"   width="44" height="44"/>
+    <!-- row 1 (q=b) -->
+    <rect class="mc allow"  x="0"   y="44"  width="44" height="44"/>
+    <rect class="mc allow"  x="44"  y="44"  width="44" height="44"/>
+    <rect class="mc causal" x="88"  y="44"  width="44" height="44"/>
+    <rect class="mc causal" x="132" y="44"  width="44" height="44"/>
+    <rect class="mc causal" x="176" y="44"  width="44" height="44"/>
+    <rect class="mc causal" x="220" y="44"  width="44" height="44"/>
+    <!-- row 2 (q=c) -->
+    <rect class="mc allow"  x="0"   y="88"  width="44" height="44"/>
+    <rect class="mc allow"  x="44"  y="88"  width="44" height="44"/>
+    <rect class="mc allow"  x="88"  y="88"  width="44" height="44"/>
+    <rect class="mc causal" x="132" y="88"  width="44" height="44"/>
+    <rect class="mc causal" x="176" y="88"  width="44" height="44"/>
+    <rect class="mc causal" x="220" y="88"  width="44" height="44"/>
+    <!-- row 3 (q=d) -->
+    <rect class="mc window" x="0"   y="132" width="44" height="44"/>
+    <rect class="mc allow"  x="44"  y="132" width="44" height="44"/>
+    <rect class="mc allow"  x="88"  y="132" width="44" height="44"/>
+    <rect class="mc allow"  x="132" y="132" width="44" height="44"/>
+    <rect class="mc causal" x="176" y="132" width="44" height="44"/>
+    <rect class="mc causal" x="220" y="132" width="44" height="44"/>
+    <!-- row 4 (q=e) -->
+    <rect class="mc window" x="0"   y="176" width="44" height="44"/>
+    <rect class="mc window" x="44"  y="176" width="44" height="44"/>
+    <rect class="mc allow"  x="88"  y="176" width="44" height="44"/>
+    <rect class="mc allow"  x="132" y="176" width="44" height="44"/>
+    <rect class="mc allow"  x="176" y="176" width="44" height="44"/>
+    <rect class="mc causal" x="220" y="176" width="44" height="44"/>
+    <!-- row 5 (q=f) -->
+    <rect class="mc window" x="0"   y="220" width="44" height="44"/>
+    <rect class="mc window" x="44"  y="220" width="44" height="44"/>
+    <rect class="mc window" x="88"  y="220" width="44" height="44"/>
+    <rect class="mc allow"  x="132" y="220" width="44" height="44"/>
+    <rect class="mc allow"  x="176" y="220" width="44" height="44"/>
+    <rect class="mc allow"  x="220" y="220" width="44" height="44"/>
+  </g>
+
+  <!-- legend -->
+  <g transform="translate(60, 372)">
+    <rect class="mc allow"  x="0"   y="-10" width="14" height="14"/>
+    <text x="20"  y="3" class="legend-text">allowed</text>
+
+    <rect class="mc causal" x="100" y="-10" width="14" height="14"/>
+    <text x="120" y="3" class="legend-text">causal-masked</text>
+
+    <rect class="mc window" x="260" y="-10" width="14" height="14"/>
+    <text x="280" y="3" class="legend-text">window-masked</text>
+  </g>
+</svg>
+<figcaption>Fig 2 · attention mask 矩阵 · SWA + causal 是一条对角线 + 宽度 W=3 的下三角带</figcaption>
+</figure>
+
+<!-- ===================== ZH ===================== -->
+<div class="lang-zh">
+
+<h2 id="zh-multi">3. 两层 SWA:实际感受野扩大</h2>
+
+<p>加一层。 <code>act₁</code> 经同一个 SWA 操作得到 <code>act₂</code>。 对 <code>act₂</code> 的 <code>d</code>,直接 attend 仍是 <code>act₁</code> 的 $\{b, c, d\}$,单层窗口看起来依然是 3。 但 <code>act₁</code> 里的 <code>b</code> 上一层已经 attend 过 <code>act₀</code> 的 $\{a, b\}$(<code>b</code> 在 act₀ 是位置 2,$[b-2, b] = [a, b]$;<code>a</code> 之前没有 token)。 这条路径让 <code>a</code> 的信息也进入 <code>act₂</code> 的 <code>d</code>。</p>
+
+<p>结果:<strong><code>act₂</code> 的 <code>d</code> 实际感受野是 <code>act₀</code> 的 $\{a, b, c, d\}$,而不是 $\{b, c, d\}$</strong>。 单层窗口在多层叠加后被放大。</p>
+
+</div>
+
+<div class="lang-en">
+
+<h2 id="en-multi">3. Two-layer SWA: the effective receptive field grows</h2>
+
+<p>Add a second layer. <code>act₁</code> goes through the same SWA op and becomes <code>act₂</code>. For <code>d</code> at <code>act₂</code>, the direct attendees are still $\{b, c, d\}$ in <code>act₁</code>, so the per-layer window still looks like 3. But <code>b</code> at <code>act₁</code> already attended to $\{a, b\}$ from <code>act₀</code> on the previous layer (<code>b</code> sits at position 2, $[b-2, b] = [a, b]$, clamped at the start). That path carries <code>a</code>'s information into <code>d</code> at <code>act₂</code>.</p>
+
+<p>The result: <strong>the effective receptive field of <code>d</code> at <code>act₂</code> is $\{a, b, c, d\}$ in <code>act₀</code>, not $\{b, c, d\}$</strong>. The per-layer window is amplified by stacking.</p>
+
+</div>
+
+<!-- ===== Figure 2: two-layer SWA receptive field ===== -->
+<figure class="swa-fig">
+<svg viewBox="0 0 800 400" width="100%" style="max-width:800px;">
+  <text x="120" y="28" class="col-label">act₀</text>
+  <text x="400" y="28" class="col-label">act₁ (after 1 layer)</text>
+  <text x="680" y="28" class="col-label">act₂ (after 2 layers)</text>
+
+  <!-- act0 column at x=80 -->
+  <g transform="translate(80, 44)">
+    <g class="cell indirect" transform="translate(0,   0)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">a</text></g>
+    <g class="cell direct"   transform="translate(0,  44)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">b</text></g>
+    <g class="cell direct"   transform="translate(0,  88)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">c</text></g>
+    <g class="cell direct"   transform="translate(0, 132)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">d</text></g>
+    <g class="cell"          transform="translate(0, 176)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">e</text></g>
+    <g class="cell"          transform="translate(0, 220)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">f</text></g>
+  </g>
+
+  <!-- act1 column at x=360 -->
+  <g transform="translate(360, 44)">
+    <g class="cell faded"  transform="translate(0,   0)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">a</text></g>
+    <g class="cell direct" transform="translate(0,  44)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">b</text></g>
+    <g class="cell direct" transform="translate(0,  88)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">c</text></g>
+    <g class="cell direct" transform="translate(0, 132)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">d</text></g>
+    <g class="cell faded"  transform="translate(0, 176)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">e</text></g>
+    <g class="cell faded"  transform="translate(0, 220)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">f</text></g>
+  </g>
+
+  <!-- act2 column at x=640 -->
+  <g transform="translate(640, 44)">
+    <g class="cell faded"  transform="translate(0,   0)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">a</text></g>
+    <g class="cell faded"  transform="translate(0,  44)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">b</text></g>
+    <g class="cell faded"  transform="translate(0,  88)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">c</text></g>
+    <g class="cell target" transform="translate(0, 132)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">d</text></g>
+    <g class="cell faded"  transform="translate(0, 176)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">e</text></g>
+    <g class="cell faded"  transform="translate(0, 220)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">f</text></g>
+  </g>
+
+  <!-- layer-2 direct arrows: b,c,d in act1 -> d in act2 (target y = 44+132+22 = 198) -->
+  <!-- arrow source right edge of act1 = x=440, target left edge of act2 = x=640 -->
+  <path class="arrow" d="M 440 110 C 510 110, 580 198, 640 198"/>
+  <path class="arrow" d="M 440 154 C 510 154, 580 198, 640 198"/>
+  <path class="arrow" d="M 440 198 L 640 198"/>
+
+  <!-- layer-1 indirect arrows: a,b in act0 -> b in act1 (b in act1 y = 110) -->
+  <!-- only draw the one that EXTENDS the receptive field: a -> b -->
+  <path class="arrow indirect" d="M 160  66 C 230  66, 290 110, 360 110"/>
+  <!-- emphasize: b in act0 -> b in act1 (within window itself, but already in direct set) - omit to avoid clutter -->
+
+  <!-- legend -->
+  <g transform="translate(40, 365)">
+    <rect x="0" y="-8" width="14" height="14" fill="var(--accent)"/>
+    <text x="20" y="3" class="legend-text">target d</text>
+
+    <rect x="100" y="-8" width="14" height="14" fill="var(--accent-tint)" stroke="var(--accent)" stroke-width="2"/>
+    <text x="120" y="3" class="legend-text">直接感受野 / direct</text>
+
+    <rect x="280" y="-8" width="14" height="14" fill="var(--accent-tint)" fill-opacity="0.45" stroke="var(--accent)" stroke-width="1.4" stroke-dasharray="4 3"/>
+    <text x="300" y="3" class="legend-text">间接感受野 / indirect</text>
+
+    <line x1="490" y1="-1" x2="514" y2="-1" class="arrow"/>
+    <text x="520" y="3" class="legend-text">act₁ → act₂</text>
+
+    <line x1="620" y1="-1" x2="644" y2="-1" class="arrow indirect"/>
+    <text x="650" y="3" class="legend-text">act₀ → act₁</text>
+  </g>
+</svg>
+<figcaption>Fig 3 · 两层 SWA · d 在 act₂ 的实际感受野扩展到 act₀ 的 {a, b, c, d}</figcaption>
+</figure>
+
+<!-- ===================== ZH ===================== -->
+<div class="lang-zh">
+
+<h2 id="zh-formula">4. 通用公式:L 层 SWA 的实际感受野</h2>
+
+<p>从 Fig 3 的逻辑外推。 一层向后看 $W-1$ 个 token,堆 $L$ 层后,某个 token 能间接看到的最远位置:</p>
+
+<div style="text-align:center; margin: 14px 0; font-size: 16px;">
+  $$\text{ERF}(L, W) \;=\; L \cdot (W - 1) + 1 \quad \text{token}$$
+</div>
+
+<p>("ERF" = effective receptive field) 例如:</p>
+
+<table class="swa-table">
+  <thead><tr><th>L 层</th><th>W=3</th><th>W=4096(Mistral)</th><th>W=8192</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>3</td><td>4096</td><td>8192</td></tr>
+    <tr><td>2</td><td>5</td><td>8191</td><td>16383</td></tr>
+    <tr><td>8</td><td>17</td><td>32761</td><td>65529</td></tr>
+    <tr><td>32(Mistral 7B)</td><td>65</td><td><strong>131073</strong></td><td>262145</td></tr>
+  </tbody>
+</table>
+
+<p>Mistral 7B 单层窗口只有 4096,32 层叠起来理论 ERF 约 131K token。 信号沿层衰减得很快,模型对远端 token 的实际表征能力有限。 但<strong>训练梯度上的跨样本污染不依赖于表征质量</strong>:只要 ERF 越过样本边界,梯度路径就成立。</p>
+
+</div>
+
+<div class="lang-en">
+
+<h2 id="en-formula">4. The general formula</h2>
+
+<p>Extrapolating Fig 3: one SWA layer reaches $W-1$ tokens back, $L$ stacked layers reach an effective receptive field of:</p>
+
+<div style="text-align:center; margin: 14px 0; font-size: 16px;">
+  $$\text{ERF}(L, W) \;=\; L \cdot (W - 1) + 1 \quad \text{tokens}$$
+</div>
+
+<table class="swa-table">
+  <thead><tr><th>L layers</th><th>W=3</th><th>W=4096 (Mistral)</th><th>W=8192</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>3</td><td>4096</td><td>8192</td></tr>
+    <tr><td>2</td><td>5</td><td>8191</td><td>16383</td></tr>
+    <tr><td>8</td><td>17</td><td>32761</td><td>65529</td></tr>
+    <tr><td>32 (Mistral 7B)</td><td>65</td><td><strong>131073</strong></td><td>262145</td></tr>
+  </tbody>
+</table>
+
+<p>Mistral 7B's per-layer window is only 4096, but 32 stacked layers reach a theoretical ERF of about 131K tokens. Signal decays sharply across layers, so the model represents distant tokens poorly in practice. <strong>The gradient on cross-sample contamination does not care about representation quality</strong>: once the ERF crosses a sample boundary, the gradient path exists.</p>
+
+</div>
+
+<hr>
+
+<!-- ===================== ZH ===================== -->
+<div class="lang-zh">
+
+<h2 id="zh-packing">5. Packing 训练:跨样本污染怎么发生</h2>
+
+<p>训练时为了避免短样本浪费 padding,常把多条样本拼成一条。假设两条样本 <code>ABC</code> 和 <code>BCD</code>,各自训练时只对最后一个 token 算 loss(causal LM 自回归 next-token loss 的简化版)。 拼成 <code>ABCBCD</code>(6 token,跟前面 abcdef 同长),用 SWA $W=3$、2 层、因果 mask 跑。 Fig 4 把"act₂ 中第二条样本的 D"做 target:</p>
+
+</div>
+
+<div class="lang-en">
+
+<h2 id="en-packing">5. Packed training: where the contamination happens</h2>
+
+<p>To avoid wasting padding on short samples, training pipelines often concatenate samples into one long sequence. Suppose two samples <code>ABC</code> and <code>BCD</code>, each computing loss on its last token (a simplified causal LM next-token loss). Concatenate them into <code>ABCBCD</code> (6 tokens, same length as <code>abcdef</code> above) and run with $W=3$ causal SWA and 2 layers. Fig 4 takes the <code>D</code> from the second sample at <code>act₂</code> as the target:</p>
+
+</div>
+
+<!-- ===== Figure 3: packing contamination ===== -->
+<figure class="swa-fig">
+<svg viewBox="0 0 800 400" width="100%" style="max-width:800px;">
+  <text x="120" y="28" class="col-label">act₀ (input)</text>
+  <text x="400" y="28" class="col-label">act₁</text>
+  <text x="680" y="28" class="col-label">act₂ (target)</text>
+
+  <!-- ===== act0 column (x=80) ===== -->
+  <g transform="translate(80, 44)">
+    <text x="-8" y="20" class="sample-label">sample 1:</text>
+    <g class="cell"     transform="translate(0,   0)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">A</text></g>
+    <g class="cell bad" transform="translate(0,  44)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">B</text></g>
+    <g class="cell bad" transform="translate(0,  88)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">C</text></g>
+    <text x="-8" y="152" class="sample-label">sample 2:</text>
+    <g class="cell direct" transform="translate(0, 132)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">B</text></g>
+    <g class="cell direct" transform="translate(0, 176)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">C</text></g>
+    <g class="cell direct" transform="translate(0, 220)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">D</text></g>
+    <!-- sample boundary line in svg-space y = inner 132 + outer translate(80,44) y-offset = 132 + 44 mapped via outer. -->
+    <!-- inside this group, y=132 already is the boundary; drawn within the group it stays at y=132. -->
+    <line x1="-30" y1="132" x2="100" y2="132" stroke="#ef4444" stroke-width="1.4" stroke-dasharray="5 3" opacity="0.85"/>
+  </g>
+
+  <!-- ===== act1 column (x=360) ===== -->
+  <g transform="translate(360, 44)">
+    <g class="cell faded"    transform="translate(0,   0)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">A</text></g>
+    <g class="cell faded"    transform="translate(0,  44)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">B</text></g>
+    <g class="cell faded"    transform="translate(0,  88)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">C</text></g>
+    <g class="cell indirect" transform="translate(0, 132)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">B</text></g>
+    <g class="cell indirect" transform="translate(0, 176)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">C</text></g>
+    <g class="cell direct"   transform="translate(0, 220)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">D</text></g>
+    <line x1="-30" y1="132" x2="100" y2="132" stroke="#ef4444" stroke-width="1.4" stroke-dasharray="5 3" opacity="0.5"/>
+  </g>
+
+  <!-- ===== act2 column (x=640) ===== -->
+  <g transform="translate(640, 44)">
+    <g class="cell faded"  transform="translate(0,   0)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">A</text></g>
+    <g class="cell faded"  transform="translate(0,  44)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">B</text></g>
+    <g class="cell faded"  transform="translate(0,  88)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">C</text></g>
+    <g class="cell faded"  transform="translate(0, 132)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">B</text></g>
+    <g class="cell faded"  transform="translate(0, 176)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">C</text></g>
+    <g class="cell target" transform="translate(0, 220)"><rect width="80" height="44"/><text x="40" y="29" text-anchor="middle">D</text></g>
+    <line x1="-30" y1="132" x2="100" y2="132" stroke="#ef4444" stroke-width="1.4" stroke-dasharray="5 3" opacity="0.5"/>
+  </g>
+
+  <!-- ===== Layer-2 direct arrows: B_s2, C_s2, D (act1) -> D (act2) ===== -->
+  <!-- SVG-space centers:
+       B_s2 in act1 right edge: (440, 198)   = outer(360,44) + inner(0,132) + (80, 22)
+       C_s2 in act1 right edge: (440, 242)
+       D    in act1 right edge: (440, 286)
+       D    in act2 left  edge: (640, 286)
+  -->
+  <path class="arrow" d="M 440 198 C 510 198, 580 286, 640 286"/>
+  <path class="arrow" d="M 440 242 C 510 242, 580 286, 640 286"/>
+  <path class="arrow" d="M 440 286 L 640 286"/>
+
+  <!-- ===== Layer-1 LEAK arrows: B_s1, C_s1 (act0, sample 1) -> B_s2 (act1, sample 2) ===== -->
+  <!-- B_s2 at act1 is at position 3 (0-indexed), window = positions [1, 2, 3] = B_s1, C_s1, B_s2.
+       So B_s1 and C_s1 in act0 leak across the sample boundary into B_s2 at act1. -->
+  <!-- B_s1 in act0 right edge: (160, 110)
+       C_s1 in act0 right edge: (160, 154)
+       B_s2 in act1 left  edge: (360, 198)
+  -->
+  <path class="arrow bad indirect" d="M 160 110 C 230 110, 290 198, 360 198"/>
+  <path class="arrow bad indirect" d="M 160 154 C 230 154, 290 198, 360 198"/>
+
+  <!-- Annotation: highlight the contaminated cell B_s2 at act1 -->
+  <text x="400" y="190" class="legend-text bad" text-anchor="middle" font-style="italic">contaminated</text>
+
+  <!-- ===== Legend (bottom) ===== -->
+  <g transform="translate(40, 360)">
+    <line x1="0" y1="-1" x2="24" y2="-1" class="arrow"/>
+    <text x="32" y="3" class="legend-text">legal: act₁ → act₂</text>
+
+    <line x1="200" y1="-1" x2="224" y2="-1" class="arrow bad indirect"/>
+    <text x="232" y="3" class="legend-text bad">cross-sample leak: act₀ → act₁ 越过样本边界</text>
+  </g>
+</svg>
+<figcaption>Fig 4 · packing 训练 · sample-1 的 {B, C} 通过 act₁ 的 B(被污染节点)流入 act₂ 的 D</figcaption>
+</figure>
+
+<!-- ===================== ZH ===================== -->
+<div class="lang-zh">
+
+<p>具体追踪:</p>
+
+<ul>
+  <li>位置 4 的 <code>B</code>(sample 2)在 act₁ 是用 act₀ 的 [pos 2, pos 3, pos 4] = $\{B_{s1}, C_{s1}, B_{s2}\}$ 算出来的 —— <strong>sample 1 的 <code>B</code> 和 <code>C</code> 已经混进去</strong>。</li>
+  <li>位置 6 的 <code>D</code> 在 act₂ 是用 act₁ 的 [pos 4, pos 5, pos 6] = $\{B_{s1+s2 \, \text{mix}}, C_{s2}, D_{s2}\}$ 算的。</li>
+  <li><strong>结果</strong>:sample 1 的 $\{B, C\}$(图里红色块)的梯度沿这条路径传到 <code>D</code> 的 logit,训练梯度不再等于"BCD 独立训练时的梯度"。 <code>A</code> 在 2 层 + $W=3$ 的设置下恰好落在 D 的 ERF 边界外(ERF = $L(W-1)+1 = 5$,A 距 D 5 个 token);再加一层就会被吸进来。</li>
+</ul>
+
+<p>另一面,模型看到的"局部上下文"<strong>是两条样本的 token 混合</strong> —— 注意力分布 / 隐藏状态包含跨样本统计,模型可能学到"sample 2 的 B 之后跟 sample 2 的 C"这种偶然 co-occurrence,污染数据分布。</p>
+
+<p>这条结论<strong>无法靠调小 $W$ 绕过</strong>。 ERF 公式 $L(W-1)+1$ 对 $L$ 和 $W$ 都单调增,缩小 $W$ 只是让每层步长变小,堆够层之后仍然越过样本边界。 反过来,$W$ 越大、$L$ 越深,污染越严重。</p>
+
+</div>
+
+<div class="lang-en">
+
+<p>Tracing it step by step:</p>
+
+<ul>
+  <li>Position 4 (<code>B</code> in sample 2) at <code>act₁</code> is computed from <code>act₀</code> positions [2, 3, 4] = $\{B_{s1}, C_{s1}, B_{s2}\}$. <strong>Sample 1's <code>B</code> and <code>C</code> are already mixed in.</strong></li>
+  <li>Position 6 (<code>D</code>) at <code>act₂</code> is computed from <code>act₁</code> positions [4, 5, 6] = $\{B_{s1+s2 \, \text{mixed}}, C_{s2}, D_{s2}\}$.</li>
+  <li><strong>Result</strong>: gradient from sample 1's $\{B, C\}$ (red cells in the figure) flows into <code>D</code>'s logit; the training gradient is no longer equal to the gradient BCD would receive on its own. <code>A</code> happens to fall just outside D's ERF in this 2-layer, $W=3$ case (ERF = $L(W-1)+1 = 5$ and A sits 5 tokens from D); one more layer pulls it in.</li>
+</ul>
+
+<p>Separately, the "local context" the model sees becomes <strong>a mixture of two samples' tokens</strong>. Attention distributions and hidden states pick up cross-sample statistics, and the model can latch onto accidental co-occurrences ("sample 2's B is often followed by sample 2's C") that corrupt the underlying data distribution.</p>
+
+<p>Shrinking $W$ does not bypass the problem. The ERF formula $L(W-1)+1$ is monotonic in both $L$ and $W$; a smaller $W$ only reduces the per-layer step, and enough layers still cross the boundary. Larger $W$ and deeper $L$ make the leakage worse, not the other way around.</p>
+
+</div>
+
+<hr>
+
+<!-- ===================== ZH ===================== -->
+<div class="lang-zh">
+
+<h2 id="zh-docmask">6. 正确做法:document mask / <code>cu_seqlens</code></h2>
+
+<p>必须显式告诉 attention "样本边界在哪",让跨边界的 attention 分数变成 $-\infty$。 在 attention 矩阵层面,等价于把矩阵切成<strong>块对角(block-diagonal)</strong>:</p>
+
+<pre class="code">      A B C B C D
+   A [• . . . . .]    sample 1 内部:三角形
+   B [• • . . . .]
+   C [• • • . . .]
+   B [. . . <span style="color:#ef4444; font-weight:bold;">×</span> . .]    跨样本的 attention = 0
+   C [. . . • • .]    sample 2 内部:三角形
+   D [. . . • • •]
+        ↑
+   sample 1 / 2 边界,× 全部 mask 掉</pre>
+
+<p>FlashAttention 的 <code>flash_attn_varlen_func</code> 原生支持,用 <code>cu_seqlens</code>(cumulative sequence lengths)告诉 kernel 切在哪:</p>
+
+<pre class="code"><span class="kw">from</span> flash_attn <span class="kw">import</span> flash_attn_varlen_func
+
+<span class="cm"># 两条样本:ABC (长度 3) 和 BCD (长度 3),拼成 6-token</span>
+cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+
+out = flash_attn_varlen_func(
+    q, k, v,
+    cu_seqlens_q=cu_seqlens,
+    cu_seqlens_k=cu_seqlens,
+    max_seqlen_q=3, max_seqlen_k=3,
+    causal=<span class="kw">True</span>,
+    window_size=(<span class="num">2</span>, <span class="num">0</span>),    <span class="cm"># 因果 + SWA,W=3 → left=W-1=2</span>
+)</pre>
+
+<p>FA kernel 内部把每段 K/V 当成独立 attention 计算,块对角之外的 K/V block <strong>连 load 都不做</strong>,数学上严格等价于"分别 forward 两条序列",计算量也按各自序列长度算。</p>
+
+<p>Document mask + SWA 是 <strong>Mistral / Mixtral 训练栈的标准配方</strong>,Megatron-LM 通过 <code>reset_attention_mask=True</code> + <code>reset_position_ids=True</code> 自动构造,HF Transformers 通过 <code>attention_mask</code> + 段 ID 显式传递。</p>
+
+</div>
+
+<div class="lang-en">
+
+<h2 id="en-docmask">6. The fix: document mask / <code>cu_seqlens</code></h2>
+
+<p>You must explicitly tell attention "where the sample boundaries are" and force cross-boundary attention scores to $-\infty$. At the attention-matrix level this is equivalent to making the matrix <strong>block-diagonal</strong>:</p>
+
+<pre class="code">      A B C B C D
+   A [• . . . . .]    inside sample 1: a triangle
+   B [• • . . . .]
+   C [• • • . . .]
+   B [. . . <span style="color:#ef4444; font-weight:bold;">×</span> . .]    cross-sample attention = 0
+   C [. . . • • .]    inside sample 2: a triangle
+   D [. . . • • •]
+        ↑
+   sample 1 / 2 boundary, × is masked out</pre>
+
+<p>FlashAttention's <code>flash_attn_varlen_func</code> supports this natively via <code>cu_seqlens</code> (cumulative sequence lengths):</p>
+
+<pre class="code"><span class="kw">from</span> flash_attn <span class="kw">import</span> flash_attn_varlen_func
+
+<span class="cm"># Two samples: ABC (len 3) and BCD (len 3), packed into a 6-token batch</span>
+cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+
+out = flash_attn_varlen_func(
+    q, k, v,
+    cu_seqlens_q=cu_seqlens,
+    cu_seqlens_k=cu_seqlens,
+    max_seqlen_q=3, max_seqlen_k=3,
+    causal=<span class="kw">True</span>,
+    window_size=(<span class="num">2</span>, <span class="num">0</span>),    <span class="cm"># causal + SWA, W=3 → left=W-1=2</span>
+)</pre>
+
+<p>The FA kernel treats each K/V segment as an independent attention computation. K/V blocks outside the block-diagonal are <strong>not even loaded</strong>. The math is strictly equivalent to "forward each sequence separately," and the compute matches per-sequence cost.</p>
+
+<p>Document mask + SWA is the <strong>standard recipe in the Mistral / Mixtral training stack</strong>. Megatron-LM constructs it automatically via <code>reset_attention_mask=True</code> + <code>reset_position_ids=True</code>. HF Transformers passes it explicitly via the <code>attention_mask</code> with segment IDs.</p>
+
+</div>
+
+<hr>
+
+<!-- ===================== ZH ===================== -->
+<div class="lang-zh">
+
+<h2 id="zh-check">7. 实操 checklist</h2>
+
+<table class="swa-table">
+  <thead><tr><th>配置</th><th>等价于独立训练?</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>拼接 + 普通因果 mask</td><td>❌</td><td>跨样本完全可见(连一层就漏)</td></tr>
+    <tr><td>拼接 + 因果 + SWA(单层)</td><td>⚠️</td><td>短样本"看起来"等价;堆层后失效</td></tr>
+    <tr><td>拼接 + 因果 + SWA(多层)</td><td>❌</td><td>本节例子,ERF ≈ $L(W-1)+1$ 跨边界</td></tr>
+    <tr><td>拼接 + <code>cu_seqlens</code>(document mask)</td><td>✅</td><td>块对角,严格等价</td></tr>
+    <tr><td>拼接 + <code>cu_seqlens</code> + SWA</td><td>✅</td><td>Mistral 训练的标准配方</td></tr>
+  </tbody>
+</table>
+
+<p>怎么自查:</p>
+
+<ul>
+  <li><strong>训练框架</strong>:
+    <ul>
+      <li>Megatron-LM:打开 <code>--reset-attention-mask --reset-position-ids</code>;数据 pipeline 用 <code>&lt;eod&gt;</code> 切样本</li>
+      <li>HF Transformers:检查 <code>position_ids</code> 是否在样本边界归零(<code>0,1,2,0,1,2,...</code>),而不是单调递增;<code>attention_mask</code> 是否含段信息</li>
+      <li>NeMo / Megatron-Core:用 <code>packed_seq_params</code> 传 <code>cu_seqlens</code></li>
+      <li>直接用 FA:确认调用的是 <code>flash_attn_varlen_func</code> 而不是 <code>flash_attn_func</code></li>
+    </ul>
+  </li>
+  <li><strong>debug 方法</strong>:训练 step 中 print 一下 attention mask 的形状 / 非零分布。整张 mask 是单一三角形,基本可以判定 document mask 没生效;正确的块对角应该在样本边界处看到明显的"断"。</li>
+  <li><strong>RoPE 位置编码</strong>:每段样本的 <code>position_ids</code> 必须从 0 重启,否则就算 attention 切对了,RoPE 也会让 sample 2 用 "全局位置 3"的 phase rotation,跟独立训练时 sample 2 用"局部位置 0"不等价。</li>
+  <li><strong>loss mask</strong>:padding token 和不算 loss 的位置在 loss 上 mask 掉是另一回事,跟 attention mask 互相独立 —— 两者都要正确。</li>
+</ul>
+
+<p class="callout"><strong>一行总结</strong>:packing 训练用 SWA 时,<strong>必须</strong>同时挂 <code>cu_seqlens</code> 或 segment-aware <code>attention_mask</code>;SWA 本身不切样本。</p>
+
+<h2 id="zh-refs">参考资料</h2>
+
+<ul>
+  <li><a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noopener">FlashAttention</a> · <code>flash_attn_varlen_func</code> 的 <code>cu_seqlens</code> + <code>window_size</code> 文档</li>
+  <li><a href="https://arxiv.org/abs/2310.06825" target="_blank" rel="noopener">Mistral 7B</a> · SWA + document mask 的训练设置</li>
+  <li><a href="https://arxiv.org/abs/2004.05150" target="_blank" rel="noopener">Longformer</a> · 最早把 sliding window attention 引入 transformer 的工作</li>
+  <li><a href="https://github.com/NVIDIA/Megatron-LM" target="_blank" rel="noopener">Megatron-LM</a> · <code>reset_attention_mask</code> / <code>reset_position_ids</code> 的实现</li>
+  <li>[[llm-attention-zoo]] · 本系列 Part 1,SWA 在 attention 变体家族里的位置</li>
+</ul>
+
+</div>
+
+<div class="lang-en">
+
+<h2 id="en-check">7. Practical checklist</h2>
+
+<table class="swa-table">
+  <thead><tr><th>Configuration</th><th>Equivalent to independent training?</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>Concat + plain causal mask</td><td>❌</td><td>Cross-sample fully visible (leaks even in one layer)</td></tr>
+    <tr><td>Concat + causal + SWA (1 layer)</td><td>⚠️</td><td>Looks equivalent for short samples; fails with depth</td></tr>
+    <tr><td>Concat + causal + SWA (multi-layer)</td><td>❌</td><td>This note's example; ERF ≈ $L(W-1)+1$ crosses boundary</td></tr>
+    <tr><td>Concat + <code>cu_seqlens</code> (document mask)</td><td>✅</td><td>Block-diagonal, strictly equivalent</td></tr>
+    <tr><td>Concat + <code>cu_seqlens</code> + SWA</td><td>✅</td><td>Standard Mistral training recipe</td></tr>
+  </tbody>
+</table>
+
+<p>How to self-check:</p>
+
+<ul>
+  <li><strong>Training framework</strong>:
+    <ul>
+      <li>Megatron-LM: turn on <code>--reset-attention-mask --reset-position-ids</code>; the data pipeline cuts samples on <code>&lt;eod&gt;</code></li>
+      <li>HF Transformers: verify <code>position_ids</code> reset to 0 at sample boundaries (<code>0,1,2,0,1,2,...</code>) rather than running monotonically; verify <code>attention_mask</code> carries segment info</li>
+      <li>NeMo / Megatron-Core: pass <code>cu_seqlens</code> via <code>packed_seq_params</code></li>
+      <li>Calling FA directly: confirm you call <code>flash_attn_varlen_func</code>, not <code>flash_attn_func</code></li>
+    </ul>
+  </li>
+  <li><strong>Debug</strong>: print the attention mask's shape and nonzero distribution mid-step. A single triangle is a strong sign the document mask was dropped. A correct block-diagonal mask shows clear "breaks" at sample boundaries.</li>
+  <li><strong>RoPE</strong>: per-sample <code>position_ids</code> must restart from 0; otherwise even with attention sliced correctly, RoPE applies sample-2 at "global position 3" rather than "local position 0," and the equivalence breaks at the positional encoding layer.</li>
+  <li><strong>Loss mask</strong>: masking padding tokens or non-loss positions out of the loss is a separate concern from the attention mask; both have to be correct independently.</li>
+</ul>
+
+<p class="callout"><strong>One-line summary</strong>: when packing under SWA, <code>cu_seqlens</code> or a segment-aware <code>attention_mask</code> <strong>must</strong> also be passed. SWA alone does not slice samples.</p>
+
+<h2 id="en-refs">References</h2>
+
+<ul>
+  <li><a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noopener">FlashAttention</a>: docs for <code>flash_attn_varlen_func</code> with <code>cu_seqlens</code> and <code>window_size</code></li>
+  <li><a href="https://arxiv.org/abs/2310.06825" target="_blank" rel="noopener">Mistral 7B</a>: SWA + document mask training setup</li>
+  <li><a href="https://arxiv.org/abs/2004.05150" target="_blank" rel="noopener">Longformer</a>: the original work introducing sliding window attention into transformers</li>
+  <li><a href="https://github.com/NVIDIA/Megatron-LM" target="_blank" rel="noopener">Megatron-LM</a>: implementation of <code>reset_attention_mask</code> / <code>reset_position_ids</code></li>
+  <li>[[llm-attention-zoo]]: Part 1 of this series, placing SWA inside the attention variant family</li>
+</ul>
+
+</div>
+
+</main>
+</div>
+</body>
+</html>
