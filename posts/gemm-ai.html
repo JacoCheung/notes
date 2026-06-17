@@ -81,7 +81,7 @@
   <p class="meta">元素字节数记作 $b$（FP32: $b=4$；FP16/BF16: $b=2$；FP8: $b=1$）。</p>
 
   <div class="highlight">
-    <strong>📌 建模前提</strong>：下面 <em>Section 一、二</em> 采用 <strong>单层 blocking</strong> 模型 —— 每个输出 tile 的输入 A / B 都假设从 DRAM 独立加载，不考虑相邻 C tile 之间通过 cache 产生的复用。这是为什么 $K_t$ 在渐近 AI 中"消掉"。<em>Section 三</em> 放开这个假设，用 <strong>2 级 blocking</strong>（DRAM ↔ L2 ↔ SMEM）重新审视，$K_t$ 会通过 cache 预算间接入场。
+    <strong>📌 建模前提</strong>：本文用两层模型。<strong>单层 blocking</strong>（§一、§二）假设每个输出 tile 的 A / B 都从 DRAM 独立加载，不考虑相邻 C tile 通过 cache 的复用，这是 $K_t$ 在渐近 AI 中"消掉"的原因。<strong>2 级 blocking</strong>（§三，DRAM ↔ L2 ↔ SMEM）放开这一限制，$K_t$ 通过 cache 预算重新进入公式。
   </div>
 
   <hr>
@@ -249,7 +249,7 @@
 
   <h2>三、2 级 blocking 与跨 tile 复用</h2>
 
-  <p>Section 一、二 只看了"一个 tile 独立从 DRAM 取数据"的最保守情形。真实硬件是多级 cache（HBM ↔ L2 ↔ SMEM ↔ 寄存器），相邻 C tile 之间会自动跨级复用。放开"tile 间无复用"假设后，$K_t$ 会通过 cache 预算间接回到 AI 公式里。</p>
+  <p>真实硬件有多级 cache（HBM ↔ L2 ↔ SMEM ↔ 寄存器），相邻 C tile 之间会自动跨级复用。把"tile 间无复用"假设放开后，$K_t$ 通过 cache 预算重新进入 AI 公式。</p>
 
   <h3>1. 跨 tile 的可复用数据总量 —— 与 $K_t$ 无关</h3>
   <p>处理 $C[0, j_1]$ 和 $C[0, j_2]$ 时，都需要 $A$ 的第 0 行块全部 $K$ 列 —— 即 $M_t \times K$ 个元素。切成 $K/K_t$ 个 $M_t \times K_t$ 小块还是整条一次加载，<strong>共享量始终是 $M_t K$</strong>。$K_t$ 只决定分块粒度，不决定复用潜力。B 端对称：$C[i_1, 0]$ 和 $C[i_2, 0]$ 共享 $N_t K$ 元素。</p>
@@ -334,7 +334,7 @@
       <tr><td>$K_t$ 小于 Tensor Core 指令宽度（如 $<16$）</td><td>✅ 指令稀疏，实际带宽打折</td></tr>
     </tbody>
   </table>
-  <p><strong>修正 Section 2.3 的说法</strong>："$K_t$ 在渐近 AI 中消掉"严格只对单层 blocking 成立。2 级 blocking 下，$K_t$ 不改变"可复用数据总量"（$M_o K$），但改变"这些数据能否真的留在 cache 里被复用"。</p>
+  <p>"$K_t$ 在渐近 AI 中消掉"这条结论严格只对单层 blocking 成立。2 级 blocking 下，$K_t$ 不改变"可复用数据总量"（$M_o K$），但决定"这些数据能否真的留在 cache 里被复用"。</p>
 
   <hr>
 
@@ -371,7 +371,7 @@
 
   <h2>六、调度算法与 tile 选型（工程实务）</h2>
 
-  <p>前面讨论的都是 "tile 的形状如何影响 AI"；现在讨论"<strong>怎么把 CTA 铺到这些 tile 上</strong>"，以及 $K_t$ 和 L2 在工程里实际怎么处理。</p>
+  <p>tile 形状决定 AI 上界；实际能跑到多少还要看 <strong>CTA 怎么铺到这些 tile 上</strong>，以及 $K_t$ 与 L2 在工程里如何处理。</p>
 
   <h3>1. 调度：把 CTA 铺到工作上</h3>
 
@@ -579,7 +579,7 @@
 
   <h2>八、训练里的三种 GEMM:fwd / dgrad / wgrad</h2>
 
-  <p>训练一个 linear 层 $Y = X W^\top$ 会拆成<strong>三个独立 GEMM</strong>:前向、对输入的反向(dgrad)、对权重的反向(wgrad)。三者的 FLOPs 和总访存字节数完全相同,但<strong>实际跑出来的 achieved TFLOPS 几乎从不相同</strong>,而且 wgrad 通常最低。这一节用前面建立的 AI / 调度 / tile 框架来解释为什么。</p>
+  <p>训练一个 linear 层 $Y = X W^\top$ 会拆成<strong>三个独立 GEMM</strong>:前向、对输入的反向(dgrad)、对权重的反向(wgrad)。三者的 FLOPs 和总访存字节数完全相同,但<strong>实测 achieved TFLOPS 几乎从不相同</strong>,wgrad 通常最低。下面拆开看每一项罚是从哪来的。</p>
 
   <h3>1. 三个 GEMM 的形状对照</h3>
 
@@ -694,7 +694,7 @@ wgrad   ~ 0.60 – 0.75 × peak TC      (TN + 长 K + split-K + FP32 accum)</pre
     <li><strong>FP8 训练里 wgrad 的相对劣势更大</strong>。FP8 fwd / dgrad 享受 2× TC 吞吐,但 wgrad 仍需 FP32 accum(精度要求),收益不及 fwd / dgrad,fwd:wgrad 比例进一步拉开。</li>
   </ul>
 
-  <p class="callout"><strong>对照前面章节</strong>:fwd / dgrad / wgrad 三个 GEMM 是 §六 调度算法表的"三种 $K$ 分布"的最干净例证。 fwd / dgrad 是 §六 的"Data-Parallel 主线",wgrad 是 §六 的"Split-K / Stream-K 主线"。它们在同一个训练 step 里同时出现,所以 LLM 训练性能调优本质是在<strong>同时优化这三条互相约束的 path</strong>。</p>
+  <p class="callout">fwd / dgrad / wgrad 恰好覆盖 §六 调度算法表的"三种 $K$ 分布":fwd 与 dgrad 走 Data-Parallel 主线,wgrad 走 Split-K / Stream-K 主线。它们在同一个训练 step 里同时跑,所以 LLM 训练性能调优本质就是<strong>同时优化这三条互相约束的 path</strong>。</p>
 
   <hr>
 
@@ -756,7 +756,7 @@ wgrad   ~ 0.60 – 0.75 × peak TC      (TN + 长 K + split-K + FP32 accum)</pre
   <p class="meta">Element byte size is denoted $b$ (FP32: $b=4$; FP16/BF16: $b=2$; FP8: $b=1$).</p>
 
   <div class="highlight">
-    <strong>Modeling premise.</strong> Sections <em>1</em> and <em>2</em> below adopt a <strong>single-level blocking</strong> model: the A / B inputs of each output tile are assumed to be loaded from DRAM independently, with no reuse via cache between adjacent C tiles. This is why $K_t$ "cancels" in the asymptotic AI. <em>Section 3</em> lifts this assumption and revisits the analysis with <strong>2-level blocking</strong> (DRAM &harr; L2 &harr; SMEM); $K_t$ then re-enters indirectly through the cache budget.
+    <strong>Modeling premise.</strong> The post uses two models. <strong>Single-level blocking</strong> (§1, §2) assumes the A / B inputs of each output tile load from DRAM independently, with no cache reuse between adjacent C tiles, which is why $K_t$ "cancels" in the asymptotic AI. <strong>2-level blocking</strong> (§3, DRAM &harr; L2 &harr; SMEM) lifts that assumption and brings $K_t$ back into the formula through the cache budget.
   </div>
 
   <hr>
@@ -924,7 +924,7 @@ wgrad   ~ 0.60 – 0.75 × peak TC      (TN + 长 K + split-K + FP32 accum)</pre
 
   <h2>3. Two-level blocking and cross-tile reuse</h2>
 
-  <p>Sections 1 and 2 only considered the most conservative case: "each tile fetches its data from DRAM independently". Real hardware has a multi-level cache hierarchy (HBM &harr; L2 &harr; SMEM &harr; registers), and adjacent C tiles automatically reuse data across levels. Once the "no reuse between tiles" assumption is lifted, $K_t$ returns to the AI formula indirectly through the cache budget.</p>
+  <p>Real hardware has a multi-level cache hierarchy (HBM &harr; L2 &harr; SMEM &harr; registers), and adjacent C tiles automatically reuse data across levels. Once the "no reuse between tiles" assumption is lifted, $K_t$ returns to the AI formula indirectly through the cache budget.</p>
 
   <h3>1. Total cross-tile reusable data: independent of $K_t$</h3>
   <p>When processing $C[0, j_1]$ and $C[0, j_2]$, both need the full 0th row-block of $A$ over all $K$ columns, i.e. $M_t \times K$ elements. Whether this slab is split into $K/K_t$ pieces of $M_t \times K_t$ or loaded as one long stripe, <strong>the shared amount is always $M_t K$</strong>. $K_t$ only determines blocking granularity, not the reuse potential. Symmetric on the B side: $C[i_1, 0]$ and $C[i_2, 0]$ share $N_t K$ elements.</p>
@@ -1009,7 +1009,7 @@ wgrad   ~ 0.60 – 0.75 × peak TC      (TN + 长 K + split-K + FP32 accum)</pre
       <tr><td>$K_t$ smaller than Tensor Core instruction width (e.g. $<16$)</td><td>Yes: instruction is sparse, effective bandwidth discounted</td></tr>
     </tbody>
   </table>
-  <p><strong>Refinement of the Section 2.3 claim:</strong> "$K_t$ cancels in the asymptotic AI" is strictly true only for single-level blocking. Under 2-level blocking, $K_t$ does not change the "total reusable data" ($M_o K$), but it does change "whether that data can actually stay in cache and be reused".</p>
+  <p>"$K_t$ cancels in the asymptotic AI" is strictly true only for single-level blocking. Under 2-level blocking, $K_t$ does not change the "total reusable data" ($M_o K$), but it does change whether that data can actually stay in cache and be reused.</p>
 
   <hr>
 
@@ -1046,7 +1046,7 @@ wgrad   ~ 0.60 – 0.75 × peak TC      (TN + 长 K + split-K + FP32 accum)</pre
 
   <h2>6. Scheduling algorithms and tile sizing (engineering practice)</h2>
 
-  <p>So far we've discussed "how the tile shape affects AI"; now we turn to "<strong>how to lay CTAs onto these tiles</strong>", and how $K_t$ and L2 are actually handled in practice.</p>
+  <p>Tile shape sets the AI ceiling; whether the kernel actually hits it depends on <strong>how CTAs are laid onto those tiles</strong>, and how $K_t$ and L2 are handled in practice.</p>
 
   <h3>1. Scheduling: spreading CTAs over the work</h3>
 
@@ -1254,7 +1254,7 @@ wgrad   ~ 0.60 – 0.75 × peak TC      (TN + 长 K + split-K + FP32 accum)</pre
 
   <h2>8. Training-time GEMMs: fwd / dgrad / wgrad</h2>
 
-  <p>Training one linear layer $Y = X W^\top$ decomposes into <strong>three independent GEMMs</strong>: forward, the gradient w.r.t. input (dgrad), and the gradient w.r.t. the weight (wgrad). All three carry the same FLOP count and the same total memory traffic, yet <strong>their achieved TFLOPS are almost never equal</strong>, and wgrad is usually the lowest. This section uses the AI / scheduling / tile framework built earlier to explain why.</p>
+  <p>Training one linear layer $Y = X W^\top$ decomposes into <strong>three independent GEMMs</strong>: forward, the gradient w.r.t. input (dgrad), and the gradient w.r.t. the weight (wgrad). All three carry the same FLOP count and the same total memory traffic, yet <strong>their achieved TFLOPS are almost never equal</strong>, and wgrad is usually the lowest. The rest of this section breaks down where each penalty comes from.</p>
 
   <h3>1. Shape comparison</h3>
 
@@ -1369,7 +1369,7 @@ wgrad   ~ 0.60 – 0.75 × peak TC      (TN + long K + split-K + FP32 accum)</pr
     <li><strong>FP8 training widens the gap.</strong> Under FP8, fwd / dgrad get the 2&times; TC throughput boost; wgrad still needs an FP32 accumulator for precision and does not get the same speedup. The fwd:wgrad ratio widens further.</li>
   </ul>
 
-  <p class="callout"><strong>Cross-reference</strong>: fwd / dgrad / wgrad are the cleanest example of the "three $K$ distributions" laid out in the §6 scheduling table. fwd / dgrad sit on the Data-Parallel main line; wgrad sits on the Split-K / Stream-K main line. They coexist in the same training step, so tuning LLM training performance is fundamentally about <strong>optimizing these three mutually-constrained paths together</strong>.</p>
+  <p class="callout">fwd / dgrad / wgrad cover the three $K$ distributions in the §6 scheduling table directly: fwd and dgrad sit on the Data-Parallel main line, while wgrad sits on the Split-K / Stream-K main line. All three run inside the same training step, so tuning LLM training performance comes down to <strong>optimizing these three mutually-constrained paths together</strong>.</p>
 
   <hr>
 
@@ -1432,7 +1432,7 @@ wgrad   ~ 0.60 – 0.75 × peak TC      (TN + long K + split-K + FP32 accum)</pr
 
 元素字节数记作 $b$（FP32: $b=4$；FP16/BF16: $b=2$；FP8: $b=1$）。
 
-> 📌 **建模前提**：Section 一、二 采用**单层 blocking** 模型——每个输出 tile 的输入 A/B 都假设从 DRAM 独立加载，不考虑相邻 C tile 之间通过 cache 产生的复用。Section 三 放开这个假设，用 2 级 blocking（DRAM ↔ L2 ↔ SMEM）重新审视，$K_t$ 会通过 cache 预算间接入场。
+> 📌 **建模前提**：**单层 blocking**（§一、§二）假设每个输出 tile 的 A/B 都从 DRAM 独立加载，不考虑相邻 C tile 通过 cache 的复用，这是 $K_t$ 在渐近 AI 中"消掉"的原因。**2 级 blocking**（§三，DRAM ↔ L2 ↔ SMEM）放开这一限制，$K_t$ 通过 cache 预算重新进入公式。
 
 ---
 
@@ -1612,7 +1612,7 @@ $$\text{AI}_{\text{col-strip}} = \frac{2MNK}{(NK + MNK)\, b} \xrightarrow{M \to 
 
 ## 三、2 级 blocking 与跨 tile 复用
 
-Section 一、二 只看了"一个 tile 独立从 DRAM 取数据"的最保守情形。真实硬件是多级 cache（HBM ↔ L2 ↔ SMEM ↔ 寄存器），相邻 C tile 之间会自动跨级复用。放开"tile 间无复用"假设后，$K_t$ 会通过 cache 预算间接回到 AI 公式里。
+真实硬件有多级 cache（HBM ↔ L2 ↔ SMEM ↔ 寄存器），相邻 C tile 之间会自动跨级复用。把"tile 间无复用"假设放开后，$K_t$ 通过 cache 预算重新进入 AI 公式。
 
 ### 1. 跨 tile 的可复用数据总量 —— 与 $K_t$ 无关
 
@@ -1689,7 +1689,7 @@ $$M_o \approx \sqrt{M_{L2}} - K_t, \qquad \text{AI}_{\text{DRAM}} \approx \frac{
 | Split-K（$K$ 拆给多 CTA 再规约） | ✅ 引入 $O(K_t M_t N_t)$ 额外 C 写/读 |
 | $K_t$ 小于 Tensor Core 宽度（$<16$） | ✅ 指令稀疏，带宽打折 |
 
-**修正 Section 2.3 的说法**：$K_t$ 在渐近 AI 中消掉严格只对单层 blocking 成立。2 级 blocking 下它不改变"可复用数据总量" $M_o K$，但改变"这些数据能否真的留在 cache 里被复用"。
+"$K_t$ 在渐近 AI 中消掉"这条结论严格只对单层 blocking 成立。2 级 blocking 下，$K_t$ 不改变"可复用数据总量" $M_o K$，但决定"这些数据能否真的留在 cache 里被复用"。
 
 ---
 
@@ -1720,7 +1720,7 @@ $$M_o \approx \sqrt{M_{L2}} - K_t, \qquad \text{AI}_{\text{DRAM}} \approx \frac{
 
 ## 六、调度算法与 tile 选型（工程实务）
 
-前面讨论的都是 "tile 的形状如何影响 AI"；这里讨论**怎么把 CTA 铺到这些 tile 上**，以及 $K_t$ 和 L2 在工程里实际怎么处理。
+tile 形状决定 AI 上界；实际能跑多少还要看**CTA 怎么铺到这些 tile 上**，以及 $K_t$ 与 L2 在工程里如何处理。
 
 ### 1. 调度：把 CTA 铺到工作上
 
