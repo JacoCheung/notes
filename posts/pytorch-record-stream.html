@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PyTorch record_stream: 多 stream 下的显存生命周期</title>
+<meta name="post:title"           content="PyTorch record_stream: 多 stream 下的显存生命周期">
+<meta name="post:title_en"        content="PyTorch record_stream: Tensor Memory Lifetime Across CUDA Streams">
+<meta name="post:slug"            content="pytorch-record-stream">
+<meta name="post:date"            content="2026-07-07">
+<meta name="post:tags"            content="PyTorch, CUDA, Stream, 显存管理">
+<meta name="post:tags_en"         content="PyTorch, CUDA, Stream, Memory Management">
+<meta name="post:reading"         content="10 分钟">
+<meta name="post:reading_en"      content="10 min">
+<meta name="post:summary"         content="record_stream 不是同步原语,而是告诉 CUDA caching allocator:这个 Tensor 的 storage 也被某个 side stream 使用过。本文用 allocator event 伪代码和 s1/s2 例子讲清 wait_stream 与 record_stream 的边界。">
+<meta name="post:summary_en"      content="record_stream is not a synchronization primitive. It tells the CUDA caching allocator that a tensor's storage was also used by a side stream. This note explains the event-based allocator model and the boundary between wait_stream and record_stream.">
+<meta name="post:series"          content="pytorch-guide">
+<meta name="post:series_title"    content="PyTorch 实践指南">
+<meta name="post:series_title_en" content="PyTorch Guide">
+<meta name="post:series_order"    content="2">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="../lang-toggle.js" defer></script>
+<style>
+  main.content { max-width: 920px; padding: 56px 32px 96px; }
+  @media (max-width: 920px) { main.content { padding: 48px 20px 80px; } }
+  pre.code { font-size: 12.5px; }
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-tint);
+    padding: 10px 14px;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    margin: 14px 0;
+    font-size: 14px;
+  }
+  .callout.warn {
+    border-left-color: #d97706;
+    background: rgba(217, 119, 6, 0.08);
+  }
+  table.note-table { border-collapse: collapse; margin: 16px 0; font-size: 13.5px; width: 100%; }
+  table.note-table th, table.note-table td {
+    border: 1px solid var(--border);
+    padding: 7px 12px;
+    text-align: left;
+    vertical-align: top;
+  }
+  table.note-table th { background: var(--bg-elevated); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录 · TOC</div>
+    <div class="lang-zh">
+    <ul>
+      <li><a href="#zh-1">1. 一句话结论</a></li>
+      <li><a href="#zh-2">2. allocator 的 event 模型</a></li>
+      <li><a href="#zh-3">3. record_stream 做了什么</a></li>
+      <li><a href="#zh-4">4. s1 / s2 例子</a></li>
+      <li><a href="#zh-5">5. 正确写法</a></li>
+      <li><a href="#zh-6">6. 和 wait_stream 的边界</a></li>
+      <li><a href="#zh-refs">参考资料</a></li>
+    </ul>
+    </div>
+    <div class="lang-en">
+    <ul>
+      <li><a href="#en-1">1. Short answer</a></li>
+      <li><a href="#en-2">2. Allocator event model</a></li>
+      <li><a href="#en-3">3. What record_stream does</a></li>
+      <li><a href="#en-4">4. The s1 / s2 example</a></li>
+      <li><a href="#en-5">5. Correct patterns</a></li>
+      <li><a href="#en-6">6. Boundary with wait_stream</a></li>
+      <li><a href="#en-refs">References</a></li>
+    </ul>
+    </div>
+  </aside>
+
+<main class="content">
+
+<div class="lang-zh">
+
+<h1>PyTorch record_stream: 多 stream 下的显存生命周期</h1>
+
+<h2 id="zh-1">1. 一句话结论</h2>
+
+<p><code>tensor.record_stream(stream)</code> 解决的是 <strong>显存复用安全性</strong>,不是计算依赖。它告诉 PyTorch CUDA caching allocator:这个 Tensor 的底层 storage 也被 <code>stream</code> 使用过;当 Tensor 释放时,这块显存不能只按创建 stream 的进度来判断是否可复用。</p>
+
+<table class="note-table">
+  <thead><tr><th>API</th><th>管什么</th><th>不管什么</th></tr></thead>
+  <tbody>
+    <tr><td><code>s2.wait_stream(s1)</code></td><td>执行顺序。让 <code>s2</code> 等 <code>s1</code> 已经排队的工作。</td><td>不延长 Tensor storage 的生命周期。</td></tr>
+    <tr><td><code>x.record_stream(s2)</code></td><td>内存生命周期。告诉 allocator:释放 <code>x</code> 时也要考虑 <code>s2</code>。</td><td>不让 <code>s2</code> 自动等待 <code>s1</code>。</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+结论先放这里:跨 stream 使用同一个 Tensor 时,通常需要先用 <code>wait_stream</code> 建立读写依赖,再用 <code>record_stream</code> 或手动 event / wait 把内存生命周期交代清楚。
+</div>
+
+<h2 id="zh-2">2. allocator 的 event 模型</h2>
+
+<p>PyTorch 的 CUDA allocator 是 caching allocator。Tensor 的 Python 引用消失时,显存通常不会真的 <code>cudaFree</code>,而是回到 allocator 的缓存池。问题在于 CUDA kernel 是异步的:Python 对象已经没引用了,不代表 GPU 真的不用这块显存了。</p>
+
+<p>一个有用的 mental model 是:allocator 用 CUDA event 判断一块缓存 block 是否可以复用。</p>
+
+<h3>释放时:不是真释放,而是记录 event</h3>
+
+<pre class="code"># 伪代码: allocator 内部逻辑,用于理解机制
+
+def deallocate(block):
+    for stream in block.associated_streams:
+        event = cudaEventCreate()
+        cudaEventRecord(event, stream)  # 在 stream 当前队列位置插一个 event
+        block.pending_events.append(event)
+
+    block.state = "PENDING"  # 还不能复用</pre>
+
+<p>这个 event 的含义是:当 GPU 执行到这个 event 时,说明这个 stream 上在 event 之前排队的工作都已经完成。allocator 不需要同步整个 GPU,只需要以后查询这个 event 的状态。</p>
+
+<h3>分配时:检查 event 是否完成</h3>
+
+<pre class="code"># 伪代码: allocator 尝试复用缓存 block
+
+def try_reuse(block):
+    for event in block.pending_events:
+        if cudaEventQuery(event) == cudaErrorNotReady:
+            return False  # GPU 还没跑到那个 event 点,不能复用
+
+    block.state = "FREE"
+    return True</pre>
+
+<p><code>cudaEventQuery</code> 是非阻塞查询。它不会把 CPU 卡到 GPU 完成,只是问一句:这个 event 现在完成了吗?没完成就跳过这块 block,去找别的可用内存。</p>
+
+<h2 id="zh-3">3. <code>record_stream</code> 做了什么</h2>
+
+<p><code>x.record_stream(s2)</code> 可以理解成把 <code>s2</code> 加入 <code>x</code> 的 storage 关联 stream 集合:</p>
+
+<pre class="code"># 语义近似,不是 PyTorch 的真实 Python 实现
+x.storage.associated_streams.add(s2)</pre>
+
+<p>这样 <code>x</code> 释放时,allocator 会知道:除了创建 stream,还要考虑 <code>s2</code> 上已经排队的工作。只有这些 stream 上对应的 event 都完成后,这块显存才可以被复用。</p>
+
+<div class="callout warn">
+注意:这里说的是 allocator 视角的生命周期。<code>record_stream</code> 不会插入计算依赖,也不会让一个 stream 等另一个 stream。
+</div>
+
+<h2 id="zh-4">4. s1 / s2 例子</h2>
+
+<p>下面这个例子里,<code>x</code> 在 <code>s1</code> 上产生,随后在 <code>s2</code> 上被 <code>g(x)</code> 异步使用:</p>
+
+<pre class="code">s1 = torch.cuda.Stream()
+s2 = torch.cuda.Stream()
+
+with torch.cuda.stream(s1):
+    x = f(a, b, c)      # x 的 storage 在 s1 上写入
+
+# 计算依赖: s2 必须等 s1 写完 x
+s2.wait_stream(s1)
+
+with torch.cuda.stream(s2):
+    y = g(x)            # g(x) 在 s2 上异步读 x</pre>
+
+<p>如果后面 <code>x</code> 的 Python 引用消失,例如 <code>del x</code> 或变量被覆盖,allocator 可能只知道 <code>x</code> 的创建 stream 是 <code>s1</code>。如果没有把 <code>s2</code> 记录进去,后续 <code>s1</code> 上的新分配就可能复用 <code>x</code> 原来的 storage:</p>
+
+<pre class="code"># 假设这里 x 已经没有 Python 引用了
+
+with torch.cuda.stream(s1):
+    z = torch.rand(shape, device="cuda")  # 可能复用原来 x 的显存</pre>
+
+<p>危险点是:此时 <code>s2</code> 上的 <code>g(x)</code> 可能还没执行完。<code>s1</code> 上的新 <code>rand</code> 不会自动等待 <code>s2</code>,于是新写入可能覆盖 <code>g(x)</code> 仍在读取的显存。</p>
+
+<h3>为什么同一个 stream 就没问题</h3>
+
+<p>如果 <code>f</code>、<code>g</code> 和后续新分配都在 <code>s1</code> 上,CUDA stream 的 FIFO 顺序天然保证:</p>
+
+<pre class="code">f 写 x  ->  g 读 x  ->  rand 写新内存</pre>
+
+<p>即使 allocator 复用了同一块显存,新的写入也会排在旧的读取之后。问题只在跨 stream 时出现,因为 <code>s1</code> 和 <code>s2</code> 是两条可以并行推进的队列。</p>
+
+<h2 id="zh-5">5. 正确写法</h2>
+
+<h3>写法 A:用 <code>record_stream</code></h3>
+
+<pre class="code">s1 = torch.cuda.Stream()
+s2 = torch.cuda.Stream()
+
+with torch.cuda.stream(s1):
+    x = f(a, b, c)
+
+s2.wait_stream(s1)
+
+with torch.cuda.stream(s2):
+    y = g(x)
+
+# 内存生命周期: 告诉 allocator s2 也使用了 x 的 storage
+x.record_stream(s2)</pre>
+
+<p>这样即使 Python 侧 <code>x</code> 被释放,allocator 也会等 <code>s2</code> 上相关工作执行到释放时记录的 event 之后,才复用这块显存。</p>
+
+<h3>写法 B:不用 <code>record_stream</code>,手动同步回创建 stream</h3>
+
+<pre class="code">with torch.cuda.stream(s1):
+    x = f(a, b, c)
+
+s2.wait_stream(s1)
+
+with torch.cuda.stream(s2):
+    y = g(x)
+
+# 在释放 x 或允许 s1 复用它的 storage 前,
+# 让创建 stream s1 等待 side stream s2。
+s1.wait_stream(s2)
+
+del x</pre>
+
+<p>这个写法把生命周期交给你自己管。好处是可控,坏处是容易把等待放太早,直接损失 overlap;或者放太晚 / 漏掉,留下数据竞争。</p>
+
+<h2 id="zh-6">6. 和 <code>wait_stream</code> 的边界</h2>
+
+<p>一个常见错误是只写 <code>record_stream</code>,但忘了建计算依赖:</p>
+
+<pre class="code">with torch.cuda.stream(s1):
+    x = f(a, b, c)
+
+with torch.cuda.stream(s2):
+    y = g(x)
+
+x.record_stream(s2)</pre>
+
+<p>这仍然不安全,因为 <code>record_stream</code> 不会让 <code>s2</code> 等 <code>s1</code>。如果 <code>g(x)</code> 开始读的时候 <code>f</code> 还没写完,结果仍然是错的。</p>
+
+<p>完整规则:</p>
+
+<ul>
+  <li><code>s2.wait_stream(s1)</code>:保证 <code>s2</code> 读 <code>x</code> 之前,<code>s1</code> 已经写完。</li>
+  <li><code>x.record_stream(s2)</code>:保证 <code>x</code> 的 storage 不会在 <code>s2</code> 用完前被 allocator 复用。</li>
+</ul>
+
+<p>一句话记法:</p>
+
+<div class="callout">
+<code>wait_stream</code> 管执行顺序;<code>record_stream</code> 管内存生命周期。
+</div>
+
+<h2 id="zh-refs">参考资料</h2>
+
+<ul>
+  <li><a href="https://docs.pytorch.org/docs/2.12/generated/torch.Tensor.record_stream.html" target="_blank" rel="noopener">PyTorch 文档: <code>torch.Tensor.record_stream</code></a></li>
+  <li><a href="https://docs.pytorch.org/docs/2.12/notes/cuda.html" target="_blank" rel="noopener">PyTorch 文档: CUDA semantics</a></li>
+  <li><a href="https://dev-discuss.pytorch.org/t/asynchronous-execution-and-memory-management/370" target="_blank" rel="noopener">PyTorch dev-discuss: Asynchronous execution and memory management</a></li>
+</ul>
+
+</div>
+
+<div class="lang-en">
+
+<h1>PyTorch record_stream: Tensor Memory Lifetime Across CUDA Streams</h1>
+
+<h2 id="en-1">1. Short answer</h2>
+
+<p><code>tensor.record_stream(stream)</code> is about <strong>safe memory reuse</strong>, not compute dependency. It tells the PyTorch CUDA caching allocator that the tensor's underlying storage was also used by <code>stream</code>. When the tensor is freed, the allocator must not judge reusability only from the tensor's creation stream.</p>
+
+<table class="note-table">
+  <thead><tr><th>API</th><th>What it handles</th><th>What it does not handle</th></tr></thead>
+  <tbody>
+    <tr><td><code>s2.wait_stream(s1)</code></td><td>Execution order. Makes <code>s2</code> wait for work already queued on <code>s1</code>.</td><td>Does not extend the tensor storage lifetime.</td></tr>
+    <tr><td><code>x.record_stream(s2)</code></td><td>Memory lifetime. Tells the allocator to consider <code>s2</code> when <code>x</code> is freed.</td><td>Does not make <code>s2</code> wait for <code>s1</code>.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+Practical rule: when one tensor crosses streams, first use <code>wait_stream</code> for the read/write dependency, then use <code>record_stream</code> or manual events / waits for the storage lifetime.
+</div>
+
+<h2 id="en-2">2. Allocator event model</h2>
+
+<p>PyTorch uses a CUDA caching allocator. When a Python tensor reference disappears, the GPU memory is usually not returned by <code>cudaFree</code>; it goes back to the allocator's cache. CUDA kernels are asynchronous, so a dead Python object does not necessarily mean the GPU is done with that memory.</p>
+
+<p>A useful mental model is that the allocator uses CUDA events to decide whether a cached block can be reused.</p>
+
+<h3>On deallocation: record events instead of freeing immediately</h3>
+
+<pre class="code"># Pseudocode: allocator-side model
+
+def deallocate(block):
+    for stream in block.associated_streams:
+        event = cudaEventCreate()
+        cudaEventRecord(event, stream)  # insert event at the current stream position
+        block.pending_events.append(event)
+
+    block.state = "PENDING"  # not reusable yet</pre>
+
+<p>Once the GPU reaches the event, all earlier work on that stream has completed. The allocator does not need to synchronize the whole GPU. It can query the event later.</p>
+
+<h3>On allocation: query whether events are complete</h3>
+
+<pre class="code"># Pseudocode: allocator tries to reuse a cached block
+
+def try_reuse(block):
+    for event in block.pending_events:
+        if cudaEventQuery(event) == cudaErrorNotReady:
+            return False  # GPU has not reached this event yet
+
+    block.state = "FREE"
+    return True</pre>
+
+<p><code>cudaEventQuery</code> is non-blocking. It does not stall the CPU until the GPU finishes. It only asks whether the event is complete now; if not, the allocator can skip this block and look for another one.</p>
+
+<h2 id="en-3">3. What <code>record_stream</code> does</h2>
+
+<p>You can think of <code>x.record_stream(s2)</code> as adding <code>s2</code> to the set of streams associated with <code>x</code>'s storage:</p>
+
+<pre class="code"># Semantic approximation, not PyTorch's real Python implementation
+x.storage.associated_streams.add(s2)</pre>
+
+<p>When <code>x</code> is freed, the allocator now knows it must consider <code>s2</code> as well as the creation stream. The memory can be reused only after the relevant events on those streams have completed.</p>
+
+<div class="callout warn">
+This is a memory-lifetime rule from the allocator's perspective. <code>record_stream</code> does not insert compute dependencies or make one stream wait for another.
+</div>
+
+<h2 id="en-4">4. The s1 / s2 example</h2>
+
+<p>In this example, <code>x</code> is produced on <code>s1</code>, then consumed asynchronously by <code>g(x)</code> on <code>s2</code>:</p>
+
+<pre class="code">s1 = torch.cuda.Stream()
+s2 = torch.cuda.Stream()
+
+with torch.cuda.stream(s1):
+    x = f(a, b, c)      # x's storage is written on s1
+
+# Compute dependency: s2 must wait until s1 has written x
+s2.wait_stream(s1)
+
+with torch.cuda.stream(s2):
+    y = g(x)            # g(x) reads x asynchronously on s2</pre>
+
+<p>If the Python reference to <code>x</code> later disappears, for example through <code>del x</code> or assignment overwrite, the allocator may only know that <code>x</code> was created on <code>s1</code>. Without recording <code>s2</code>, a later allocation on <code>s1</code> may reuse <code>x</code>'s old storage:</p>
+
+<pre class="code"># Suppose x has no Python references now.
+
+with torch.cuda.stream(s1):
+    z = torch.rand(shape, device="cuda")  # may reuse x's old storage</pre>
+
+<p>The danger is that <code>g(x)</code> on <code>s2</code> may still be running. The new <code>rand</code> on <code>s1</code> does not automatically wait for <code>s2</code>, so its writes may overwrite memory that <code>g(x)</code> is still reading.</p>
+
+<h3>Why the same stream is fine</h3>
+
+<p>If <code>f</code>, <code>g</code>, and the later allocation all run on <code>s1</code>, the CUDA stream FIFO order guarantees:</p>
+
+<pre class="code">f writes x  ->  g reads x  ->  rand writes new data</pre>
+
+<p>Even if the allocator reuses the same memory, the new write is queued after the old read. The problem appears with multiple streams, because <code>s1</code> and <code>s2</code> are independent queues that can make progress concurrently.</p>
+
+<h2 id="en-5">5. Correct patterns</h2>
+
+<h3>Pattern A: use <code>record_stream</code></h3>
+
+<pre class="code">s1 = torch.cuda.Stream()
+s2 = torch.cuda.Stream()
+
+with torch.cuda.stream(s1):
+    x = f(a, b, c)
+
+s2.wait_stream(s1)
+
+with torch.cuda.stream(s2):
+    y = g(x)
+
+# Memory lifetime: tell the allocator that s2 also used x's storage.
+x.record_stream(s2)</pre>
+
+<p>Now, even if Python releases <code>x</code>, the allocator waits until the relevant work on <code>s2</code> reaches the recorded event before reusing the storage.</p>
+
+<h3>Pattern B: no <code>record_stream</code>, but manually sync back to the creation stream</h3>
+
+<pre class="code">with torch.cuda.stream(s1):
+    x = f(a, b, c)
+
+s2.wait_stream(s1)
+
+with torch.cuda.stream(s2):
+    y = g(x)
+
+# Before releasing x, or allowing s1 to reuse its storage,
+# make the creation stream wait for the side stream.
+s1.wait_stream(s2)
+
+del x</pre>
+
+<p>This puts lifetime management in your hands. It is more explicit, but it is also easier to place the wait too early and lose overlap, or too late and leave a race.</p>
+
+<h2 id="en-6">6. Boundary with <code>wait_stream</code></h2>
+
+<p>A common bug is to call <code>record_stream</code> but forget the compute dependency:</p>
+
+<pre class="code">with torch.cuda.stream(s1):
+    x = f(a, b, c)
+
+with torch.cuda.stream(s2):
+    y = g(x)
+
+x.record_stream(s2)</pre>
+
+<p>This is still unsafe. <code>record_stream</code> does not make <code>s2</code> wait for <code>s1</code>. If <code>g(x)</code> starts reading before <code>f</code> finishes writing, the result can still be wrong.</p>
+
+<p>The full rule is:</p>
+
+<ul>
+  <li><code>s2.wait_stream(s1)</code>: before <code>s2</code> reads <code>x</code>, make sure <code>s1</code> has finished writing it.</li>
+  <li><code>x.record_stream(s2)</code>: before allocator reuses <code>x</code>'s storage, make sure <code>s2</code> has finished using it.</li>
+</ul>
+
+<div class="callout">
+<code>wait_stream</code> is for execution order; <code>record_stream</code> is for memory lifetime.
+</div>
+
+<h2 id="en-refs">References</h2>
+
+<ul>
+  <li><a href="https://docs.pytorch.org/docs/2.12/generated/torch.Tensor.record_stream.html" target="_blank" rel="noopener">PyTorch docs: <code>torch.Tensor.record_stream</code></a></li>
+  <li><a href="https://docs.pytorch.org/docs/2.12/notes/cuda.html" target="_blank" rel="noopener">PyTorch docs: CUDA semantics</a></li>
+  <li><a href="https://dev-discuss.pytorch.org/t/asynchronous-execution-and-memory-management/370" target="_blank" rel="noopener">PyTorch dev-discuss: Asynchronous execution and memory management</a></li>
+</ul>
+
+</div>
+
+</main>
+</div>
+</body>
+</html>
