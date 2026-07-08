@@ -1,0 +1,863 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FP8 scaling 与训练 recipe</title>
+<meta name="post:title"           content="FP8 scaling 与训练 recipe">
+<meta name="post:title_en"        content="FP8 scaling and training recipes">
+<meta name="post:slug"            content="fp8-scaling-recipes">
+<meta name="post:date"            content="2026-07-07">
+<meta name="post:tags"            content="LLM, 训练系统, FP8, 量化">
+<meta name="post:tags_en"         content="LLM, Training Systems, FP8, Quantization">
+<meta name="post:reading"         content="22 分钟">
+<meta name="post:reading_en"      content="22 min">
+<meta name="post:summary"         content="把 FP8 训练拆到 dtype、scale 粒度、amax 更新、tensor 覆盖范围和分布式同步几条轴上看:为什么 FP8 仍然需要 scaling,为什么 MXFP8 的 block scale 要沿 reduction 维度放。">
+<meta name="post:summary_en"      content="A systems-oriented view of FP8 training recipes: dtype choice, scale granularity, amax update policy, tensor coverage, distributed synchronization, and MXFP8 reduction-dimension scaling.">
+<meta name="post:series"          content="llm-training">
+<meta name="post:series_title"    content="LLM 训练系统">
+<meta name="post:series_title_en" content="LLM Training Systems">
+<meta name="post:series_order"    content="2">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js" defer></script>
+<script src="../lang-toggle.js" defer></script>
+<style>
+  main.content { max-width: 1180px; padding: 56px 32px 96px; }
+  @media (max-width: 1180px) { main.content { padding: 48px 22px 84px; } }
+  .tree-frame {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    margin: 18px 0 26px;
+    padding: 12px 14px 16px;
+    overflow: hidden;
+  }
+  .tree-frame .tree-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--fg-subtle);
+    margin-bottom: 6px;
+    letter-spacing: 0;
+  }
+  .tree-frame .tree-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tree-frame .tree-actions button {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg);
+    color: var(--fg-muted);
+    cursor: pointer;
+    transition: all var(--dur-fast) var(--ease-out);
+  }
+  .tree-frame .tree-actions button:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .tree-svg { width: 100%; display: block; }
+  .tree-svg text {
+    font-family: var(--font-mono);
+    fill: var(--fg);
+    cursor: pointer;
+  }
+  .tree-svg .node--leaf text { fill: var(--fg-muted); }
+  .tree-svg .node--root text { font-weight: 600; fill: var(--fg); }
+  .tree-svg .node--branch text { font-weight: 500; fill: var(--fg); }
+  .tree-svg .link {
+    fill: none;
+    stroke: var(--border-strong);
+    stroke-opacity: 0.72;
+    stroke-width: 1.2;
+  }
+  .tree-svg .node circle { stroke-width: 0; }
+  .tree-svg .node--branch circle { fill: var(--accent); }
+  .tree-svg .node--branch.collapsed circle {
+    fill: var(--accent);
+    stroke: var(--accent-tint);
+    stroke-width: 4;
+  }
+  .tree-svg .node--leaf circle { fill: var(--fg-subtle); }
+  .tree-svg .node:hover circle {
+    stroke: var(--accent-tint);
+    stroke-width: 6;
+  }
+  .tooltip {
+    position: fixed;
+    pointer-events: none;
+    background: var(--fg);
+    color: var(--bg);
+    font-family: var(--font-sans);
+    font-size: 12.5px;
+    line-height: 1.45;
+    padding: 7px 11px;
+    border-radius: var(--radius-sm);
+    max-width: 340px;
+    box-shadow: var(--shadow-md);
+    z-index: 200;
+    opacity: 0;
+    transition: opacity 0.12s;
+    letter-spacing: -0.005em;
+  }
+  .tooltip.show { opacity: 1; }
+  table.recipe-table td:first-child,
+  table.recipe-table th:first-child { white-space: nowrap; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录 · TOC</div>
+    <div class="lang-zh">
+    <ul>
+      <li><a href="#zh-scope">0. 范围</a></li>
+      <li><a href="#zh-format">1. FP8 数值格式</a></li>
+      <li><a href="#zh-scaling">2. scale 的位置</a></li>
+      <li><a href="#zh-map">3. recipe 分类图</a></li>
+      <li><a href="#zh-granularity">4. scale 粒度</a></li>
+      <li><a href="#zh-update">5. amax 更新方式</a></li>
+      <li><a href="#zh-training">6. 训练系统里的 recipe</a></li>
+      <li><a href="#zh-te-mha">7. TE MHA 的实现例子</a></li>
+      <li><a href="#zh-pytorch">8. PyTorch 视角</a></li>
+      <li><a href="#zh-refs">参考资料</a></li>
+    </ul>
+    </div>
+    <div class="lang-en">
+    <ul>
+      <li><a href="#en-scope">0. Scope</a></li>
+      <li><a href="#en-format">1. FP8 formats</a></li>
+      <li><a href="#en-scaling">2. Where scale lives</a></li>
+      <li><a href="#en-map">3. Recipe map</a></li>
+      <li><a href="#en-granularity">4. Scale granularity</a></li>
+      <li><a href="#en-update">5. Amax update policy</a></li>
+      <li><a href="#en-training">6. Recipes in training systems</a></li>
+      <li><a href="#en-te-mha">7. Transformer Engine MHA example</a></li>
+      <li><a href="#en-pytorch">8. PyTorch view</a></li>
+      <li><a href="#en-refs">References</a></li>
+    </ul>
+    </div>
+  </aside>
+
+<main class="content">
+
+<div class="lang-zh">
+
+<h1>FP8 scaling 与训练 recipe</h1>
+
+<p class="small">FP8 训练不是把模型参数改成 <code>torch.float8</code> 后开跑。它更像一组系统约定:哪些 GEMM operand 用 FP8,scale 怎么算,amax 是否跨 rank 同步,哪些层和状态保留在 BF16/FP32。recipe 讨论的就是这些约定。</p>
+
+<h2 id="zh-scope">0. 范围</h2>
+
+<p>这篇只讨论 LLM 训练里的 FP8 mixed precision,重点是 Transformer block 中的线性层、MLP 和部分 attention 计算。optimizer state、master weights、loss、softmax、normalization、reduction 这类位置通常继续用更高精度。换句话说,FP8 是训练系统里的局部加速路径,不是整张计算图的默认数值类型。</p>
+
+<p>先分清两个层面:</p>
+
+<table class="recipe-table">
+  <thead><tr><th>层面</th><th>问题</th><th>例子</th></tr></thead>
+  <tbody>
+    <tr><td>format</td><td>一个 FP8 值本身怎么编码</td><td>E4M3, E5M2</td></tr>
+    <tr><td>recipe</td><td>训练系统怎么使用这些值</td><td>DelayedScaling, current scaling, MXFP8 block scaling, HYBRID format</td></tr>
+  </tbody>
+</table>
+
+<p>把这两层混在一起,很多描述会变形。E4M3 只是一个 dtype。HYBRID 不是第三种 FP8 编码,而是训练时把 forward 和 backward 分别映射到不同格式的一种约定。MXFP8 也不是简单的 "更小 dtype",它把 scale 粒度推到 block 级别,还改变了 scale 的表示方式。</p>
+
+<h2 id="zh-format">1. FP8 数值格式</h2>
+
+<p>FP8 仍然是浮点数:1 bit 符号位,再把剩下的 bit 分给 exponent 和 mantissa。E4M3 给 exponent 4 bit,给 mantissa 3 bit。E5M2 给 exponent 5 bit,给 mantissa 2 bit。</p>
+
+<table class="recipe-table">
+  <thead><tr><th>格式</th><th>取舍</th><th>常见位置</th><th>备注</th></tr></thead>
+  <tbody>
+    <tr><td>E4M3</td><td>范围较窄,有效精度较高</td><td>weights, activations, forward GEMM</td><td>NVIDIA 文档给出的最大有限值约为 448</td></tr>
+    <tr><td>E5M2</td><td>范围更宽,有效精度较低</td><td>activation gradients, backward GEMM</td><td>NVIDIA 文档给出的最大有限值约为 57344,支持 inf</td></tr>
+    <tr><td>HYBRID</td><td>forward 用 E4M3,backward 用 E5M2</td><td>Transformer Engine 默认 FP8 训练格式之一</td><td>这是 format 选择策略,不是新的 bit layout</td></tr>
+  </tbody>
+</table>
+
+<p>这个设计背后的直觉很直接。forward 里的权重和激活通常更需要 mantissa 精度,梯度更容易出现大范围波动,所以 backward 往往更需要 exponent 范围。并不是所有模型都必须这样配,但这是许多 FP8 训练栈的默认起点。</p>
+
+<h2 id="zh-scaling">2. scale 的位置</h2>
+
+<p>FP8 有 exponent,但它仍然需要外部 scaling。原因不是 "FP8 不会表示大数" 这么简单,而是同一个 LLM 里不同 tensor 的分布差异太大。一个 tensor 的 amax 可能在 0.02,另一个可能在 2000。用同一套 FP8 网格直接表示,小值会浪费码点,大值会溢出或饱和。</p>
+
+<p>实际系统一般把高精度 tensor <code>x</code> 映射成 FP8 raw data <code>q</code>,同时保存一个 scale。常见有两种等价写法。Transformer Engine 文档采用乘法 scale 习惯:</p>
+
+<pre class="code">scale = FP8_MAX / amax(x)
+q = cast_fp8(x * scale)
+x_hat = q / scale</pre>
+
+<p>也有人把反方向的量叫 scale:</p>
+
+<pre class="code">s = amax(x) / FP8_MAX
+q = cast_fp8(x / s)
+x_hat = q * s</pre>
+
+<p>两种写法只差一个倒数。看代码和论文时,先确认 scale 的方向,否则公式会看起来互相矛盾。</p>
+
+<p>scale 同时解决两个问题。第一,把 tensor 的最大值压到 FP8 可表示范围内,减少 overflow 或 saturation。第二,让 tensor 中的大多数值落在更有分辨率的区域,少把 mantissa 浪费在空区间上。BF16 的 exponent 足够宽,通常不需要为每个 tensor 单独维护 scale。FP8 的 bit 数不够,这件事必须显式做。</p>
+
+<h2 id="zh-map">3. recipe 分类图</h2>
+
+<p>FP8 recipe 可以按几条轴来看。图里每个分支都是一个决策点,不是互斥产品名。一个实际配置可能同时是 HYBRID format、delayed scaling、per-tensor FP32 scale、跨 TP group reduce amax。</p>
+
+</div>
+
+<div class="lang-en">
+
+<h1>FP8 scaling and training recipes</h1>
+
+<p class="small">FP8 training is not "change the model to <code>torch.float8</code> and run". It is a set of systems decisions: which GEMM operands use FP8, how scales are computed, whether amax values are synchronized across ranks, and which layers or states remain in BF16/FP32. A recipe is the bundle of those choices.</p>
+
+<h2 id="en-scope">0. Scope</h2>
+
+<p>This article focuses on FP8 mixed precision for LLM training, mainly the linear layers, MLPs, and selected attention paths inside Transformer blocks. Optimizer state, master weights, loss computation, softmax, normalization, and reductions usually stay in higher precision. FP8 is a local acceleration path inside the training system, not the default dtype for the whole graph.</p>
+
+<p>Two layers should stay separate:</p>
+
+<table class="recipe-table">
+  <thead><tr><th>Layer</th><th>Question</th><th>Examples</th></tr></thead>
+  <tbody>
+    <tr><td>format</td><td>How one FP8 value is encoded</td><td>E4M3, E5M2</td></tr>
+    <tr><td>recipe</td><td>How the training stack uses those values</td><td>DelayedScaling, current scaling, MXFP8 block scaling, HYBRID format</td></tr>
+  </tbody>
+</table>
+
+<p>Mixing these two layers creates confusion. E4M3 is a dtype. HYBRID is not a third FP8 encoding, it is a convention that maps forward and backward tensors to different formats. MXFP8 is not just a smaller dtype either; it changes scale granularity and the representation of the scales.</p>
+
+<h2 id="en-format">1. FP8 formats</h2>
+
+<p>FP8 is still floating point: 1 sign bit, with the remaining bits split between exponent and mantissa. E4M3 uses 4 exponent bits and 3 mantissa bits. E5M2 uses 5 exponent bits and 2 mantissa bits.</p>
+
+<table class="recipe-table">
+  <thead><tr><th>Format</th><th>Tradeoff</th><th>Common placement</th><th>Note</th></tr></thead>
+  <tbody>
+    <tr><td>E4M3</td><td>Narrower range, more useful precision</td><td>weights, activations, forward GEMM</td><td>NVIDIA docs list the maximum finite value at about 448</td></tr>
+    <tr><td>E5M2</td><td>Wider range, less useful precision</td><td>activation gradients, backward GEMM</td><td>NVIDIA docs list the maximum finite value at about 57344, with inf support</td></tr>
+    <tr><td>HYBRID</td><td>E4M3 for forward, E5M2 for backward</td><td>One default FP8 training format in Transformer Engine</td><td>A format policy, not a new bit layout</td></tr>
+  </tbody>
+</table>
+
+<p>The usual reason is simple. Weights and activations in the forward pass tend to benefit from mantissa precision. Gradients often need more exponent range. Not every model must use that split, but it is a common starting point.</p>
+
+<h2 id="en-scaling">2. Where scale lives</h2>
+
+<p>FP8 has an exponent, but it still needs external scaling. The issue is not merely that FP8 cannot represent large values. Tensor distributions inside one LLM vary too much. One tensor may have an amax near 0.02, another near 2000. A single FP8 grid wastes codes for small tensors and clips large tensors.</p>
+
+<p>A training stack usually maps a high precision tensor <code>x</code> into FP8 raw data <code>q</code>, plus a scale. Transformer Engine documents the multiplicative convention:</p>
+
+<pre class="code">scale = FP8_MAX / amax(x)
+q = cast_fp8(x * scale)
+x_hat = q / scale</pre>
+
+<p>Some systems name the inverse quantity as the scale:</p>
+
+<pre class="code">s = amax(x) / FP8_MAX
+q = cast_fp8(x / s)
+x_hat = q * s</pre>
+
+<p>The two forms differ by a reciprocal. When reading code or papers, check the scale direction first.</p>
+
+<p>Scaling does two jobs. It keeps the largest values inside the representable range, reducing overflow or saturation. It also places the common values into regions with useful resolution, rather than wasting mantissa codes on empty space. BF16 has enough exponent range that per-tensor scaling is usually unnecessary. FP8 does not.</p>
+
+<h2 id="en-map">3. Recipe map</h2>
+
+<p>FP8 recipes are easier to read as a set of axes. Each branch below is a decision point, not a mutually exclusive product name. A real configuration may use HYBRID format, delayed scaling, per-tensor FP32 scales, and a cross-TP amax reduction at the same time.</p>
+
+</div>
+
+<div class="tree-frame">
+  <div class="tree-meta">
+    <span><span class="lang-zh">FP8 recipe 分类图</span><span class="lang-en">FP8 recipe map</span></span>
+    <span class="tree-actions">
+      <button onclick="expandAll('tree-recipes')">
+        <span class="lang-zh">全部展开</span><span class="lang-en">Expand all</span>
+      </button>
+      <button onclick="collapseAll('tree-recipes')">
+        <span class="lang-zh">仅第 1 层</span><span class="lang-en">Depth 1 only</span>
+      </button>
+    </span>
+  </div>
+  <div id="tree-recipes"></div>
+</div>
+
+<div class="lang-zh">
+
+<h2 id="zh-granularity">4. scale 粒度</h2>
+
+<p>scale 粒度决定一个 scale 覆盖多少元素。粒度越粗,metadata 越少,kernel 越简单,但 outlier 会影响更多元素。粒度越细,数值更稳,但 scale 的存储、加载、同步和 layout 都会变复杂。</p>
+
+<table class="recipe-table">
+  <thead><tr><th>粒度</th><th>做法</th><th>适合场景</th><th>代价</th></tr></thead>
+  <tbody>
+    <tr><td>per tensor</td><td>整个 tensor 共用一个 FP32 scale</td><td>Hopper 上常见 FP8 训练路径</td><td>一个 outlier 会拉大整个 tensor 的范围</td></tr>
+    <tr><td>per axis</td><td>按 row 或 column 维护 scale</td><td>权重或 activation 分布沿某一维差异明显</td><td>scale load 和 layout 约束增加</td></tr>
+    <tr><td>software block</td><td>按小块维护 scale,例如 1x128 或 128x128</td><td>需要处理 outlier,硬件未提供原生 microscaling</td><td>kernel 和转置路径更复杂</td></tr>
+    <tr><td>MXFP8</td><td>每 32 个连续值一个 E8M0 scale</td><td>Blackwell Tensor Core 原生支持的 microscaling</td><td>scale 方向和转置副本需要特别处理</td></tr>
+  </tbody>
+</table>
+
+<p>per-tensor scaling 解释了为什么早期 FP8 recipe 常用 HYBRID。每个 tensor 只有一个 scale 时,梯度的动态范围压力仍然很大,E5M2 的宽 exponent 有用。MXFP8 把 block 内的动态范围压小,因此很多 tensor 可以统一用 E4M3,把更多 bit 留给 mantissa。</p>
+
+<p>MXFP8 的 block scale 最容易误解的地方是方向。对矩阵乘来说,block scale 不是随便沿物理 row 或 column 放,而是要服务那一次 matmul 的 reduction 维度。以 <code>Y = X[M,K] @ W[K,N]</code> 为例,两个 operand 的 scale 在数学语义上都沿 <code>K</code> 放,因为每个输出元素都在 <code>K</code> 上做 dot product。若 <code>W</code> 真的按 <code>[K,N]</code> row-major 存,那沿 <code>K</code> 是 columnwise;若 Linear 权重按常见的 <code>[N,K]</code> 存,并在计算里用 <code>W.T</code>,那沿 <code>K</code> 又变成 rowwise。TE 代码里的 rowwise/columnwise 是存储视角,不是数学轴名。</p>
+
+<pre class="code"># 数学语义
+Y[m, n] = sum_k X[m, k] * W[k, n]
+
+# block scale 要贴着 reduction chunk
+X[m, k:k+32]      # 沿 K
+W[k:k+32, n]      # 也沿 K</pre>
+
+<h2 id="zh-update">5. amax 更新方式</h2>
+
+<p>scale 通常来自 amax,也就是 tensor 的最大绝对值。recipe 需要决定什么时候拿到这个 amax,以及用它怎样更新下一次的 scale。</p>
+
+<table class="recipe-table">
+  <thead><tr><th>策略</th><th>怎么做</th><th>优点</th><th>风险</th></tr></thead>
+  <tbody>
+    <tr><td>current scaling</td><td>用当前 tensor 的 amax 计算当前 scale</td><td>scale 跟分布同步</td><td>amax reduction 和 cast 可能进入 critical path</td></tr>
+    <tr><td>just-in-time output scaling</td><td>先产生高精度输出,再统计 amax 并量化</td><td>数值上直接</td><td>多 pass 代价高,NVIDIA 文档认为训练中通常不可取</td></tr>
+    <tr><td>delayed scaling</td><td>记录历史 amax,用前几次的统计决定本次 scale</td><td>性能路径干净,Transformer Engine 常用</td><td>分布突变时 scale 会滞后</td></tr>
+    <tr><td>static scaling</td><td>scale 来自校准或离线规则</td><td>推理路径简单</td><td>预训练分布持续变化,不适合作为默认训练策略</td></tr>
+  </tbody>
+</table>
+
+<p>DelayedScaling 的状态一般包含 amax history、history 长度、取 history 最大值还是最近值、margin、format、以及分布式 reduce 规则。从实现角度看,它是一套 operator state。每个参与 FP8 的 tensor 都要能找到自己的 scale 和 amax 记录。</p>
+
+<h2 id="zh-training">6. 训练系统里的 recipe</h2>
+
+<p>把前面的轴组合起来,常见 recipe 大致有下面几类。</p>
+
+<table class="recipe-table">
+  <thead><tr><th>recipe</th><th>组成</th><th>使用动机</th><th>排查点</th></tr></thead>
+  <tbody>
+    <tr><td>FP8 delayed HYBRID</td><td>per-tensor FP32 scale,forward E4M3,backward E5M2,历史 amax</td><td>Hopper 时代的稳妥默认项</td><td>amax history 是否过长,梯度 outlier 是否频繁</td></tr>
+    <tr><td>FP8 current scaling</td><td>当前 amax,通常仍是 per-tensor 或 per-axis scale</td><td>scale 跟随更快,便于实验</td><td>amax reduction 是否拖慢 step time</td></tr>
+    <tr><td>FP8 block scaling</td><td>小块 scale,format 多为 E4M3 或 HYBRID</td><td>减轻 outlier 对整块 tensor 的影响</td><td>转置、scale layout、kernel 支持</td></tr>
+    <tr><td>MXFP8</td><td>每 32 个值一个 E8M0 scale,Blackwell 原生路径</td><td>更细粒度 scaling,减少对 E5M2 的依赖</td><td>scale rounding、转置副本、rowwise/columnwise 方向</td></tr>
+    <tr><td>calibrated FP8 inference</td><td>离线 scale,常用于 W8A8 或 KV cache 量化</td><td>部署简单,吞吐和显存收益明确</td><td>校准集是否覆盖真实分布</td></tr>
+  </tbody>
+</table>
+
+<p>训练 recipe 还会规定哪些张量不进 FP8。很多系统只让 GEMM operand 走 FP8,accumulation、bias、residual add、LayerNorm、RMSNorm、softmax、loss 和 optimizer 继续留在高精度。原因很实际:这些位置的数值误差更容易累积,并且它们未必是 step time 的主耗时。</p>
+
+<p>分布式训练还要处理 amax 同步。若 TP 或 FSDP group 内不同 rank 用不同 scale,数学上不一定错,但 checkpoint、recompute、通信融合和调试会变复杂。Transformer Engine 的 recipe 里有 <code>reduce_amax</code> 这类选项,就是在性能、确定性和局部统计之间取舍。</p>
+
+<h2 id="zh-te-mha">7. TE MHA 的实现例子</h2>
+
+<p>Transformer Engine 里 attention 的 FP8 recipe 不能只看 recipe object 上有没有 <code>fp8_dpa</code> 或 <code>fp8_mha</code> 字段,还要看 backend selector 最后是否接受这个组合。以 TE v2.16 为例,MXFP8 attention 的实现会把 DPA 当成自己的 consumer,重新按 attention 需要的方向量化 Q/K/V。</p>
+
+<p>先看 attention 的两次 matmul:</p>
+
+<pre class="code">S = Q[B,H,Sq,D] @ K[B,H,Sk,D]^T
+O = P[B,H,Sq,Sk] @ V[B,H,Sk,Dv]</pre>
+
+<p>第一步 <code>QK^T</code> 的 reduction 维度是 <code>D</code>,所以 Q 和 K 的 MXFP8 block scale 沿 <code>D</code>。第二步 <code>P@V</code> 的 reduction 维度是 <code>Sk</code>,所以 P 和 V 的 scale 沿 <code>Sk</code>。如果 V 按 <code>[B,H,Sk,Dv]</code> 存,沿 <code>Sk</code> 就不是最后一维,TE 术语里会落到 columnwise。</p>
+
+<table class="recipe-table">
+  <thead><tr><th>attention matmul</th><th>operand</th><th>reduction 维度</th><th>TE v2.16 MXFP8 forward 用法</th></tr></thead>
+  <tbody>
+    <tr><td><code>Q @ K^T</code></td><td>Q</td><td><code>D</code></td><td>rowwise</td></tr>
+    <tr><td><code>Q @ K^T</code></td><td>K</td><td><code>D</code></td><td>rowwise</td></tr>
+    <tr><td><code>P @ V</code></td><td>V</td><td><code>Sk</code></td><td>columnwise</td></tr>
+  </tbody>
+</table>
+
+<pre class="code"># TE v2.16 combine_and_quantize() 的 forward MXFP8 方向,概念化写法
+Q: rowwise=True,  columnwise=False   # 沿 D
+K: rowwise=True,  columnwise=False   # 沿 D
+V: rowwise=False, columnwise=True    # 沿 Sk</pre>
+
+<p>这和 QKV projection 的 output scale 方向不是同一个问题。projection 是普通 GEMM:输入 X 和权重 W 的 scale 跟那次 Linear GEMM 的 reduction 维度走。DPA 是两次 attention matmul:Q/K 要服务 <code>QK^T</code>,V 要服务 <code>P@V</code>。因此 TE v2.16 的可用 MXFP8 attention 路径更像这样:</p>
+
+<pre class="code">QKV projection:
+  MXFP8 GEMM 内部使用 projection 自己的 scale 方向
+  输出回 BF16/FP16 Q, K, V
+
+DPA:
+  按 attention reduction 维度重新量化 Q/K/V
+  Q/K 沿 D,V 沿 Sk
+  FusedAttention 执行 FP8 DPA</pre>
+
+<p>这也解释了 <code>fp8_mha</code> 在 MXFP8 下的限制。TE v2.16 的 backend selector 明确在 <code>fp8_recipe.mxfp8()</code> 且 <code>fp8_mha=True</code> 时禁用 FusedAttention。也就是说,下面这个 recipe 可以构造,但不代表 v2.16 已经有端到端 MXFP8 MHA backend:</p>
+
+<pre class="code">MXFP8BlockScaling(
+    fp8_dpa=True,
+    fp8_mha=True,
+)</pre>
+
+<p>更现实的配置是保留 DPA 边界:</p>
+
+<pre class="code">MXFP8BlockScaling(
+    fp8_dpa=True,
+    fp8_mha=False,
+)</pre>
+
+<p>即便如此,还要满足 selector 的其它条件,例如 sm100+、cuDNN 版本足够新、<code>qkv_format != "thd"</code>。如果这些条件不满足,TE 会把 FusedAttention 关掉,最后可能没有可用的 FP8 attention backend。</p>
+
+<h2 id="zh-pytorch">8. PyTorch 视角</h2>
+
+<p>PyTorch 的 float8 dtype 是 unscaled 的。也就是说,<code>torch.float8_e4m3fn</code> 和 <code>torch.float8_e5m2</code> 只描述 raw data 的格式,并不自动携带 scale。scale 需要由上层建模代码、tensor subclass 或专门的 kernel API 管理。PyTorch dev-discuss 里提到的 <code>torch.scaled_mm</code> 就是这种分层设计:matrix 是 FP8,scale 作为单独参数传入。</p>
+
+<p>这也是为什么 FP8 训练很少表现为一个普通 autocast dtype。autocast 只负责 dtype promotion 或 cast 还不够。系统还要维护 per-tensor state、amax history、分布式 reduce、module rewrite、保存给 backward 的 tensor 版本,以及编译器能否把这些额外操作融合掉。</p>
+
+<p>调 FP8 训练时,我一般先看四组信号:</p>
+
+<ul>
+  <li>每类 tensor 的 amax 曲线是否突然跳变。</li>
+  <li>scale 是否长期被某些 outlier 拉大。</li>
+  <li>E4M3 路径是否出现明显 saturation,梯度是否需要 E5M2 或更细粒度 scale。</li>
+  <li>amax reduce 和 cast 是否抵消了 FP8 GEMM 的收益。</li>
+</ul>
+
+<p>这些信号比单独问 "FP8 有没有开" 更有用。FP8 的精度和性能都藏在 recipe 里。</p>
+
+<h2 id="zh-refs">参考资料</h2>
+
+<ul>
+  <li>Micikevicius et al., <a href="https://arxiv.org/abs/2209.05433" target="_blank" rel="noopener">FP8 Formats for Deep Learning</a>. FP8 E4M3/E5M2 的原始论文。</li>
+  <li>NVIDIA Transformer Engine, <a href="https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html" target="_blank" rel="noopener">Using FP8 and FP4 with Transformer Engine</a>. FP8 scaling、delayed scaling、MXFP8 和 block scaling 的官方说明。</li>
+  <li>NVIDIA Transformer Engine, <a href="https://nvidia.github.io/TransformerEngine/api/common.html" target="_blank" rel="noopener">Common API</a>. <code>Format.HYBRID</code>、<code>DelayedScaling</code>、<code>MXFP8BlockScaling</code> 等 recipe API。</li>
+  <li>NVIDIA Transformer Engine v2.16, <a href="https://github.com/NVIDIA/TransformerEngine/blob/v2.16/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L2385-L2423" target="_blank" rel="noopener">FP8 DPA quantizer setup</a> 和 <a href="https://github.com/NVIDIA/TransformerEngine/blob/v2.16/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L2675-L2776" target="_blank" rel="noopener">MXFP8 Q/K/V quantize path</a>. TE MHA 例子的源码依据。</li>
+  <li>NVIDIA Transformer Engine v2.16, <a href="https://github.com/NVIDIA/TransformerEngine/blob/v2.16/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L593-L609" target="_blank" rel="noopener">attention backend selector</a>. MXFP8 + <code>fp8_mha=True</code> 在 v2.16 中禁用 FusedAttention。</li>
+  <li>PyTorch dev-discuss, <a href="https://dev-discuss.pytorch.org/t/float8-in-pytorch-1-x/1815" target="_blank" rel="noopener">Float8 in PyTorch</a>. PyTorch float8 dtype unscaled 的设计说明。</li>
+  <li>Chung et al., <a href="https://arxiv.org/html/2506.08027v2" target="_blank" rel="noopener">Recipes for Pre-training LLMs with MXFP8</a>. MXFP8 预训练 recipe、rounding 和 block scale 讨论。</li>
+</ul>
+
+</div>
+
+<div class="lang-en">
+
+<h2 id="en-granularity">4. Scale granularity</h2>
+
+<p>Scale granularity decides how many values share one scale. Coarser granularity has less metadata and simpler kernels, but one outlier can affect more values. Finer granularity is usually more robust numerically, but scale storage, loads, synchronization, and layout get more complicated.</p>
+
+<table class="recipe-table">
+  <thead><tr><th>Granularity</th><th>Mechanism</th><th>Where it fits</th><th>Cost</th></tr></thead>
+  <tbody>
+    <tr><td>per tensor</td><td>One FP32 scale for the whole tensor</td><td>Common Hopper FP8 training path</td><td>One outlier stretches the whole tensor range</td></tr>
+    <tr><td>per axis</td><td>Scale per row or column</td><td>Weights or activations with axis-specific distributions</td><td>More scale loads and layout constraints</td></tr>
+    <tr><td>software block</td><td>Scale small blocks, such as 1x128 or 128x128</td><td>Outlier handling without native microscaling</td><td>More complex kernels and transpose paths</td></tr>
+    <tr><td>MXFP8</td><td>One E8M0 scale per 32 consecutive values</td><td>Native Blackwell Tensor Core microscaling</td><td>Scale direction and transpose copies need care</td></tr>
+  </tbody>
+</table>
+
+<p>Per-tensor scaling explains why early FP8 recipes often used HYBRID. With only one scale per tensor, gradients still put heavy pressure on dynamic range, so E5M2 is useful. MXFP8 reduces the dynamic range inside each block, allowing many tensors to use E4M3 and spend more bits on mantissa.</p>
+
+<p>The common trap with MXFP8 is direction. For matrix multiplication, the block scale should follow the reduction dimension of that matmul, not a fixed physical row or column. In <code>Y = X[M,K] @ W[K,N]</code>, both operands are scaled along <code>K</code> in the mathematical sense, because every output element is a dot product over <code>K</code>. If <code>W</code> is physically stored as row-major <code>[K,N]</code>, that <code>K</code> direction is columnwise. If a Linear layer stores weight as <code>[N,K]</code> and computes with <code>W.T</code>, the same <code>K</code> direction is rowwise. TE's rowwise/columnwise names are storage-facing terms, not mathematical axis names.</p>
+
+<pre class="code"># Mathematical semantics
+Y[m, n] = sum_k X[m, k] * W[k, n]
+
+# Block scale follows the reduction chunk
+X[m, k:k+32]      # along K
+W[k:k+32, n]      # also along K</pre>
+
+<h2 id="en-update">5. Amax update policy</h2>
+
+<p>The scale usually comes from amax, the maximum absolute value of a tensor. A recipe must decide when that amax is known and how it updates the next scale.</p>
+
+<table class="recipe-table">
+  <thead><tr><th>Policy</th><th>Mechanism</th><th>Benefit</th><th>Risk</th></tr></thead>
+  <tbody>
+    <tr><td>current scaling</td><td>Use the current tensor amax for the current scale</td><td>Scale follows the current distribution</td><td>Amax reductions and casts may enter the critical path</td></tr>
+    <tr><td>just-in-time output scaling</td><td>Produce high precision output, compute amax, then quantize</td><td>Numerically direct</td><td>Extra passes are expensive; NVIDIA docs describe it as impractical for training</td></tr>
+    <tr><td>delayed scaling</td><td>Keep amax history and use previous statistics for this step</td><td>Clean performance path, common in Transformer Engine</td><td>Scale can lag sudden distribution changes</td></tr>
+    <tr><td>static scaling</td><td>Use calibration or offline rules</td><td>Simple inference path</td><td>Pre-training distributions drift, so it is not a default training strategy</td></tr>
+  </tbody>
+</table>
+
+<p>DelayedScaling state usually contains amax history, history length, max versus most recent selection, margin, format, and distributed reduction rules. Implementation-wise, it is operator state. Every tensor that participates in FP8 needs a way to find its scale and amax record.</p>
+
+<h2 id="en-training">6. Recipes in training systems</h2>
+
+<p>Combining the axes above gives a few common recipe families.</p>
+
+<table class="recipe-table">
+  <thead><tr><th>Recipe</th><th>Composition</th><th>Motivation</th><th>Debug focus</th></tr></thead>
+  <tbody>
+    <tr><td>FP8 delayed HYBRID</td><td>per-tensor FP32 scale, E4M3 forward, E5M2 backward, historical amax</td><td>Conservative Hopper-era default</td><td>History length, gradient outliers</td></tr>
+    <tr><td>FP8 current scaling</td><td>current amax, often per-tensor or per-axis scale</td><td>Scale follows faster and is easy to experiment with</td><td>Amax reduction overhead</td></tr>
+    <tr><td>FP8 block scaling</td><td>small-block scales, usually E4M3 or HYBRID</td><td>Reduce outlier impact on the whole tensor</td><td>Transpose, scale layout, kernel support</td></tr>
+    <tr><td>MXFP8</td><td>one E8M0 scale per 32 values, native Blackwell path</td><td>Finer scaling and less dependence on E5M2</td><td>Scale rounding, transpose copies, rowwise/columnwise direction</td></tr>
+    <tr><td>calibrated FP8 inference</td><td>offline scales, often for W8A8 or KV cache quantization</td><td>Simple deployment, clear throughput and memory wins</td><td>Calibration coverage</td></tr>
+  </tbody>
+</table>
+
+<p>A training recipe also states which tensors do not enter FP8. Many systems only run GEMM operands in FP8. Accumulation, bias, residual add, LayerNorm, RMSNorm, softmax, loss, and optimizer state stay in higher precision. The reason is practical: these positions accumulate error more visibly, and many of them are not the dominant step-time cost.</p>
+
+<p>Distributed training adds amax synchronization. If ranks inside a TP or FSDP group keep different scales, the math may still run, but checkpointing, recompute, communication fusion, and debugging get harder. Transformer Engine exposes options such as <code>reduce_amax</code> because this is a tradeoff between performance, determinism, and local statistics.</p>
+
+<h2 id="en-te-mha">7. Transformer Engine MHA example</h2>
+
+<p>In Transformer Engine, an attention FP8 recipe cannot be judged from the <code>fp8_dpa</code> and <code>fp8_mha</code> fields alone. The backend selector still decides whether the requested combination is available. In TE v2.16, MXFP8 attention treats DPA as its own consumer and quantizes Q/K/V again with attention-specific directions.</p>
+
+<p>Attention has two matmuls:</p>
+
+<pre class="code">S = Q[B,H,Sq,D] @ K[B,H,Sk,D]^T
+O = P[B,H,Sq,Sk] @ V[B,H,Sk,Dv]</pre>
+
+<p>For <code>QK^T</code>, the reduction dimension is <code>D</code>, so Q and K use MXFP8 blocks along <code>D</code>. For <code>P@V</code>, the reduction dimension is <code>Sk</code>, so P and V use blocks along <code>Sk</code>. If V is stored as <code>[B,H,Sk,Dv]</code>, <code>Sk</code> is not the last dimension, which maps to columnwise in TE terminology.</p>
+
+<table class="recipe-table">
+  <thead><tr><th>attention matmul</th><th>operand</th><th>reduction dim</th><th>TE v2.16 MXFP8 forward usage</th></tr></thead>
+  <tbody>
+    <tr><td><code>Q @ K^T</code></td><td>Q</td><td><code>D</code></td><td>rowwise</td></tr>
+    <tr><td><code>Q @ K^T</code></td><td>K</td><td><code>D</code></td><td>rowwise</td></tr>
+    <tr><td><code>P @ V</code></td><td>V</td><td><code>Sk</code></td><td>columnwise</td></tr>
+  </tbody>
+</table>
+
+<pre class="code"># Conceptualized from TE v2.16 combine_and_quantize()
+Q: rowwise=True,  columnwise=False   # along D
+K: rowwise=True,  columnwise=False   # along D
+V: rowwise=False, columnwise=True    # along Sk</pre>
+
+<p>This is separate from the output scale direction of the QKV projection. The projection is a normal GEMM: X and W follow the reduction dimension of that Linear GEMM. DPA has its own two matmuls: Q/K serve <code>QK^T</code>, while V serves <code>P@V</code>. In TE v2.16, the practical MXFP8 attention path looks like this:</p>
+
+<pre class="code">QKV projection:
+  MXFP8 GEMM uses projection-specific scale directions
+  output returns to BF16/FP16 Q, K, V
+
+DPA:
+  re-quantize Q/K/V along attention reduction dimensions
+  Q/K along D, V along Sk
+  FusedAttention runs FP8 DPA</pre>
+
+<p>This also explains the current <code>fp8_mha</code> limitation for MXFP8. TE v2.16 disables FusedAttention when the recipe is MXFP8 and <code>fp8_mha=True</code>. The recipe below can be constructed, but that does not mean v2.16 has an end-to-end MXFP8 MHA backend:</p>
+
+<pre class="code">MXFP8BlockScaling(
+    fp8_dpa=True,
+    fp8_mha=True,
+)</pre>
+
+<p>The more realistic configuration keeps the DPA boundary:</p>
+
+<pre class="code">MXFP8BlockScaling(
+    fp8_dpa=True,
+    fp8_mha=False,
+)</pre>
+
+<p>Even then, the selector still requires conditions such as sm100+, a recent enough cuDNN, and <code>qkv_format != "thd"</code>. If those checks fail, TE disables FusedAttention and may end up with no usable FP8 attention backend.</p>
+
+<h2 id="en-pytorch">8. PyTorch view</h2>
+
+<p>PyTorch float8 dtypes are unscaled. <code>torch.float8_e4m3fn</code> and <code>torch.float8_e5m2</code> describe the raw data format; they do not automatically carry a scale. The modeling layer, a tensor subclass, or a specialized kernel API must manage the scale. The PyTorch dev-discuss post uses <code>torch.scaled_mm</code> as the example: matrices are FP8, scales are separate arguments.</p>
+
+<p>This is why FP8 training rarely looks like an ordinary autocast dtype. Autocast handles dtype promotion or casts, but FP8 training also needs per-tensor state, amax history, distributed reduction, module rewrites, saved tensor policy for backward, and compiler fusion for the extra operations.</p>
+
+<p>When debugging FP8 training, I start with four signals:</p>
+
+<ul>
+  <li>whether amax curves jump suddenly for specific tensor classes;</li>
+  <li>whether scales are held too large by recurring outliers;</li>
+  <li>whether E4M3 paths show saturation, especially for gradients;</li>
+  <li>whether amax reductions and casts erase the FP8 GEMM speedup.</li>
+</ul>
+
+<p>These signals are more useful than asking whether FP8 is simply "on". FP8 precision and speed both live inside the recipe.</p>
+
+<h2 id="en-refs">References</h2>
+
+<ul>
+  <li>Micikevicius et al., <a href="https://arxiv.org/abs/2209.05433" target="_blank" rel="noopener">FP8 Formats for Deep Learning</a>. Original FP8 E4M3/E5M2 paper.</li>
+  <li>NVIDIA Transformer Engine, <a href="https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html" target="_blank" rel="noopener">Using FP8 and FP4 with Transformer Engine</a>. Official notes on FP8 scaling, delayed scaling, MXFP8, and block scaling.</li>
+  <li>NVIDIA Transformer Engine, <a href="https://nvidia.github.io/TransformerEngine/api/common.html" target="_blank" rel="noopener">Common API</a>. Recipe API for <code>Format.HYBRID</code>, <code>DelayedScaling</code>, <code>MXFP8BlockScaling</code>, and related settings.</li>
+  <li>NVIDIA Transformer Engine v2.16, <a href="https://github.com/NVIDIA/TransformerEngine/blob/v2.16/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L2385-L2423" target="_blank" rel="noopener">FP8 DPA quantizer setup</a> and <a href="https://github.com/NVIDIA/TransformerEngine/blob/v2.16/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L2675-L2776" target="_blank" rel="noopener">MXFP8 Q/K/V quantize path</a>. Source basis for the TE MHA example.</li>
+  <li>NVIDIA Transformer Engine v2.16, <a href="https://github.com/NVIDIA/TransformerEngine/blob/v2.16/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L593-L609" target="_blank" rel="noopener">attention backend selector</a>. FusedAttention is disabled for MXFP8 + <code>fp8_mha=True</code> in v2.16.</li>
+  <li>PyTorch dev-discuss, <a href="https://dev-discuss.pytorch.org/t/float8-in-pytorch-1-x/1815" target="_blank" rel="noopener">Float8 in PyTorch</a>. Design note for unscaled PyTorch float8 dtypes.</li>
+  <li>Chung et al., <a href="https://arxiv.org/html/2506.08027v2" target="_blank" rel="noopener">Recipes for Pre-training LLMs with MXFP8</a>. MXFP8 pre-training recipe, rounding, and block-scale discussion.</li>
+</ul>
+
+</div>
+
+</main>
+</div>
+
+<div id="tooltip" class="tooltip"></div>
+
+<script>
+const FP8_RECIPE_TREE = {
+  name: "FP8 training recipe",
+  desc: {
+    zh: "format、scale、amax、tensor scope 和分布式同步共同构成训练 recipe",
+    en: "Format, scale, amax, tensor scope, and distributed sync together define the recipe"
+  },
+  children: [
+    {
+      name: "format policy",
+      desc: {
+        zh: "决定每类 FP8 tensor 使用 E4M3、E5M2 还是 HYBRID",
+        en: "Chooses E4M3, E5M2, or HYBRID for each FP8 tensor class"
+      },
+      children: [
+        { name: "E4M3", desc: { zh: "更多 mantissa,常用于 weights 和 activations", en: "More mantissa bits, commonly used for weights and activations" } },
+        { name: "E5M2", desc: { zh: "更多 exponent,常用于 gradients", en: "More exponent bits, commonly used for gradients" } },
+        { name: "HYBRID", desc: { zh: "forward E4M3,backward E5M2", en: "E4M3 forward, E5M2 backward" } },
+        { name: "MXFP8 E4M3", desc: { zh: "block scale 降低动态范围压力,更多 tensor 可以用 E4M3", en: "Block scaling reduces dynamic range pressure, allowing more tensors to use E4M3" } }
+      ]
+    },
+    {
+      name: "scale granularity",
+      desc: {
+        zh: "决定一个 scale 覆盖多少元素",
+        en: "Decides how many values share one scale"
+      },
+      children: [
+        { name: "per tensor FP32", desc: { zh: "整个 tensor 一个 scale,实现简单", en: "One scale for the whole tensor, simple implementation" } },
+        { name: "per axis", desc: { zh: "按 row 或 column 放 scale,更贴近矩阵分布", en: "Rowwise or columnwise scale, closer to matrix distributions" } },
+        { name: "software block", desc: { zh: "小块 scale,常见于 outlier 压制", en: "Small-block scale, useful for outlier pressure" } },
+        { name: "MXFP8 reduction block K=32", desc: { zh: "沿每次 matmul 的 reduction 维度,每 32 个值一个 E8M0 scale", en: "One E8M0 scale per 32 values along the matmul reduction dimension" } }
+      ]
+    },
+    {
+      name: "amax update",
+      desc: {
+        zh: "决定 scale 使用当前统计、历史统计还是离线统计",
+        en: "Chooses current, historical, or offline statistics for scale updates"
+      },
+      children: [
+        { name: "current scaling", desc: { zh: "当前 tensor 的 amax 直接决定当前 scale", en: "The current tensor amax determines the current scale" } },
+        { name: "delayed scaling", desc: { zh: "用历史 amax 计算本次 scale,同时记录新 amax", en: "Use historical amax for this scale while recording the new amax" } },
+        { name: "history max / most recent", desc: { zh: "history 里取最大值或最近值,对应不同稳定性", en: "Take max or most recent from history for different stability behavior" } },
+        { name: "static calibration", desc: { zh: "常见于推理,不适合作为预训练默认项", en: "Common in inference, not a default pre-training policy" } }
+      ]
+    },
+    {
+      name: "tensor scope",
+      desc: {
+        zh: "决定哪些 tensor 进入 FP8,哪些位置留在高精度",
+        en: "Chooses which tensors enter FP8 and which stay high precision"
+      },
+      children: [
+        { name: "GEMM operands", desc: { zh: "最常见收益点:linear 和 MLP 的矩阵乘输入", en: "The common win: matrix multiply operands in linear and MLP layers" } },
+        { name: "FP8 attention", desc: { zh: "部分 fused attention 后端支持 FP8 DPA 或 MHA", en: "Some fused attention backends support FP8 DPA or MHA" } },
+        { name: "high precision islands", desc: { zh: "softmax、norm、loss、optimizer 通常留在高精度", en: "Softmax, norm, loss, and optimizer state usually stay high precision" } },
+        { name: "backward saved tensors", desc: { zh: "保存 FP8、保存高精度或 backward 前 dequantize 都是 recipe 决策", en: "Saving FP8, saving high precision, or dequantizing before backward are recipe choices" } }
+      ]
+    },
+    {
+      name: "distributed policy",
+      desc: {
+        zh: "决定 amax 和 scale 是否跨 rank 对齐",
+        en: "Decides whether amax and scales are aligned across ranks"
+      },
+      children: [
+        { name: "reduce amax", desc: { zh: "跨 TP/FSDP group 同步 amax,更利于确定性和 checkpoint", en: "Synchronize amax across TP/FSDP groups for determinism and checkpointing" } },
+        { name: "local amax", desc: { zh: "每个 rank 保留本地统计,减少通信但状态更多", en: "Keep local statistics per rank, reducing communication but increasing state variance" } },
+        { name: "FP8 collectives", desc: { zh: "通信也可能用 FP8,但要配合 scale 和分布式 layout", en: "Collectives may also use FP8, but scales and distributed layout must agree" } }
+      ]
+    },
+    {
+      name: "conversion details",
+      desc: {
+        zh: "rounding、margin、scale 表示和转置副本会影响稳定性",
+        en: "Rounding, margin, scale representation, and transpose copies affect stability"
+      },
+      children: [
+        { name: "margin", desc: { zh: "保留一点范围余量,减少下一步突增带来的 saturation", en: "Keeps range headroom to reduce saturation after sudden jumps" } },
+        { name: "rounding mode", desc: { zh: "MXFP8 预训练论文显示 conversion rounding 会影响收敛", en: "MXFP8 pre-training work shows conversion rounding can affect convergence" } },
+        { name: "power-of-2 scale", desc: { zh: "E8M0 scale 只能表示 2 的幂,硬件便宜但更离散", en: "E8M0 scale represents powers of two, cheap in hardware but more discrete" } },
+        { name: "transpose copies", desc: { zh: "block scale 有方向性,转置通常需要从高精度源重新量化", en: "Block scaling has direction, so transpose forms are often requantized from the high precision source" } }
+      ]
+    }
+  ]
+};
+
+function ensureD3() {
+  return new Promise((resolve) => {
+    if (window.d3) return resolve();
+    const i = setInterval(() => {
+      if (window.d3) {
+        clearInterval(i);
+        resolve();
+      }
+    }, 30);
+  });
+}
+
+const tooltipEl = document.getElementById('tooltip');
+function tipHTML(d) {
+  const lang = (document.documentElement.lang || 'zh-CN').toLowerCase().startsWith('en') ? 'en' : 'zh';
+  if (!d.data.desc) return '';
+  return d.data.desc[lang] || d.data.desc.zh || d.data.desc.en || '';
+}
+function showTip(event, d) {
+  const html = tipHTML(d);
+  if (!html) return;
+  tooltipEl.textContent = html;
+  tooltipEl.classList.add('show');
+  moveTip(event);
+}
+function moveTip(event) {
+  const pad = 14;
+  let x = event.clientX + pad;
+  let y = event.clientY + pad;
+  const tw = tooltipEl.offsetWidth, th = tooltipEl.offsetHeight;
+  if (x + tw > window.innerWidth - 8) x = event.clientX - tw - pad;
+  if (y + th > window.innerHeight - 8) y = event.clientY - th - pad;
+  tooltipEl.style.left = x + 'px';
+  tooltipEl.style.top = y + 'px';
+}
+function hideTip() {
+  tooltipEl.classList.remove('show');
+}
+
+const TREES = {};
+
+function buildTree(containerId, data) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.innerHTML = '';
+
+  const root = d3.hierarchy(data);
+  root.x0 = 0;
+  root.y0 = 0;
+  let nextId = 0;
+  root.eachBefore(d => {
+    d.id = ++nextId;
+    d._children = d.children;
+  });
+
+  root.eachBefore(d => {
+    if (d.depth >= 1 && d.children) d.children = null;
+  });
+  root.children = root._children;
+
+  const dx = 23;
+  const width = Math.min(container.clientWidth || 1000, 1700);
+  const dy = Math.max(180, Math.min(250, (width - 120) / Math.max(1, root.height + 1)));
+  const tree = d3.tree().nodeSize([dx, dy]);
+  const diagonal = d3.linkHorizontal().x(d => d.y).y(d => d.x);
+
+  const LEFT_PAD = 230;
+  const svg = d3.select(container).append('svg')
+    .attr('class', 'tree-svg')
+    .attr('viewBox', [-LEFT_PAD, -dx, width + LEFT_PAD, dx]);
+
+  const gLink = svg.append('g').attr('class', 'links');
+  const gNode = svg.append('g').attr('class', 'nodes');
+
+  function update(source) {
+    const dur = 240;
+    tree(root);
+
+    let left = root;
+    let right = root;
+    root.eachBefore(d => {
+      if (d.x < left.x) left = d;
+      if (d.x > right.x) right = d;
+    });
+    const height = right.x - left.x + dx * 2;
+
+    svg.transition().duration(dur)
+      .attr('viewBox', [-LEFT_PAD, left.x - dx, width + LEFT_PAD, height])
+      .attr('height', height);
+
+    const node = gNode.selectAll('g.node').data(root.descendants(), d => d.id);
+
+    const nodeEnter = node.enter().append('g')
+      .attr('class', d => 'node ' + (d.depth === 0 ? 'node--root' : (d._children ? 'node--branch' : 'node--leaf')) + (d._children && !d.children ? ' collapsed' : ''))
+      .attr('transform', _ => `translate(${source.y0},${source.x0})`)
+      .attr('fill-opacity', 0)
+      .attr('stroke-opacity', 0)
+      .on('click', (event, d) => {
+        if (!d._children) return;
+        d.children = d.children ? null : d._children;
+        update(d);
+      })
+      .on('mouseenter', (event, d) => showTip(event, d))
+      .on('mousemove', moveTip)
+      .on('mouseleave', hideTip);
+
+    nodeEnter.append('circle').attr('r', 4);
+
+    nodeEnter.append('text')
+      .attr('dy', '0.32em')
+      .attr('x', d => d.children ? -10 : 10)
+      .attr('text-anchor', d => d.children ? 'end' : 'start')
+      .style('font-size', d => d.depth === 0 ? '13px' : (d.depth === 1 ? '12.5px' : '12px'))
+      .text(d => d.data.name);
+
+    const merged = node.merge(nodeEnter);
+    merged
+      .attr('class', d => 'node ' + (d.depth === 0 ? 'node--root' : (d._children ? 'node--branch' : 'node--leaf')) + (d._children && !d.children ? ' collapsed' : ''))
+      .transition().duration(dur)
+      .attr('transform', d => `translate(${d.y},${d.x})`)
+      .attr('fill-opacity', 1)
+      .attr('stroke-opacity', 1);
+    merged.select('text')
+      .attr('x', d => d.children ? -10 : 10)
+      .attr('text-anchor', d => d.children ? 'end' : 'start');
+
+    node.exit().transition().duration(dur).remove()
+      .attr('transform', _ => `translate(${source.y},${source.x})`)
+      .attr('fill-opacity', 0)
+      .attr('stroke-opacity', 0);
+
+    const link = gLink.selectAll('path.link').data(root.links(), d => d.target.id);
+
+    const linkEnter = link.enter().append('path')
+      .attr('class', 'link')
+      .attr('d', _ => {
+        const o = { x: source.x0, y: source.y0 };
+        return diagonal({ source: o, target: o });
+      });
+
+    link.merge(linkEnter).transition().duration(dur).attr('d', diagonal);
+
+    link.exit().transition().duration(dur).remove()
+      .attr('d', _ => {
+        const o = { x: source.x, y: source.y };
+        return diagonal({ source: o, target: o });
+      });
+
+    root.eachBefore(d => {
+      d.x0 = d.x;
+      d.y0 = d.y;
+    });
+  }
+
+  TREES[containerId] = { root, update, container };
+  update(root);
+}
+
+window.expandAll = function(id) {
+  const T = TREES[id];
+  if (!T) return;
+  T.root.eachBefore(d => {
+    if (d._children) d.children = d._children;
+  });
+  T.update(T.root);
+};
+
+window.collapseAll = function(id) {
+  const T = TREES[id];
+  if (!T) return;
+  T.root.eachBefore(d => {
+    if (d.depth >= 1 && d._children) d.children = null;
+  });
+  T.root.children = T.root._children;
+  T.update(T.root);
+};
+
+async function renderAll() {
+  await ensureD3();
+  buildTree('tree-recipes', FP8_RECIPE_TREE);
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', renderAll);
+} else {
+  renderAll();
+}
+</script>
+</body>
+</html>
