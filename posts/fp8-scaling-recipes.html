@@ -200,9 +200,34 @@ x_hat = q / scale</pre>
 q = cast_fp8(x / s)
 x_hat = q * s</pre>
 
-<p>两种写法只差一个倒数。看代码和论文时,先确认 scale 的方向,否则公式会看起来互相矛盾。</p>
+<p>两种写法只差一个倒数。看代码和论文时,先确认 scale 的方向,否则公式会看起来互相矛盾。更严格地说,<code>q</code> 不是原始数值域里的数,而是一个 FP8 code。真实参与后续计算的近似值由 <code>(q, scale)</code> 或 <code>(q, scale_inv)</code> 共同决定。</p>
 
-<p>scale 同时解决两个问题。第一,把 tensor 的最大值压到 FP8 可表示范围内,减少 overflow 或 saturation。第二,让 tensor 中的大多数值落在更有分辨率的区域,少把 mantissa 浪费在空区间上。BF16 的 exponent 足够宽,通常不需要为每个 tensor 单独维护 scale。FP8 的 bit 数不够,这件事必须显式做。</p>
+<pre class="code"># TE 习惯:保存 scale 和 scale_inv = 1 / scale
+q_i = cast_fp8(x_i * scale_i)
+r_i = decode_fp8(q_i)
+x_hat_i = descale(r_i, scale_i) = r_i / scale_i
+
+# 若代码里保存的是 scale_inv
+x_hat_i = r_i * scale_inv_i</pre>
+
+<p>所以相同的 FP8 bit pattern 不一定表示相同的原始域数值。它先 decode 成 FP8 网格里的 <code>r_i</code>,再通过 scale 或 scale inverse 回到 tensor 自己的数值域。只有 raw FP8 data 而没有 scale metadata,通常还原不出训练系统想表达的数。</p>
+
+<p>MXFP8 只是把这个公式从 tensor 级 scale 换成 block 级 scale。若每 32 个值一个 block,元素 <code>i</code> 属于 <code>b(i)=floor(i/32)</code>,则:</p>
+
+<pre class="code">q_i = cast_fp8(x_i * scale_b(i))
+r_i = decode_fp8(q_i)
+x_hat_i = r_i * scale_inv_b(i)</pre>
+
+<p>在 GEMM 里,这个 block 通常沿那次 matmul 的 reduction 维度放。这样每个 dot product 的 32-element chunk 都能用自己的 scale,而不是被整行、整列或整个 tensor 的 outlier 牵着走。</p>
+
+<p>scale 主要处理两件事:</p>
+
+<ul>
+  <li>把 tensor 的最大值压到 FP8 可表示范围内,减少 overflow 或 saturation。</li>
+  <li>让 tensor 中的大多数值落在更有分辨率的区域,少把 mantissa 浪费在空区间上。</li>
+</ul>
+
+<p>BF16 的 exponent 足够宽,通常不需要为每个 tensor 单独维护 scale。FP8 的 bit 数不够,这件事必须显式做。</p>
 
 <h2 id="zh-map">3. recipe 分类图</h2>
 
@@ -263,9 +288,34 @@ x_hat = q / scale</pre>
 q = cast_fp8(x / s)
 x_hat = q * s</pre>
 
-<p>The two forms differ by a reciprocal. When reading code or papers, check the scale direction first.</p>
+<p>The two forms differ by a reciprocal. When reading code or papers, check the scale direction first. More precisely, <code>q</code> is not a number in the original tensor domain. It is an FP8 code. The approximate value used by later computation is determined by <code>(q, scale)</code> or <code>(q, scale_inv)</code> together.</p>
 
-<p>Scaling does two jobs. It keeps the largest values inside the representable range, reducing overflow or saturation. It also places the common values into regions with useful resolution, rather than wasting mantissa codes on empty space. BF16 has enough exponent range that per-tensor scaling is usually unnecessary. FP8 does not.</p>
+<pre class="code"># TE convention: keep scale and scale_inv = 1 / scale
+q_i = cast_fp8(x_i * scale_i)
+r_i = decode_fp8(q_i)
+x_hat_i = descale(r_i, scale_i) = r_i / scale_i
+
+# If the code stores scale_inv
+x_hat_i = r_i * scale_inv_i</pre>
+
+<p>The same FP8 bit pattern does not necessarily represent the same value in the original domain. It first decodes to <code>r_i</code> on the FP8 grid, then scale or scale inverse maps it back into that tensor's value domain. Raw FP8 data without scale metadata usually cannot reconstruct the value the training system meant.</p>
+
+<p>MXFP8 applies the same rule at block granularity. If one block covers 32 values and element <code>i</code> belongs to <code>b(i)=floor(i/32)</code>, then:</p>
+
+<pre class="code">q_i = cast_fp8(x_i * scale_b(i))
+r_i = decode_fp8(q_i)
+x_hat_i = r_i * scale_inv_b(i)</pre>
+
+<p>In GEMM, the block usually follows the reduction dimension of that matmul. Each 32-element dot-product chunk can then use its own scale instead of being dominated by an outlier from a full row, full column, or full tensor.</p>
+
+<p>Scaling mainly does two things:</p>
+
+<ul>
+  <li>It keeps the largest values inside the representable range, reducing overflow or saturation.</li>
+  <li>It places common values into regions with useful resolution, instead of wasting mantissa codes on empty space.</li>
+</ul>
+
+<p>BF16 has enough exponent range that per-tensor scaling is usually unnecessary. FP8 does not.</p>
 
 <h2 id="en-map">3. Recipe map</h2>
 
@@ -300,11 +350,13 @@ x_hat = q * s</pre>
     <tr><td>per tensor</td><td>整个 tensor 共用一个 FP32 scale</td><td>Hopper 上常见 FP8 训练路径</td><td>一个 outlier 会拉大整个 tensor 的范围</td></tr>
     <tr><td>per axis</td><td>按 row 或 column 维护 scale</td><td>权重或 activation 分布沿某一维差异明显</td><td>scale load 和 layout 约束增加</td></tr>
     <tr><td>software block</td><td>按小块维护 scale,例如 1x128 或 128x128</td><td>需要处理 outlier,硬件未提供原生 microscaling</td><td>kernel 和转置路径更复杂</td></tr>
-    <tr><td>MXFP8</td><td>每 32 个连续值一个 E8M0 scale</td><td>Blackwell Tensor Core 原生支持的 microscaling</td><td>scale 方向和转置副本需要特别处理</td></tr>
+    <tr><td>MXFP8</td><td>沿 scaling 方向每 32 个逻辑连续值一个 E8M0 scale</td><td>Blackwell Tensor Core 原生支持的 microscaling</td><td>scale 方向和转置副本需要特别处理</td></tr>
   </tbody>
 </table>
 
 <p>per-tensor scaling 解释了为什么早期 FP8 recipe 常用 HYBRID。每个 tensor 只有一个 scale 时,梯度的动态范围压力仍然很大,E5M2 的宽 exponent 有用。MXFP8 把 block 内的动态范围压小,因此很多 tensor 可以统一用 E4M3,把更多 bit 留给 mantissa。</p>
+
+<p>这里的 "连续" 指沿 scaling 方向的逻辑连续值,不等于原始 tensor 内存地址一定连续。比如 <code>X[M,K]</code> row-major 里沿 <code>K</code> 的 32 个值通常是 memory contiguous;但 <code>W[K,N]</code> row-major 里沿 <code>K</code> 的 32 个值是 stride-N 访问。二者在数学上都沿 reduction 维度 <code>K</code> 分 block,只是存储连续性不同。实际 kernel 可能会生成 columnwise copy、scale layout、padding 或 swizzle,避免直接按原始内存地址每 32 个元素切 block。</p>
 
 <p>MXFP8 的 block scale 最容易误解的地方是方向。对矩阵乘来说,block scale 不是随便沿物理 row 或 column 放,而是要服务那一次 matmul 的 reduction 维度。以 <code>Y = X[M,K] @ W[K,N]</code> 为例,两个 operand 的 scale 在数学语义上都沿 <code>K</code> 放,因为每个输出元素都在 <code>K</code> 上做 dot product。若 <code>W</code> 真的按 <code>[K,N]</code> row-major 存,那沿 <code>K</code> 是 columnwise;若 Linear 权重按常见的 <code>[N,K]</code> 存,并在计算里用 <code>W.T</code>,那沿 <code>K</code> 又变成 rowwise。TE 代码里的 rowwise/columnwise 是存储视角,不是数学轴名。</p>
 
@@ -445,11 +497,13 @@ DPA:
     <tr><td>per tensor</td><td>One FP32 scale for the whole tensor</td><td>Common Hopper FP8 training path</td><td>One outlier stretches the whole tensor range</td></tr>
     <tr><td>per axis</td><td>Scale per row or column</td><td>Weights or activations with axis-specific distributions</td><td>More scale loads and layout constraints</td></tr>
     <tr><td>software block</td><td>Scale small blocks, such as 1x128 or 128x128</td><td>Outlier handling without native microscaling</td><td>More complex kernels and transpose paths</td></tr>
-    <tr><td>MXFP8</td><td>One E8M0 scale per 32 consecutive values</td><td>Native Blackwell Tensor Core microscaling</td><td>Scale direction and transpose copies need care</td></tr>
+    <tr><td>MXFP8</td><td>One E8M0 scale per 32 logically consecutive values along the scaling direction</td><td>Native Blackwell Tensor Core microscaling</td><td>Scale direction and transpose copies need care</td></tr>
   </tbody>
 </table>
 
 <p>Per-tensor scaling explains why early FP8 recipes often used HYBRID. With only one scale per tensor, gradients still put heavy pressure on dynamic range, so E5M2 is useful. MXFP8 reduces the dynamic range inside each block, allowing many tensors to use E4M3 and spend more bits on mantissa.</p>
+
+<p>"Consecutive" here means logically consecutive along the scaling direction. It does not necessarily mean contiguous addresses in the original tensor. In row-major <code>X[M,K]</code>, 32 values along <code>K</code> are usually memory contiguous. In row-major <code>W[K,N]</code>, 32 values along <code>K</code> are strided by <code>N</code>. Both are block-scaled along the mathematical reduction dimension <code>K</code>, but their storage contiguity differs. Real kernels may materialize a columnwise copy, scale layout, padding, or swizzle instead of cutting the original memory buffer into 32-element chunks.</p>
 
 <p>The common trap with MXFP8 is direction. For matrix multiplication, the block scale should follow the reduction dimension of that matmul, not a fixed physical row or column. In <code>Y = X[M,K] @ W[K,N]</code>, both operands are scaled along <code>K</code> in the mathematical sense, because every output element is a dot product over <code>K</code>. If <code>W</code> is physically stored as row-major <code>[K,N]</code>, that <code>K</code> direction is columnwise. If a Linear layer stores weight as <code>[N,K]</code> and computes with <code>W.T</code>, the same <code>K</code> direction is rowwise. TE's rowwise/columnwise names are storage-facing terms, not mathematical axis names.</p>
 
