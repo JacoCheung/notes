@@ -155,13 +155,13 @@
 
 <h1>FP8 scaling 与训练 recipe</h1>
 
-<p class="small">FP8 训练不是把模型参数改成 <code>torch.float8</code> 后开跑。它更像一组系统约定:哪些 GEMM operand 用 FP8,scale 怎么算,amax 是否跨 rank 同步,哪些层和状态保留在 BF16/FP32。recipe 讨论的就是这些约定。</p>
+<p class="small">FP8 训练不是把模型参数改成 <code>torch.float8</code> 后开跑。它是一组系统约定:哪些 GEMM operand 用 FP8,scale 怎么算,amax 是否跨 rank 同步,哪些层和状态保留在 BF16/FP32。recipe 讨论的就是这些约定。</p>
 
 <h2 id="zh-scope">0. 范围</h2>
 
-<p>这篇只讨论 LLM 训练里的 FP8 mixed precision,重点是 Transformer block 中的线性层、MLP 和部分 attention 计算。optimizer state、master weights、loss、softmax、normalization、reduction 这类位置通常继续用更高精度。换句话说,FP8 是训练系统里的局部加速路径,不是整张计算图的默认数值类型。</p>
+<p>这篇只讨论 LLM 训练里的 FP8 mixed precision,重点是 Transformer block 中的线性层、MLP 和部分 attention 计算。optimizer state、master weights、loss、softmax、normalization、reduction 这类位置通常继续用更高精度。这里把 FP8 当作训练系统里的局部加速路径,不是整张计算图的默认数值类型。</p>
 
-<p>先分清两个层面:</p>
+<p>先把两个层面拆开:</p>
 
 <table class="recipe-table">
   <thead><tr><th>层面</th><th>问题</th><th>例子</th></tr></thead>
@@ -186,11 +186,11 @@
   </tbody>
 </table>
 
-<p>这个设计背后的直觉很直接。forward 里的权重和激活通常更需要 mantissa 精度,梯度更容易出现大范围波动,所以 backward 往往更需要 exponent 范围。并不是所有模型都必须这样配,但这是许多 FP8 训练栈的默认起点。</p>
+<p>这样分配 bit 的理由很朴素。forward 里的权重和激活通常更需要 mantissa 精度,梯度更容易出现大范围波动,backward 往往更需要 exponent 范围。不是所有模型都必须这样配,但这是许多 FP8 训练栈的默认起点。</p>
 
 <h2 id="zh-scaling">2. scale 的位置</h2>
 
-<p>FP8 有 exponent,但它仍然需要外部 scaling。原因不是 "FP8 不会表示大数" 这么简单,而是同一个 LLM 里不同 tensor 的分布差异太大。一个 tensor 的 amax 可能在 0.02,另一个可能在 2000。用同一套 FP8 网格直接表示,小值会浪费码点,大值会溢出或饱和。</p>
+<p>FP8 有 exponent,但它仍然需要外部 scaling。真正麻烦的不是单个大数,而是同一个 LLM 里不同 tensor 的分布差异太大。一个 tensor 的 amax 可能在 0.02,另一个可能在 2000。用同一套 FP8 网格直接表示,小值会浪费码点,大值会溢出或饱和。</p>
 
 <p>实际系统一般把高精度 tensor <code>x</code> 映射成 FP8 raw data <code>q</code>,同时保存一个 scale。常见有两种等价写法。Transformer Engine 文档采用乘法 scale 习惯:</p>
 
@@ -214,7 +214,7 @@ x_hat_i = descale(r_i, scale_i) = r_i / scale_i
 # 若代码里保存的是 scale_inv
 x_hat_i = r_i * scale_inv_i</pre>
 
-<p>所以相同的 FP8 bit pattern 不一定表示相同的原始域数值。它先 decode 成 FP8 网格里的 <code>r_i</code>,再通过 scale 或 scale inverse 回到 tensor 自己的数值域。只有 raw FP8 data 而没有 scale metadata,通常还原不出训练系统想表达的数。</p>
+<p>相同的 FP8 bit pattern 不一定表示相同的原始域数值。它先 decode 成 FP8 网格里的 <code>r_i</code>,再通过 scale 或 scale inverse 回到 tensor 自己的数值域。只有 raw FP8 data 而没有 scale metadata,通常还原不出训练系统想表达的数。</p>
 
 <p>MXFP8 只是把这个公式从 tensor 级 scale 换成 block 级 scale。若每 32 个值一个 block,元素 <code>i</code> 属于 <code>b(i)=floor(i/32)</code>,则:</p>
 
@@ -274,7 +274,7 @@ x_hat_i = r_i * scale_inv_b(i)</pre>
   </tbody>
 </table>
 
-<p>The usual reason is simple. Weights and activations in the forward pass tend to benefit from mantissa precision. Gradients often need more exponent range. Not every model must use that split, but it is a common starting point.</p>
+<p>The split is practical. Weights and activations in the forward pass tend to benefit from mantissa precision. Gradients often need more exponent range. Not every model must use that split, but it is a common starting point.</p>
 
 <h2 id="en-scaling">2. Where scale lives</h2>
 
@@ -292,7 +292,7 @@ x_hat = q / scale</pre>
 q = cast_fp8(x / s)
 x_hat = q * s</pre>
 
-<p>The two forms differ by a reciprocal. When reading code or papers, check the scale direction first. More precisely, <code>q</code> is not a number in the original tensor domain. It is an FP8 code. The approximate value used by later computation is determined by <code>(q, scale)</code> or <code>(q, scale_inv)</code> together.</p>
+<p>The two forms differ by a reciprocal. When reading code or papers, check the scale direction first. Here, <code>q</code> is not a number in the original tensor domain. It is an FP8 code. Later computation recovers an approximate value from <code>(q, scale)</code> or <code>(q, scale_inv)</code> together.</p>
 
 <pre class="code"># TE convention: keep scale and scale_inv = 1 / scale
 q_i = cast_fp8(x_i * scale_i)
@@ -360,7 +360,7 @@ x_hat_i = r_i * scale_inv_b(i)</pre>
 
 <p>per-tensor scaling 解释了为什么早期 FP8 recipe 常用 HYBRID。每个 tensor 只有一个 scale 时,梯度的动态范围压力仍然很大,E5M2 的宽 exponent 有用。MXFP8 把 block 内的动态范围压小,因此很多 tensor 可以统一用 E4M3,把更多 bit 留给 mantissa。</p>
 
-<p>这里的 "连续" 指沿 scaling 方向的逻辑连续值,不等于原始 tensor 内存地址一定连续。比如 <code>X[M,K]</code> row-major 里沿 <code>K</code> 的 32 个值通常是 memory contiguous;但 <code>W[K,N]</code> row-major 里沿 <code>K</code> 的 32 个值是 stride-N 访问。二者在数学上都沿 reduction 维度 <code>K</code> 分 block,只是存储连续性不同。实际 kernel 可能会生成 columnwise copy、scale layout、padding 或 swizzle,避免直接按原始内存地址每 32 个元素切 block。</p>
+<p>这里说的 "连续" 是沿 scaling 方向的逻辑连续值,不要求原始 tensor 地址连续。比如 <code>X[M,K]</code> row-major 里沿 <code>K</code> 的 32 个值通常是 memory contiguous;但 <code>W[K,N]</code> row-major 里沿 <code>K</code> 的 32 个值是 stride-N 访问。二者在数学上都沿 reduction 维度 <code>K</code> 分 block,只是存储连续性不同。实际 kernel 可能会生成 columnwise copy、scale layout、padding 或 swizzle,避免直接按原始内存地址每 32 个元素切 block。</p>
 
 <p>MXFP8 的 block scale 最容易误解的地方是方向。对矩阵乘来说,block scale 不是随便沿物理 row 或 column 放,而是要服务那一次 matmul 的 reduction 维度。以 <code>Y = X[M,K] @ W[K,N]</code> 为例,两个 operand 的 scale 在数学语义上都沿 <code>K</code> 放,因为每个输出元素都在 <code>K</code> 上做 dot product。若 <code>W</code> 真的按 <code>[K,N]</code> row-major 存,那沿 <code>K</code> 是 columnwise;若 Linear 权重按常见的 <code>[N,K]</code> 存,并在计算里用 <code>W.T</code>,那沿 <code>K</code> 又变成 rowwise。TE 代码里的 rowwise/columnwise 是存储视角,不是数学轴名。</p>
 
@@ -406,11 +406,11 @@ C_hat[m, n] = decode_fp8(qC[m, n]) * scale_inv_C[block(m, n)]</pre>
 
 <p>表里的 shape 是逻辑形状。TE 源码还会按 kernel 要求把 scale tensor padding 到指定倍数,并要求参与 MXFP8 quantization 的维度满足 block 对齐。</p>
 
-<p>TE <code>Linear</code> 的 forward epilogue 会把 <code>output_quantizer</code> 传给 <code>general_gemm</code>。如果调用方传入 <code>fp8_output=True</code>,<code>Linear</code> 取 <code>GEMM1_OUTPUT</code> quantizer,并把它设成 <code>rowwise=True, columnwise=False</code>。因此普通 <code>C[M,N]</code> 的 MXFP8 Linear output 是沿 <code>N</code> 方向量化:</p>
+<p>TE <code>Linear</code> 的 forward epilogue 会把 <code>output_quantizer</code> 传给 <code>general_gemm</code>。如果调用方传入 <code>fp8_output=True</code>,<code>Linear</code> 取 <code>GEMM1_OUTPUT</code> quantizer,并把它设成 <code>rowwise=True, columnwise=False</code>。普通 <code>C[M,N]</code> 的 MXFP8 Linear output 会沿 <code>N</code> 方向量化:</p>
 
 <pre class="code">C[m, n:n+32] 共享一个 output scale</pre>
 
-<p>这也解释了 QKV projection 不能把 MXFP8 output 直接交给 attention。QKV projection 的 output quantizer 沿 packed feature 维量化,也就是 <code>[M, 3*H*D]</code> 的最后一维。attention 需要的是 Q/K 沿 head dim <code>D</code>,V 沿 sequence 维 <code>Sk</code>。FP8 payload 可以 reshape,但 <code>(payload, scale)</code> 的 block membership 已经不再对应 attention 的 reduction 维度。</p>
+<p>QKV projection 不能把 MXFP8 output 直接交给 attention。QKV projection 的 output quantizer 沿 packed feature 维量化,也就是 <code>[M, 3*H*D]</code> 的最后一维。attention 需要的是 Q/K 沿 head dim <code>D</code>,V 沿 sequence 维 <code>Sk</code>。FP8 payload 可以 reshape,但 <code>(payload, scale)</code> 的 block membership 已经不再对应 attention 的 reduction 维度。</p>
 
 <h2 id="zh-update">6. amax 更新方式</h2>
 
@@ -462,14 +462,14 @@ C_hat[m, n] = decode_fp8(qC[m, n]) * scale_inv_C[block(m, n)]</pre>
   </tbody>
 </table>
 
-<p>所以这个依赖关系是单向的:正常语义上 <code>fp8_mha=True</code> 依赖 <code>fp8_dpa=True</code>,但 <code>fp8_dpa=True</code> 不要求 <code>fp8_mha=True</code>。TE API 文档描述的也是这两条数据流:<code>fp8_dpa=True, fp8_mha=False</code> 时,QKV projection 输出高精度,DPA 边界做 cast;两个都为 true 时,TE 才尝试让 QKV projection 输出 FP8,并把 DPA 的 FP8 输出直接交给 output projection。源码层面,recipe object 上这两个字段只是两个 bool,不要把它理解成 dataclass 构造时一定会拦截的 invariant。真正决定 FP8 attention backend 入口的仍然是 <code>fp8_dpa</code>。</p>
+<p>这个依赖关系是单向的:正常语义上 <code>fp8_mha=True</code> 依赖 <code>fp8_dpa=True</code>,但 <code>fp8_dpa=True</code> 不要求 <code>fp8_mha=True</code>。TE API 文档描述的也是这两条数据流:<code>fp8_dpa=True, fp8_mha=False</code> 时,QKV projection 输出高精度,DPA 边界做 cast;两个都为 true 时,TE 才尝试让 QKV projection 输出 FP8,并把 DPA 的 FP8 输出直接交给 output projection。源码层面,recipe object 上这两个字段只是两个 bool,不要把它理解成 dataclass 构造时一定会拦截的 invariant。真正决定 FP8 attention backend 入口的仍然是 <code>fp8_dpa</code>。</p>
 
-<p>先看 attention 的两次 matmul:</p>
+<p>attention 有两次 matmul:</p>
 
 <pre class="code">S = Q[B,H,Sq,D] @ K[B,H,Sk,D]^T
 O = P[B,H,Sq,Sk] @ V[B,H,Sk,Dv]</pre>
 
-<p>第一步 <code>QK^T</code> 的 reduction 维度是 <code>D</code>,所以 Q 和 K 的 MXFP8 block scale 沿 <code>D</code>。第二步 <code>P@V</code> 的 reduction 维度是 <code>Sk</code>,所以 P 和 V 的 scale 沿 <code>Sk</code>。如果 V 按 <code>[B,H,Sk,Dv]</code> 存,沿 <code>Sk</code> 就不是最后一维,TE 术语里会落到 columnwise。</p>
+<p><code>QK^T</code> 的 reduction 维度是 <code>D</code>,Q 和 K 的 MXFP8 block scale 沿 <code>D</code>。<code>P@V</code> 的 reduction 维度是 <code>Sk</code>,P 和 V 的 scale 沿 <code>Sk</code>。如果 V 按 <code>[B,H,Sk,Dv]</code> 存,沿 <code>Sk</code> 就不是最后一维,TE 术语里会落到 columnwise。</p>
 
 <table class="recipe-table">
   <thead><tr><th>attention matmul</th><th>operand</th><th>reduction 维度</th><th>TE v2.16 MXFP8 forward 用法</th></tr></thead>
@@ -497,11 +497,11 @@ V: rowwise=False, columnwise=True    # 沿 Sk</pre>
     and not mxfp8_scaling
 )</pre>
 
-<p>MXFP8 被排除在这个条件外,不是因为 DPA 不能用 MXFP8,而是 projection 输出的形状和 attention 需要的 scaling 方向不一致。QKV GEMM 先产出 <code>bs(hd)</code>、<code>sb(hd)</code> 或 <code>t(hd)</code> 这类布局;MXFP8 attention 需要按 <code>s</code> 和 <code>d</code> 方向重新量化成 <code>bhsd</code>、<code>sbhd</code> 或 <code>thd</code> 可消费的形状。因此在 MXFP8 路径下,QKV projection 仍按 module 的高精度 dtype 返回,后面的 DPA 准备逻辑再按 attention 自己的 reduction 方向量化 Q/K/V。</p>
+<p>MXFP8 被排除在这个条件外,原因是 projection 输出的形状和 attention 需要的 scaling 方向不一致。QKV GEMM 先产出 <code>bs(hd)</code>、<code>sb(hd)</code> 或 <code>t(hd)</code> 这类布局;MXFP8 attention 需要按 <code>s</code> 和 <code>d</code> 方向重新量化成 <code>bhsd</code>、<code>sbhd</code> 或 <code>thd</code> 可消费的形状。在 MXFP8 路径下,QKV projection 仍按 module 的高精度 dtype 返回,后面的 DPA 准备逻辑再按 attention 自己的 reduction 方向量化 Q/K/V。</p>
 
-<p>DPA output dtype 也有单独 gate。TE v2.16 写成 <code>dpa_fp8_output = fp8 and (fp8_dpa or fp8_mha) and not mxfp8_scaling</code>,所以 MXFP8 DPA 在这个版本不会把 O 作为 FP8 边界输出给 output projection。<code>_update_output_quantizer_roles</code> 会把这些边界关系交给 quantizer role:QKV linear 到 DPA、DPA 到 output projection,以及对应 backward 边。</p>
+<p>DPA output dtype 也有单独 gate。TE v2.16 写成 <code>dpa_fp8_output = fp8 and (fp8_dpa or fp8_mha) and not mxfp8_scaling</code>。MXFP8 DPA 在这个版本不会把 O 作为 FP8 边界输出给 output projection。<code>_update_output_quantizer_roles</code> 会把这些边界关系交给 quantizer role:QKV linear 到 DPA、DPA 到 output projection,以及对应 backward 边。</p>
 
-<p>因此 TE v2.16 可落地的 MXFP8 attention 数据流是:</p>
+<p>TE v2.16 可落地的 MXFP8 attention 数据流是:</p>
 
 <pre class="code">QKV projection:
   MXFP8 GEMM 内部使用 projection 自己的 scale 方向
@@ -512,14 +512,14 @@ DPA:
   Q/K 沿 D,V 沿 Sk
   FusedAttention 执行 FP8 DPA</pre>
 
-<p>这也解释了 <code>fp8_mha</code> 在 MXFP8 下的限制。TE v2.16 的 backend selector 先用 <code>fp8_dpa</code> 决定是否进入 FP8 attention 分支;进入之后,如果 <code>fp8_recipe.mxfp8()</code> 为 true 且 <code>fp8_mha=True</code>,就明确禁用 FusedAttention。也就是说,下面这个 recipe 可以构造,但不代表 v2.16 已经有端到端 MXFP8 MHA backend:</p>
+<p>MXFP8 下的 <code>fp8_mha</code> 限制来自 backend selector。TE v2.16 先用 <code>fp8_dpa</code> 决定是否进入 FP8 attention 分支;进入之后,如果 <code>fp8_recipe.mxfp8()</code> 为 true 且 <code>fp8_mha=True</code>,就明确禁用 FusedAttention。下面这个 recipe 可以构造,但不代表 v2.16 已经有端到端 MXFP8 MHA backend:</p>
 
 <pre class="code">MXFP8BlockScaling(
     fp8_dpa=True,
     fp8_mha=True,
 )</pre>
 
-<p>更现实的配置是保留 DPA 边界:</p>
+<p>可用配置通常保留 DPA 边界:</p>
 
 <pre class="code">MXFP8BlockScaling(
     fp8_dpa=True,
@@ -626,11 +626,11 @@ def mxfp8_gemm_sim(A, B, fp32_accum=False):
 
 <h2 id="zh-pytorch">10. PyTorch 视角</h2>
 
-<p>PyTorch 的 float8 dtype 是 unscaled 的。也就是说,<code>torch.float8_e4m3fn</code> 和 <code>torch.float8_e5m2</code> 只描述 raw data 的格式,并不自动携带 scale。scale 需要由上层建模代码、tensor subclass 或专门的 kernel API 管理。PyTorch dev-discuss 里提到的 <code>torch.scaled_mm</code> 就是这种分层设计:matrix 是 FP8,scale 作为单独参数传入。</p>
+<p>PyTorch 的 float8 dtype 是 unscaled 的。<code>torch.float8_e4m3fn</code> 和 <code>torch.float8_e5m2</code> 只描述 raw data 的格式,并不自动携带 scale。scale 需要由上层建模代码、tensor subclass 或专门的 kernel API 管理。PyTorch dev-discuss 里提到的 <code>torch.scaled_mm</code> 就是这种分层设计:matrix 是 FP8,scale 作为单独参数传入。</p>
 
 <p>这也是为什么 FP8 训练很少表现为一个普通 autocast dtype。autocast 只负责 dtype promotion 或 cast 还不够。系统还要维护 per-tensor state、amax history、分布式 reduce、module rewrite、保存给 backward 的 tensor 版本,以及编译器能否把这些额外操作融合掉。</p>
 
-<p>调 FP8 训练时,我一般先看四组信号:</p>
+<p>调 FP8 训练时,我一般检查四组信号:</p>
 
 <ul>
   <li>每类 tensor 的 amax 曲线是否突然跳变。</li>
@@ -723,11 +723,11 @@ C_hat[m, n] = decode_fp8(qC[m, n]) * scale_inv_C[block(m, n)]</pre>
 
 <p>The shapes in the table are logical shapes. TE also pads scale tensors to kernel-friendly multiples and requires MXFP8-quantized dimensions to satisfy block alignment.</p>
 
-<p>In TE <code>Linear</code>, the forward epilogue passes <code>output_quantizer</code> into <code>general_gemm</code>. If the caller sets <code>fp8_output=True</code>,<code>Linear</code> takes the <code>GEMM1_OUTPUT</code> quantizer and sets it to <code>rowwise=True, columnwise=False</code>. A normal <code>C[M,N]</code> MXFP8 Linear output is therefore quantized along <code>N</code>:</p>
+<p>TE <code>Linear</code> passes <code>output_quantizer</code> into <code>general_gemm</code> in the forward epilogue. If the caller sets <code>fp8_output=True</code>,<code>Linear</code> takes the <code>GEMM1_OUTPUT</code> quantizer and sets it to <code>rowwise=True, columnwise=False</code>. A normal <code>C[M,N]</code> MXFP8 Linear output is quantized along <code>N</code>:</p>
 
 <pre class="code">C[m, n:n+32] shares one output scale</pre>
 
-<p>This is also why a QKV projection cannot directly hand its MXFP8 output to attention. The QKV projection output quantizer follows the packed feature dimension, the last dimension of <code>[M, 3*H*D]</code>. Attention wants Q/K scaled along head dim <code>D</code>, and V scaled along sequence dim <code>Sk</code>. The FP8 payload can be reshaped, but the <code>(payload, scale)</code> block membership no longer matches attention's reduction dimensions.</p>
+<p>A QKV projection cannot directly hand its MXFP8 output to attention. The QKV projection output quantizer follows the packed feature dimension, the last dimension of <code>[M, 3*H*D]</code>. Attention wants Q/K scaled along head dim <code>D</code>, and V scaled along sequence dim <code>Sk</code>. The FP8 payload can be reshaped, but the <code>(payload, scale)</code> block membership no longer matches attention's reduction dimensions.</p>
 
 <h2 id="en-update">6. Amax update policy</h2>
 
@@ -768,7 +768,7 @@ C_hat[m, n] = decode_fp8(qC[m, n]) * scale_inv_C[block(m, n)]</pre>
 
 <p>In Transformer Engine, an attention FP8 recipe cannot be judged from the <code>fp8_dpa</code> and <code>fp8_mha</code> fields alone. The backend selector still decides whether the requested combination is available. In TE v2.16, MXFP8 attention treats DPA as its own consumer and quantizes Q/K/V again with attention-specific directions.</p>
 
-<p>These checks have different jobs. <code>fp8_dpa</code> controls whether DPA may enter the FP8 path: TE's backend selector only enters the FP8 attention branch when FP8 autocast is active and <code>fp8_recipe.fp8_dpa</code> is true. <code>fp8_recipe.mxfp8()</code> is not a DPA switch; it only says that the current recipe class is <code>MXFP8BlockScaling</code>. <code>fp8_mha</code> controls MHA boundaries, meaning whether TE tries to remove the BF16/FP16 casts between QKV projection and DPA, and between DPA and the output projection. In practice, <code>fp8_mha</code> should be read together with <code>fp8_dpa=True</code>; otherwise the boundary dtype discussion is detached from FP8 DPA.</p>
+<p>The three checks do different work. <code>fp8_dpa</code> controls whether DPA may enter the FP8 path: TE's backend selector only enters the FP8 attention branch when FP8 autocast is active and <code>fp8_recipe.fp8_dpa</code> is true. <code>fp8_recipe.mxfp8()</code> is not a DPA switch; it only says that the current recipe class is <code>MXFP8BlockScaling</code>. <code>fp8_mha</code> controls MHA boundaries, meaning whether TE tries to remove the BF16/FP16 casts between QKV projection and DPA, and between DPA and the output projection. In normal use, <code>fp8_mha</code> should be read together with <code>fp8_dpa=True</code>; otherwise the boundary dtype discussion is detached from FP8 DPA.</p>
 
 <table class="recipe-table">
   <thead><tr><th>switch or check</th><th>scope</th><th>effect on MHA data flow</th></tr></thead>
@@ -779,7 +779,7 @@ C_hat[m, n] = decode_fp8(qC[m, n]) * scale_inv_C[block(m, n)]</pre>
   </tbody>
 </table>
 
-<p>The dependency is one-way in normal use: <code>fp8_mha=True</code> depends on <code>fp8_dpa=True</code>, but <code>fp8_dpa=True</code> does not require <code>fp8_mha=True</code>. The TE API documentation describes those two data flows. With <code>fp8_dpa=True, fp8_mha=False</code>, QKV projection returns high precision and DPA casts at its boundary. When both are true, TE tries to make QKV projection output FP8 and pass FP8 DPA output directly to the output projection. In source code, the recipe object stores these as two bool fields, so this should not be read as a dataclass constructor invariant. The real entry gate for an FP8 attention backend is still <code>fp8_dpa</code>.</p>
+<p>The dependency is one-way: <code>fp8_mha=True</code> depends on <code>fp8_dpa=True</code>, but <code>fp8_dpa=True</code> does not require <code>fp8_mha=True</code>. The TE API documentation describes those two data flows. With <code>fp8_dpa=True, fp8_mha=False</code>, QKV projection returns high precision and DPA casts at its boundary. When both are true, TE tries to make QKV projection output FP8 and pass FP8 DPA output directly to the output projection. In source code, the recipe object stores these as two bool fields, so this should not be read as a dataclass constructor invariant. The real entry gate for an FP8 attention backend is still <code>fp8_dpa</code>.</p>
 
 <p>Attention has two matmuls:</p>
 
@@ -814,11 +814,11 @@ V: rowwise=False, columnwise=True    # along Sk</pre>
     and not mxfp8_scaling
 )</pre>
 
-<p>MXFP8 is excluded here not because DPA cannot use MXFP8, but because the projection output shape and the attention scaling directions do not line up. The QKV GEMM first produces layouts such as <code>bs(hd)</code>, <code>sb(hd)</code>, or <code>t(hd)</code>. MXFP8 attention needs Q/K/V quantized along <code>s</code> and <code>d</code>, in shapes consumable as <code>bhsd</code>, <code>sbhd</code>, or <code>thd</code>. On this path, QKV projection therefore returns in the module's high-precision dtype, and the DPA preparation code re-quantizes Q/K/V along attention's own reduction directions.</p>
+<p>MXFP8 is excluded here because the projection output shape and the attention scaling directions do not line up. The QKV GEMM first produces layouts such as <code>bs(hd)</code>, <code>sb(hd)</code>, or <code>t(hd)</code>. MXFP8 attention needs Q/K/V quantized along <code>s</code> and <code>d</code>, in shapes consumable as <code>bhsd</code>, <code>sbhd</code>, or <code>thd</code>. On this path, QKV projection returns in the module's high-precision dtype, and the DPA preparation code re-quantizes Q/K/V along attention's own reduction directions.</p>
 
-<p>DPA output dtype has its own gate. TE v2.16 uses <code>dpa_fp8_output = fp8 and (fp8_dpa or fp8_mha) and not mxfp8_scaling</code>, so MXFP8 DPA in this version does not expose O as an FP8 boundary tensor to the output projection. <code>_update_output_quantizer_roles</code> records these boundary relationships in quantizer roles: QKV linear to DPA, DPA to output projection, and the matching backward edges.</p>
+<p>DPA output dtype has its own gate. TE v2.16 uses <code>dpa_fp8_output = fp8 and (fp8_dpa or fp8_mha) and not mxfp8_scaling</code>. MXFP8 DPA in this version does not expose O as an FP8 boundary tensor to the output projection. <code>_update_output_quantizer_roles</code> records these boundary relationships in quantizer roles: QKV linear to DPA, DPA to output projection, and the matching backward edges.</p>
 
-<p>In TE v2.16, the practical MXFP8 attention path looks like this:</p>
+<p>TE v2.16 lands on this MXFP8 attention path:</p>
 
 <pre class="code">QKV projection:
   MXFP8 GEMM uses projection-specific scale directions
@@ -829,7 +829,7 @@ DPA:
   Q/K along D, V along Sk
   FusedAttention runs FP8 DPA</pre>
 
-<p>This also explains the current <code>fp8_mha</code> limitation for MXFP8. TE v2.16 first uses <code>fp8_dpa</code> to decide whether it enters the FP8 attention branch. Once inside that branch, if <code>fp8_recipe.mxfp8()</code> is true and <code>fp8_mha=True</code>, FusedAttention is explicitly disabled. The recipe below can be constructed, but that does not mean v2.16 has an end-to-end MXFP8 MHA backend:</p>
+<p>MXFP8's <code>fp8_mha</code> limitation comes from the backend selector. TE v2.16 first uses <code>fp8_dpa</code> to decide whether it enters the FP8 attention branch. Once inside that branch, if <code>fp8_recipe.mxfp8()</code> is true and <code>fp8_mha=True</code>, FusedAttention is explicitly disabled. The recipe below can be constructed, but that does not mean v2.16 has an end-to-end MXFP8 MHA backend:</p>
 
 <pre class="code">MXFP8BlockScaling(
     fp8_dpa=True,
@@ -945,7 +945,7 @@ def mxfp8_gemm_sim(A, B, fp32_accum=False):
 
 <p>PyTorch float8 dtypes are unscaled. <code>torch.float8_e4m3fn</code> and <code>torch.float8_e5m2</code> describe the raw data format; they do not automatically carry a scale. The modeling layer, a tensor subclass, or a specialized kernel API must manage the scale. The PyTorch dev-discuss post uses <code>torch.scaled_mm</code> as the example: matrices are FP8, scales are separate arguments.</p>
 
-<p>This is why FP8 training rarely looks like an ordinary autocast dtype. Autocast handles dtype promotion or casts, but FP8 training also needs per-tensor state, amax history, distributed reduction, module rewrites, saved tensor policy for backward, and compiler fusion for the extra operations.</p>
+<p>FP8 training rarely looks like an ordinary autocast dtype. Autocast handles dtype promotion or casts, but FP8 training also needs per-tensor state, amax history, distributed reduction, module rewrites, saved tensor policy for backward, and compiler fusion for the extra operations.</p>
 
 <p>When debugging FP8 training, I start with four signals:</p>
 
