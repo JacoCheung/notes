@@ -3,17 +3,17 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PyTorch Linear 到 cuBLAS: shape、layout 与 reduction</title>
-<meta name="post:title"           content="PyTorch Linear 到 cuBLAS: shape、layout 与 reduction">
-<meta name="post:title_en"        content="PyTorch Linear to cuBLAS: shapes, layout, and reduction">
+<title>torch linear 和 layout</title>
+<meta name="post:title"           content="torch linear 和 layout">
+<meta name="post:title_en"        content="torch linear and layout">
 <meta name="post:slug"            content="pytorch-linear-cublas-layout">
 <meta name="post:date"            content="2026-07-20">
 <meta name="post:tags"            content="PyTorch, cuBLAS, Linear, GEMM">
 <meta name="post:tags_en"         content="PyTorch, cuBLAS, Linear, GEMM">
-<meta name="post:reading"         content="8 分钟">
-<meta name="post:reading_en"      content="8 min">
-<meta name="post:summary"         content="从 PyTorch 的 y=xW^T 出发,把 forward、dW、dX 三个 Linear GEMM 映射到 classic cuBLAS 的 column-major 视角,并标清每一行的 m,n,k 和真正发生求和规约的逻辑维度。">
-<meta name="post:summary_en"      content="Maps PyTorch Linear forward, weight-gradient, and input-gradient GEMMs from y=xW^T to the classic cuBLAS column-major view, with m,n,k and the logical reduction dimension made explicit.">
+<meta name="post:reading"         content="2 分钟">
+<meta name="post:reading_en"      content="2 min">
+<meta name="post:summary"         content="torch linear 的 torch 视角、cuBLAS 视角、layout 和 reduce axis 对照。">
+<meta name="post:summary_en"      content="A compact table for torch linear shapes, cuBLAS layout, and reduce axis.">
 <meta name="post:series"          content="pytorch-internals">
 <meta name="post:series_title"    content="PyTorch 内部机制">
 <meta name="post:series_title_en" content="PyTorch Internals">
@@ -33,44 +33,43 @@
 <style>
   main.content { max-width: 960px; padding: 56px 32px 96px; }
   @media (max-width: 920px) { main.content { padding: 48px 20px 80px; } }
-  .callout {
-    border-left: 3px solid var(--accent);
-    background: var(--accent-tint);
-    padding: 10px 14px;
-    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-    margin: 14px 0;
-    font-size: 14px;
+  .note-card {
+    background: #e8f4ff;
+    border-radius: 16px;
+    padding: 22px 28px;
+    margin: 0 0 72px;
+    color: #222;
+    font-size: 21px;
+    line-height: 1.8;
   }
+  .note-card .bulb { margin-right: 12px; }
+  .note-card strong { font-weight: 700; }
   .table-scroll {
     overflow-x: auto;
-    margin: 16px 0;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
+    margin: 18px 0;
   }
   table.note-table {
     border-collapse: collapse;
-    font-size: 13.5px;
+    font-size: 18px;
     width: 100%;
-    min-width: 1120px;
+    min-width: 960px;
   }
   table.note-table th, table.note-table td {
     border: 1px solid var(--border);
-    padding: 8px 10px;
+    padding: 12px 14px;
     text-align: left;
     vertical-align: top;
   }
   table.note-table th {
-    background: var(--bg-elevated);
-    font-weight: 600;
+    color: var(--text-muted);
+    font-weight: 500;
     white-space: nowrap;
   }
-  table.note-table td:nth-child(1),
-  table.note-table td:nth-child(5),
-  table.note-table td:nth-child(6) {
+  table.note-table td:nth-child(2),
+  table.note-table td:nth-child(4),
+  table.note-table td:nth-child(5) {
     white-space: nowrap;
   }
-  .compact-table { min-width: 780px; }
-  .dim-list code { white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -79,22 +78,12 @@
     <div class="toc-title">目录 · TOC</div>
     <div class="lang-zh">
     <ul>
-      <li><a href="#zh-1">1. PyTorch 里的 shape</a></li>
-      <li><a href="#zh-2">2. cuBLAS 的视角为什么会转置</a></li>
-      <li><a href="#zh-3">3. forward / dW / dX 对照表</a></li>
-      <li><a href="#zh-4">4. reduction 维度怎么读</a></li>
-      <li><a href="#zh-5">5. cuBLASLt 的另一种写法</a></li>
-      <li><a href="#zh-refs">参考资料</a></li>
+      <li><a href="#zh-table">torch linear 和 layout</a></li>
     </ul>
     </div>
     <div class="lang-en">
     <ul>
-      <li><a href="#en-1">1. PyTorch shapes</a></li>
-      <li><a href="#en-2">2. Why the cuBLAS view is transposed</a></li>
-      <li><a href="#en-3">3. Forward / dW / dX table</a></li>
-      <li><a href="#en-4">4. Reading the reduction dimension</a></li>
-      <li><a href="#en-5">5. The cuBLASLt variant</a></li>
-      <li><a href="#en-refs">References</a></li>
+      <li><a href="#en-table">torch linear and layout</a></li>
     </ul>
     </div>
   </aside>
@@ -103,380 +92,105 @@
 
 <div class="lang-zh">
 
-<h1>PyTorch Linear 到 cuBLAS: shape、layout 与 reduction</h1>
-
-<p><code>torch.nn.Linear</code> 的官方定义是对输入做 \(y=xA^T+b\)。在代码里通常把权重记成 \(W\),所以本文写成 \(Y=XW^T+b\)。PyTorch 存的 <code>weight</code> shape 是 <code>(out_features, in_features)</code>,也就是下文的 \(W\in\mathbb{R}^{N\times K}\)。</p>
-
-<h2 id="zh-1">1. PyTorch 里的 shape</h2>
-
-<p>把 batch、sequence 等前导维度都展平成 \(M\)。Linear 的三个主要张量是:</p>
-
-\[
-X\in\mathbb{R}^{M\times K},\quad
-W\in\mathbb{R}^{N\times K},\quad
-Y\in\mathbb{R}^{M\times N}
-\]
-
-<ul class="dim-list">
-  <li>\(M\): batch/token 维度,来自输入最后一维之前的所有维度乘积。</li>
-  <li>\(K\): <code>in_features</code>,输入特征维度。</li>
-  <li>\(N\): <code>out_features</code>,输出特征维度。</li>
-</ul>
-
-<p>忽略 bias 后,forward 和 backward 的矩阵形式是:</p>
-
-\[
-Y=XW^T,\qquad dX=dY\,W,\qquad dW=dY^T X
-\]
-
-<p>也可以把 weight gradient 写成 \(dW^T=X^T dY\)。这个写法很适合对照 classic cuBLAS,因为 row-major 的 \(dW\) buffer 在 cuBLAS 眼里就是 \(dW^T\)。</p>
-
-<h2 id="zh-2">2. cuBLAS 的视角为什么会转置</h2>
-
-<p>classic cuBLAS 按 column-major 矩阵理解传入的指针。一个连续 row-major buffer \(R_{r\times c}\),如果不搬数据,直接交给 column-major API,数学上会被看成:</p>
-
-\[
-\operatorname{cm}(R_{r\times c}) = R^T_{c\times r}
-\]
-
-<p>cuBLAS GEMM 的接口模型是:</p>
-
-\[
-C=\alpha\,\operatorname{op}(A)\operatorname{op}(B)+\beta C,\qquad
-\operatorname{op}(A)\in\mathbb{R}^{m\times k},\quad
-\operatorname{op}(B)\in\mathbb{R}^{k\times n},\quad
-C\in\mathbb{R}^{m\times n}
-\]
-
-<p>所以同一块 row-major 输出内存,cuBLAS 写的不是 PyTorch 视角的 \(Y\),而是它自己的 column-major view。对 forward 来说,这块内存在 PyTorch 里是 \(Y_{M\times N}\),在 classic cuBLAS 里就是 \(Y^T_{N\times M}\)。这就是表格里公式看起来"反着写"的原因。</p>
-
-<div class="callout">
-表里的 <code>layout</code> 指 <code>(transA, transB)</code>,不是 PyTorch Tensor 的 memory format。<code>TN</code> 表示 <code>transA=CUBLAS_OP_T</code>,<code>transB=CUBLAS_OP_N</code>。
+<div class="note-card">
+  <div><span class="bulb">💡</span>torch 中的 shape 和 cuBLAS 的 shape 是转置的关系,因此 torch 中 \(A * B\) 在 cuBLAS 中是 \(B * A\)</div>
+  <div><strong>\(\mathrm{d}w\) 永远是 <code>nt</code></strong></div>
 </div>
 
-<h2 id="zh-3">3. forward / dW / dX 对照表</h2>
+<h1 id="zh-table">torch linear 和 layout</h1>
 
 <div class="table-scroll">
 <table class="note-table">
   <thead>
     <tr>
-      <th>阶段</th>
-      <th>PyTorch 视角</th>
-      <th>cuBLAS 写入的 C view</th>
-      <th>A / B / C buffer</th>
-      <th>layout</th>
-      <th>cuBLAS \(m,n,k\)</th>
-      <th>reduction</th>
-      <th>备注</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>forward</td>
-      <td>\(Y=XW^T\)</td>
-      <td>\(Y^T=W X^T\)</td>
-      <td>\(A=W,\ B=X,\ C=Y\)</td>
-      <td><code>TN</code></td>
-      <td>\(m=N,\ n=M,\ k=K\)</td>
-      <td>\(k\),逻辑上是输入特征 \(K\)</td>
-      <td>row-major \(Y[M,N]\) 被 cuBLAS 看成 column-major \(Y^T[N,M]\)。</td>
-    </tr>
-    <tr>
-      <td>dW</td>
-      <td>\(dW=dY^T X\),等价于 \(dW^T=X^T dY\)</td>
-      <td>\(dW^T=X^T dY\)</td>
-      <td>\(A=X,\ B=dY,\ C=dW\)</td>
-      <td><code>NT</code></td>
-      <td>\(m=K,\ n=N,\ k=M\)</td>
-      <td>\(k\),逻辑上是 batch/token 维度 \(M\)</td>
-      <td>实际需要的参数梯度是 \(dW[N,K]\),但 C 的 column-major view 是 \(dW^T[K,N]\)。</td>
-    </tr>
-    <tr>
-      <td>dX</td>
-      <td>\(dX=dY\,W^{TT}=dY\,W\)</td>
-      <td>\(dX^T=W^T dY^T\)</td>
-      <td>\(A=W,\ B=dY,\ C=dX\)</td>
-      <td><code>NN</code></td>
-      <td>\(m=K,\ n=M,\ k=N\)</td>
-      <td>\(k\),逻辑上是输出特征 \(N\)</td>
-      <td>\(W^{TT}=W\)。保留这个写法是为了提醒:forward 里用了 \(W^T\),反传到 \(X\) 时又转回 \(W\)。</td>
-    </tr>
-  </tbody>
-</table>
-</div>
-
-<p>如果只看截图里那种短表,它可以压成这样:</p>
-
-<div class="table-scroll">
-<table class="note-table compact-table">
-  <thead>
-    <tr>
       <th>torch 视角</th>
-      <th>阶段</th>
-      <th>classic cuBLAS 视角</th>
+      <th>text</th>
+      <th>cuBLAS 视角</th>
       <th>layout</th>
-      <th>reduction</th>
+      <th>reduce axis</th>
       <th>remark</th>
     </tr>
   </thead>
   <tbody>
     <tr>
-      <td>\(XW^T\)</td>
+      <td>\(x * w^t\)</td>
       <td>前向</td>
-      <td>\(Y^T=WX^T\)</td>
-      <td><code>TN</code></td>
-      <td>\(k=K\)</td>
-      <td>reduce over <code>in_features</code>。</td>
+      <td>\(w^t * x\)</td>
+      <td><code>tn</code></td>
+      <td>k (input dim)</td>
+      <td></td>
     </tr>
     <tr>
-      <td>\(dW^T=X^T dY\)</td>
+      <td>\(\mathrm{d}w^t = x^t * \mathrm{d}y\)</td>
       <td>反向</td>
-      <td>\(dW^T=X^T dY\)</td>
-      <td><code>NT</code></td>
-      <td>\(k=M\)</td>
-      <td>实际参数梯度是 \(dW=dY^T X\)。</td>
+      <td>\(\mathrm{d}w = x * \mathrm{d}y^t\)</td>
+      <td><code>nt</code></td>
+      <td>m (batch)</td>
+      <td>实际要求的是 \(\mathrm{d}w = \mathrm{d}y^t * x\)</td>
     </tr>
     <tr>
-      <td>\(dX=dY W^{TT}=dY W\)</td>
+      <td>\(\mathrm{d}x = \mathrm{d}y * w^{tt}\)</td>
       <td>反向</td>
-      <td>\(dX^T=W^T dY^T\)</td>
-      <td><code>NN</code></td>
-      <td>\(k=N\)</td>
-      <td>reduce over <code>out_features</code>。</td>
+      <td>\(\mathrm{d}x = w * \mathrm{d}y\)</td>
+      <td><code>nn</code></td>
+      <td>n (output dim)</td>
+      <td></td>
     </tr>
   </tbody>
 </table>
 </div>
-
-<h2 id="zh-4">4. reduction 维度怎么读</h2>
-
-<p>对 GEMM 本身,求和规约的维度永远是 cuBLAS 的 \(k\):</p>
-
-\[
-C_{i,j}=\sum_{\ell=1}^{k}\operatorname{op}(A)_{i,\ell}\operatorname{op}(B)_{\ell,j}
-\]
-
-<p>容易混淆的是:三次 Linear 相关 GEMM 的 cuBLAS \(k\) 对应的逻辑维度不一样。</p>
-
-<ul>
-  <li>forward: \(k=K\),沿 <code>in_features</code> 规约。</li>
-  <li>dW: \(k=M\),沿 batch/token 维度规约。参数梯度把所有样本对同一个权重元素的贡献加起来。</li>
-  <li>dX: \(k=N\),沿 <code>out_features</code> 规约。每个输入特征的梯度来自所有输出通道的反向贡献。</li>
-</ul>
-
-<p>这也是做 FP8 / MXFP8 scaling 或者看 kernel descriptor 时必须盯住的地方。不要只记 \(XW^T\) 这条公式,要问这次 GEMM 的 reduction axis 在当前 layout 里落到哪里。</p>
-
-<h2 id="zh-5">5. cuBLASLt 的另一种写法</h2>
-
-<p>cuBLASLt 可以用 matrix layout descriptor 描述矩阵的 rows、cols、leading dimension,也可以通过 layout order 表达 row-major 数据。用这种接口时,你可能看到更接近 PyTorch 公式的 <code>transA/transB</code>:</p>
-
-<div class="table-scroll">
-<table class="note-table compact-table">
-  <thead>
-    <tr>
-      <th>目标</th>
-      <th>A / B / C</th>
-      <th>row-major descriptor 下常见 op</th>
-      <th>reduction</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>\(Y=XW^T\)</td>
-      <td>\(A=X,\ B=W,\ C=Y\)</td>
-      <td><code>NT</code></td>
-      <td>\(K\)</td>
-    </tr>
-    <tr>
-      <td>\(dW=dY^T X\)</td>
-      <td>\(A=dY,\ B=X,\ C=dW\)</td>
-      <td><code>TN</code></td>
-      <td>\(M\)</td>
-    </tr>
-    <tr>
-      <td>\(dX=dY W\)</td>
-      <td>\(A=dY,\ B=W,\ C=dX\)</td>
-      <td><code>NN</code></td>
-      <td>\(N\)</td>
-    </tr>
-  </tbody>
-</table>
-</div>
-
-<p>所以读代码时先确认是哪一层抽象:classic cuBLAS column-major wrapper、cuBLASLt row-major descriptor,还是框架内部又包了一层自己的命名。否则 <code>TN</code> 和 <code>NT</code> 很容易被看反。</p>
-
-<h2 id="zh-refs">参考资料</h2>
-
-<ul>
-  <li><a href="https://docs.pytorch.org/docs/2.12/generated/torch.nn.Linear.html" target="_blank" rel="noopener">PyTorch 文档: <code>torch.nn.Linear</code></a></li>
-  <li><a href="https://docs.nvidia.com/cuda/cublas/index.html#data-layout" target="_blank" rel="noopener">NVIDIA cuBLAS 文档: Data Layout</a></li>
-  <li><a href="https://docs.nvidia.com/cuda/cublas/index.html#cublas-t-gemm" target="_blank" rel="noopener">NVIDIA cuBLAS 文档: <code>cublas&lt;t&gt;gemm()</code></a></li>
-  <li><a href="https://docs.nvidia.com/cuda/cublas/index.html#cublasltmatrixlayoutcreate" target="_blank" rel="noopener">NVIDIA cuBLASLt 文档: <code>cublasLtMatrixLayoutCreate()</code></a></li>
-</ul>
 
 </div>
 
 <div class="lang-en">
 
-<h1>PyTorch Linear to cuBLAS: shapes, layout, and reduction</h1>
-
-<p><code>torch.nn.Linear</code> applies \(y=xA^T+b\). This note uses \(W\) for the stored weight, so the forward formula is \(Y=XW^T+b\). PyTorch stores <code>weight</code> as <code>(out_features, in_features)</code>, written here as \(W\in\mathbb{R}^{N\times K}\).</p>
-
-<h2 id="en-1">1. PyTorch shapes</h2>
-
-<p>Flatten all leading batch or sequence dimensions into \(M\):</p>
-
-\[
-X\in\mathbb{R}^{M\times K},\quad
-W\in\mathbb{R}^{N\times K},\quad
-Y\in\mathbb{R}^{M\times N}
-\]
-
-<ul class="dim-list">
-  <li>\(M\): batch/token dimension.</li>
-  <li>\(K\): <code>in_features</code>.</li>
-  <li>\(N\): <code>out_features</code>.</li>
-</ul>
-
-<p>Ignoring bias, the forward and backward GEMMs are:</p>
-
-\[
-Y=XW^T,\qquad dX=dY\,W,\qquad dW=dY^T X
-\]
-
-<p>The weight gradient can also be written as \(dW^T=X^T dY\), which lines up with the classic cuBLAS view of a row-major <code>dW</code> buffer.</p>
-
-<h2 id="en-2">2. Why the cuBLAS view is transposed</h2>
-
-<p>The classic cuBLAS API interprets matrix pointers as column-major. A contiguous row-major buffer \(R_{r\times c}\), passed to cuBLAS without moving data, is seen mathematically as:</p>
-
-\[
-\operatorname{cm}(R_{r\times c}) = R^T_{c\times r}
-\]
-
-<p>The GEMM contract is:</p>
-
-\[
-C=\alpha\,\operatorname{op}(A)\operatorname{op}(B)+\beta C,\qquad
-\operatorname{op}(A)\in\mathbb{R}^{m\times k},\quad
-\operatorname{op}(B)\in\mathbb{R}^{k\times n},\quad
-C\in\mathbb{R}^{m\times n}
-\]
-
-<p>That is why the same output memory is named differently. The PyTorch forward output is \(Y[M,N]\), but classic cuBLAS sees that buffer as \(Y^T[N,M]\).</p>
-
-<div class="callout">
-In the tables below, <code>layout</code> means <code>(transA, transB)</code>. It is not the PyTorch tensor memory format.
+<div class="note-card">
+  <div><span class="bulb">💡</span>The torch shape and the cuBLAS shape are transposed. So \(A * B\) in torch becomes \(B * A\) in cuBLAS.</div>
+  <div><strong>\(\mathrm{d}w\) is always <code>nt</code></strong></div>
 </div>
 
-<h2 id="en-3">3. Forward / dW / dX table</h2>
+<h1 id="en-table">torch linear and layout</h1>
 
 <div class="table-scroll">
 <table class="note-table">
   <thead>
     <tr>
-      <th>Pass</th>
-      <th>PyTorch view</th>
-      <th>cuBLAS C view</th>
-      <th>A / B / C buffer</th>
+      <th>torch view</th>
+      <th>text</th>
+      <th>cuBLAS view</th>
       <th>layout</th>
-      <th>cuBLAS \(m,n,k\)</th>
-      <th>reduction</th>
-      <th>Note</th>
+      <th>reduce axis</th>
+      <th>remark</th>
     </tr>
   </thead>
   <tbody>
     <tr>
+      <td>\(x * w^t\)</td>
       <td>forward</td>
-      <td>\(Y=XW^T\)</td>
-      <td>\(Y^T=W X^T\)</td>
-      <td>\(A=W,\ B=X,\ C=Y\)</td>
-      <td><code>TN</code></td>
-      <td>\(m=N,\ n=M,\ k=K\)</td>
-      <td>\(k\), logically \(K\)</td>
-      <td>cuBLAS sees row-major \(Y[M,N]\) as column-major \(Y^T[N,M]\).</td>
+      <td>\(w^t * x\)</td>
+      <td><code>tn</code></td>
+      <td>k (input dim)</td>
+      <td></td>
     </tr>
     <tr>
-      <td>dW</td>
-      <td>\(dW=dY^T X\), or \(dW^T=X^T dY\)</td>
-      <td>\(dW^T=X^T dY\)</td>
-      <td>\(A=X,\ B=dY,\ C=dW\)</td>
-      <td><code>NT</code></td>
-      <td>\(m=K,\ n=N,\ k=M\)</td>
-      <td>\(k\), logically \(M\)</td>
-      <td>The desired gradient is \(dW[N,K]\), while the cuBLAS C view is \(dW^T[K,N]\).</td>
+      <td>\(\mathrm{d}w^t = x^t * \mathrm{d}y\)</td>
+      <td>backward</td>
+      <td>\(\mathrm{d}w = x * \mathrm{d}y^t\)</td>
+      <td><code>nt</code></td>
+      <td>m (batch)</td>
+      <td>the actual requested value is \(\mathrm{d}w = \mathrm{d}y^t * x\)</td>
     </tr>
     <tr>
-      <td>dX</td>
-      <td>\(dX=dY\,W^{TT}=dY\,W\)</td>
-      <td>\(dX^T=W^T dY^T\)</td>
-      <td>\(A=W,\ B=dY,\ C=dX\)</td>
-      <td><code>NN</code></td>
-      <td>\(m=K,\ n=M,\ k=N\)</td>
-      <td>\(k\), logically \(N\)</td>
-      <td>\(W^{TT}=W\). This keeps the link to the forward \(W^T\) explicit.</td>
+      <td>\(\mathrm{d}x = \mathrm{d}y * w^{tt}\)</td>
+      <td>backward</td>
+      <td>\(\mathrm{d}x = w * \mathrm{d}y\)</td>
+      <td><code>nn</code></td>
+      <td>n (output dim)</td>
+      <td></td>
     </tr>
   </tbody>
 </table>
 </div>
-
-<h2 id="en-4">4. Reading the reduction dimension</h2>
-
-<p>For GEMM, the summation dimension is always cuBLAS \(k\):</p>
-
-\[
-C_{i,j}=\sum_{\ell=1}^{k}\operatorname{op}(A)_{i,\ell}\operatorname{op}(B)_{\ell,j}
-\]
-
-<p>The logical dimension behind that \(k\) changes by pass: forward reduces over \(K\), weight gradient over \(M\), and input gradient over \(N\). This distinction matters when reading quantization scales, block layouts, and kernel descriptors.</p>
-
-<h2 id="en-5">5. The cuBLASLt variant</h2>
-
-<p>cuBLASLt matrix layout descriptors can describe rows, columns, leading dimension, and layout order more directly. With a row-major descriptor, the operation flags often look closer to the PyTorch formula:</p>
-
-<div class="table-scroll">
-<table class="note-table compact-table">
-  <thead>
-    <tr>
-      <th>Target</th>
-      <th>A / B / C</th>
-      <th>Common row-major op</th>
-      <th>reduction</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>\(Y=XW^T\)</td>
-      <td>\(A=X,\ B=W,\ C=Y\)</td>
-      <td><code>NT</code></td>
-      <td>\(K\)</td>
-    </tr>
-    <tr>
-      <td>\(dW=dY^T X\)</td>
-      <td>\(A=dY,\ B=X,\ C=dW\)</td>
-      <td><code>TN</code></td>
-      <td>\(M\)</td>
-    </tr>
-    <tr>
-      <td>\(dX=dY W\)</td>
-      <td>\(A=dY,\ B=W,\ C=dX\)</td>
-      <td><code>NN</code></td>
-      <td>\(N\)</td>
-    </tr>
-  </tbody>
-</table>
-</div>
-
-<p>When reading framework code, first identify the abstraction level: classic cuBLAS column-major wrapper, cuBLASLt row-major descriptor, or a framework-specific wrapper around either one.</p>
-
-<h2 id="en-refs">References</h2>
-
-<ul>
-  <li><a href="https://docs.pytorch.org/docs/2.12/generated/torch.nn.Linear.html" target="_blank" rel="noopener">PyTorch docs: <code>torch.nn.Linear</code></a></li>
-  <li><a href="https://docs.nvidia.com/cuda/cublas/index.html#data-layout" target="_blank" rel="noopener">NVIDIA cuBLAS docs: Data Layout</a></li>
-  <li><a href="https://docs.nvidia.com/cuda/cublas/index.html#cublas-t-gemm" target="_blank" rel="noopener">NVIDIA cuBLAS docs: <code>cublas&lt;t&gt;gemm()</code></a></li>
-  <li><a href="https://docs.nvidia.com/cuda/cublas/index.html#cublasltmatrixlayoutcreate" target="_blank" rel="noopener">NVIDIA cuBLASLt docs: <code>cublasLtMatrixLayoutCreate()</code></a></li>
-</ul>
 
 </div>
 
