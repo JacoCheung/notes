@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Codex session 文件都存了什么</title>
+<meta name="post:title"           content="Codex session 文件都存了什么">
+<meta name="post:title_en"        content="What Codex session files store">
+<meta name="post:slug"            content="codex-session-files">
+<meta name="post:date"            content="2026-07-21">
+<meta name="post:tags"            content="Codex, Agentic Coding, Session, 工程实践">
+<meta name="post:tags_en"         content="Codex, Agentic Coding, Session, Engineering">
+<meta name="post:reading"         content="9 分钟">
+<meta name="post:reading_en"      content="9 min">
+<meta name="post:summary"         content="用一个 10 轮 Codex 会话拆开看 rollout JSONL、session_index、state_5.sqlite、logs、goals、memories 和 SQLite WAL 文件分别负责什么。">
+<meta name="post:summary_en"      content="A concrete 10-turn Codex session example that explains rollout JSONL, session_index, state_5.sqlite, logs, goals, memories, and SQLite WAL files.">
+<meta name="post:series"          content="agentic-coding-practice">
+<meta name="post:series_title"    content="Agentic Coding Practice">
+<meta name="post:series_title_en" content="Agentic Coding Practice">
+<meta name="post:series_order"    content="1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  main.content { max-width: 940px; padding: 56px 32px 96px; }
+  @media (max-width: 920px) { main.content { padding: 48px 20px 80px; } }
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-tint);
+    padding: 10px 14px;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    margin: 16px 0;
+    font-size: 14px;
+  }
+  table.note-table {
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 13.5px;
+    width: 100%;
+  }
+  table.note-table th, table.note-table td {
+    border: 1px solid var(--border);
+    padding: 8px 11px;
+    text-align: left;
+    vertical-align: top;
+  }
+  table.note-table th { background: var(--bg-elevated); font-weight: 600; }
+  .table-scroll { overflow-x: auto; margin: 16px 0; }
+  .table-scroll table { min-width: 820px; }
+  pre.code { font-size: 12.5px; line-height: 1.55; }
+  .meta-note { color: var(--text-muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录</div>
+    <ul>
+      <li><a href="#scope">1. 先把范围说清楚</a></li>
+      <li><a href="#turns">2. 一个 10 轮会话</a></li>
+      <li><a href="#files">3. 每个文件负责什么</a></li>
+      <li><a href="#examples">4. 文件内容长什么样</a></li>
+      <li><a href="#share">5. 哪些文件最敏感</a></li>
+      <li><a href="#refs">参考资料</a></li>
+    </ul>
+    <a class="toc-back-to-top" href="#">↑ 回到顶部</a>
+  </aside>
+
+<main class="content">
+
+<h1>Codex session 文件都存了什么</h1>
+
+<p>看 Codex 的本地目录时,最容易被一堆 <code>.sqlite</code>、<code>.jsonl</code>、<code>-wal</code> 文件搞晕。先别从文件名猜功能。按使用方式看,它们大致分成三层:会话正文、可查询状态、运行日志和后台任务。</p>
+
+<div class="callout">
+下面的 JSONL 和 SQL 表都是示意,不是官方 schema。官方文档确认了 <code>CODEX_HOME</code>、<code>CODEX_SQLITE_HOME</code>、session transcripts、archived sessions、thread rollout、SQLite-backed state DB 这些概念,但没有承诺 <code>state_5.sqlite</code> 里的表结构会稳定。
+</div>
+
+<h2 id="scope">1. 先把范围说清楚</h2>
+
+<p><code>CODEX_HOME</code> 默认是 <code>~/.codex</code>。官方文档说它放 config、auth、logs、sessions、skills 和 standalone package metadata。<code>CODEX_SQLITE_HOME</code> 控制 SQLite-backed state 的位置,默认也在 <code>CODEX_HOME</code> 下。</p>
+
+<p>所以,如果你看到这些文件,可以先按下面这张表读:</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr>
+      <th>文件</th>
+      <th>更像什么</th>
+      <th>通常包含什么</th>
+      <th>敏感程度</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>sessions/YYYY/MM/DD/rollout-*.jsonl</code></td>
+      <td>会话录像</td>
+      <td>用户消息、assistant 消息、tool call、命令输出片段、cwd、模型、turn/item 事件</td>
+      <td>最高</td>
+    </tr>
+    <tr>
+      <td><code>session_index.jsonl</code></td>
+      <td>聊天列表索引</td>
+      <td>thread id、标题、preview、更新时间、rollout 路径</td>
+      <td>中等</td>
+    </tr>
+    <tr>
+      <td><code>state_5.sqlite</code></td>
+      <td>主状态库</td>
+      <td>thread 元信息、cwd、archived 状态、spawn 关系、动态工具、agent jobs</td>
+      <td>中到高</td>
+    </tr>
+    <tr>
+      <td><code>logs_2.sqlite</code></td>
+      <td>结构化运行日志</td>
+      <td>错误、警告、target、file、line、thread_id、部分命令或输出</td>
+      <td>中等</td>
+    </tr>
+    <tr>
+      <td><code>goals_1.sqlite</code></td>
+      <td>任务进度板</td>
+      <td>goal objective、status、token budget、tokens used、continuation 状态</td>
+      <td>中等</td>
+    </tr>
+    <tr>
+      <td><code>memories_1.sqlite</code></td>
+      <td>memory 后台管线</td>
+      <td>memory / summarization job、中间结果、thread summary 类输出</td>
+      <td>中到高</td>
+    </tr>
+    <tr>
+      <td><code>*.sqlite-wal</code> / <code>*.sqlite-shm</code></td>
+      <td>SQLite 辅助文件</td>
+      <td>WAL 写前日志和共享内存协调文件</td>
+      <td>看主库内容</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="turns">2. 一个 10 轮会话</h2>
+
+<p>假设有一条 thread,标题叫 <code>整理 FP8 note</code>,工作目录是 <code>/Users/me/projects/notes</code>。10 轮大概是这样:</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr>
+      <th>轮次</th>
+      <th>发生了什么</th>
+      <th>会写进哪里</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>用户说:帮我 review 这篇 note</td><td>rollout JSONL, session_index/state 更新 preview 和时间</td></tr>
+    <tr><td>2</td><td>Codex 搜文件、读 HTML</td><td>rollout 记录 tool call 和结果片段, logs 可能记录命令事件</td></tr>
+    <tr><td>3</td><td>用户说:直接改</td><td>rollout 追加新 turn</td></tr>
+    <tr><td>4</td><td>Codex 调 <code>apply_patch</code> 改文件</td><td>rollout 记录 file change item, state 更新时间</td></tr>
+    <tr><td>5</td><td>Codex 跑 <code>python3 scripts/build-index.py</code></td><td>rollout 记录命令输出, logs 可能记 INFO/WARN</td></tr>
+    <tr><td>6</td><td>用户说:太啰嗦</td><td>rollout 追加用户消息</td></tr>
+    <tr><td>7</td><td>Codex 精简文章</td><td>rollout 记录 patch 和 assistant 消息</td></tr>
+    <tr><td>8</td><td>用户说:push</td><td>rollout 追加用户消息</td></tr>
+    <tr><td>9</td><td>Codex commit / push</td><td>rollout 记录 git 命令和输出片段, logs 可能记诊断</td></tr>
+    <tr><td>10</td><td>用户问:这些 session 文件是什么</td><td>rollout 继续追加, memories 以后可能用这条 thread 生成摘要</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>这 10 轮不会平均分散到所有文件里。真正的逐轮正文主要在 rollout。其他文件多半是为了列表、恢复、后台任务、诊断和记忆加工。</p>
+
+<h2 id="files">3. 每个文件负责什么</h2>
+
+<h3>rollout JSONL: 会话正文</h3>
+
+<p>这是最该小心的文件。它像一条 append-only 的事件流。官方 app-server 文档把 archive 描述成移动 persisted thread log,也把 unarchive 叫做把 archived thread rollout 移回 active sessions。换句话说,thread 的可恢复记录主要就在这里。</p>
+
+<p>你可以把它理解成:如果只有一个文件最像完整聊天记录,就是 <code>rollout-*.jsonl</code>。</p>
+
+<h3>session_index.jsonl: 聊天列表索引</h3>
+
+<p>它通常不是正文,更像 UI 列表用的目录卡。它让 Codex 不必每次都扫所有 rollout 文件,就能显示标题、预览、时间和路径。它可能暴露项目名、路径、thread 标题和第一句 prompt。</p>
+
+<h3>state_5.sqlite: 主状态库</h3>
+
+<p>官方把 SQLite-backed state DB 描述成 agent jobs 和 resumable runtime state 用的数据库。放到 thread 上就是:Codex 要快速知道有哪些 thread、哪个归档了、cwd 是什么、rollout 文件在哪、有没有子 thread、动态工具怎么恢复。</p>
+
+<p><code>_5</code> 不要当业务含义看。它更像内部 schema 版本号。升级以后文件名、表名、字段都可能变。</p>
+
+<h3>logs_2.sqlite: 运行日志</h3>
+
+<p>它不是 transcript。它更像 app-server / CLI 的结构化日志库:命令开始了、命令失败了、哪个 target 抛错了、哪个 thread 相关。日志里仍然可能带路径、命令、错误栈和输出片段,所以不能随手上传。</p>
+
+<h3>goals_1.sqlite: 目标和 continuation</h3>
+
+<p>如果一条任务有 goal、token budget、continuation 或后台续跑状态,这类库会保存进度。它回答的不是"用户说了什么",而是"这个任务做到哪了"。</p>
+
+<h3>memories_1.sqlite: memory 生成过程</h3>
+
+<p>官方 memories 文档说,本地 Codex memories 会从符合条件的旧 chat 里提取有用上下文,在后台更新,并放在 Codex home 下面。<code>memories_1.sqlite</code> 可以理解成这条后台管线用的 job 和中间结果库。真正可读的 memory 文件还可能在 <code>~/.codex/memories/</code> 下面。</p>
+
+<h3>WAL / SHM: SQLite 的写入机制</h3>
+
+<p><code>state_5.sqlite-wal</code>、<code>state_5.sqlite-shm</code> 不是新的业务库。SQLite WAL 模式会先写 <code>-wal</code>,再择机合并回主库。<code>-shm</code> 用来协调并发读写。Codex 正在运行时看到它们是正常现象。</p>
+
+<h2 id="examples">4. 文件内容长什么样</h2>
+
+<p class="meta-note">下面的字段名是为了说明结构,不要照着写解析器。</p>
+
+<h3>rollout JSONL 示例</h3>
+
+<pre class="code">{"type":"session_metadata","thread_id":"thr_fp8","cwd":"/Users/me/projects/notes","model":"gpt-5-codex","created_at":"2026-07-21T10:00:00Z"}
+{"type":"turn.started","turn_id":"turn_1"}
+{"type":"user_message","turn_id":"turn_1","text":"帮我 review 这篇 note"}
+{"type":"assistant_message","turn_id":"turn_1","text":"我先看一下文章结构和现有 series。"}
+{"type":"item.started","turn_id":"turn_1","item":{"type":"command_execution","command":"rg --files posts"}}
+{"type":"item.completed","turn_id":"turn_1","item":{"type":"command_execution","exit_code":0,"output":"posts/fp8-scaling-recipes.html\nposts/pytorch-record-stream.html\n..."}}
+{"type":"turn.completed","turn_id":"turn_1","usage":{"input_tokens":12400,"output_tokens":820}}
+{"type":"turn.started","turn_id":"turn_4"}
+{"type":"user_message","turn_id":"turn_4","text":"直接修改"}
+{"type":"item.started","turn_id":"turn_4","item":{"type":"file_change","path":"posts/fp8-scaling-recipes.html"}}
+{"type":"item.completed","turn_id":"turn_4","item":{"type":"file_change","summary":"updated title and table section"}}
+{"type":"turn.completed","turn_id":"turn_4"}
+{"type":"turn.started","turn_id":"turn_9"}
+{"type":"user_message","turn_id":"turn_9","text":"push"}
+{"type":"item.started","turn_id":"turn_9","item":{"type":"command_execution","command":"git push origin main"}}
+{"type":"item.completed","turn_id":"turn_9","item":{"type":"command_execution","exit_code":0,"output":"main -&gt; main"}}
+{"type":"assistant_message","turn_id":"turn_9","text":"已 push。"}
+{"type":"turn.completed","turn_id":"turn_9"}</pre>
+
+<p>如果某轮触发 compaction 或 rollback,同一个 rollout 里还可能追加 context compaction item 或 rollback marker。app-server 文档明确说 rollback 会把 marker persist 到 rollout log。</p>
+
+<h3>session_index.jsonl 示例</h3>
+
+<pre class="code">{"thread_id":"thr_fp8","name":"整理 FP8 note","preview":"帮我 review 这篇 note","cwd":"/Users/me/projects/notes","rollout_path":"sessions/2026/07/21/rollout-019f....jsonl","updated_at_ms":1784629000000}
+{"thread_id":"thr_layout","name":"torch linear 和 layout","preview":"我这个表格写得有问题吗?","cwd":"/Users/me/projects/notes","rollout_path":"sessions/2026/07/20/rollout-019e....jsonl","updated_at_ms":1784540000000}</pre>
+
+<p>这个文件看起来轻,但它仍然会泄漏你做过什么项目、在哪个目录、thread 大概聊了什么。</p>
+
+<h3>state_5.sqlite 示例</h3>
+
+<pre class="code">threads
+thread_id | name          | cwd                       | rollout_path                         | archived | model       | updated_at_ms
+thr_fp8   | 整理 FP8 note | /Users/me/projects/notes  | sessions/2026/07/21/rollout-...jsonl | 0        | gpt-5-codex | 1784629000000
+
+thread_spawn_edges
+parent_thread_id | child_thread_id | status
+thr_fp8          | thr_fp8_review  | completed
+
+thread_dynamic_tools
+thread_id | tool_name | enabled_at_ms
+thr_fp8   | github    | 1784628300000
+
+agent_jobs
+job_id | thread_id | kind             | status
+job_7  | thr_fp8   | subAgentReview   | completed</pre>
+
+<p>这类库解释了为什么 Codex 打开聊天列表快,也解释了为什么删除 thread 时不能只删一个 JSONL 文件。app-server 的 delete 文档说,删除 persisted thread 时会移除 rollout files 和 associated metadata。</p>
+
+<h3>logs_2.sqlite 示例</h3>
+
+<pre class="code">logs
+ts_ms         | level | thread_id | target          | message
+1784628100000 | INFO  | thr_fp8   | codex.tool.exec | running command: python3 scripts/build-index.py
+1784628112000 | WARN  | thr_fp8   | codex.tool.exec | command exited non-zero
+1784628113000 | ERROR | thr_fp8   | app_server      | failed to parse post metadata at posts/fp8-scaling-recipes.html</pre>
+
+<p>官方 troubleshooting 文档也提醒,分享日志前要先检查敏感信息。这个提醒不是客套话。路径、命令和错误输出经常足够还原上下文。</p>
+
+<h3>goals_1.sqlite 示例</h3>
+
+<pre class="code">thread_goals
+thread_id | objective                       | status | token_budget | tokens_used | elapsed_ms
+thr_fp8   | review and polish all blog notes | active | 200000       | 87320       | 5400000
+
+thread_goal_continuation_deferrals
+thread_id | reason               | next_run_after_ms
+thr_fp8   | waiting for test run | 1784629000000</pre>
+
+<p>如果你没有用 goal 或 continuation,这个库可能只有几行。小不代表没用,只是这条功能线暂时没多少状态。</p>
+
+<h3>memories_1.sqlite 示例</h3>
+
+<pre class="code">jobs
+job_id | kind             | source_thread_id | status
+mem_1  | summarize_thread | thr_fp8          | completed
+
+stage1_outputs
+source_thread_id | kind            | content
+thr_fp8          | rollout_summary | 用户在 notes repo 里维护 PyTorch/FP8 系列文章,偏好技术准确、少 AI 味、直接 commit/push...</pre>
+
+<p>memory 不一定马上生成。官方文档说 Codex 会等 chat idle 足够久,并且会在后台更新。它还会跳过 active 或 short-lived sessions。</p>
+
+<h2 id="share">5. 哪些文件最敏感</h2>
+
+<p>按风险排序,我会这么处理:</p>
+
+<ol>
+  <li><code>auth.json</code>:当成密码。官方文档也这么说。</li>
+  <li><code>rollout-*.jsonl</code>:当成完整聊天记录。里面可能有 prompt、代码、命令输出、路径、tool result。</li>
+  <li><code>memories/</code> 和 <code>memories_1.sqlite</code>:当成压缩后的个人工作画像。它不一定逐字保存原文,但总结更容易暴露偏好和项目。</li>
+  <li><code>logs_2.sqlite</code>:当成诊断日志。它不是全文,但可能有足够多的片段。</li>
+  <li><code>state_5.sqlite</code> / <code>session_index.jsonl</code>:当成索引和元信息。不要因为"不是正文"就随手贴出去。</li>
+</ol>
+
+<p>如果只是想知道"这条聊天为什么还能 resume",先看 rollout。想知道"列表页为什么还显示这条",看 session index 和 state DB。想知道"Codex 哪里报错",看 logs。想知道"为什么下次还记得我偏好",看 memories。</p>
+
+<h2 id="refs">参考资料</h2>
+
+<ul>
+  <li><a href="https://developers.openai.com/codex/config-file/environment-variables" target="_blank" rel="noopener">Codex environment variables: <code>CODEX_HOME</code> / <code>CODEX_SQLITE_HOME</code></a></li>
+  <li><a href="https://developers.openai.com/codex/config-reference" target="_blank" rel="noopener">Codex configuration reference: <code>sqlite_home</code></a></li>
+  <li><a href="https://developers.openai.com/codex/app-server" target="_blank" rel="noopener">Codex app-server: thread list, archive, delete, unarchive, rollback</a></li>
+  <li><a href="https://developers.openai.com/codex/reference/troubleshooting" target="_blank" rel="noopener">Codex troubleshooting: feedback and logs</a></li>
+  <li><a href="https://developers.openai.com/codex/memories" target="_blank" rel="noopener">Codex memories: local memory storage and background updates</a></li>
+  <li><a href="https://developers.openai.com/codex/non-interactive-mode" target="_blank" rel="noopener">Codex non-interactive mode: JSONL event stream examples</a></li>
+</ul>
+
+</main>
+</div>
+</body>
+</html>
