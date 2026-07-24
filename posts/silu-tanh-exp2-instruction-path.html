@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SiLU 的 tanh 形式与 exp2 形式: 指令路径比较</title>
+<meta name="post:title"           content="SiLU 的 tanh 形式与 exp2 形式: 指令路径比较">
+<meta name="post:title_en"        content="SiLU via tanh vs exp2: instruction-path comparison">
+<meta name="post:slug"            content="silu-tanh-exp2-instruction-path">
+<meta name="post:date"            content="2026-07-24">
+<meta name="post:tags"            content="CUDA, GPU, SiLU, 指令优化">
+<meta name="post:tags_en"         content="CUDA, GPU, SiLU, Instruction Optimization">
+<meta name="post:reading"         content="6 分钟">
+<meta name="post:reading_en"      content="6 min">
+<meta name="post:summary"         content="比较 SiLU 的 sigmoid/exp2 写法与 tanh 恒等式写法: tanh 路径通常用一个近似 tanh 和少量 FMUL/FFMA 避开 reciprocal/divide,最终仍要用 SASS 和 profile 定论。">
+<meta name="post:summary_en"      content="A focused comparison of SiLU through sigmoid/exp2 and through the tanh identity, centered on instruction paths, reciprocal/divide cost, and validation.">
+<meta name="post:series"          content="special-optimization">
+<meta name="post:series_title"    content="特殊优化">
+<meta name="post:series_title_en" content="Specialized Optimization">
+<meta name="post:series_order"    content="1">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(','\\)'], ['$','$']], displayMath: [['\\[','\\]'], ['$$','$$']] },
+    options: { skipHtmlTags: ['script', 'style', 'pre', 'code'] }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
+<script src="../lang-toggle.js" defer></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  main.content { max-width: 980px; padding: 56px 32px 96px; }
+  @media (max-width: 920px) { main.content { padding: 48px 20px 80px; } }
+  .table-scroll {
+    overflow-x: auto;
+    margin: 18px 0 24px;
+  }
+  table.opt-table {
+    width: 100%;
+    min-width: 860px;
+    border-collapse: collapse;
+  }
+  table.opt-table th,
+  table.opt-table td {
+    border: 1px solid var(--border);
+    padding: 11px 13px;
+    text-align: left;
+    vertical-align: top;
+  }
+  table.opt-table th {
+    color: var(--fg-muted);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  table.opt-table td:first-child,
+  table.opt-table td:nth-child(3) {
+    white-space: nowrap;
+  }
+  .formula-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+    margin: 18px 0 24px;
+  }
+  .formula-box {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    padding: 15px 16px;
+  }
+  .formula-box .label {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--fg-subtle);
+    margin-bottom: 8px;
+  }
+  @media (max-width: 760px) {
+    .formula-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录 · TOC</div>
+    <div class="lang-zh">
+    <ul>
+      <li><a href="#zh-formula">1. 公式关系</a></li>
+      <li><a href="#zh-path">2. 指令路径</a></li>
+      <li><a href="#zh-why">3. 性能直觉</a></li>
+      <li><a href="#zh-check">4. 编译与验证</a></li>
+      <li><a href="#zh-refs">参考资料</a></li>
+    </ul>
+    </div>
+    <div class="lang-en">
+    <ul>
+      <li><a href="#en-formula">1. Formula</a></li>
+      <li><a href="#en-path">2. Instruction path</a></li>
+      <li><a href="#en-why">3. Performance intuition</a></li>
+      <li><a href="#en-check">4. Build and validation</a></li>
+      <li><a href="#en-refs">References</a></li>
+    </ul>
+    </div>
+  </aside>
+
+<main class="content">
+
+<div class="lang-zh">
+
+<h1>SiLU 的 tanh 形式与 exp2 形式: 指令路径比较</h1>
+
+<p class="small">SiLU 的数学定义简单,但 kernel 不执行公式,它执行编译后的指令。sigmoid 写法通常会落到 <code>ex2</code> 加 reciprocal/divide;tanh 恒等式则把倒数那段换成几条 <code>FMUL</code>/<code>FFMA</code>。这只在 activation 本身是热点时值得讨论。如果 kernel 已经被 memory、load/store 或 tensor core GEMM 限住,换公式可能只会改变局部指令统计。</p>
+
+<h2 id="zh-formula">1. 公式关系</h2>
+
+<p>SiLU 定义为:</p>
+
+<p>\[
+\mathrm{silu}(x)=x\sigma(x),\qquad \sigma(x)=\frac{1}{1+e^{-x}}
+\]</p>
+
+<p>在 NVIDIA GPU 上,指数路径常被改写成 base-2 exponential。PTX 里有 <code>ex2.approx.f32</code>,所以 sigmoid 可以写成:</p>
+
+<div class="formula-grid">
+  <div class="formula-box">
+    <div class="label">sigmoid / exp2</div>
+    <p>\[
+    \sigma(x)=\frac{1}{1+2^{-x\log_2 e}}
+    \]</p>
+  </div>
+  <div class="formula-box">
+    <div class="label">tanh identity</div>
+    <p>\[
+    \sigma(x)=\frac{1+\tanh(x/2)}{2}
+    \]</p>
+  </div>
+</div>
+
+<p>两个公式在实数域等价。到了 GPU 指令层,它们已经不是同一个实现:一个走 <code>ex2</code> 后接 reciprocal 或 divide,另一个走 <code>tanh</code> 后接普通浮点乘加。</p>
+
+<h2 id="zh-path">2. 指令路径</h2>
+
+<p>下面按 FP32 scalar 路径估算。真实 SASS 取决于编译器、fast math 选项、目标架构和 dtype。</p>
+
+<div class="table-scroll">
+<table class="opt-table">
+  <thead>
+    <tr>
+      <th>写法</th>
+      <th>可能的指令序列</th>
+      <th>special path</th>
+      <th>普通 FP 指令</th>
+      <th>主要代价</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>\(x/(1+e^{-x})\)</td>
+      <td><code>FMUL</code> 计算 \(-x\log_2e\),<br><code>MUFU.EX2</code>,<br><code>FADD</code> 加 1,<br><code>RCP</code> 或 divide sequence,<br><code>FMUL</code> 乘回 \(x\)</td>
+      <td><code>EX2</code> + reciprocal/divide</td>
+      <td>约 2 个 <code>FMUL</code> + 1 个 <code>FADD</code></td>
+      <td>倒数或除法拉长依赖链</td>
+    </tr>
+    <tr>
+      <td>\(x(1+\tanh(x/2))/2\)</td>
+      <td><code>FMUL</code> 计算 \(x/2\),<br><code>MUFU.TANH</code>,<br><code>FFMA</code> 计算 \(0.5t+0.5\),<br><code>FMUL</code> 乘回 \(x\)</td>
+      <td><code>TANH</code></td>
+      <td>约 2 个 <code>FMUL</code> + 1 个 <code>FFMA</code></td>
+      <td>避开 reciprocal/divide</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<pre class="code">// sigmoid / exp2 style
+float t = -1.4426950408889634f * x;
+float e = ex2_approx(t);
+float y = x * rcp_approx(1.0f + e);
+
+// tanh identity style
+float h = 0.5f * x;
+float s = fmaf(0.5f, tanh_approx(h), 0.5f);
+float y = x * s;</pre>
+
+<h2 id="zh-why">3. 性能直觉</h2>
+
+<p>CUDA Best Practices Guide 的 native arithmetic throughput 表把 FP32 add/multiply/FMA 和 approximate reciprocal/ex2/log/sin/cos 放在不同吞吐档位。以常见现代架构的表项看,普通 FP32 乘加每个 SM 每 cycle 的理论结果数高于 approximate special-function 那一类。具体比例随架构变,但性能假设可以落到一条指令链上:多付几条 <code>FMUL</code>/<code>FFMA</code>,换掉 sigmoid 路径里的 reciprocal/divide。</p>
+
+<p>因果不要写反。tanh 版本的优势来源不是 <code>MUFU.TANH</code> 必然快过 <code>MUFU.EX2</code>。PTX 文档只定义 <code>tanh.approx.f32</code> 和 <code>ex2.approx.f32</code> 的语义、精度和架构要求,没有承诺所有 GPU 上 tanh 对 ex2 的固定倍率。更保守的说法是:exp2 sigmoid 路径通常还要做倒数或除法,tanh 恒等式把这段换成了高吞吐的乘加。</p>
+
+<p>半精度路径还要看 dtype。PTX 支持 <code>tanh.approx.f16</code>、<code>tanh.approx.f16x2</code>、<code>tanh.approx.bf16</code> 和 <code>tanh.approx.bf16x2</code>,其中 bf16/bf16x2 的目标架构要求更高。kernel 如果在 half2 或 bf16x2 上跑,必须确认编译结果有没有生成 packed instruction。否则纸面指令数只是源码层面的猜测。</p>
+
+<h2 id="zh-check">4. 编译与验证</h2>
+
+<p>这类改写不能只看源码。判断时看这几层:</p>
+
+<ul>
+  <li>用 <code>cuobjdump --dump-sass</code> 或 <code>nvdisasm</code> 看 cubin,确认最终是 <code>MUFU.EX2</code>、<code>MUFU.TANH</code>、<code>RCP</code>、<code>FFMA</code>,还是 libdevice 调用。</li>
+  <li>固定编译选项再比较,尤其是 <code>-use_fast_math</code>、<code>-ftz</code>、<code>-prec-div</code>。这些选项会改变除法、denormal 和 intrinsic lowering。</li>
+  <li>单独测数值误差。tanh identity 和 exp2 sigmoid 在实数域等价,但近似指令、flush-to-zero 和 rounding 会让结果不再 bitwise 相同。</li>
+</ul>
+
+<p>比较保守的结论是:当 SiLU 是热点,并且目标架构能把 <code>tanh</code> lowering 成近似硬件指令时,tanh 恒等式通常比 exp2 加 reciprocal 的 sigmoid 路径更值得试。它是一个优化候选,不是定理。结果以 SASS 和 profiling 为准。</p>
+
+<h2 id="zh-refs">参考资料</h2>
+
+<ul>
+  <li><a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#arithmetic-instructions">CUDA C++ Best Practices Guide: Arithmetic Instructions</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#floating-point-instructions-ex2">PTX ISA: ex2.approx.f32</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#floating-point-instructions-tanh">PTX ISA: tanh.approx.f32</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/cuda-math-api/cuda_math_api/group__CUDA__MATH__INTRINSIC__SINGLE.html">CUDA Math API: single precision intrinsics</a></li>
+</ul>
+
+</div>
+
+<div class="lang-en">
+
+<h1>SiLU via tanh vs exp2: instruction-path comparison</h1>
+
+<p class="small">SiLU has a compact definition, but a kernel executes instructions, not algebra. The sigmoid form often becomes <code>ex2</code> plus reciprocal/divide. The tanh identity trades that reciprocal path for a few <code>FMUL</code>/<code>FFMA</code> instructions. This matters only when the activation itself is hot. If the kernel is limited by memory traffic, load/store pressure, or tensor core GEMM, the change may only move local instruction counters.</p>
+
+<h2 id="en-formula">1. Formula</h2>
+
+<p>\[
+\mathrm{silu}(x)=x\sigma(x),\qquad \sigma(x)=\frac{1}{1+e^{-x}}
+\]</p>
+
+<div class="formula-grid">
+  <div class="formula-box">
+    <div class="label">sigmoid / exp2</div>
+    <p>\[
+    \sigma(x)=\frac{1}{1+2^{-x\log_2 e}}
+    \]</p>
+  </div>
+  <div class="formula-box">
+    <div class="label">tanh identity</div>
+    <p>\[
+    \sigma(x)=\frac{1+\tanh(x/2)}{2}
+    \]</p>
+  </div>
+</div>
+
+<p>The two forms are equivalent over real numbers. At the GPU instruction level, they are different implementations: the exp2 form still needs a reciprocal or divide, while the tanh form adds ordinary floating-point multiply-add work around one approximate tanh.</p>
+
+<h2 id="en-path">2. Instruction path</h2>
+
+<div class="table-scroll">
+<table class="opt-table">
+  <thead>
+    <tr>
+      <th>Form</th>
+      <th>Likely instruction sequence</th>
+      <th>Special path</th>
+      <th>Regular FP work</th>
+      <th>Main cost</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>\(x/(1+e^{-x})\)</td>
+      <td><code>FMUL</code> for \(-x\log_2e\),<br><code>MUFU.EX2</code>,<br><code>FADD</code>,<br><code>RCP</code> or divide sequence,<br><code>FMUL</code></td>
+      <td><code>EX2</code> + reciprocal/divide</td>
+      <td>about 2 <code>FMUL</code> + 1 <code>FADD</code></td>
+      <td>reciprocal/divide lengthens the dependency chain</td>
+    </tr>
+    <tr>
+      <td>\(x(1+\tanh(x/2))/2\)</td>
+      <td><code>FMUL</code> for \(x/2\),<br><code>MUFU.TANH</code>,<br><code>FFMA</code> for \(0.5t+0.5\),<br><code>FMUL</code></td>
+      <td><code>TANH</code></td>
+      <td>about 2 <code>FMUL</code> + 1 <code>FFMA</code></td>
+      <td>avoids reciprocal/divide</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="en-why">3. Performance intuition</h2>
+
+<p>The CUDA Best Practices Guide puts ordinary FP32 add/multiply/FMA and approximate reciprocal/ex2/log/sin/cos in different throughput classes. On common modern compute capabilities, FP32 multiply-add has higher theoretical result throughput per SM per cycle than the approximate special-function class. The ratio depends on the GPU. The performance hypothesis is narrower: spend a few <code>FMUL</code>/<code>FFMA</code> instructions to remove reciprocal/divide from the sigmoid path.</p>
+
+<p>The tanh form should not be justified by assuming one <code>MUFU.TANH</code> is always faster than one <code>MUFU.EX2</code>. NVIDIA's PTX ISA defines both approximate instructions and their target requirements, but the final schedule is a hardware and compiler question. The part worth testing is the removal of reciprocal/divide.</p>
+
+<h2 id="en-check">4. Build and validation</h2>
+
+<ul>
+  <li>Inspect SASS with <code>cuobjdump --dump-sass</code> or <code>nvdisasm</code>.</li>
+  <li>Compare with fixed compiler flags, especially <code>-use_fast_math</code>, <code>-ftz</code>, and <code>-prec-div</code>.</li>
+  <li>Measure numerical error separately. Approximate instructions, flush-to-zero behavior, and rounding mean the two formulas do not have to match bit for bit.</li>
+</ul>
+
+<p>If SiLU is hot and the target architecture lowers tanh to an approximate hardware instruction, the tanh identity is usually the better candidate to try. It is an optimization candidate, not a theorem. The answer still has to come from SASS and profiling.</p>
+
+<h2 id="en-refs">References</h2>
+
+<ul>
+  <li><a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#arithmetic-instructions">CUDA C++ Best Practices Guide: Arithmetic Instructions</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#floating-point-instructions-ex2">PTX ISA: ex2.approx.f32</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#floating-point-instructions-tanh">PTX ISA: tanh.approx.f32</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/cuda-math-api/cuda_math_api/group__CUDA__MATH__INTRINSIC__SINGLE.html">CUDA Math API: single precision intrinsics</a></li>
+</ul>
+
+</div>
+
+</main>
+</div>
+</body>
+</html>
