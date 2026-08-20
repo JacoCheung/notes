@@ -12,8 +12,8 @@
 <meta name="post:tags_en"         content="PyTorch, Autograd, DDP, Megatron">
 <meta name="post:reading"         content="18 分钟">
 <meta name="post:reading_en"      content="18 min">
-<meta name="post:summary"         content="从 Node、Edge 和 InputBuffer 的角度解释 grad_fn 与 next_functions,并用 fan-in 梯度累加例子说明 Megatron-Core DDP 如何拿到 leaf 参数的 AccumulateGrad。">
-<meta name="post:summary_en"      content="A source-oriented explanation of grad_fn, next_functions, InputBuffer fan-in accumulation, and Megatron-Core DDP's hook on leaf AccumulateGrad nodes.">
+<meta name="post:summary"         content="从 Python 可观察的 grad_fn.next_functions 解释 autograd 反向图,并用 fan-in 梯度累加例子说明 Megatron-Core DDP 如何拿到 leaf 参数的 AccumulateGrad。">
+<meta name="post:summary_en"      content="A Python-facing explanation of grad_fn.next_functions, fan-in gradient accumulation, and Megatron-Core DDP's hook on leaf AccumulateGrad nodes.">
 <meta name="post:series"          content="pytorch-internals">
 <meta name="post:series_title"    content="PyTorch 内部机制">
 <meta name="post:series_title_en" content="PyTorch Internals">
@@ -146,11 +146,11 @@
     <div class="toc-title">目录 · TOC</div>
     <ul>
       <li><a href="#scope">0. 本文范围</a></li>
-      <li><a href="#objects">1. Tensor 图与 Node 图</a></li>
+      <li><a href="#objects">1. Tensor 与 grad_fn 图</a></li>
       <li><a href="#forward">2. forward 如何建图</a></li>
       <li><a href="#read-next">3. next_functions 如何读</a></li>
       <li><a href="#fan-in">4. 多分支梯度的 fan-in 规约</a></li>
-      <li><a href="#engine">5. backward 的迭代顺序</a></li>
+      <li><a href="#backward-order">5. backward 的迭代顺序</a></li>
       <li><a href="#accumulate-grad">6. AccumulateGrad 与 leaf .grad</a></li>
       <li><a href="#megatron">7. Megatron-Core DDP 的应用</a></li>
       <li><a href="#refs">参考资料</a></li>
@@ -161,17 +161,17 @@
 
 <h1>PyTorch Autograd 图结构解析：grad_fn、next_functions 与 AccumulateGrad</h1>
 
-<p class="lead">本文以 <a href="https://jacocheung.notion.site/autograd-functional-cb49bb6bc11f4772b0f7f3c9c92fe3e0">autograd 和 functional</a> 为起点,整理 Python 侧 <code>grad_fn</code>、<code>next_functions</code> 与 C++ 侧 <code>Node</code>、<code>Edge</code>、<code>InputBuffer</code> 的对应关系。链式法则本身不展开,重点放在建图语义、backward 调度、fan-in 梯度规约,以及 Megatron-Core DDP 如何通过 identity/view op 接入 leaf 参数的梯度累加器。</p>
+<p class="lead">本文以 <a href="https://jacocheung.notion.site/autograd-functional-cb49bb6bc11f4772b0f7f3c9c92fe3e0">autograd 和 functional</a> 为起点,只站在 Python 可观察对象上解释 <code>grad_fn</code> 与 <code>next_functions</code>。链式法则本身不展开,重点放在 forward 如何挂上 <code>grad_fn</code>、backward 如何沿 <code>next_functions</code> 执行、fan-in 梯度如何累加,以及 Megatron-Core DDP 如何通过 identity/view op 接入 leaf 参数的梯度累加器。</p>
 
 <h2 id="scope">0. 本文范围</h2>
 
-<p>PyTorch 官方 autograd mechanics 文档把 autograd 描述成一张由 <code>Function</code> 对象组成的反向图:forward 执行真实计算时,同时记录用于 backward 的图;反向从输出根节点走向输入叶子节点。这里的 <code>Function</code> 对应 C++ 里的 <code>Node</code>,而 Python 里 Tensor 的 <code>.grad_fn</code> 是进入这张 Node 图的入口。</p>
+<p>PyTorch 官方 autograd mechanics 文档把 autograd 描述成一张由 <code>Function</code> 对象组成的反向图:forward 执行真实计算时,同时记录用于 backward 的图;反向从输出 Tensor 走向输入 leaves。在 Python 里,Tensor 的 <code>.grad_fn</code> 就是进入这张反向图的入口。</p>
 
-<p>本文只讨论 eager autograd 的常规路径。AOTAutograd、torch.compile、functorch、forward-mode AD 和 distributed autograd 都有额外层次,不纳入讨论。</p>
+<p>本文只讨论 eager autograd 的常规路径。文章里的“图”和“边”都指 Python 里能通过 <code>.grad_fn</code>、<code>.next_functions</code> 观察到的结构。</p>
 
-<h2 id="objects">1. Tensor 图与 Node 图</h2>
+<h2 id="objects">1. Tensor 与 grad_fn 图</h2>
 
-<p>分析 autograd 时容易混在一起的是两张图。</p>
+<p>先把几个 Python 侧对象分清楚。</p>
 
 <div class="table-scroll">
 <table class="note-table">
@@ -179,43 +179,67 @@
     <tr>
       <th>对象</th>
       <th>Python 侧看到什么</th>
-      <th>C++ 侧对应什么</th>
       <th>含义</th>
+      <th>典型打印</th>
     </tr>
   </thead>
   <tbody>
     <tr>
       <td>非叶子 Tensor</td>
       <td><code>y.grad_fn</code></td>
-      <td><code>Node*</code></td>
-      <td>产生 <code>y</code> 的反向节点,例如 <code>AddBackward0</code>、<code>SinBackward0</code>。</td>
+      <td>产生 <code>y</code> 的反向函数,例如 <code>AddBackward0</code>、<code>SinBackward0</code>。</td>
+      <td><code>&lt;AddBackward0 ...&gt;</code></td>
     </tr>
     <tr>
       <td>叶子 Tensor</td>
       <td><code>p.grad_fn is None</code></td>
+      <td>用户直接创建并设置 <code>requires_grad=True</code> 的 Tensor。叶子没有 <code>grad_fn</code>,这一点不要和 <code>AccumulateGrad</code> 混在一起。</td>
+      <td><code>None</code></td>
+    </tr>
+    <tr>
+      <td><code>next_functions</code></td>
+      <td><code>y.grad_fn.next_functions</code></td>
+      <td>当前反向函数的上游依赖。沿着它走,方向是从 loss 走回输入 Tensor。</td>
+      <td><code>((fn0, 0), (fn1, 0))</code></td>
+    </tr>
+    <tr>
+      <td>叶子累加器</td>
       <td><code>AccumulateGrad</code></td>
-      <td>叶子没有 <code>grad_fn</code>,但需要梯度时会有一个梯度累加器。它可以从下游节点的 <code>next_functions</code> 里看到。</td>
+      <td>它不是 leaf 的 <code>grad_fn</code>。它是 autograd 为 leaf 准备的梯度累加函数,只能从下游 <code>next_functions</code> 间接看到。</td>
+      <td><code>&lt;AccumulateGrad ...&gt;</code></td>
     </tr>
     <tr>
-      <td>反向边</td>
+      <td>tuple 第二项</td>
       <td><code>(fn, input_nr)</code></td>
-      <td><code>Edge(function, input_nr)</code></td>
-      <td><code>function</code> 是目标 Node,<code>input_nr</code> 是梯度要写入目标 Node 的哪个输入槽位。</td>
-    </tr>
-    <tr>
-      <td>下游到上游</td>
-      <td><code>node.next_functions</code></td>
-      <td><code>Node::next_edges()</code></td>
-      <td>名字叫 <code>next</code>,但方向是 backward 的下一跳,也就是 forward 图里的上游。</td>
+      <td>同一个反向函数可能对应多个输出。<code>input_nr</code> 标记梯度要进入这个反向函数的哪个输入槽位。</td>
+      <td><code>(PairIdentityBackward, 1)</code></td>
     </tr>
   </tbody>
 </table>
 </div>
 
-<p><code>Edge</code> 在源码里只有两个字段:<code>function</code> 和 <code>input_nr</code>。<code>Node</code> 通过 <code>next_edge(index)</code>、<code>next_edges()</code> 维护这些边。这个结构解释了一个现象:多输出 op 的多个输出 Tensor 可以共享同一个 backward Node,只是它们携带的 output slot 不同。</p>
+<p>下面这段代码对应第一张图。它只用了一个乘法和一个加法,因此 <code>y.grad_fn</code> 是 <code>AddBackward0</code>。这个 <code>AddBackward0</code> 有两个输入来源:一个是中间结果 <code>x = a * b</code>,另一个是 leaf Tensor <code>c</code>。</p>
+
+<pre class="code">import torch
+
+a = torch.randn(4, requires_grad=True)
+b = torch.randn(4, requires_grad=True)
+c = torch.randn(4, requires_grad=True)
+
+x = a * b
+y = x + c
+
+print(y.grad_fn)
+# &lt;AddBackward0 ...&gt;
+
+print(y.grad_fn.next_functions)
+# (
+#   (&lt;MulBackward0 ...&gt;, 0),
+#   (&lt;AccumulateGrad ...&gt;, 0),
+# )</pre>
 
 <div class="diagram-frame">
-  <div class="diagram-title">Tensor.grad_fn 与 Node.next_edges 的关系</div>
+  <div class="diagram-title">Tensor.grad_fn 与 grad_fn.next_functions 的关系</div>
   <svg class="diagram-svg" viewBox="0 0 980 420" role="img" aria-label="grad_fn and next_functions object model">
     <defs>
       <marker id="arrow-1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -229,14 +253,14 @@
     <rect class="box op" x="335" y="38" width="230" height="110" rx="8"></rect>
     <line class="edge" x1="335" y1="75" x2="565" y2="75"></line>
     <text x="450" y="63" text-anchor="middle" font-size="15" font-weight="600">AddBackward0</text>
-    <text class="mono muted" x="354" y="100" font-size="12">next_edges = [</text>
+    <text class="mono muted" x="354" y="100" font-size="12">next_functions = [</text>
     <text class="mono" x="374" y="123" font-size="12">(MulBackward0, 0),</text>
     <text class="mono" x="374" y="142" font-size="12">(AccumulateGrad, 0)</text>
     <text class="mono muted" x="354" y="161" font-size="12">]</text>
 
     <rect class="box op" x="690" y="40" width="190" height="76" rx="8"></rect>
     <text x="785" y="72" text-anchor="middle" font-size="15" font-weight="600">MulBackward0</text>
-    <text class="mono muted" x="785" y="96" text-anchor="middle" font-size="12">for non-leaf input</text>
+    <text class="mono muted" x="785" y="96" text-anchor="middle" font-size="12">for x = a * b</text>
 
     <rect class="box acc" x="690" y="165" width="190" height="76" rx="8"></rect>
     <text x="785" y="197" text-anchor="middle" font-size="15" font-weight="600">AccumulateGrad</text>
@@ -250,7 +274,7 @@
     <text x="145" y="311" text-anchor="middle" font-size="15" font-weight="600">Leaf Tensor c</text>
     <text class="mono muted" x="145" y="335" text-anchor="middle" font-size="12">grad_fn = None</text>
     <path class="edge dash" marker-end="url(#arrow-1)" d="M 690 221 C 520 360, 310 355, 220 320"></path>
-    <text class="muted" x="432" y="355" text-anchor="middle" font-size="12">叶子的累加器不挂在 c.grad_fn 上,而是被下游 Edge 指到</text>
+    <text class="muted" x="432" y="355" text-anchor="middle" font-size="12">c.grad_fn 是 None,但 AddBackward0.next_functions 会指到 c 的 AccumulateGrad</text>
   </svg>
 </div>
 
@@ -258,20 +282,20 @@
 
 <h2 id="forward">2. forward 如何建图</h2>
 
-<p>一个需要梯度的 op 在 forward 期间通常经历几步:</p>
+<p>从 Python 侧看,一个需要梯度的 op 在 forward 期间会留下几类信息:</p>
 
 <ol>
   <li>检查输入 Tensor 里是否有 <code>requires_grad=True</code> 的变量。</li>
-  <li>如果需要建图,创建这个 op 对应的 backward <code>Node</code>。</li>
-  <li>从输入 Tensor 收集反向边。非叶子输入返回自己的 <code>grad_fn</code> 与 <code>output_nr</code>;叶子输入返回它的 <code>AccumulateGrad</code> 与 slot 0。</li>
-  <li>执行真实 forward kernel。</li>
-  <li>把输出 Tensor 的 history 设置为刚创建的 backward Node,并记录输出属于这个 Node 的第几个输出槽位。</li>
+  <li>如果需要建图,输出 Tensor 会带上 <code>grad_fn</code>,例如 <code>AddBackward0</code>。</li>
+  <li><code>grad_fn.next_functions</code> 会记录这个 op 的输入来自哪里。输入是非叶子 Tensor 时,它指向该 Tensor 的 <code>grad_fn</code>;输入是叶子 Tensor 时,它指向该 leaf 对应的 <code>AccumulateGrad</code>。</li>
+  <li>叶子 Tensor 本身仍然没有 <code>grad_fn</code>。<code>AccumulateGrad</code> 不是 leaf 的 <code>.grad_fn</code>,只是反向图最终把梯度写回 leaf <code>.grad</code> 的入口。</li>
+  <li>多输出 op 的多个输出可以共享同一个 <code>grad_fn</code>,tuple 里的第二个整数用来区分梯度回到这个 <code>grad_fn</code> 的哪个输出槽位。</li>
 </ol>
 
-<p>源码上可以对照几个位置。<code>collect_next_edges</code> 会对输入调用 <code>gradient_edge</code>。<code>gradient_edge</code> 对非叶子返回 <code>grad_fn</code>,对叶子返回 <code>grad_accumulator</code>。<code>set_history</code> 则把输出 Tensor 连接到当前 backward Node。自定义 C++ <code>autograd::Function</code> 的 <code>apply</code> 路径里,也能看到 <code>collect_next_edges</code>、<code>set_next_edges</code>、执行 forward、包装输出这条流程。</p>
+<p>继续看第一张图里的例子。<code>x = a * b</code> 产生非叶子 Tensor <code>x</code>,所以 <code>x.grad_fn</code> 是 <code>MulBackward0</code>。再执行 <code>y = x + c</code> 时,<code>y.grad_fn</code> 是 <code>AddBackward0</code>,它的 <code>next_functions</code> 第一项指向 <code>x.grad_fn</code>,第二项指向 leaf <code>c</code> 的 <code>AccumulateGrad</code>。</p>
 
 <div class="note-box">
-  <p>叶子 Tensor 的 <code>.grad_fn</code> 是 <code>None</code>,这不是说它没有出现在反向图里。它的反向入口是 <code>AccumulateGrad</code>,由下游 Node 的 <code>next_functions</code> 指过去。</p>
+  <p>叶子 Tensor 的 <code>.grad_fn</code> 一定是 <code>None</code>。如果在下游 <code>next_functions</code> 里看到了 <code>AccumulateGrad</code>,含义是“反向到这里以后把梯度累加到这个 leaf 的 <code>.grad</code>”,不是“这个 leaf 有 grad_fn”。</p>
 </div>
 
 <h2 id="read-next">3. next_functions 如何读</h2>
@@ -301,7 +325,7 @@ loss = (p + q + v).sum()</pre>
 
 <ul>
   <li><code>u.grad_fn</code> 和 <code>v.grad_fn</code> 都指向同一个 <code>PairIdentityBackward</code>。</li>
-  <li><code>u</code> 是 <code>PairIdentityBackward</code> 的第 0 个输出,<code>v</code> 是第 1 个输出。所以下游节点指回它时,边分别写成 <code>(PairIdentityBackward, 0)</code> 和 <code>(PairIdentityBackward, 1)</code>。</li>
+  <li><code>u</code> 是 <code>PairIdentityBackward</code> 的第 0 个输出,<code>v</code> 是第 1 个输出。所以下游反向函数指回它时,tuple 分别写成 <code>(PairIdentityBackward, 0)</code> 和 <code>(PairIdentityBackward, 1)</code>。</li>
 </ul>
 
 <p>用数学符号写,这个 forward 是:</p>
@@ -319,7 +343,7 @@ L = \sum_i (p_i + q_i + v_i)
 \mathrm{d}u = \mathrm{d}p \cdot 2 + \mathrm{d}q \cdot \cos(u)
 \]</p>
 
-<p>在这个例子里 \(\mathrm{d}p = 1\)、\(\mathrm{d}q = 1\),所以 \(\mathrm{d}u = 2 + \cos(u)\)。这两个分支的梯度不会让 <code>PairIdentityBackward</code> 执行两次。它们先进同一个 <code>InputBuffer</code> 的 slot 0,累加成一个 \(\mathrm{d}u\),然后 <code>PairIdentityBackward</code> 只执行一次。</p>
+<p>在这个例子里 \(\mathrm{d}p = 1\)、\(\mathrm{d}q = 1\),所以 \(\mathrm{d}u = 2 + \cos(u)\)。这两个分支的梯度不会让 <code>PairIdentityBackward</code> 执行两次。它们先在 <code>PairIdentityBackward</code> 的第 0 个梯度槽位上累加成一个 \(\mathrm{d}u\),然后 <code>PairIdentityBackward</code> 只执行一次。</p>
 
 <div class="diagram-frame">
   <div class="diagram-title">包含多分支 fan-in 规约的反向图</div>
@@ -338,8 +362,8 @@ L = \sum_i (p_i + q_i + v_i)
     <rect class="box op" x="250" y="276" width="190" height="100" rx="8"></rect>
     <line class="edge" x1="250" y1="312" x2="440" y2="312"></line>
     <text x="345" y="302" text-anchor="middle" font-size="15" font-weight="600">PairIdentityBackward</text>
-    <text class="mono muted" x="270" y="336" font-size="12">inputs: [du, dv]</text>
-    <text class="mono muted" x="270" y="356" font-size="12">next: AccGrad(a), AccGrad(b)</text>
+    <text class="mono muted" x="270" y="336" font-size="12">backward(du, dv)</text>
+    <text class="mono muted" x="270" y="356" font-size="12">next_functions -> AccGrad(a/b)</text>
 
     <rect class="box tensor" x="520" y="145" width="92" height="54" rx="9"></rect>
     <text x="566" y="178" text-anchor="middle" font-size="15" font-weight="600">u</text>
@@ -359,7 +383,7 @@ L = \sum_i (p_i + q_i + v_i)
     <text class="mono muted" x="765" y="446" text-anchor="middle" font-size="12">dv</text>
 
     <rect class="box buffer" x="500" y="268" width="150" height="96" rx="8"></rect>
-    <text x="575" y="296" text-anchor="middle" font-size="15" font-weight="600">InputBuffer</text>
+    <text x="575" y="296" text-anchor="middle" font-size="15" font-weight="600">grad slots</text>
     <text class="mono" x="520" y="322" font-size="12">slot 0: du0 + du1</text>
     <text class="mono" x="520" y="344" font-size="12">slot 1: dv</text>
 
@@ -418,7 +442,7 @@ loss.grad_fn.next_functions[0][0]
 
 <p>回到规约问题:同一个 Tensor 被多个下游 op 消费时,反向产生的多个梯度 Tensor 是不是在图里形成一个独立规约节点?</p>
 
-<p>对普通 eager backward 来说,Python 能遍历到的 <code>grad_fn</code> 图里不会多出一个显式的 <code>AddBackward</code> 节点专门做这件事。PyTorch engine 在内部给每个待执行 Node 准备一个 <code>InputBuffer</code>。源码注释把 <code>NodeTask.inputs_</code> 称作所有流入梯度的隐式加法节点。因此,fan-in 规约是 engine 的执行状态,不是用户图上的新 Node。</p>
+<p>对普通 eager backward 来说,Python 能遍历到的 <code>grad_fn</code> 图里不会多出一个显式的 <code>AddBackward</code> 节点专门做这件事。你能观察到的是:同一个上游反向函数只执行一次,它收到的某个 <code>grad_x</code> 已经是多个下游分支相加后的结果。</p>
 
 <p>它的行为可以按 slot 理解。对 <code>PairIdentityBackward</code> 来说:</p>
 
@@ -428,11 +452,22 @@ loss.grad_fn.next_functions[0][0]
   <li><code>v</code> 那条分支产生一份给 slot 1 的梯度。</li>
 </ul>
 
-<p><code>InputBuffer::add(pos, grad)</code> 看到第一份 slot 0 梯度时直接放入 buffer;看到第二份 slot 0 梯度时做 <code>old + grad</code>,或者在安全条件满足时用 <code>add_</code> 复用 storage。所有依赖计数归零后,engine 才把这个 buffer 交给 <code>PairIdentityBackward.apply([du, dv])</code>。</p>
+<p>可以把它理解为 <code>PairIdentityBackward</code> 有一个待填充的梯度参数表。第一条分支填入 slot 0,第二条分支也写入 slot 0,于是这两份梯度先相加。等 slot 0 和 slot 1 都准备好以后,autograd 才调用一次 <code>PairIdentityBackward.backward(ctx, grad_u, grad_v)</code>。</p>
+
+<pre class="code">class PairIdentity(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, a, b):
+        return a, b
+
+    @staticmethod
+    def backward(ctx, grad_u, grad_v):
+        print("grad_u =", grad_u)  # 已经包含 u * 2 和 u.sin() 两条分支
+        print("grad_v =", grad_v)
+        return grad_u, grad_v</pre>
 
 <div class="diagram-frame">
-  <div class="diagram-title">InputBuffer 按 input_nr 聚合梯度</div>
-  <svg class="diagram-svg" viewBox="0 0 980 360" role="img" aria-label="InputBuffer accumulation slots">
+  <div class="diagram-title">grad_fn.next_functions 按 input_nr 聚合梯度</div>
+  <svg class="diagram-svg" viewBox="0 0 980 360" role="img" aria-label="next_functions accumulation slots">
     <defs>
       <marker id="arrow-3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
         <path d="M 0 0 L 10 5 L 0 10 z" fill="#71717a"></path>
@@ -446,7 +481,7 @@ loss.grad_fn.next_functions[0][0]
     <text x="155" y="280" text-anchor="middle" font-size="14" font-weight="600">v branch</text>
 
     <rect class="box buffer" x="390" y="80" width="240" height="190" rx="8"></rect>
-    <text x="510" y="112" text-anchor="middle" font-size="15" font-weight="600">InputBuffer for PairIdentityBackward</text>
+    <text x="510" y="112" text-anchor="middle" font-size="15" font-weight="600">grad args for PairIdentityBackward</text>
     <rect class="box" x="420" y="140" width="180" height="42" rx="6"></rect>
     <text class="mono" x="510" y="166" text-anchor="middle" font-size="12">slot 0 = du_sin + du_mul</text>
     <rect class="box" x="420" y="202" width="180" height="42" rx="6"></rect>
@@ -454,7 +489,7 @@ loss.grad_fn.next_functions[0][0]
 
     <rect class="box op" x="760" y="137" width="165" height="76" rx="8"></rect>
     <text x="842" y="168" text-anchor="middle" font-size="14" font-weight="600">PairIdentityBackward</text>
-    <text class="mono muted" x="842" y="192" text-anchor="middle" font-size="12">apply([du, dv])</text>
+    <text class="mono muted" x="842" y="192" text-anchor="middle" font-size="12">backward(du, dv)</text>
 
     <path class="edge" marker-end="url(#arrow-3)" d="M 240 91 C 300 92, 326 136, 390 153"></path>
     <text class="mono subtle" x="298" y="111" font-size="12">input_nr=0</text>
@@ -466,53 +501,54 @@ loss.grad_fn.next_functions[0][0]
   </svg>
 </div>
 
-<p>如果使用 <code>backward(create_graph=True)</code> 或某些高阶梯度路径,累加本身可能进入更高阶图,源码里也能看到 GradMode 打开时用 <code>old_var + var</code>。但训练里常见的 <code>loss.backward()</code> 路径,这个规约主要是 engine 内部状态。</p>
+<p>所以“有没有独立规约节点”的回答是:从 Python 的 <code>grad_fn.next_functions</code> 图上看,没有。规约发生在某个反向函数真正被调用之前,最后体现为它收到的 <code>grad_u</code> 已经合并。</p>
 
-<h2 id="engine">5. backward 的迭代顺序</h2>
+<h2 id="backward-order">5. backward 的迭代顺序</h2>
 
-<p>把 backward 说成 DFS 或 BFS 都不够准确。PyTorch engine 更接近“依赖计数 + ready queue”的迭代调度。</p>
+<p>从 Python 图上看,backward 从 <code>loss.grad_fn</code> 开始,沿着 <code>next_functions</code> 逐步走回 leaves。它不是简单地把某个分支一路走到底:如果一个上游反向函数被多个下游分支依赖,它要等这些分支的梯度都准备好以后才会被调用。</p>
 
 <ol>
-  <li>从 root edge 出发,遍历 <code>next_edges()</code>,统计每个 Node 还有多少下游依赖没有完成。这个计数放在 <code>GraphTask.dependencies_</code>。</li>
-  <li>root Node 先进入 ready queue。单 loss 的常规路径可能直接用 loss 的 <code>grad_fn</code>;多 root 时会有额外的 root 聚合节点。</li>
-  <li>worker 从 ready queue 取一个 <code>NodeTask</code>,调用 <code>call_function</code> 执行该 Node 的 backward。</li>
-  <li>当前 Node 产生的每个输出梯度,按照 <code>fn.next_edge(i)</code> 找到上游 Node 和 <code>input_nr</code>,调用对方的 <code>InputBuffer::add(input_nr, grad)</code>。</li>
-  <li>上游 Node 的依赖计数减 1。减到 0 时,它带着已经填好的 <code>InputBuffer</code> 进入 ready queue。</li>
+  <li><code>loss.backward()</code> 先把初始梯度交给 <code>loss.grad_fn</code>。</li>
+  <li>当前 <code>grad_fn</code> 运行自己的 backward,得到对它输入 Tensor 的梯度。</li>
+  <li>每一份输入梯度按照 <code>next_functions</code> 里的 <code>(fn, input_nr)</code> 送给上游反向函数的对应槽位。</li>
+  <li>如果同一个槽位收到多份梯度,先相加。</li>
+  <li>某个上游反向函数需要的梯度都准备好以后,它才会被调用。</li>
+  <li>走到 <code>AccumulateGrad</code> 时,梯度被写入对应 leaf Tensor 的 <code>.grad</code>。</li>
 </ol>
 
 <div class="diagram-frame">
-  <div class="diagram-title">Engine 执行循环: dependency count + ready queue</div>
-  <svg class="diagram-svg" viewBox="0 0 1060 430" role="img" aria-label="autograd engine execution loop">
+  <div class="diagram-title">backward 从 loss.grad_fn 沿 next_functions 迭代</div>
+  <svg class="diagram-svg" viewBox="0 0 1060 430" role="img" aria-label="autograd backward execution order">
     <defs>
       <marker id="arrow-4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
         <path d="M 0 0 L 10 5 L 0 10 z" fill="#71717a"></path>
       </marker>
     </defs>
     <rect class="box" x="60" y="70" width="185" height="72" rx="8"></rect>
-    <text x="152" y="101" text-anchor="middle" font-size="15" font-weight="600">compute_dependencies</text>
-    <text class="mono muted" x="152" y="124" text-anchor="middle" font-size="12">walk next_edges()</text>
+    <text x="152" y="101" text-anchor="middle" font-size="15" font-weight="600">loss.grad_fn</text>
+    <text class="mono muted" x="152" y="124" text-anchor="middle" font-size="12">start backward</text>
 
     <rect class="box buffer" x="320" y="70" width="180" height="72" rx="8"></rect>
-    <text x="410" y="101" text-anchor="middle" font-size="15" font-weight="600">dependencies_</text>
-    <text class="mono muted" x="410" y="124" text-anchor="middle" font-size="12">Node -> count</text>
+    <text x="410" y="101" text-anchor="middle" font-size="15" font-weight="600">run backward</text>
+    <text class="mono muted" x="410" y="124" text-anchor="middle" font-size="12">produce input grads</text>
 
     <rect class="box acc" x="600" y="70" width="170" height="72" rx="8"></rect>
-    <text x="685" y="101" text-anchor="middle" font-size="15" font-weight="600">ReadyQueue</text>
-    <text class="mono muted" x="685" y="124" text-anchor="middle" font-size="12">priority queue</text>
+    <text x="685" y="101" text-anchor="middle" font-size="15" font-weight="600">next_functions</text>
+    <text class="mono muted" x="685" y="124" text-anchor="middle" font-size="12">(fn, input_nr)</text>
 
     <rect class="box op" x="840" y="70" width="160" height="72" rx="8"></rect>
-    <text x="920" y="101" text-anchor="middle" font-size="15" font-weight="600">call_function</text>
-    <text class="mono muted" x="920" y="124" text-anchor="middle" font-size="12">run backward</text>
+    <text x="920" y="101" text-anchor="middle" font-size="15" font-weight="600">upstream grad_fn</text>
+    <text class="mono muted" x="920" y="124" text-anchor="middle" font-size="12">wait until grads ready</text>
 
     <rect class="box buffer" x="640" y="250" width="210" height="90" rx="8"></rect>
-    <text x="745" y="282" text-anchor="middle" font-size="15" font-weight="600">InputBuffer::add</text>
+    <text x="745" y="282" text-anchor="middle" font-size="15" font-weight="600">accumulate slots</text>
     <text class="mono muted" x="745" y="306" text-anchor="middle" font-size="12">write by input_nr</text>
     <text class="mono muted" x="745" y="326" text-anchor="middle" font-size="12">accumulate fan-in grads</text>
 
     <rect class="box" x="335" y="250" width="195" height="90" rx="8"></rect>
-    <text x="432" y="282" text-anchor="middle" font-size="15" font-weight="600">decrement count</text>
-    <text class="mono muted" x="432" y="306" text-anchor="middle" font-size="12">count == 0</text>
-    <text class="mono muted" x="432" y="326" text-anchor="middle" font-size="12">queue next NodeTask</text>
+    <text x="432" y="282" text-anchor="middle" font-size="15" font-weight="600">call once</text>
+    <text class="mono muted" x="432" y="306" text-anchor="middle" font-size="12">after all branches</text>
+    <text class="mono muted" x="432" y="326" text-anchor="middle" font-size="12">have contributed grads</text>
 
     <path class="edge" marker-end="url(#arrow-4)" d="M 245 106 C 270 106, 292 106, 320 106"></path>
     <path class="edge" marker-end="url(#arrow-4)" d="M 500 106 C 535 106, 562 106, 600 106"></path>
@@ -520,19 +556,19 @@ loss.grad_fn.next_functions[0][0]
     <path class="edge" marker-end="url(#arrow-4)" d="M 920 142 C 920 205, 850 232, 805 250"></path>
     <path class="edge" marker-end="url(#arrow-4)" d="M 640 300 C 602 300, 570 299, 530 298"></path>
     <path class="edge" marker-end="url(#arrow-4)" d="M 432 250 C 435 178, 564 148, 628 142"></path>
-    <text class="subtle" x="690" y="386" text-anchor="middle" font-size="12">每次执行一个 ready Node,把产生的梯度推给 next_edges 指向的上游 Node</text>
+    <text class="subtle" x="690" y="386" text-anchor="middle" font-size="12">next_functions 决定梯度往哪里传,input_nr 决定传到哪个参数槽位</text>
   </svg>
 </div>
 
 <p>执行顺序有两个层面。</p>
 
-<p>第一层是拓扑约束:一个 Node 的所有下游用户都完成后,它才能执行。上面的 fan-in 例子里,<code>PairIdentityBackward</code> 要等 <code>MulBackward0</code>、<code>SinBackward0</code> 和 <code>v</code> 那条分支都把梯度写进 buffer 后才能运行。</p>
+<p>第一层是依赖约束:一个反向函数的所有下游梯度都准备好后,它才能执行。上面的 fan-in 例子里,<code>PairIdentityBackward</code> 要等 <code>MulBackward0</code>、<code>SinBackward0</code> 和 <code>v</code> 那条分支都贡献梯度后才能运行。</p>
 
-<p>第二层是 ready queue 的优先级。源码里同一 reentrant depth 下会比较 <code>sequence_nr()</code>,通常 forward 越晚创建的 Node,backward 越先执行。<code>AccumulateGrad</code> 例外,它的 sequence number 被设为 <code>UINT64_MAX</code>,所以一旦 ready 会被尽早调度。多设备、多线程、stream 同步和 reentrant backward 会让实际顺序更复杂,因此不要把 <code>next_functions</code> 的元组顺序当成数值累加顺序的稳定 ABI。</p>
+<p>第二层是同一批可执行反向函数之间的调度顺序。这个顺序不适合作为写模型逻辑的依据。对理解 <code>next_functions</code> 更重要的是依赖关系:某条边指向谁,以及 tuple 里的 <code>input_nr</code> 是多少。</p>
 
 <h2 id="accumulate-grad">6. AccumulateGrad 与 leaf .grad</h2>
 
-<p><code>AccumulateGrad</code> 是 leaf Tensor 的终点 Node。它的 <code>apply</code> 不再向上游返回梯度,而是把输入梯度写到 leaf 的 <code>.grad</code> 里。源码注释也把它称作 sink:接收一个输入,没有输出,副作用是累加梯度。</p>
+<p><code>AccumulateGrad</code> 是 leaf Tensor 的梯度累加函数。它不是 leaf 的 <code>grad_fn</code>。leaf Tensor 的 <code>grad_fn</code> 仍然是 <code>None</code>。</p>
 
 <p>这也解释了为什么用户可以间接拿到 <code>AccumulateGrad</code>:</p>
 
@@ -545,7 +581,7 @@ y.grad_fn
 y.grad_fn.next_functions[0][0]
 # AccumulateGrad for p</pre>
 
-<p>但 <code>p.grad_fn</code> 仍然是 <code>None</code>。叶子节点对外的 Tensor API 不把 accumulator 暴露在 <code>.grad_fn</code> 上,而是在内部用 <code>grad_accumulator(p)</code> 管理。只要某个需要梯度的 op 消费了这个 leaf,下游 Node 的 <code>next_functions</code> 就会指到它。</p>
+<p>这段代码的边界是:用户拿不到 <code>p.grad_fn</code>,因为它就是 <code>None</code>;但用户可以从消费 <code>p</code> 的下游反向函数里看到 <code>AccumulateGrad</code>。反向走到这个对象时,梯度会被累加到 <code>p.grad</code>。</p>
 
 <h2 id="megatron">7. Megatron-Core DDP 的应用</h2>
 
@@ -562,7 +598,7 @@ if param.requires_grad:
     grad_acc.register_hook(self._make_backward_post_hook(param))
     self.grad_accs.append(grad_acc)</pre>
 
-<p><code>expand_as</code> 对 shape 相同的参数来说不需要复制数据,但它会产生一个非叶子 Tensor <code>param_tmp</code>。这个 Tensor 有 <code>grad_fn</code>,通常是 <code>ExpandBackward0</code> 或同类 view backward Node。由于 <code>param_tmp</code> 的输入是 leaf 参数,所以 <code>param_tmp.grad_fn.next_functions[0][0]</code> 指向原参数的 <code>AccumulateGrad</code>。</p>
+<p><code>expand_as</code> 对 shape 相同的参数来说不需要复制数据,但它会产生一个非叶子 Tensor <code>param_tmp</code>。这个 Tensor 有 <code>grad_fn</code>,通常能看到 <code>ExpandBackward0</code> 或同类 view 反向函数。由于 <code>param_tmp</code> 的输入是 leaf 参数,所以 <code>param_tmp.grad_fn.next_functions[0][0]</code> 指向原参数的 <code>AccumulateGrad</code>。</p>
 
 <div class="diagram-frame">
   <div class="diagram-title">Megatron-Core DDP 通过 identity/view op 取得 leaf 参数的 AccumulateGrad</div>
@@ -616,18 +652,9 @@ if param.requires_grad:
 <ul>
   <li><a href="https://jacocheung.notion.site/autograd-functional-cb49bb6bc11f4772b0f7f3c9c92fe3e0">autograd 和 functional</a></li>
   <li><a href="https://docs.pytorch.org/docs/2.13/notes/autograd.html#how-autograd-encodes-the-history">PyTorch Autograd mechanics: How autograd encodes the history</a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/b2329090622d2b6f97f7a3853e9aed8566732775/torch/csrc/autograd/edge.h#L13-L38">PyTorch <code>Edge</code> 定义</a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/b2329090622d2b6f97f7a3853e9aed8566732775/torch/csrc/autograd/node.h#L96-L115">PyTorch <code>Node</code> 与 <code>next_edges</code> 说明</a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/b2329090622d2b6f97f7a3853e9aed8566732775/torch/csrc/autograd/functions/utils.h#L67-L80">PyTorch <code>set_history</code> 设置输出 Tensor 的 gradient edge</a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/b2329090622d2b6f97f7a3853e9aed8566732775/torch/csrc/autograd/custom_function.h#L496-L510">PyTorch custom Function forward 建图路径</a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/b2329090622d2b6f97f7a3853e9aed8566732775/torch/csrc/autograd/variable.cpp#L291-L340">PyTorch leaf <code>grad_accumulator</code> 与 <code>gradient_edge</code></a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/b2329090622d2b6f97f7a3853e9aed8566732775/torch/csrc/autograd/engine.h#L52-L58">PyTorch <code>NodeTask.inputs_</code> 作为隐式加法节点</a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/b2329090622d2b6f97f7a3853e9aed8566732775/torch/csrc/autograd/engine.cpp#L1351-L1357">PyTorch engine 统计 Node 依赖计数</a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/b2329090622d2b6f97f7a3853e9aed8566732775/torch/csrc/autograd/engine.cpp#L1218-L1284">PyTorch engine 分发输出梯度到 <code>InputBuffer</code></a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/b2329090622d2b6f97f7a3853e9aed8566732775/torch/csrc/autograd/engine.h#L87-L104">PyTorch <code>ReadyQueue</code> 优先级比较</a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/b2329090622d2b6f97f7a3853e9aed8566732775/torch/csrc/autograd/node.h#L344-L353">PyTorch <code>sequence_nr</code> 在 backward 调度中的用途</a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/b2329090622d2b6f97f7a3853e9aed8566732775/torch/csrc/autograd/input_buffer.cpp#L134-L173">PyTorch <code>InputBuffer</code> 梯度累加实现</a></li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/b2329090622d2b6f97f7a3853e9aed8566732775/torch/csrc/autograd/functions/accumulate_grad.cpp#L88-L125">PyTorch <code>AccumulateGrad</code> 实现</a></li>
+  <li><a href="https://docs.pytorch.org/docs/stable/generated/torch.Tensor.is_leaf.html">PyTorch <code>Tensor.is_leaf</code> 文档</a></li>
+  <li><a href="https://docs.pytorch.org/tutorials/beginner/introyt/autogradyt_tutorial.html">PyTorch The Fundamentals of Autograd: <code>grad_fn.next_functions</code> 示例</a></li>
+  <li><a href="https://docs.pytorch.org/docs/stable/notes/extending.html#extending-torch-autograd">PyTorch Extending autograd 文档</a></li>
   <li><a href="https://github.com/NVIDIA/Megatron-LM/blob/7ee599a25ca15f042c1087176b73ebddb0566d02/megatron/core/distributed/distributed_data_parallel.py#L284-L290">Megatron-Core DDP 获取 leaf 参数 <code>AccumulateGrad</code></a></li>
   <li><a href="https://github.com/NVIDIA/Megatron-LM/blob/7ee599a25ca15f042c1087176b73ebddb0566d02/megatron/core/distributed/distributed_data_parallel.py#L360-L383">Megatron-Core DDP backward post hook</a></li>
 </ul>
