@@ -1,0 +1,566 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PyTorch DDP 梯度规约机制：Reducer、Bucket 与 NCCL AllReduce</title>
+<meta name="post:title"           content="PyTorch DDP 梯度规约机制：Reducer、Bucket 与 NCCL AllReduce">
+<meta name="post:title_en"        content="Gradient Reduction in PyTorch DDP: Reducer, Buckets, and NCCL AllReduce">
+<meta name="post:slug"            content="pytorch-ddp-gradient-reduction">
+<meta name="post:date"            content="2026-08-20">
+<meta name="post:tags"            content="PyTorch, DDP, Reducer, NCCL, AllReduce">
+<meta name="post:tags_en"         content="PyTorch, DDP, Reducer, NCCL, AllReduce">
+<meta name="post:reading"         content="14 分钟">
+<meta name="post:reading_en"      content="14 min">
+<meta name="post:summary"         content="沿着参数梯度就绪、bucket 规约与 backward 收尾的执行路径，说明 DDP 何时发起 AllReduce、一次反向包含多少次 collective，以及平均梯度的缩放发生在哪里。">
+<meta name="post:summary_en"      content="A source-guided account of DDP gradient readiness, bucket reduction, collective counts, and where gradient averaging occurs.">
+<meta name="post:series"          content="pytorch-internals">
+<meta name="post:series_title"    content="PyTorch 内部机制">
+<meta name="post:series_title_en" content="PyTorch Internals">
+<meta name="post:series_order"    content="7">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(','\\)'], ['$','$']], displayMath: [['\\[','\\]'], ['$$','$$']] },
+    options: { skipHtmlTags: ['script', 'style', 'pre', 'code'] }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
+<script src="../lang-toggle.js" defer></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  main.content { max-width: 1060px; min-width: 0; padding: 56px 32px 96px; letter-spacing: 0; }
+  main.content h1,
+  main.content h2,
+  main.content h3,
+  main.content h4 { letter-spacing: 0; }
+  @media (max-width: 960px) { main.content { width: 100%; max-width: 100%; padding: 48px 20px 80px; } }
+  .lead {
+    font-size: 17px;
+    line-height: 1.8;
+    color: var(--fg-muted);
+    margin: -6px 0 30px;
+    max-width: 82ch;
+  }
+  .note-box {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-tint);
+    padding: 12px 16px;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    margin: 18px 0 24px;
+  }
+  .note-box.warn {
+    border-left-color: #d97706;
+    background: rgba(217, 119, 6, 0.08);
+  }
+  .note-box p { margin: 6px 0; }
+  .table-scroll {
+    overflow-x: auto;
+    margin: 18px 0 26px;
+  }
+  table.note-table {
+    width: 100%;
+    min-width: 820px;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  table.note-table th,
+  table.note-table td {
+    border: 1px solid var(--border);
+    padding: 9px 12px;
+    text-align: left;
+    vertical-align: top;
+  }
+  table.note-table th {
+    background: var(--bg-elevated);
+    font-weight: 600;
+  }
+  .diagram-frame {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    padding: 14px 16px;
+    margin: 18px 0 28px;
+    max-width: 100%;
+    box-sizing: border-box;
+    overflow-x: auto;
+  }
+  .diagram-title {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--fg-subtle);
+    letter-spacing: 0;
+    margin-bottom: 10px;
+  }
+  .diagram-svg {
+    display: block;
+    min-width: 900px;
+    width: 100%;
+    height: auto;
+  }
+  .diagram-svg text {
+    font-family: var(--font-sans);
+    fill: var(--fg);
+    letter-spacing: 0;
+  }
+  .diagram-svg .mono { font-family: var(--font-mono); }
+  .diagram-svg .muted { fill: var(--fg-muted); }
+  .diagram-svg .subtle { fill: var(--fg-subtle); }
+  .diagram-svg .lane {
+    fill: var(--bg);
+    stroke: var(--border);
+    stroke-width: 1;
+  }
+  .diagram-svg .compute {
+    fill: rgba(244, 114, 182, 0.17);
+    stroke: #be185d;
+    stroke-width: 1.4;
+  }
+  .diagram-svg .ready {
+    fill: rgba(245, 158, 11, 0.15);
+    stroke: #d97706;
+    stroke-width: 1.4;
+  }
+  .diagram-svg .comm {
+    fill: rgba(37, 99, 235, 0.13);
+    stroke: #2563eb;
+    stroke-width: 1.4;
+  }
+  .diagram-svg .finalize {
+    fill: rgba(16, 185, 129, 0.14);
+    stroke: #059669;
+    stroke-width: 1.4;
+  }
+  .diagram-svg .guide {
+    stroke: var(--border-strong);
+    stroke-width: 1.2;
+    stroke-dasharray: 5 5;
+    fill: none;
+  }
+  .diagram-svg .axis {
+    stroke: var(--fg-muted);
+    stroke-width: 1.3;
+    fill: none;
+  }
+  main.content mjx-container[display="true"] {
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 2px;
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录 · TOC</div>
+    <ul>
+      <li><a href="#scope">0. 讨论范围</a></li>
+      <li><a href="#wgrad">1. 从 wgrad 到 bucket</a></li>
+      <li><a href="#trigger">2. AllReduce 的触发时机</a></li>
+      <li><a href="#count">3. Collective 与 kernel 数量</a></li>
+      <li><a href="#sum-avg">4. SUM 与平均梯度</a></li>
+      <li><a href="#scaling">5. wgrad scaling 的位置</a></li>
+      <li><a href="#other-scales">6. 其他梯度缩放</a></li>
+      <li><a href="#observe">7. 运行时观测</a></li>
+      <li><a href="#boundary">8. DDP 与 reduce-scatter</a></li>
+      <li><a href="#refs">参考资料</a></li>
+    </ul>
+  </aside>
+
+<main class="content">
+
+<h1>PyTorch DDP 梯度规约机制：Reducer、Bucket 与 NCCL AllReduce</h1>
+
+<p class="lead"><code>loss.backward()</code> 并不会等所有参数的梯度算完以后，再对整份模型梯度做一次 AllReduce。DDP 把参数梯度组织成若干 bucket。一个 bucket 内的梯度全部就绪后，<code>Reducer</code> 立即发起异步通信，让后续 backward 计算与前面 bucket 的通信重叠。本文沿着这条执行路径说明规约何时发生、一次 backward 会发起多少次 collective，以及 NCCL SUM 如何得到平均梯度。</p>
+
+<h2 id="scope">0. 讨论范围</h2>
+
+<p>本文讨论标准 <code>torch.nn.parallel.DistributedDataParallel</code>，每个 rank 保存完整参数、完整梯度和完整优化器状态。源码说明以 PyTorch main commit <a href="https://github.com/pytorch/pytorch/tree/9c603a799add5df0195762d18f320b8bf00e848f"><code>9c603a7</code></a> 为基准。自定义 communication hook、<code>join()</code> 和稀疏梯度会改变部分细节，相关差异在对应章节单列。</p>
+
+<p>DDP 的规约对象是梯度 bucket，不是参数，也不是整个模型。设一个 DDP 实例在 bucket 重建后有 \(B\) 个梯度 bucket。常规同步 backward 中，默认通信路径会为每个 bucket 发起一次梯度 AllReduce。</p>
+
+<h2 id="wgrad">1. 从 wgrad 到 bucket</h2>
+
+<p>以 Linear 为例，rank \(r\) 上的 forward 和权重梯度写成：</p>
+
+<p>\[
+Y_r = X_r W^{\mathsf T}, \qquad
+G_r = \frac{\mathrm{d}L_r}{\mathrm{d}W}
+\]</p>
+
+<p>GEMM 或其他 backward kernel 只计算本 rank 的局部梯度 \(G_r\)。DDP 不参与这个 wgrad kernel。局部梯度经过 autograd 的 fan-in 累加并写入参数的 <code>.grad</code> 后，DDP 注册在梯度累加器上的 post hook 才会运行。这个 hook 的挂载方式与 <a href="./pytorch-autograd-grad-fn-next-functions.html">grad_fn、next_functions 与 AccumulateGrad</a> 一文讨论的是同一层对象。</p>
+
+<p><a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/reducer.cpp#L158-L195">Reducer 构造阶段</a>为每个可训练参数取得梯度累加器并注册 post hook。<a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/reducer.cpp#L668-L754"><code>Reducer::autograd_hook()</code></a> 的注释明确写明：调用发生在参数梯度已经累加到梯度 Tensor 之后。</p>
+
+<p>从 Python 语义看，这段流程可以缩写为：</p>
+
+<pre class="code"># 语义化伪代码，不是 PyTorch 的 Python 实现
+
+local_backward_kernel(param)       # 计算当前分支贡献的 wgrad
+accumulate_into(param.grad)        # 合并本 rank 的 fan-in 梯度
+ddp_post_accumulate_hook(param)    # 通知 Reducer: 该参数已就绪
+
+bucket = reducer.bucket_of(param)
+bucket.write(param.grad)
+bucket.pending -= 1</pre>
+
+<p>所以 DDP 所说的 "gradient ready" 不是某个 GEMM 刚刚结束，而是这个参数在当前 backward 中应收集的本地梯度已经完成 autograd 累加。</p>
+
+<h2 id="trigger">2. AllReduce 的触发时机</h2>
+
+<p>每个 bucket 维护一个未就绪参数计数 <code>pending</code>。参数 hook 运行时，<code>Reducer</code> 把梯度写入该参数对应的 bucket view，并将 <code>pending</code> 减一。计数归零说明这个 bucket 已经可以通信。对应源码在 <a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/reducer.cpp#L894-L962"><code>mark_variable_ready()</code></a>。</p>
+
+<p>bucket ready 并不保证立刻发起通信。所有 rank 必须以相同顺序调用 collective，否则可能发生错配或挂起。DDP 因此按 bucket index 规约。若 bucket 1 先于 bucket 0 就绪，bucket 1 会暂时等待；bucket 0 就绪后，<code>Reducer</code> 可以连续发起 bucket 0 和 bucket 1。这个顺序约束写在 <a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/reducer.cpp#L1049-L1072"><code>mark_bucket_ready()</code></a> 中。</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">一次同步 backward 中的计算与通信重叠</div>
+  <svg class="diagram-svg" viewBox="0 0 1100 500" role="img" aria-label="DDP backward and NCCL allreduce overlap timeline">
+    <defs>
+      <marker id="ddp-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#71717a"></path>
+      </marker>
+    </defs>
+
+    <rect class="lane" x="120" y="65" width="930" height="125" rx="7"></rect>
+    <rect class="lane" x="120" y="235" width="930" height="125" rx="7"></rect>
+    <text x="95" y="115" text-anchor="end" font-size="14" font-weight="600">Autograd</text>
+    <text class="muted" x="95" y="138" text-anchor="end" font-size="12">compute stream</text>
+    <text x="95" y="285" text-anchor="end" font-size="14" font-weight="600">ProcessGroup</text>
+    <text class="muted" x="95" y="308" text-anchor="end" font-size="12">NCCL stream</text>
+
+    <path class="axis" marker-end="url(#ddp-arrow)" d="M 120 405 L 1048 405"></path>
+    <text class="muted" x="585" y="438" text-anchor="middle" font-size="12">time</text>
+
+    <rect class="compute" x="145" y="98" width="170" height="58" rx="7"></rect>
+    <text x="230" y="121" text-anchor="middle" font-size="13" font-weight="600">last layers backward</text>
+    <text class="mono muted" x="230" y="143" text-anchor="middle" font-size="11">wgrad -> bucket 0</text>
+
+    <rect class="compute" x="335" y="98" width="185" height="58" rx="7"></rect>
+    <text x="427" y="121" text-anchor="middle" font-size="13" font-weight="600">middle layers backward</text>
+    <text class="mono muted" x="427" y="143" text-anchor="middle" font-size="11">wgrad -> bucket 1</text>
+
+    <rect class="compute" x="540" y="98" width="185" height="58" rx="7"></rect>
+    <text x="632" y="121" text-anchor="middle" font-size="13" font-weight="600">first layers backward</text>
+    <text class="mono muted" x="632" y="143" text-anchor="middle" font-size="11">wgrad -> bucket 2</text>
+
+    <rect class="ready" x="295" y="74" width="40" height="22" rx="4"></rect>
+    <text class="mono" x="315" y="89" text-anchor="middle" font-size="10">B0</text>
+    <rect class="ready" x="500" y="74" width="40" height="22" rx="4"></rect>
+    <text class="mono" x="520" y="89" text-anchor="middle" font-size="10">B1</text>
+    <rect class="ready" x="705" y="74" width="40" height="22" rx="4"></rect>
+    <text class="mono" x="725" y="89" text-anchor="middle" font-size="10">B2</text>
+
+    <path class="guide" d="M 315 96 L 315 280"></path>
+    <path class="guide" d="M 520 96 L 520 280"></path>
+    <path class="guide" d="M 725 96 L 725 280"></path>
+
+    <rect class="comm" x="315" y="280" width="200" height="44" rx="6"></rect>
+    <text x="415" y="307" text-anchor="middle" font-size="12" font-weight="600">AllReduce SUM: bucket 0</text>
+    <rect class="comm" x="520" y="280" width="200" height="44" rx="6"></rect>
+    <text x="620" y="307" text-anchor="middle" font-size="12" font-weight="600">AllReduce SUM: bucket 1</text>
+    <rect class="comm" x="725" y="280" width="245" height="44" rx="6"></rect>
+    <text x="847" y="307" text-anchor="middle" font-size="12" font-weight="600">AllReduce SUM: bucket 2</text>
+
+    <rect class="finalize" x="855" y="98" width="165" height="58" rx="7"></rect>
+    <text x="937" y="121" text-anchor="middle" font-size="13" font-weight="600">finalize backward</text>
+    <text class="mono muted" x="937" y="143" text-anchor="middle" font-size="11">join bucket futures</text>
+    <path class="guide" d="M 970 324 L 970 98"></path>
+
+    <text class="subtle" x="585" y="468" text-anchor="middle" font-size="12">bucket ready 后异步发起通信；backward 收尾阶段汇合 future 并建立 stream 依赖</text>
+  </svg>
+</div>
+
+<p>通信是异步发起的。后面的 backward kernel 可以继续在计算 stream 上运行。最后一个 bucket 被调度后，autograd 安排收尾回调；<a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/reducer.cpp#L1726-L1808"><code>finalize_backward()</code></a> 处理各 bucket 的通信 future，并把规约结果映射回参数梯度。</p>
+
+<p>对 NCCL backend，这里的等待主要建立 CUDA stream 之间的依赖。<a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp#L3898-L3921">NCCL future 带有通信 stream 的设备信息</a>，后续在当前 stream 上读取 <code>.grad</code> 会排在规约之后。默认情况下，<code>loss.backward()</code> 的 CPU 返回不等于执行了一次 <code>cudaDeviceSynchronize()</code>；此时 NCCL kernel 仍可能在 GPU 上运行。</p>
+
+<p>图中的三个 AllReduce 按 bucket index 入队。这里的 overlap 指 NCCL 通信与后续 backward 计算重叠，不表示同一 process group 的三个 bucket collective 同时执行。</p>
+
+<h2 id="count">3. Collective 与 kernel 数量</h2>
+
+<p>这里要区分三种计数：参数数量、DDP 发起的逻辑 collective 数量、NCCL 在 GPU 上执行的 kernel 数量。它们没有一一对应关系。</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr>
+      <th>配置</th>
+      <th>一次 backward 的梯度 collective</th>
+      <th>补充通信</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>默认同步 backward</td>
+      <td>\(B\) 次 AllReduce，每个梯度 bucket 一次</td>
+      <td>无</td>
+    </tr>
+    <tr>
+      <td><code>no_sync()</code> 内的 backward</td>
+      <td>0 次</td>
+      <td>梯度只在本地 <code>.grad</code> 中累加</td>
+    </tr>
+    <tr>
+      <td>离开 <code>no_sync()</code> 后的首个同步 backward</td>
+      <td>\(B\) 次 AllReduce</td>
+      <td>规约对象包含此前累计的本地梯度</td>
+    </tr>
+    <tr>
+      <td><code>find_unused_parameters=True</code>，动态图路径</td>
+      <td>通常仍为 \(B\) 次</td>
+      <td>另有一次参数使用位图 AllReduce；它不是梯度 bucket</td>
+    </tr>
+    <tr>
+      <td>自定义 communication hook</td>
+      <td>每个 ready bucket 调用一次 hook</td>
+      <td>hook 可以发起零次、一次或多次 collective</td>
+    </tr>
+    <tr>
+      <td><code>skip_all_reduce_unused_params=True</code></td>
+      <td>允许跳过完全由未使用参数组成的 bucket</td>
+      <td>各 rank 的未使用参数集合必须保持一致</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p>\(B\) 受 bucket 容量、参数大小、dtype、device 和稀疏梯度影响。默认 <code>bucket_cap_mb</code> 是 25 MiB，但 \(B\) 不一定严格等于总梯度字节数除以 25 MiB 后向上取整。DDP 还会根据首轮 backward 的梯度到达顺序重建 bucket，以改善计算与通信重叠。官方 <a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html"><code>DistributedDataParallel</code> 文档</a>给出了 bucket 容量及相关参数的定义。</p>
+
+<p><code>find_unused_parameters=True</code> 的动态图路径需要在 rank 之间同步参数使用情况。<a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/reducer.cpp#L755-L833"><code>all_reduce_local_used_map()</code></a> 对一份整型位图执行额外 AllReduce；这次通信不携带 wgrad，也不计入上面的 \(B\) 次梯度 collective。</p>
+
+<div class="note-box warn">
+  <p>一次 bucket AllReduce 对应一次 <code>ProcessGroup::allreduce</code> 调用。在传统 NCCL host API 路径中，每个 rank 的 profiler 通常会为它显示一个 <code>ncclDevKernel_AllReduce_...</code> 通信 kernel。NCCL channel 一般对应这个 kernel 内的 CUDA block / CTA，不是若干个独立 kernel。这里说的是常见实现形态，不是 DDP API 对 profiler trace 的保证。NCCL grouping、CUDA Graph、device API 以及 PyTorch 的 copy-engine collective 都可能改变逻辑 collective 与底层活动的映射。</p>
+</div>
+
+<h2 id="sum-avg">4. NCCL SUM 与 DDP 平均梯度</h2>
+
+<p>设 data parallel group 有 \(P\) 个 rank，第 \(r\) 个 rank 的本地梯度是 \(G_r\)。DDP 默认结果为：</p>
+
+<p>\[
+G_{\mathrm{DDP}} = \frac{1}{P}\sum_{r=0}^{P-1}G_r
+\]</p>
+
+<p>NCCL 并不替 DDP 决定平均语义。<a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html">NCCL AllReduce 文档</a>把 AllReduce 定义为带 reduction operator 的 collective；当 operator 为 SUM 时，每个 rank 都收到逐元素求和结果。PyTorch 默认 <a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/reducer.cpp#L968-L980">调用 <code>_AllReduceBySumCommHook</code></a>，该 hook 最终使用 <a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/default_comm_hooks.cpp#L46-L59"><code>ProcessGroup::allreduce</code></a>，没有改成 AVG operator。</p>
+
+<p>平均发生在 SUM 之前。默认路径把每个本地梯度先除以 <code>div_factor</code>，通常就是 process group 的大小 \(P\)，随后调用 SUM：</p>
+
+<p>\[
+\operatorname{NCCL\_SUM}\left(
+\frac{G_0}{P},\frac{G_1}{P},\ldots,\frac{G_{P-1}}{P}
+\right)
+=
+\frac{1}{P}\sum_{r=0}^{P-1}G_r
+\]</p>
+
+<p>例如两个 rank 的标量梯度分别为 6 和 10。各 rank 先得到 3 和 5，NCCL SUM 后都得到 8。把除法放在通信前还能降低 FP16 等窄格式在求和时溢出的风险。PyTorch 的内置 <a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/default_comm_hooks.cpp#L11-L17"><code>AllReduceCommHook</code></a> 也明确采用先除后加的顺序。</p>
+
+<p><code>div_factor</code> 在普通训练中等于 process group size。使用 DDP <code>join()</code> 处理不均匀输入时，它可以按配置取初始 world size 或仍在参与训练的有效 rank 数量。</p>
+
+<h3>自定义 communication hook 的语义不同</h3>
+
+<p>注册 <code>register_comm_hook()</code> 后，Reducer 不再预除 <code>world_size</code>。官方 API 文档明确要求 hook 自己负责需要的平均操作。下面这种 hook 只做 SUM，得到的梯度会比默认 DDP 大 \(P\) 倍：</p>
+
+<pre class="code">def sum_only_hook(process_group, bucket):
+    return (
+        torch.distributed.all_reduce(
+            bucket.buffer(),
+            group=process_group,
+            async_op=True,
+        )
+        .get_future()
+        .then(lambda fut: fut.value()[0])
+    )</pre>
+
+<p>若要保持默认 DDP 数值语义，应在 hook 中显式除以 group size，或直接参考 PyTorch 的 <a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/distributed/algorithms/ddp_comm_hooks/default_hooks.py#L25-L79"><code>allreduce_hook</code></a>。</p>
+
+<h2 id="scaling">5. wgrad scaling 的位置</h2>
+
+<p>world-size scaling 不在 Linear、Conv 或 attention 的 wgrad kernel 内。它发生在 Reducer 处理已就绪参数梯度时。当前实现根据梯度与 bucket 的存储关系选择不同路径：</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr>
+      <th>梯度存储状态</th>
+      <th>缩放位置</th>
+      <th>源码行为</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>param.grad</code> 与 bucket view 不共享存储</td>
+      <td>参数梯度写入 bucket 时</td>
+      <td>用 <code>mul_out(bucket_view, grad, 1 / div_factor)</code> 合并复制与缩放</td>
+    </tr>
+    <tr>
+      <td><code>gradient_as_bucket_view=True</code>，两者已经 alias</td>
+      <td>参数被标记 ready 时</td>
+      <td>对相应 bucket view 原地 <code>div_</code></td>
+    </tr>
+    <tr>
+      <td><code>batched_grad_copy=True</code></td>
+      <td>整个 bucket ready 时</td>
+      <td>先批量复制，再对 flat bucket 做一次 <code>div_</code></td>
+    </tr>
+    <tr>
+      <td>注册自定义 communication hook</td>
+      <td>由 hook 决定</td>
+      <td>Reducer 跳过默认除法</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p>前两条路径位于 <a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/reducer.cpp#L356-L445"><code>mark_variable_ready_dense()</code></a>。批量复制路径在 <a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/reducer.cpp#L1838-L1882"><code>flush_deferred_copies()</code></a> 中。默认路径在参数梯度就绪时完成缩放；批量路径等整个 bucket 就绪后统一缩放，随后发起 SUM AllReduce。</p>
+
+<h2 id="other-scales">6. loss reduction、梯度累积与 AMP</h2>
+
+<p>训练代码里还有几种缩放会改变 wgrad 数值。它们与 DDP 的 world-size 平均属于不同层次。</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr>
+      <th>缩放来源</th>
+      <th>发生位置</th>
+      <th>DDP 是否自动处理</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>loss 的 <code>mean</code> 或 <code>sum</code></td>
+      <td>本地 loss 定义</td>
+      <td>否，DDP只接收由该 loss 产生的局部梯度</td>
+    </tr>
+    <tr>
+      <td>data parallel group 平均</td>
+      <td>Reducer 与 communication hook</td>
+      <td>默认处理，除数通常为 group size</td>
+    </tr>
+    <tr>
+      <td>gradient accumulation 的 \(1/K\)</td>
+      <td>loss 或优化器侧约定</td>
+      <td>否，<code>no_sync()</code> 不会自动除以累计步数</td>
+    </tr>
+    <tr>
+      <td>AMP loss scale 的 \(s\) 与 \(1/s\)</td>
+      <td><code>GradScaler.scale()</code> 与 <code>unscale_()</code>/<code>step()</code></td>
+      <td>否，DDP 规约的是仍带 loss scale 的梯度</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h3>局部 mean loss</h3>
+
+<p>若每个 rank 的 local batch 大小都为 \(N\)，本地 loss 是样本均值：</p>
+
+<p>\[
+L_r = \frac{1}{N}\sum_{i=1}^{N}\ell_{r,i}
+\]</p>
+
+<p>DDP 再对 \(P\) 个 rank 的梯度取平均，结果正好对应 global batch \(PN\) 上的均值梯度：</p>
+
+<p>\[
+\frac{1}{P}\sum_{r=0}^{P-1}\frac{\mathrm{d}L_r}{\mathrm{d}W}
+=
+\frac{1}{PN}\sum_{r=0}^{P-1}\sum_{i=1}^{N}
+\frac{\mathrm{d}\ell_{r,i}}{\mathrm{d}W}
+\]</p>
+
+<p>如果各 rank 的有效样本数不同，简单 rank 平均不再等同于按样本数加权的 global mean。DDP 不会从梯度 Tensor 推断各 rank 的样本权重。</p>
+
+<h3><code>no_sync()</code> 与 \(K\) 个 microbatch</h3>
+
+<p><code>no_sync()</code> 只关闭通信。前 \(K-1\) 个 microbatch 的梯度继续累加在本地 <code>.grad</code> 中，离开上下文后的同步 backward 再规约总和：</p>
+
+<p>\[
+G_r^{\mathrm{acc}} = \sum_{j=1}^{K}G_{r,j}, \qquad
+G_{\mathrm{DDP}}^{\mathrm{acc}} = \frac{1}{P}\sum_{r=0}^{P-1}G_r^{\mathrm{acc}}
+\]</p>
+
+<p>公式里没有自动出现 \(1/K\)。若目标是 \(K\) 个 microbatch 的均值梯度，通常要把每个 microbatch loss 除以 \(K\)，或者在等价位置处理这个比例。官方 <a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html#torch.nn.parallel.DistributedDataParallel.no_sync"><code>no_sync()</code> 文档</a>也说明同步发生在退出上下文后的首个 forward-backward。</p>
+
+<h3>AMP GradScaler</h3>
+
+<p>AMP 先把 loss 乘以 \(s\)，所以 DDP 看到的是 \(sG_r\)。AllReduce 的线性性质保证：</p>
+
+<p>\[
+\frac{1}{P}\sum_{r=0}^{P-1}sG_r
+=
+s\left(\frac{1}{P}\sum_{r=0}^{P-1}G_r\right)
+\]</p>
+
+<p>随后 <code>GradScaler.unscale_(optimizer)</code> 或 <code>GradScaler.step(optimizer)</code> 在 optimizer step 前除以 \(s\)。这一步不是 DDP 的 wgrad scaling，也不发生在 NCCL 内。</p>
+
+<h2 id="observe">7. 运行时如何确认 bucket 与 collective</h2>
+
+<p>DDP 的诊断数据可以查看最终 bucket 大小。<code>_get_ddp_logging_data()</code> 是内部诊断接口，适合分析，不宜作为训练逻辑依赖：</p>
+
+<pre class="code">ddp_info = ddp_model._get_ddp_logging_data()
+
+print(ddp_info.get("bucket_sizes"))
+print(ddp_info.get("bucket_cap_bytes"))
+print(ddp_info.get("prev_iteration_grad_ready_order_indices"))</pre>
+
+<p>设置 <code>TORCH_DISTRIBUTED_DEBUG=DETAIL</code> 也会在 DDP 初始化和运行日志中打印 bucket 信息。要确认实际 collective，应使用 <code>torch.profiler</code>、Nsight Systems 或 NCCL Flight Recorder，按 <code>nccl:all_reduce</code>、<code>c10d::allreduce_</code> 等逻辑事件统计。PyTorch 的 <a href="https://docs.pytorch.org/docs/stable/distributed.html#profiling-collective-communication">collective profiling 文档</a>给出了 profiler 的用法。</p>
+
+<p>GPU trace 中的 <code>ncclDevKernel_AllReduce_...</code> 用来分析传统 NCCL 路径的实际执行。统计 bucket 数时，仍应先数 collective 事件，再展开其中某一次 collective 对应的 GPU 活动。NCCL 文档对 <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-nthreads">channel 与 CUDA block</a> 的关系有明确说明。</p>
+
+<h2 id="boundary">8. DDP 与 reduce-scatter 的边界</h2>
+
+<p>标准 DDP 的参数和梯度在各 rank 上完整复制，因此默认用 AllReduce：规约后每个 rank 都拿到同一份完整梯度。ReduceScatter 则只把规约结果的一段留在每个 rank，适合梯度或优化器状态已经分片的训练方式。</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr>
+      <th>训练方式</th>
+      <th>梯度通信</th>
+      <th>通信后每个 rank 持有的梯度</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>PyTorch DDP</td>
+      <td>默认 AllReduce</td>
+      <td>完整且相同</td>
+    </tr>
+    <tr>
+      <td>FSDP / ZeRO 类分片优化</td>
+      <td>常用 ReduceScatter</td>
+      <td>只保留本 rank 负责的 shard</td>
+    </tr>
+    <tr>
+      <td>DDP 自定义 communication hook</td>
+      <td>由 hook 决定</td>
+      <td>必须满足后续优化器与参数布局的约定</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p>因此，看到训练框架使用 ReduceScatter 时，不能直接套用标准 DDP 的 "每个 bucket 一次 AllReduce"。Megatron distributed optimizer、ZeRO 和 FSDP 会把梯度分片与 optimizer state 布局纳入通信设计，规约结束后的 Tensor 所有权已经不同。</p>
+
+<h2 id="refs">参考资料</h2>
+
+<ul>
+  <li><a href="https://docs.pytorch.org/docs/main/notes/ddp.html">PyTorch Distributed Data Parallel design note</a></li>
+  <li><a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html">PyTorch <code>DistributedDataParallel</code> API</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/reducer.cpp">PyTorch <code>Reducer</code> source</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp">PyTorch <code>ProcessGroupNCCL</code> source</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/default_comm_hooks.cpp">PyTorch default C++ DDP communication hooks</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/distributed/algorithms/ddp_comm_hooks/default_hooks.py">PyTorch default Python DDP communication hooks</a></li>
+  <li><a href="https://docs.pytorch.org/docs/stable/ddp_comm_hooks.html">PyTorch DDP communication hooks</a></li>
+  <li><a href="https://docs.pytorch.org/docs/stable/distributed.html#profiling-collective-communication">PyTorch collective communication profiling</a></li>
+  <li><a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html">NCCL collective operations</a></li>
+  <li><a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-nthreads">NCCL channels and CUDA blocks</a></li>
+</ul>
+
+</main>
+</div>
+</body>
+</html>
