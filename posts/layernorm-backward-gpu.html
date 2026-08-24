@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LayerNorm 反向传播：数学推导、CUDA 规约与 Triton 融合实现</title>
+<meta name="post:title"           content="LayerNorm 反向传播：数学推导、CUDA 规约与 Triton 融合实现">
+<meta name="post:title_en"        content="LayerNorm Backpropagation: Derivation, CUDA Reductions, and Triton Fusion">
+<meta name="post:slug"            content="layernorm-backward-gpu">
+<meta name="post:date"            content="2026-08-24">
+<meta name="post:tags"            content="LLM, 训练系统, LayerNorm, CUDA, Triton">
+<meta name="post:tags_en"         content="LLM, Training Systems, LayerNorm, CUDA, Triton">
+<meta name="post:reading"         content="15 分钟">
+<meta name="post:reading_en"      content="15 min">
+<meta name="post:summary"         content="从 LayerNorm 的微分推导出 dX、dweight 与 dbias，沿 reduction axis 对照 PyTorch native CUDA kernel，并分析 Triton fused backward 如何合并 dX 与参数梯度的第一阶段。">
+<meta name="post:summary_en"      content="Derives LayerNorm input and parameter gradients, maps their reduction axes to PyTorch native CUDA kernels, and examines a Triton fused backward implementation.">
+<meta name="post:series"          content="llm-training">
+<meta name="post:series_title"    content="LLM 训练系统">
+<meta name="post:series_title_en" content="LLM Training Systems">
+<meta name="post:series_order"    content="3">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(','\\)'], ['$','$']], displayMath: [['\\[','\\]'], ['$$','$$']] },
+    options: { skipHtmlTags: ['script', 'style', 'pre', 'code'] }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
+<script src="../lang-toggle.js" defer></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  main.content { max-width: 1060px; min-width: 0; padding: 56px 32px 96px; letter-spacing: 0; }
+  main.content h1,
+  main.content h2,
+  main.content h3 { letter-spacing: 0; }
+  @media (max-width: 960px) {
+    main.content { width: 100%; max-width: 100%; padding: 48px 20px 80px; }
+  }
+  .lead {
+    max-width: 84ch;
+    margin: -6px 0 30px;
+    color: var(--fg-muted);
+    font-size: 17px;
+    line-height: 1.8;
+  }
+  .note-box {
+    margin: 18px 0 24px;
+    padding: 12px 16px;
+    border-left: 3px solid var(--accent);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    background: var(--accent-tint);
+  }
+  .note-box.warn {
+    border-left-color: #d97706;
+    background: rgba(217, 119, 6, 0.08);
+  }
+  .note-box p { margin: 6px 0; }
+  .table-scroll {
+    max-width: 100%;
+    margin: 18px 0 26px;
+    overflow-x: auto;
+  }
+  table.note-table {
+    width: 100%;
+    min-width: 780px;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  table.note-table th,
+  table.note-table td {
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    text-align: left;
+    vertical-align: top;
+  }
+  table.note-table th {
+    background: var(--bg-elevated);
+    font-weight: 600;
+  }
+  .diagram-frame {
+    max-width: 100%;
+    margin: 18px 0 28px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    box-sizing: border-box;
+  }
+  .diagram-title {
+    margin-bottom: 10px;
+    color: var(--fg-subtle);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: 0;
+  }
+  .diagram-svg {
+    display: block;
+    width: 100%;
+    min-width: 850px;
+    height: auto;
+  }
+  .diagram-svg text {
+    fill: var(--fg);
+    font-family: var(--font-sans);
+    letter-spacing: 0;
+  }
+  .diagram-svg .mono { font-family: var(--font-mono); }
+  .diagram-svg .muted { fill: var(--fg-muted); }
+  .diagram-svg .cell { fill: var(--bg); stroke: var(--border-strong); }
+  .diagram-svg .row { fill: rgba(37, 99, 235, 0.13); stroke: #2563eb; }
+  .diagram-svg .col { fill: rgba(16, 185, 129, 0.14); stroke: #059669; }
+  .diagram-svg .result { fill: rgba(245, 158, 11, 0.14); stroke: #d97706; }
+  .diagram-svg .arrow { fill: none; stroke: var(--fg-muted); stroke-width: 1.4; }
+  main.content mjx-container[display="true"] {
+    max-width: 100%;
+    padding-bottom: 2px;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录 · TOC</div>
+    <ul>
+      <li><a href="#shape">0. 形状与记号</a></li>
+      <li><a href="#forward">1. 前向定义</a></li>
+      <li><a href="#dx">2. 输入梯度推导</a></li>
+      <li><a href="#param-grad">3. 参数梯度与规约轴</a></li>
+      <li><a href="#native">4. PyTorch native CUDA</a></li>
+      <li><a href="#fused">5. Triton fused 实现</a></li>
+      <li><a href="#compare">6. 两种实现的边界</a></li>
+      <li><a href="#precision">7. 精度与正确性验证</a></li>
+      <li><a href="#refs">参考资料</a></li>
+    </ul>
+  </aside>
+
+<main class="content">
+
+<h1>LayerNorm 反向传播：数学推导、CUDA 规约与 Triton 融合实现</h1>
+
+<p class="lead">LayerNorm backward 的计算量不大，难点在 reduction。输入梯度要在每一行内部求两个和，weight 与 bias 的梯度则沿所有行求和。两个方向正好相反，也决定了 GPU kernel 的拆分方式。PyTorch native CUDA 把它们放在不同的 kernel 中；Triton fused 版本把 <code>dX</code> 与参数梯度的第一阶段合在一起，最后再规约 partial buffer。</p>
+
+<h2 id="shape">0. 形状与记号</h2>
+
+<p><code>torch.nn.LayerNorm(normalized_shape)</code> 对输入末尾若干维做归一化。PyTorch native 先把输入视为二维矩阵。若原始形状为 $[s_0,\ldots,s_{k-1},n_0,\ldots,n_{p-1}]$，且 <code>normalized_shape</code> 为 $[n_0,\ldots,n_{p-1}]$，则：</p>
+
+<p>\[
+R = \prod_{i=0}^{k-1}s_i, \qquad
+H = \prod_{i=0}^{p-1}n_i, \qquad
+X \in \mathbb{R}^{R\times H}.
+\]</p>
+
+<p>在典型 LLM 中，输入形状是 $[B,S,H]$，LayerNorm 只归一化 hidden dimension，此时 $R=B\times S$。每个 token 对应矩阵中的一行。</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>本文</th><th>PyTorch native</th><th>generative-recommenders Triton</th><th>含义</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>$R$</td><td><code>M</code></td><td><code>N</code></td><td>独立归一化的行数</td></tr>
+    <tr><td>$H$</td><td><code>N</code></td><td><code>D</code></td><td>每行的归一化宽度</td></tr>
+    <tr><td>$X_{rj}$</td><td><code>X[i * N + j]</code></td><td><code>X[row, col]</code></td><td>第 $r$ 行、第 $j$ 个 feature</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>这组映射来自 PyTorch 的 <a href="https://github.com/pytorch/pytorch/blob/f772fda46b402b0b4a5082966e77bfafeeddfd40/aten/src/ATen/native/layer_norm.h#L52-L102"><code>_check_layer_norm_inputs()</code></a>。下文用 $R,H$ 推导，读源码时再按表格替换。</p>
+
+<h2 id="forward">1. 前向定义</h2>
+
+<p>对第 $r$ 行，LayerNorm 的前向为：</p>
+
+<p>\[
+\mu_r = \frac{1}{H}\sum_{j=0}^{H-1}X_{rj},
+\]</p>
+
+<p>\[
+v_r = \frac{1}{H}\sum_{j=0}^{H-1}(X_{rj}-\mu_r)^2,
+\qquad
+q_r = \frac{1}{\sqrt{v_r+\epsilon}},
+\]</p>
+
+<p>\[
+\widehat{X}_{rj}=(X_{rj}-\mu_r)q_r,
+\qquad
+Y_{rj}=\gamma_j\widehat{X}_{rj}+\beta_j.
+\]</p>
+
+<p>$q_r$ 就是源码中的 <code>rstd</code>。PyTorch 使用总体方差，也就是除以 $H$，与 <a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html"><code>torch.nn.LayerNorm</code> 文档</a>里的 <code>unbiased=False</code> 一致。forward 会保存每一行的 <code>mean</code> 和 <code>rstd</code>，backward 直接读取，不再计算一次方差。CUDA wrapper 分配和返回这两个 Tensor 的位置见 <a href="https://github.com/pytorch/pytorch/blob/f772fda46b402b0b4a5082966e77bfafeeddfd40/aten/src/ATen/native/cuda/layer_norm_kernel.cu#L1865-L1915"><code>layer_norm_cuda()</code></a>。</p>
+
+<h2 id="dx">2. 输入梯度推导</h2>
+
+<p>先固定一行并省略下标 $r$。记上游梯度为 $g_j=\partial L/\partial y_j$，经过 affine weight 后的梯度为：</p>
+
+<p>\[
+h_j = g_j\gamma_j.
+\]</p>
+
+<p>再记 $z_j=x_j-\mu$、$q=(v+\epsilon)^{-1/2}$、$\widehat{x}_j=z_jq$。均值和逆标准差的微分分别为：</p>
+
+<p>\[
+\mathrm{d}\mu=\frac{1}{H}\sum_j \mathrm{d}x_j,
+\]</p>
+
+<p>\[
+\mathrm{d}v
+=\frac{2}{H}\sum_j z_j\,\mathrm{d}x_j,
+\qquad
+\mathrm{d}q
+=-\frac{q^3}{H}\sum_j z_j\,\mathrm{d}x_j.
+\]</p>
+
+<p>这里用到了 $\sum_j z_j=0$。归一化结果的微分是：</p>
+
+<p>\[
+\mathrm{d}\widehat{x}_j
+=q(\mathrm{d}x_j-\mathrm{d}\mu)+z_j\,\mathrm{d}q.
+\]</p>
+
+<p>把它代入 $\mathrm{d}L=\sum_j h_j\mathrm{d}\widehat{x}_j$，收集每个 $\mathrm{d}x_j$ 的系数：</p>
+
+<p>\[
+\boxed{
+\frac{\partial L}{\partial x_j}
+=q\left[
+h_j-\frac{1}{H}\sum_k h_k
+-\widehat{x}_j\frac{1}{H}\sum_k h_k\widehat{x}_k
+\right]
+}
+\]</p>
+
+<p>GPU 代码通常不会显式写两个 mean，而是保存两个行规约结果：</p>
+
+<p>\[
+S_1=\sum_k h_k,
+\qquad
+S_2=\sum_k h_k\widehat{x}_k.
+\]</p>
+
+<p>于是同一公式可以写成：</p>
+
+<p>\[
+\boxed{
+\frac{\partial L}{\partial x_j}
+=\frac{q}{H}\left(Hh_j-S_1-\widehat{x}_jS_2\right)
+}
+\]</p>
+
+<pre class="code"># X, dY: [R, H]；gamma: [H]
+xhat = (X - mean[:, None]) * rstd[:, None]
+h = dY * gamma[None, :]
+
+s1 = h.sum(dim=1, keepdim=True)
+s2 = (h * xhat).sum(dim=1, keepdim=True)
+dX = (rstd[:, None] / H) * (H * h - s1 - xhat * s2)</pre>
+
+<div class="note-box">
+  <p><code>eps</code> 没有单独出现在 backward 公式里，因为它已经进入 forward 保存的 <code>rstd</code>。重新传入 <code>eps</code> 并不能代替保存 <code>mean</code> 与 <code>rstd</code>。</p>
+</div>
+
+<h2 id="param-grad">3. 参数梯度与规约轴</h2>
+
+<p>记完整矩阵上的上游梯度为 $G_{rj}=\partial L/\partial Y_{rj}$。$\gamma$ 和 $\beta$ 在所有行之间共享，因此参数梯度沿 $R$ 规约：</p>
+
+<p>\[
+\boxed{
+\frac{\partial L}{\partial \gamma_j}
+=\sum_{r=0}^{R-1}G_{rj}\widehat{X}_{rj}
+},
+\qquad
+\boxed{
+\frac{\partial L}{\partial \beta_j}
+=\sum_{r=0}^{R-1}G_{rj}
+}.
+\]</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">LayerNorm backward 的两个 reduction axis</div>
+  <svg class="diagram-svg" viewBox="0 0 1000 470" role="img" aria-label="LayerNorm backward row and column reduction axes">
+    <defs>
+      <marker id="ln-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#71717a"></path>
+      </marker>
+    </defs>
+
+    <text x="235" y="38" text-anchor="middle" font-size="15" font-weight="600">X, dY [R, H]</text>
+    <text class="muted mono" x="235" y="60" text-anchor="middle" font-size="12">R rows × H features</text>
+
+    <g transform="translate(85,85)">
+      <rect class="cell row" x="0" y="0" width="300" height="46" rx="4"></rect>
+      <rect class="cell" x="0" y="52" width="300" height="46" rx="4"></rect>
+      <rect class="cell" x="0" y="104" width="300" height="46" rx="4"></rect>
+      <rect class="cell" x="0" y="156" width="300" height="46" rx="4"></rect>
+      <rect class="cell" x="0" y="208" width="300" height="46" rx="4"></rect>
+      <text x="150" y="29" text-anchor="middle" font-size="12">row r: reduce H → S1[r], S2[r]</text>
+      <text class="muted" x="150" y="81" text-anchor="middle" font-size="12">row r + 1</text>
+      <text class="muted" x="150" y="133" text-anchor="middle" font-size="12">row r + 2</text>
+      <text class="muted" x="150" y="185" text-anchor="middle" font-size="12">...</text>
+      <text class="muted" x="150" y="237" text-anchor="middle" font-size="12">row R - 1</text>
+
+      <rect class="cell col" x="15" y="0" width="42" height="254" rx="4"></rect>
+      <rect class="cell col" x="129" y="0" width="42" height="254" rx="4"></rect>
+      <rect class="cell col" x="243" y="0" width="42" height="254" rx="4"></rect>
+      <text x="36" y="282" text-anchor="middle" font-size="11">j=0</text>
+      <text x="150" y="282" text-anchor="middle" font-size="11">j</text>
+      <text x="264" y="282" text-anchor="middle" font-size="11">H-1</text>
+    </g>
+
+    <path class="arrow" marker-end="url(#ln-arrow)" d="M 400 108 C 480 108, 480 108, 550 108"></path>
+    <rect class="result row" x="565" y="76" width="330" height="72" rx="7"></rect>
+    <text x="730" y="103" text-anchor="middle" font-size="13" font-weight="600">dX: 每行独立</text>
+    <text class="mono muted" x="730" y="127" text-anchor="middle" font-size="11">reduce H, then write H outputs</text>
+
+    <path class="arrow" marker-end="url(#ln-arrow)" d="M 235 372 C 235 425, 480 415, 550 346"></path>
+    <rect class="result col" x="565" y="310" width="330" height="78" rx="7"></rect>
+    <text x="730" y="338" text-anchor="middle" font-size="13" font-weight="600">dγ, dβ: 每个 feature 独立</text>
+    <text class="mono muted" x="730" y="363" text-anchor="middle" font-size="11">reduce R, then write H outputs</text>
+
+    <text class="muted" x="480" y="452" text-anchor="middle" font-size="12">同一个 [R, H] 矩阵，dX 横向规约，参数梯度纵向规约</text>
+  </svg>
+</div>
+
+<p><code>dX</code> 的每一行互不依赖，适合一个 CUDA block 负责一行。<code>dγ</code> 和 <code>dβ</code> 要跨行求和；当 $R$ 很大时，一个 block 顺序扫完所有行会缺少并行度，因此常见实现先产生 partial sum，再做第二级规约。</p>
+
+<h2 id="native">4. PyTorch native CUDA 实现</h2>
+
+<p>以下说明以 PyTorch main commit <a href="https://github.com/pytorch/pytorch/tree/f772fda46b402b0b4a5082966e77bfafeeddfd40"><code>f772fda</code></a> 为基准。<a href="https://github.com/pytorch/pytorch/blob/f772fda46b402b0b4a5082966e77bfafeeddfd40/aten/src/ATen/native/cuda/layer_norm_kernel.cu#L1918-L1990"><code>layer_norm_backward_cuda()</code></a> 根据 <code>grad_input_mask</code> 分配 <code>dX</code>、<code>dgamma</code> 和 <code>dbeta</code>，再进入 <code>LayerNormBackwardKernelImpl()</code>。如果某个梯度没有被请求，对应 Tensor 保持 undefined，kernel 路径也会跳过。</p>
+
+<h3>dX：一个 block 处理一行</h3>
+
+<p>CUDA 路径为 $R$ 行启动 $R$ 个 block。每个线程以步进方式读取该行的 $X$、<code>dY</code> 和 $\gamma$，先累加：</p>
+
+<p>\[
+\texttt{stats\_x1}=\sum_j G_{rj}\gamma_j=S_{1,r},
+\]</p>
+
+<p>\[
+\texttt{stats\_x2}
+=\sum_jG_{rj}\gamma_j(X_{rj}-\mu_r)q_r
+=S_{2,r}.
+\]</p>
+
+<p>随后 block reduction 把两个和广播给整块线程。源码中的 <code>fH=N</code>、<code>term1=rstd/N</code>，最终逐元素执行：</p>
+
+<pre class="code">dx = (rstd / H) * (H * dy * gamma
+                   - stats_x1
+                   - xhat * stats_x2)</pre>
+
+<p>这正是上一节的闭式公式。对应代码集中在 <a href="https://github.com/pytorch/pytorch/blob/f772fda46b402b0b4a5082966e77bfafeeddfd40/aten/src/ATen/native/cuda/layer_norm_kernel.cu#L486-L620"><code>layer_norm_grad_input_kernel_vectorized()</code></a>。它先扫一遍数据求 $S_1,S_2$，规约完成后再扫一遍写 <code>dX</code>。第二遍通常能受益于缓存，但从程序语义看，$X$、<code>dY</code> 和 $\gamma$ 都会再次加载。</p>
+
+<p>当 $H$ 能被 4 整除、数据类型受支持且几个 buffer 满足对齐条件时，dispatcher 选择四元素向量化 load/store；否则回到标量版本。分支条件在 <a href="https://github.com/pytorch/pytorch/blob/f772fda46b402b0b4a5082966e77bfafeeddfd40/aten/src/ATen/native/cuda/layer_norm_kernel.cu#L1680-L1760"><code>LayerNormBackwardKernelImplInternal()</code></a> 中。</p>
+
+<h3>dγ 与 dβ：沿行维规约</h3>
+
+<p>参数梯度的访存方向不同。相邻线程负责相邻 feature，因此读取 $X$ 和 <code>dY</code> 时仍然保持 coalesced；每个线程或线程组沿 $R$ 累加自己的列。<a href="https://github.com/pytorch/pytorch/blob/f772fda46b402b0b4a5082966e77bfafeeddfd40/aten/src/ATen/native/cuda/layer_norm_kernel.cu#L797-L900"><code>GammaBetaBackwardCUDAKernelTemplate</code></a> 同时计算：</p>
+
+<pre class="code">dgamma[j] += dY[r, j] * (X[r, j] - mean[r]) * rstd[r]
+dbeta[j]  += dY[r, j]</pre>
+
+<p>普通 CUDA 路径根据 $R$ 选择不同的二维 thread block。$R&lt;64$ 时，一个 y-thread 可以完成一列；$R$ 增大后，多个 y-thread 分担同一列，再经 shared memory 转置和 warp shuffle 得到最终结果。调度阈值见 <a href="https://github.com/pytorch/pytorch/blob/f772fda46b402b0b4a5082966e77bfafeeddfd40/aten/src/ATen/native/cuda/layer_norm_kernel.cu#L1002-L1083"><code>LaunchGammaBetaBackwardCUDAKernel()</code></a>。</p>
+
+<p>还有一个专门处理 $R\gg H$ 且 $H$ 很小的分支。它沿行维启动多个 block，先写出形状为 $[\text{num partials},H]$ 的临时结果，再调用 <code>sum(0)</code> 完成第二级规约。多一次 kernel 和一次临时 buffer 读写，换来更多并行 block。源码把这个分支限制在 $R&gt;64\mathrm{K}$ 且列方向不足以占满一半 SM 的情形。</p>
+
+<h3>常见 kernel 数量</h3>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>请求的梯度</th><th>普通 CUDA 路径</th><th>$R\gg H$ 特殊路径</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>仅 <code>dX</code></td><td>1 个行规约 kernel</td><td>相同</td></tr>
+    <tr><td>仅 <code>dγ/dβ</code></td><td>1 个列规约 kernel</td><td>partial kernel + final <code>sum(0)</code></td></tr>
+    <tr><td>三者都需要</td><td>通常 2 个 kernel</td><td><code>dX</code> kernel + 两阶段参数规约</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>这里按源码中的逻辑 launch 计数。编译器、CUDA Graph 或底层 reduction 实现可能让 profiler 中的活动名称有所不同，但不会改变两个 reduction axis。</p>
+
+<h2 id="fused">5. Triton fused 实现</h2>
+
+<p>你给出的 generative-recommenders 代码中，<a href="https://github.com/meta-recsys/generative-recommenders/blob/2a4fa9256aff3b6e21decab8738b6f1872891f4f/generative_recommenders/ops/triton/triton_layer_norm.py#L188-L270"><code>_weighted_layer_norm_fwd()</code></a> 是 forward kernel。它在一个 Triton program 中完成 mean、variance、normalization 和 affine。<code>IS_SWISH</code> 分支还会计算 <code>X * sigmoid(LayerNorm(X) * W + B)</code>，这里并不是通常定义的 <code>SiLU(Y)</code>。这个入口本身不是 backward。</p>
+
+<p>learnable backward 从 <a href="https://github.com/meta-recsys/generative-recommenders/blob/2a4fa9256aff3b6e21decab8738b6f1872891f4f/generative_recommenders/ops/triton/triton_layer_norm.py#L316-L449"><code>_weighted_layer_norm_bwd_dx()</code></a> 开始。下面先看 <code>IS_SWISH=False</code> 的标准 LayerNorm 路径。一个 program 处理若干个 $[\texttt{BLOCK\_N},\texttt{BLOCK\_D}]$ tile，并在同一次读取后完成 <code>dX</code> 和参数梯度 partial sum：</p>
+
+<pre class="code">xhat = (x - mean) * rstd
+wdy = weight * dy
+
+c1 = mean(xhat * wdy, axis=feature)
+c2 = mean(wdy, axis=feature)
+dx = (wdy - xhat * c1 - c2) * rstd
+
+partial_dw += sum(dy * xhat, axis=row)
+partial_db += sum(dy, axis=row)</pre>
+
+<p><code>dx</code> 直接写回最终输出，参数梯度只写 partial sum。launcher 根据 SM 数和行数计算 <code>tile_num</code>，并分配两个 FP32 临时矩阵：</p>
+
+<p>\[
+\texttt{\_dweight},\texttt{\_dbias}
+\in\mathbb{R}^{\texttt{tile\_num}\times H}.
+\]</p>
+
+<p>具体分配和 launch 在 <a href="https://github.com/meta-recsys/generative-recommenders/blob/2a4fa9256aff3b6e21decab8738b6f1872891f4f/generative_recommenders/ops/triton/triton_layer_norm.py#L609-L669"><code>_triton_weighted_layer_norm_bwd_impl()</code></a>。第二个 kernel <a href="https://github.com/meta-recsys/generative-recommenders/blob/2a4fa9256aff3b6e21decab8738b6f1872891f4f/generative_recommenders/ops/triton/triton_layer_norm.py#L473-L499"><code>_layer_norm_bwd_dwdb()</code></a> 沿 <code>tile_num</code> 规约 partial buffer，输出最终 <code>dweight</code> 与 <code>dbias</code>。</p>
+
+<div class="note-box warn">
+  <p>这里的 fused backward 不是单 kernel 完成全部梯度。第一阶段融合了 <code>dX</code> 与参数梯度 partial sum，第二阶段仍要处理跨 program 的依赖。若直接让多个 program 写同一个 <code>dweight[j]</code>，就需要 atomic add；这份实现选择 FP32 partial buffer 和确定的第二级规约。</p>
+</div>
+
+<p>这种融合减少了 $X$、<code>dY</code>、<code>mean</code> 和 <code>rstd</code> 的重复读取。代价也很具体：program 同时持有 $[\texttt{BLOCK\_N},\texttt{BLOCK\_D}]$ 数据和两个长度为 <code>BLOCK_D</code> 的 accumulator，寄存器压力会提高；临时 partial buffer 还要额外写回和读取。代码用 autotune 为不同 GPU 世代选择 <code>BLOCK_N</code> 和 warp 数，而不是固定一套 tile。</p>
+
+<p>该实现要求每行能放进 fused feature block。<a href="https://github.com/meta-recsys/generative-recommenders/blob/2a4fa9256aff3b6e21decab8738b6f1872891f4f/generative_recommenders/ops/triton/triton_layer_norm.py#L502-L545"><code>compute_BLOCK_D()</code></a> 把上限设为每行 64 KiB，并将 feature width 向上取到 2 的幂。超出上限会直接报错。</p>
+
+<h2 id="compare">6. 两种实现的边界</h2>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>项目</th><th>PyTorch native CUDA</th><th>generative-recommenders Triton</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>二维命名</td><td><code>[M, N]</code></td><td><code>[N, D]</code></td></tr>
+    <tr><td><code>dX</code></td><td>独立行规约 kernel</td><td>与 <code>dweight/dbias</code> partial sum 融合</td></tr>
+    <tr><td>参数梯度</td><td>普通形状直接完成；极端 $R\gg H$ 两阶段</td><td>learnable 路径固定使用 partial buffer + final reduction</td></tr>
+    <tr><td>中间存储</td><td>普通路径不需要参数 partial buffer</td><td>两个 $[\texttt{tile\_num},H]$ FP32 buffer</td></tr>
+    <tr><td>向量化与 tile</td><td>显式四元素向量化分支，按 $R$ 选择列规约 tile</td><td>Triton block pointer 与 autotune 配置</td></tr>
+    <tr><td>扩展融合</td><td>LayerNorm 算子边界内</td><td>forward 和 backward 都保留 <code>IS_SWISH</code> 分支</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>fused 并不自动等于更快。若 $R$ 很小，parameter partial buffer 的第二阶段可能不划算；若 $H$ 很大，融合后的寄存器占用可能压低 occupancy。PyTorch native 把两种规约拆开，能分别为行方向和列方向选 launch shape。Triton 版本用一次主数据读取换取更复杂的 tile 和收尾规约。判断哪条路径合适，仍要看实际的 $R,H$、dtype 和 GPU。</p>
+
+<h2 id="precision">7. 精度与正确性验证</h2>
+
+<p>LayerNorm backward 的误差主要来自 reduction 顺序。PyTorch native 用 <code>acc_type&lt;T, true&gt;</code> 选择累加类型；CUDA 上的 FP16 和 BF16 输入通常用 FP32 保存 <code>mean</code>、<code>rstd</code> 和规约中间值。Triton 实现也把 $X$、<code>dY</code>、weight 以及 partial <code>dweight/dbias</code> 转成 FP32，写最终输出时再转回目标 dtype。</p>
+
+<p>验证自定义 kernel 时，最好把三个梯度分开检查：</p>
+
+<pre class="code"># 参考路径使用 FP64，kernel 路径使用目标 dtype
+x_ref = x.double().requires_grad_(True)
+w_ref = weight.double().requires_grad_(True)
+b_ref = bias.double().requires_grad_(True)
+
+y_ref = torch.nn.functional.layer_norm(
+    x_ref, (H,), w_ref, b_ref, eps
+)
+(y_ref * dy.double()).sum().backward()
+
+# 分别比较 dx、dweight、dbias；不要只比较最终 loss
+torch.testing.assert_close(dx, x_ref.grad.to(dx.dtype), rtol=..., atol=...)
+torch.testing.assert_close(dw, w_ref.grad.to(dw.dtype), rtol=..., atol=...)
+torch.testing.assert_close(db, b_ref.grad.to(db.dtype), rtol=..., atol=...)</pre>
+
+<p>测试形状不能只选 $H$ 为 2 的幂。至少要覆盖 $H$ 不能被 4 整除、$H$ 接近 fused size 上限、$R$ 很小、$R\gg H$、非 contiguous 输入，以及只请求部分梯度的情况。输入分布还应包含常量行和大幅平移后的行，例如 $X+c$。常量行能检查 $\epsilon$ 与零方差路径；平移测试能暴露 mean 处理或低精度消减中的问题。</p>
+
+<p>还可以检查一个结构性质。对每一行，LayerNorm 的 shift invariance 给出：</p>
+
+<p>\[
+\sum_j \frac{\partial L}{\partial X_{rj}}\approx 0.
+\]</p>
+
+<p>这个等式适合做快速诊断，但不能替代 reference comparison。浮点 reduction 的顺序不同，PyTorch native、Triton 和 FP64 reference 不会逐 bit 相同。</p>
+
+<h2 id="refs">参考资料</h2>
+
+<ul>
+  <li><a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html">PyTorch <code>torch.nn.LayerNorm</code> documentation</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/f772fda46b402b0b4a5082966e77bfafeeddfd40/aten/src/ATen/native/layer_norm.h">PyTorch native LayerNorm shape checks and dispatch declarations</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/f772fda46b402b0b4a5082966e77bfafeeddfd40/aten/src/ATen/native/cuda/layer_norm_kernel.cu">PyTorch native CUDA LayerNorm kernels</a></li>
+  <li><a href="https://github.com/meta-recsys/generative-recommenders/blob/2a4fa9256aff3b6e21decab8738b6f1872891f4f/generative_recommenders/ops/triton/triton_layer_norm.py">generative-recommenders Triton LayerNorm implementation</a></li>
+</ul>
+
+</main>
+</div>
+</body>
+</html>
