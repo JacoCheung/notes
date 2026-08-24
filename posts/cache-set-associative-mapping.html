@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>四路组相联 Cache：顺序访问后的映射与替换</title>
+<meta name="post:title"           content="四路组相联 Cache：顺序访问后的映射与替换">
+<meta name="post:title_en"        content="Four-Way Set-Associative Cache: Mapping and Replacement After a Sequential Scan">
+<meta name="post:slug"            content="cache-set-associative-mapping">
+<meta name="post:date"            content="2026-08-24">
+<meta name="post:tags"            content="计算机体系结构, Cache, 组相联, LRU">
+<meta name="post:tags_en"         content="Computer Architecture, Cache, Set Associativity, LRU">
+<meta name="post:reading"         content="4 分钟">
+<meta name="post:reading_en"      content="4 min">
+<meta name="post:summary"         content="以 4 路、256 组、共 1024 条 cache line 为例，说明顺序遍历后的 set/way 映射，以及继续访问第 1025 条 line 时的 LRU 替换。">
+<meta name="post:summary_en"      content="Uses a four-way, 256-set cache to explain set and way placement after a sequential scan and the LRU replacement caused by the 1025th line.">
+<meta name="post:series"          content="programmer-essentials">
+<meta name="post:series_title"    content="程序员必备清单">
+<meta name="post:series_title_en" content="Programmer Essentials">
+<meta name="post:series_order"    content="2">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(','\\)'], ['$','$']], displayMath: [['\\[','\\]'], ['$$','$$']] },
+    options: { skipHtmlTags: ['script', 'style', 'pre', 'code'] }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
+<script src="../lang-toggle.js" defer></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  main.content { max-width: 940px; min-width: 0; padding: 56px 32px 96px; letter-spacing: 0; }
+  main.content h1,
+  main.content h2 { letter-spacing: 0; }
+  @media (max-width: 960px) {
+    main.content { width: 100%; max-width: 100%; padding: 48px 20px 80px; }
+  }
+  .lead {
+    max-width: 78ch;
+    margin: -6px 0 30px;
+    color: var(--fg-muted);
+    font-size: 17px;
+    line-height: 1.8;
+  }
+  .table-scroll {
+    max-width: 100%;
+    margin: 18px 0 24px;
+    overflow-x: auto;
+  }
+  table.mapping-table {
+    width: 100%;
+    min-width: 680px;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  table.mapping-table th,
+  table.mapping-table td {
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    text-align: center;
+    vertical-align: middle;
+  }
+  table.mapping-table th {
+    background: var(--bg-elevated);
+    font-weight: 600;
+  }
+  .note-box {
+    margin: 18px 0 24px;
+    padding: 12px 16px;
+    border-left: 3px solid var(--accent);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    background: var(--accent-tint);
+  }
+  .note-box p { margin: 6px 0; }
+  main.content mjx-container[display="true"] {
+    max-width: 100%;
+    padding-bottom: 2px;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录 · TOC</div>
+    <ul>
+      <li><a href="#layout">1. Cache 组织</a></li>
+      <li><a href="#scan">2. 顺序遍历</a></li>
+      <li><a href="#next">3. 第 1025 条 line</a></li>
+    </ul>
+  </aside>
+
+<main class="content">
+
+<h1>四路组相联 Cache：顺序访问后的映射与替换</h1>
+
+<p class="lead">一块 4 路组相联 Cache，每个 way 有 256 条 line，总共能保存 1024 条 line。地址先决定 set，再由该 set 的填充或替换策略选择 way。下面用连续的主存 cache line 编号说明这一过程。</p>
+
+<h2 id="layout">1. Cache 组织</h2>
+
+<p>4 路、每路 256 条 line，等价于：</p>
+
+<p>\[
+256\ \text{sets}\times 4\ \text{ways}=1024\ \text{cache lines}.
+\]</p>
+
+<p>设主存 cache line 编号为 $L$。不考虑 line 内 byte offset 时：</p>
+
+<p>\[
+\text{set}(L)=L\bmod256,
+\qquad
+\text{tag}(L)=\left\lfloor\frac{L}{256}\right\rfloor.
+\]</p>
+
+<p>地址映射只规定 set，不规定具体 way。同一个 set 内的四个位置地位相同，硬件按空 way 选择或替换策略决定写入哪一路。</p>
+
+<h2 id="scan">2. 顺序遍历 1024 条 line</h2>
+
+<p>假设 Cache 初始为空，依次访问主存 line 0 到 1023，期间没有其他访问。前 256 条 line 分别进入 set 0 到 set 255；接下来的三轮重复相同的 set index，并占用各 set 的其余 way。</p>
+
+<p>若为了展示，假设空 way 按 Way 0 到 Way 3 的顺序填充，遍历结束后的硬件编号如下：</p>
+
+<div class="table-scroll">
+<table class="mapping-table">
+  <thead>
+    <tr>
+      <th>Set</th>
+      <th>Way 0</th>
+      <th>Way 1</th>
+      <th>Way 2</th>
+      <th>Way 3</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>0</td><td>0</td><td>256</td><td>512</td><td>768</td></tr>
+    <tr><td>1</td><td>1</td><td>257</td><td>513</td><td>769</td></tr>
+    <tr><td>2</td><td>2</td><td>258</td><td>514</td><td>770</td></tr>
+    <tr><td>...</td><td>...</td><td>...</td><td>...</td><td>...</td></tr>
+    <tr><td>255</td><td>255</td><td>511</td><td>767</td><td>1023</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>因此，任意 set $s$ 保存的四条主存 line 是：</p>
+
+<p>\[
+\boxed{s,\quad s+256,\quad s+512,\quad s+768}.
+\]</p>
+
+<p>表中的 way 顺序只是一种可能的硬件状态。无论 way 如何编号，set $s$ 中保存的四个 line 编号不变。此时 1024 个 Cache 位置全部有效；若立即再次遍历 line 0 到 1023，所有访问都会命中。</p>
+
+<h2 id="next">3. 继续访问第 1025 条 line</h2>
+
+<p>本文使用 0-based 编号，所以第 1025 条 line 是 line 1024。它的映射为：</p>
+
+<p>\[
+\text{set}(1024)=0,
+\qquad
+\text{tag}(1024)=4.
+\]</p>
+
+<p>set 0 已经保存 line 0、256、512 和 768，必须先选择一个 victim。若采用严格 LRU，四条 line 在顺序遍历中的访问次序是：</p>
+
+<p>\[
+0\rightarrow256\rightarrow512\rightarrow768.
+\]</p>
+
+<p>line 0 最久没有被访问，因此硬件淘汰 line 0，并把 line 1024 放进它原来的 way。set 0 从：</p>
+
+<p>\[
+\{0,256,512,768\}
+\quad\longrightarrow\quad
+\{1024,256,512,768\}.
+\]</p>
+
+<p>set 1 到 set 255 保持不变，Cache 仍然保存 1024 条 line。若被淘汰的 line 0 是 dirty line，硬件需要先把它写回下一级存储；clean line 可以直接覆盖。</p>
+
+<div class="note-box">
+  <p>LRU 决定上述例子淘汰 line 0。若硬件采用 Random 或 PLRU，victim 可能不同，但 line 1024 仍然只能进入 set 0。</p>
+</div>
+
+</main>
+</div>
+</body>
+</html>
