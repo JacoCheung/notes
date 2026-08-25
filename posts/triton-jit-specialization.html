@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Triton JIT Specialization 机制：参数特化、编译变体与缓存</title>
+<meta name="post:title"           content="Triton JIT Specialization 机制：参数特化、编译变体与缓存">
+<meta name="post:title_en"        content="Triton JIT Specialization: Arguments, Kernel Variants, and Caching">
+<meta name="post:slug"            content="triton-jit-specialization">
+<meta name="post:date"            content="2026-08-25">
+<meta name="post:tags"            content="Triton, JIT, Specialization, Kernel DSL">
+<meta name="post:tags_en"         content="Triton, JIT, Specialization, Kernel DSL">
+<meta name="post:reading"         content="14 分钟">
+<meta name="post:reading_en"      content="14 min">
+<meta name="post:summary"         content="沿 Triton kernel launch 路径说明 specialization descriptor、tl.constexpr、对齐属性、运行时与磁盘缓存，以及它和 autotune 的关系。">
+<meta name="post:summary_en"      content="Explains Triton's specialization descriptors, tl.constexpr, alignment attributes, runtime and disk caches, and the boundary between JIT specialization and autotuning.">
+<meta name="post:series"          content="kernel-dsl">
+<meta name="post:series_title"    content="Kernel DSL">
+<meta name="post:series_title_en" content="Kernel DSL">
+<meta name="post:series_order"    content="1">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(','\\)'], ['$','$']], displayMath: [['\\[','\\]'], ['$$','$$']] },
+    options: { skipHtmlTags: ['script', 'style', 'pre', 'code'] }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
+<script src="../lang-toggle.js" defer></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  main.content { max-width: 1060px; min-width: 0; padding: 56px 32px 96px; letter-spacing: 0; }
+  main.content h1,
+  main.content h2,
+  main.content h3 { letter-spacing: 0; }
+  @media (max-width: 960px) {
+    main.content { width: 100%; max-width: 100%; padding: 48px 20px 80px; }
+  }
+  .lead {
+    max-width: 84ch;
+    margin: -6px 0 30px;
+    color: var(--fg-muted);
+    font-size: 17px;
+    line-height: 1.8;
+  }
+  .note-box {
+    margin: 18px 0 24px;
+    padding: 12px 16px;
+    border-left: 3px solid var(--accent);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    background: var(--accent-tint);
+  }
+  .note-box.warn {
+    border-left-color: #d97706;
+    background: rgba(217, 119, 6, 0.08);
+  }
+  .note-box p { margin: 6px 0; }
+  .table-scroll {
+    max-width: 100%;
+    margin: 18px 0 26px;
+    overflow-x: auto;
+  }
+  table.note-table {
+    width: 100%;
+    min-width: 820px;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  table.note-table th,
+  table.note-table td {
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    text-align: left;
+    vertical-align: top;
+  }
+  table.note-table th {
+    background: var(--bg-elevated);
+    font-weight: 600;
+  }
+  .diagram-frame {
+    max-width: 100%;
+    margin: 18px 0 28px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    box-sizing: border-box;
+  }
+  .diagram-title {
+    margin-bottom: 10px;
+    color: var(--fg-subtle);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: 0;
+  }
+  .diagram-svg {
+    display: block;
+    width: 100%;
+    min-width: 900px;
+    height: auto;
+  }
+  .diagram-svg text {
+    fill: var(--fg);
+    font-family: var(--font-sans);
+    letter-spacing: 0;
+  }
+  .diagram-svg .mono { font-family: var(--font-mono); }
+  .diagram-svg .muted { fill: var(--fg-muted); }
+  .diagram-svg .box { fill: var(--bg); stroke: var(--border-strong); stroke-width: 1.3; }
+  .diagram-svg .specialize { fill: rgba(37, 99, 235, 0.13); stroke: #2563eb; }
+  .diagram-svg .cache { fill: rgba(16, 185, 129, 0.14); stroke: #059669; }
+  .diagram-svg .compile { fill: rgba(245, 158, 11, 0.14); stroke: #d97706; }
+  .diagram-svg .run { fill: rgba(190, 24, 93, 0.10); stroke: #be185d; }
+  .diagram-svg .arrow { fill: none; stroke: var(--fg-muted); stroke-width: 1.4; }
+  main.content mjx-container[display="true"] {
+    max-width: 100%;
+    padding-bottom: 2px;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录 · TOC</div>
+    <ul>
+      <li><a href="#scope">0. JIT 与 specialization</a></li>
+      <li><a href="#launch">1. Kernel launch 路径</a></li>
+      <li><a href="#descriptor">2. 参数如何进入 key</a></li>
+      <li><a href="#constexpr">3. tl.constexpr</a></li>
+      <li><a href="#runtime">4. 运行时隐式特化</a></li>
+      <li><a href="#cache">5. 两级缓存</a></li>
+      <li><a href="#control">6. 控制变体数量</a></li>
+      <li><a href="#autotune">7. 与 autotune 的关系</a></li>
+      <li><a href="#inspect">8. 定位重复编译</a></li>
+      <li><a href="#refs">参考资料</a></li>
+    </ul>
+  </aside>
+
+<main class="content">
+
+<h1>Triton JIT Specialization 机制：参数特化、编译变体与缓存</h1>
+
+<p class="lead"><code>@triton.jit</code> 会在运行期把 Python 函数编译成 GPU kernel。每次 launch 之前，Triton 根据参数类型、编译期常量、对齐属性和编译选项构造 specialization key。key 相同就复用已有 kernel；key 不同则得到新的编译变体。理解这套规则，才能解释为什么两个形状不同的输入有时共用 kernel，有时又会触发编译。</p>
+
+<h2 id="scope">0. JIT 与 specialization</h2>
+
+<p>JIT 说明编译发生在运行期，specialization 说明编译器拿到了哪些静态信息。两者是不同概念。</p>
+
+<p>普通 CUDA kernel 的参数值在编译时不可见。Triton 可以把一部分参数提升为编译期常量，也可以从普通运行时参数提取类型和对齐属性。于是，同一个 Python 函数会对应一组 GPU kernel：</p>
+
+<p>\[
+\text{Python JIT function}
+\quad\longrightarrow\quad
+\{K_0,K_1,\ldots,K_n\}.
+\]</p>
+
+<p>每个 $K_i$ 都有自己的参数签名、常量、编译属性和 launch options。本文以 Triton main commit <a href="https://github.com/triton-lang/triton/tree/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7"><code>a2d75c0</code></a> 为基准。旧版本的整数特化规则与当前实现并不完全相同。</p>
+
+<h2 id="launch">1. 从 kernel launch 到编译变体</h2>
+
+<pre class="code">@triton.jit
+def copy_kernel(
+    x,
+    y,
+    n,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < n
+    values = tl.load(x + offsets, mask=mask)
+    tl.store(y + offsets, values, mask=mask)
+
+copy_kernel[(1,)](x, y, 1024, BLOCK=256)</pre>
+
+<p>装饰器先创建一个 <code>JITFunction</code>，记录 Python signature、函数源码、被调用的其他 JIT function 和使用到的全局值。真正的编译发生在 <code>kernel[grid](...)</code>。</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">一次 Triton kernel launch 的 JIT 路径</div>
+  <svg class="diagram-svg" viewBox="0 0 1120 360" role="img" aria-label="Triton JIT specialization and cache flow">
+    <defs>
+      <marker id="jit-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#71717a"></path>
+      </marker>
+    </defs>
+
+    <rect class="box" x="30" y="112" width="180" height="84" rx="7"></rect>
+    <text x="120" y="143" text-anchor="middle" font-size="14" font-weight="600">kernel[grid](args)</text>
+    <text class="mono muted" x="120" y="169" text-anchor="middle" font-size="11">bind args + options</text>
+
+    <path class="arrow" marker-end="url(#jit-arrow)" d="M 210 154 L 270 154"></path>
+    <rect class="box specialize" x="280" y="92" width="220" height="124" rx="7"></rect>
+    <text x="390" y="123" text-anchor="middle" font-size="14" font-weight="600">specialization descriptor</text>
+    <text class="mono muted" x="390" y="149" text-anchor="middle" font-size="11">type / constexpr / attrs</text>
+    <text class="mono muted" x="390" y="173" text-anchor="middle" font-size="11">num_warps / num_stages</text>
+    <text class="mono muted" x="390" y="197" text-anchor="middle" font-size="11">compute runtime key</text>
+
+    <path class="arrow" marker-end="url(#jit-arrow)" d="M 500 154 L 560 154"></path>
+    <rect class="box cache" x="570" y="112" width="190" height="84" rx="7"></rect>
+    <text x="665" y="143" text-anchor="middle" font-size="14" font-weight="600">per-device cache</text>
+    <text class="mono muted" x="665" y="169" text-anchor="middle" font-size="11">kernel_cache[key]</text>
+
+    <path class="arrow" marker-end="url(#jit-arrow)" d="M 760 135 C 820 82, 850 82, 895 82"></path>
+    <text class="muted" x="824" y="93" text-anchor="middle" font-size="11">miss</text>
+    <rect class="box compile" x="900" y="35" width="190" height="94" rx="7"></rect>
+    <text x="995" y="66" text-anchor="middle" font-size="14" font-weight="600">compile ASTSource</text>
+    <text class="mono muted" x="995" y="91" text-anchor="middle" font-size="11">TTIR → backend IR</text>
+    <text class="mono muted" x="995" y="112" text-anchor="middle" font-size="11">persistent cache</text>
+
+    <path class="arrow" marker-end="url(#jit-arrow)" d="M 760 174 C 820 235, 850 245, 895 245"></path>
+    <text class="muted" x="824" y="230" text-anchor="middle" font-size="11">hit</text>
+    <path class="arrow" marker-end="url(#jit-arrow)" d="M 995 129 L 995 196"></path>
+    <rect class="box run" x="900" y="205" width="190" height="80" rx="7"></rect>
+    <text x="995" y="237" text-anchor="middle" font-size="14" font-weight="600">launch compiled kernel</text>
+    <text class="mono muted" x="995" y="263" text-anchor="middle" font-size="11">grid is launch-time state</text>
+
+    <text class="muted" x="560" y="330" text-anchor="middle" font-size="12">相同 Python 函数可以在 cache 中同时保存多个 specialization</text>
+  </svg>
+</div>
+
+<p><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L733-L765"><code>JITFunction.run()</code></a> 先调用 binder 生成 specialization，再计算 key 并查询当前 device 的 kernel cache。cache miss 时，signature、constexpr 和属性被打包成 <code>ASTSource</code>，然后进入编译器。</p>
+
+<h2 id="descriptor">2. 参数如何进入 specialization key</h2>
+
+<p>Triton 不会简单地把所有 Python 参数做一次字符串序列化。<a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L397-L427"><code>create_function_from_signature()</code></a> 为每个参数生成 specialization descriptor。当前规则可以整理为：</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>参数</th><th>进入 signature 的内容</th><th>是否按精确值拆分</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>tl.constexpr</code></td><td><code>("constexpr", value)</code></td><td>是</td></tr>
+    <tr><td>Tensor / pointer</td><td>pointer element dtype、const 属性、对齐属性</td><td>不按 Tensor 内容或 shape</td></tr>
+    <tr><td>普通整数</td><td><code>i32</code>、<code>i64</code> 或 <code>u64</code>，可带整除属性</td><td>通常否；整数 1 是特例</td></tr>
+    <tr><td>普通 float</td><td><code>fp32</code></td><td>否</td></tr>
+    <tr><td>普通 bool</td><td><code>u1</code></td><td>否</td></tr>
+    <tr><td><code>None</code></td><td>constexpr <code>None</code></td><td>是</td></tr>
+    <tr><td>tuple / namedtuple</td><td>递归处理每个成员</td><td>由成员规则决定</td></tr>
+    <tr><td>被调用的 JIT function</td><td>callee 的源码 cache key</td><td>callee 改动会使缓存失效</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>这组行为在 Triton 的 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/test/unit/runtime/test_specialize.py#L42-L87">specialization reference test</a> 中有一份可读性很高的 Python 对照实现。它还说明了两个容易误判的细节：</p>
+
+<ul>
+  <li>普通 Tensor 参数不会自动把 shape 和 stride 放进 specialization key。kernel 看到的主要是 pointer 类型和对齐属性。</li>
+  <li>普通整数并非每个数值都生成一个 kernel。当前实现主要按整数宽度和 backend 属性拆分，数值 1 会提升为 constexpr。</li>
+</ul>
+
+<h2 id="constexpr">3. <code>tl.constexpr</code> 的编译期语义</h2>
+
+<p><code>tl.constexpr</code> 按精确值进入 key，也会成为 <code>ASTSource.constants</code>。编译器因此可以在 AST 转 TTIR 之前就使用它：</p>
+
+<pre class="code">@triton.jit
+def reduce_kernel(
+    x,
+    y,
+    n,
+    BLOCK: tl.constexpr,
+    USE_FAST_PATH: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK)
+    values = tl.load(x + offsets, mask=offsets < n)
+
+    if USE_FAST_PATH:
+        values = fast_transform(values)
+    else:
+        values = accurate_transform(values)
+
+    tl.store(y + offsets, values, mask=offsets < n)</pre>
+
+<p><code>BLOCK=256</code> 和 <code>BLOCK=512</code> 是两个编译变体。<code>USE_FAST_PATH=True</code> 与 <code>False</code> 也是两个变体；未选择的分支不会留到运行时。循环次数、tile shape、算法分支和 dtype policy 适合作为 constexpr，因为这些值会改变程序结构。</p>
+
+<p>把任意数据维度都声明成 constexpr 则会迅速放大编译数量。若业务出现 40 种 sequence length，而 kernel 并不需要针对每个长度展开循环，那么 <code>N: tl.constexpr</code> 会产生 40 份近似的 binary。</p>
+
+<h2 id="runtime">4. 普通参数的隐式特化</h2>
+
+<p>即使参数没有标成 constexpr，Triton 仍会提取对优化有用的属性。当前通用 backend 用字母 <code>D</code> 表示 <code>tt.divisibility=16</code>：</p>
+
+<ul>
+  <li>整数能被 16 整除时，descriptor 带 <code>D</code>。</li>
+  <li>pointer 地址按 16 byte 对齐时，descriptor 带 <code>D</code>。</li>
+</ul>
+
+<p>实现位于 backend 的 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/backends/compiler.py#L73-L92"><code>get_int_specialization()</code> 与 <code>get_tensor_specialization()</code></a>。编译器可以利用这些属性减少 mask、选择向量化访问或简化地址计算。</p>
+
+<p>继续使用前面的 <code>copy_kernel</code>，以下调用展示了 key 的拆分：</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>调用</th><th><code>n</code> descriptor</th><th><code>x</code> descriptor</th><th><code>BLOCK</code></th><th>是否复用 A</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>A：<code>n=1024</code>，对齐 pointer</td><td><code>i32 + D</code></td><td><code>*fp32 + D</code></td><td>256</td><td>基准变体</td></tr>
+    <tr><td>B：<code>n=2048</code>，对齐 pointer</td><td><code>i32 + D</code></td><td><code>*fp32 + D</code></td><td>256</td><td>是</td></tr>
+    <tr><td>C：<code>n=1000</code>，对齐 pointer</td><td><code>i32</code></td><td><code>*fp32 + D</code></td><td>256</td><td>否</td></tr>
+    <tr><td>D：<code>n=1024</code>，非对齐 pointer</td><td><code>i32 + D</code></td><td><code>*fp32</code></td><td>256</td><td>否</td></tr>
+    <tr><td>E：<code>n=1024</code>，对齐 pointer</td><td><code>i32 + D</code></td><td><code>*fp32 + D</code></td><td>512</td><td>否</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>A 与 B 的运行时数值不同，但 descriptor 相同，因此共用 kernel。C 失去整数整除属性，D 失去 pointer alignment 属性，E 改变了 constexpr。五次调用最终产生四个变体。</p>
+
+<div class="note-box">
+  <p>launch grid 通常不是 specialization key 的一部分。若 <code>n</code> 是普通运行时整数，<code>grid=(triton.cdiv(n, BLOCK),)</code> 可以随调用变化而不触发编译。grid 使用的 <code>BLOCK</code> 本身是 constexpr，所以改变 <code>BLOCK</code> 仍会生成新变体。</p>
+</div>
+
+<h2 id="cache">5. 运行时缓存与编译缓存</h2>
+
+<p>Triton 在这条路径上使用两级缓存，二者解决的问题不同。</p>
+
+<h3>JITFunction 的 per-device cache</h3>
+
+<p>每个 <code>JITFunction</code> 为 device 保存一份 <code>kernel_cache</code>。运行时 key 由 specialization descriptor 和编译 options 组成：</p>
+
+<p>\[
+\text{runtime key}
+=
+(\text{specialization},\text{options}).
+\]</p>
+
+<p><code>num_warps</code>、<code>num_stages</code>、<code>num_ctas</code> 等属于 options。参数完全相同但 <code>num_warps</code> 不同，仍然是两个 kernel。key 的构造与查询见 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L611-L620"><code>compute_cache_key()</code></a>。</p>
+
+<h3>编译器的 persistent cache</h3>
+
+<p>内存 cache miss 后，Triton 构造 <code>ASTSource</code>。它的 hash 包含：</p>
+
+<ul>
+  <li>当前函数以及传递依赖的源码 hash</li>
+  <li>参数 signature</li>
+  <li>constexpr 的精确值</li>
+  <li>alignment 和 divisibility 属性</li>
+  <li>backend target、编译 options 与会使缓存失效的环境变量</li>
+</ul>
+
+<p><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/compiler/compiler.py#L52-L81"><code>ASTSource.hash()</code></a> 负责 source 一侧，<a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/compiler/compiler.py#L226-L290"><code>compile()</code></a> 再加入 target 和 options，查询磁盘上的编译产物。新 Python 进程可以命中 persistent cache，不必重新跑完整 lowering pipeline。</p>
+
+<h2 id="control">6. 控制 specialization 数量</h2>
+
+<p>普通整数和 pointer 的隐式属性可能带来额外变体。若某个参数的取值很多，而 kernel 不依赖它的整除或对齐信息，可以关闭相应规则：</p>
+
+<pre class="code">@triton.jit(do_not_specialize=["n"])
+def dynamic_kernel(x, y, n, BLOCK: tl.constexpr):
+    ...</pre>
+
+<p><code>do_not_specialize</code> 关闭 <code>n</code> 的运行时 value/alignment specialization。不同的普通 <code>i32 n</code> 共用一个变体。</p>
+
+<pre class="code">@triton.jit(do_not_specialize_on_alignment=["n"])
+def dynamic_kernel(x, y, n, BLOCK: tl.constexpr):
+    ...</pre>
+
+<p><code>do_not_specialize_on_alignment</code> 只关闭 alignment/divisibility 属性。其他规则仍保留，例如当前实现仍可能把整数 1 提升为 constexpr。两个参数都支持用名字或参数位置指定，具体初始化逻辑见 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L793-L829"><code>JITFunction.__init__()</code></a>。</p>
+
+<div class="note-box warn">
+  <p>关闭 specialization 不会改变 kernel 的数学语义，但会减少编译器可用的静态信息。变体数量下降以后，某些形状可能失去向量化或无 mask 路径。它是编译时间、代码体积和运行性能之间的取舍。</p>
+</div>
+
+<h2 id="autotune">7. Specialization 与 autotune</h2>
+
+<p><code>@triton.autotune</code> 负责在若干 <code>triton.Config</code> 之间测量和选型，specialization JIT 负责把每个候选配置编译成可执行 kernel。它们不是同一层缓存。</p>
+
+<pre class="code">@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK": 128}, num_warps=4),
+        triton.Config({"BLOCK": 256}, num_warps=8),
+    ],
+    key=["n"],
+)
+@triton.jit
+def kernel(x, y, n, BLOCK: tl.constexpr):
+    ...</pre>
+
+<p>这里至少有两个 JIT 变体，因为 <code>BLOCK</code> 和 <code>num_warps</code> 都不同。autotune 的 <code>key=["n"]</code> 表示不同 <code>n</code> 可以分别选择胜出的 config；它不等于把 <code>n</code> 自动声明成 <code>tl.constexpr</code>。最终编译数量取决于候选 config、参数 specialization 和实际到达的输入组合。</p>
+
+<h2 id="inspect">8. 定位重复编译</h2>
+
+<p>出现首次迭代很慢或 cache 目录快速增长时，可以先检查三个位置：</p>
+
+<ol>
+  <li>列出所有 <code>tl.constexpr</code>，确认它们是否真的改变 tile、循环或控制流。</li>
+  <li>检查 shape/stride 参数是否在 16 的整除边界两侧频繁跳动，以及 pointer 是否来自带 offset 的 view。</li>
+  <li>检查 autotune config 和 <code>num_warps/num_stages</code>，它们同样扩大编译组合。</li>
+</ol>
+
+<p><code>TRITON_CACHE_DIR</code> 可以指定 persistent cache 位置。<code>TRITON_KERNEL_DUMP=1</code> 会把各阶段 IR 写入 <code>TRITON_DUMP_DIR</code>，适合比较两个 specialization 的 TTIR 或 PTX。调试缓存命中时还可以使用 <code>TRITON_ALWAYS_COMPILE=1</code> 强制重编译；这些环境变量的当前定义在 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/knobs.py#L343-L363"><code>knobs.py</code></a> 中。</p>
+
+<p>实际排查时，先打印每次调用的 dtype、constexpr、<code>num_warps</code> 和关键整数的 <code>% 16</code> 结果，通常就能解释大部分重复编译。Tensor shape 本身不是普通 pointer 参数的 key，真正进入 key 的往往是显式传入的 shape 标量及其整除属性。</p>
+
+<h2 id="refs">参考资料</h2>
+
+<ul>
+  <li><a href="https://triton-lang.org/main/python-api/generated/triton.jit.html">Triton <code>triton.jit</code> API</a></li>
+  <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py">Triton runtime JIT implementation</a></li>
+  <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/test/unit/runtime/test_specialize.py">Triton specialization tests</a></li>
+  <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/compiler/compiler.py">Triton compiler and persistent cache path</a></li>
+  <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/backends/compiler.py">Triton backend specialization attributes</a></li>
+</ul>
+
+</main>
+</div>
+</body>
+</html>
