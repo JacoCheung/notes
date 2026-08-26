@@ -1,0 +1,512 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPU Occupancy 的计算模型、资源约束与 Nsight Compute 指标</title>
+<meta name="post:title"           content="GPU Occupancy 的计算模型、资源约束与 Nsight Compute 指标">
+<meta name="post:title_en"        content="GPU Occupancy: Calculation, Resource Limits, and Nsight Compute Metrics">
+<meta name="post:slug"            content="gpu-occupancy-resource-limits">
+<meta name="post:date"            content="2026-08-26">
+<meta name="post:tags"            content="GPU, CUDA, Occupancy, Nsight Compute">
+<meta name="post:tags_en"         content="GPU, CUDA, Occupancy, Nsight Compute">
+<meta name="post:reading"         content="12 分钟">
+<meta name="post:reading_en"      content="12 min">
+<meta name="post:summary"         content="从 SM 的常驻 warp slot 出发，推导 occupancy 的资源模型，解释 NCU 的 launch__occupancy_limit_* 指标，并整理各代 compute capability 的 warp residency 规格。">
+<meta name="post:summary_en"      content="Derives GPU occupancy from SM warp residency slots, explains Nsight Compute occupancy limit metrics, and compares warp residency specifications across compute capabilities.">
+<meta name="post:series"          content="gpu-programming-basics">
+<meta name="post:series_title"    content="GPU Programming Basics">
+<meta name="post:series_title_en" content="GPU Programming Basics">
+<meta name="post:series_order"    content="1">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(','\\)'], ['$','$']], displayMath: [['\\[','\\]'], ['$$','$$']] },
+    options: { skipHtmlTags: ['script', 'style', 'pre', 'code'] }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
+<script src="../lang-toggle.js" defer></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  main.content { max-width: 1060px; min-width: 0; padding: 56px 32px 96px; letter-spacing: 0; }
+  main.content h1,
+  main.content h2,
+  main.content h3 { letter-spacing: 0; }
+  @media (max-width: 960px) {
+    main.content { width: 100%; max-width: 100%; padding: 48px 20px 80px; }
+  }
+  .lead {
+    max-width: 84ch;
+    margin: -6px 0 30px;
+    color: var(--fg-muted);
+    font-size: 17px;
+    line-height: 1.8;
+  }
+  .table-scroll {
+    max-width: 100%;
+    margin: 18px 0 26px;
+    overflow-x: auto;
+  }
+  table.note-table {
+    width: 100%;
+    min-width: 820px;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  table.note-table th,
+  table.note-table td {
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    text-align: left;
+    vertical-align: top;
+  }
+  table.note-table th {
+    background: var(--bg-elevated);
+    font-weight: 600;
+  }
+  table.centered th,
+  table.centered td { text-align: center; vertical-align: middle; }
+  .note-box {
+    margin: 18px 0 26px;
+    padding: 12px 16px;
+    border-left: 3px solid var(--accent);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    background: var(--accent-tint);
+  }
+  .note-box.warn {
+    border-left-color: #d97706;
+    background: rgba(245, 158, 11, 0.09);
+  }
+  .note-box p { margin: 6px 0; }
+  .diagram-frame {
+    max-width: 100%;
+    margin: 20px 0 30px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    box-sizing: border-box;
+  }
+  .diagram-title {
+    margin-bottom: 10px;
+    color: var(--fg-subtle);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: 0;
+  }
+  .diagram-svg {
+    display: block;
+    width: 100%;
+    min-width: 880px;
+    height: auto;
+  }
+  .diagram-svg text {
+    fill: var(--fg);
+    font-family: var(--font-sans);
+    letter-spacing: 0;
+  }
+  .diagram-svg .mono { font-family: var(--font-mono); }
+  .diagram-svg .muted { fill: var(--fg-muted); }
+  .diagram-svg .resource { fill: rgba(37, 99, 235, 0.10); stroke: #2563eb; stroke-width: 1.3; }
+  .diagram-svg .scheduler { fill: rgba(16, 185, 129, 0.10); stroke: #059669; stroke-width: 1.3; }
+  .diagram-svg .slot { fill: var(--bg); stroke: var(--border-strong); stroke-width: 1; }
+  .diagram-svg .issue { fill: rgba(190, 24, 93, 0.09); stroke: #be185d; stroke-width: 1.3; }
+  .diagram-svg .arrow { fill: none; stroke: var(--fg-muted); stroke-width: 1.3; }
+  main.content mjx-container[display="true"] {
+    max-width: 100%;
+    padding-bottom: 2px;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录 · TOC</div>
+    <ul>
+      <li><a href="#definition">0. Occupancy 测量什么</a></li>
+      <li><a href="#h100-slots">1. H100 的 64 个 warp slot</a></li>
+      <li><a href="#model">2. Occupancy 计算模型</a></li>
+      <li><a href="#example">3. H100 算例</a></li>
+      <li><a href="#ncu">4. NCU limiter 指标</a></li>
+      <li><a href="#specs">5. Compute capability 规格</a></li>
+      <li><a href="#achieved">6. 理论值与实测值</a></li>
+      <li><a href="#query">7. 查询硬件上限</a></li>
+      <li><a href="#refs">参考资料</a></li>
+    </ul>
+  </aside>
+
+<main class="content">
+
+<h1>GPU Occupancy 的计算模型、资源约束与 Nsight Compute 指标</h1>
+
+<p class="lead">Occupancy 描述一个 SM 同时保留了多少个 warp 执行上下文。它由 block size、寄存器、shared memory、barrier 和硬件 block slot 共同决定。这个指标衡量的是可用于隐藏延迟的 warp 数量，并不直接表示计算单元利用率。</p>
+
+<h2 id="definition">0. Occupancy 测量什么</h2>
+
+<p>CUDA 把 occupancy 定义为每个 SM 的 active warps 与架构最大 active warps 的比值：</p>
+
+<p>\[
+\mathrm{Occupancy}
+=
+\frac{W_{\mathrm{resident}}}{W_{\max}}.
+\]</p>
+
+<p>NCU 在 occupancy 语境里使用 <em>active warp</em>，它与 resident warp 指向同一类状态：warp 已经占用 SM 上的执行上下文，并且尚未结束。后续调度还要经过 eligible 和 issued 两个状态。</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>状态</th><th>含义</th><th>与 occupancy 的关系</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Resident / Active</td><td>执行上下文已经分配在 SM 上，warp 尚未完成</td><td>计入 occupancy</td></tr>
+    <tr><td>Stalled</td><td>下一条指令在等待数据、同步或执行管线</td><td>仍然计入 occupancy</td></tr>
+    <tr><td>Eligible</td><td>下一条指令及其目标管线已经 ready</td><td>是 scheduler 的候选项</td></tr>
+    <tr><td>Issued</td><td>scheduler 在当前 issue 时刻选中了该 warp</td><td>反映发射，不改变 occupancy 定义</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p><a href="https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html#occupancy">CUDA Programming Guide</a> 给出的 occupancy 定义也是 active warps 与 SM 最大 active warps 的比例。一个 stalled warp 仍会占用寄存器和 warp slot，所以高 occupancy 可能同时伴随大量停顿。</p>
+
+<h2 id="h100-slots">1. H100 的 64 个 resident warp slot</h2>
+
+<p>H100 属于 compute capability 9.0。一个 H100 SM 有 4 个 warp scheduler，warp 会静态分配给其中一个 scheduler。该架构允许每个 SM 最多常驻 64 个 warp，平均分到每个 scheduler 的 residency 上限为 16 个 warp：</p>
+
+<p>\[
+4\ \text{schedulers/SM}
+\times
+16\ \text{warps/scheduler}
+=
+64\ \text{warps/SM}.
+\]</p>
+
+<p>Warp size 为 32，所以同一个限制也可以写成 2048 resident threads：</p>
+
+<p>\[
+64\ \text{warps}
+\times
+32\ \text{threads/warp}
+=
+2048\ \text{threads}.
+\]</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">H100 SM 的 warp residency 与 scheduler 分区</div>
+  <svg class="diagram-svg" viewBox="0 0 1080 470" role="img" aria-label="Four H100 warp schedulers with sixteen resident warp slots each">
+    <defs>
+      <marker id="occ-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#71717a"></path>
+      </marker>
+    </defs>
+
+    <rect class="resource" x="40" y="28" width="1000" height="70" rx="7"></rect>
+    <text x="540" y="56" text-anchor="middle" font-size="14" font-weight="600">SM shared residency resources</text>
+    <text class="mono muted" x="540" y="80" text-anchor="middle" font-size="11">64K registers · up to 228 KiB shared memory · 32 CTA slots · barrier state</text>
+
+    <g transform="translate(50,132)">
+      <rect class="scheduler" x="0" y="0" width="220" height="210" rx="7"></rect>
+      <text x="110" y="30" text-anchor="middle" font-size="14" font-weight="600">Warp Scheduler 0</text>
+      <text class="mono muted" x="110" y="51" text-anchor="middle" font-size="11">16 resident warp slots</text>
+      <g transform="translate(34,72)">
+        <rect class="slot" x="0" y="0" width="32" height="24" rx="3"></rect><rect class="slot" x="40" y="0" width="32" height="24" rx="3"></rect><rect class="slot" x="80" y="0" width="32" height="24" rx="3"></rect><rect class="slot" x="120" y="0" width="32" height="24" rx="3"></rect>
+        <rect class="slot" x="0" y="34" width="32" height="24" rx="3"></rect><rect class="slot" x="40" y="34" width="32" height="24" rx="3"></rect><rect class="slot" x="80" y="34" width="32" height="24" rx="3"></rect><rect class="slot" x="120" y="34" width="32" height="24" rx="3"></rect>
+        <rect class="slot" x="0" y="68" width="32" height="24" rx="3"></rect><rect class="slot" x="40" y="68" width="32" height="24" rx="3"></rect><rect class="slot" x="80" y="68" width="32" height="24" rx="3"></rect><rect class="slot" x="120" y="68" width="32" height="24" rx="3"></rect>
+        <rect class="slot" x="0" y="102" width="32" height="24" rx="3"></rect><rect class="slot" x="40" y="102" width="32" height="24" rx="3"></rect><rect class="slot" x="80" y="102" width="32" height="24" rx="3"></rect><rect class="slot" x="120" y="102" width="32" height="24" rx="3"></rect>
+      </g>
+    </g>
+
+    <g transform="translate(303,132)">
+      <rect class="scheduler" x="0" y="0" width="220" height="210" rx="7"></rect>
+      <text x="110" y="30" text-anchor="middle" font-size="14" font-weight="600">Warp Scheduler 1</text>
+      <text class="mono muted" x="110" y="51" text-anchor="middle" font-size="11">16 resident warp slots</text>
+      <g transform="translate(34,72)">
+        <rect class="slot" x="0" y="0" width="32" height="24" rx="3"></rect><rect class="slot" x="40" y="0" width="32" height="24" rx="3"></rect><rect class="slot" x="80" y="0" width="32" height="24" rx="3"></rect><rect class="slot" x="120" y="0" width="32" height="24" rx="3"></rect>
+        <rect class="slot" x="0" y="34" width="32" height="24" rx="3"></rect><rect class="slot" x="40" y="34" width="32" height="24" rx="3"></rect><rect class="slot" x="80" y="34" width="32" height="24" rx="3"></rect><rect class="slot" x="120" y="34" width="32" height="24" rx="3"></rect>
+        <rect class="slot" x="0" y="68" width="32" height="24" rx="3"></rect><rect class="slot" x="40" y="68" width="32" height="24" rx="3"></rect><rect class="slot" x="80" y="68" width="32" height="24" rx="3"></rect><rect class="slot" x="120" y="68" width="32" height="24" rx="3"></rect>
+        <rect class="slot" x="0" y="102" width="32" height="24" rx="3"></rect><rect class="slot" x="40" y="102" width="32" height="24" rx="3"></rect><rect class="slot" x="80" y="102" width="32" height="24" rx="3"></rect><rect class="slot" x="120" y="102" width="32" height="24" rx="3"></rect>
+      </g>
+    </g>
+
+    <g transform="translate(556,132)">
+      <rect class="scheduler" x="0" y="0" width="220" height="210" rx="7"></rect>
+      <text x="110" y="30" text-anchor="middle" font-size="14" font-weight="600">Warp Scheduler 2</text>
+      <text class="mono muted" x="110" y="51" text-anchor="middle" font-size="11">16 resident warp slots</text>
+      <g transform="translate(34,72)">
+        <rect class="slot" x="0" y="0" width="32" height="24" rx="3"></rect><rect class="slot" x="40" y="0" width="32" height="24" rx="3"></rect><rect class="slot" x="80" y="0" width="32" height="24" rx="3"></rect><rect class="slot" x="120" y="0" width="32" height="24" rx="3"></rect>
+        <rect class="slot" x="0" y="34" width="32" height="24" rx="3"></rect><rect class="slot" x="40" y="34" width="32" height="24" rx="3"></rect><rect class="slot" x="80" y="34" width="32" height="24" rx="3"></rect><rect class="slot" x="120" y="34" width="32" height="24" rx="3"></rect>
+        <rect class="slot" x="0" y="68" width="32" height="24" rx="3"></rect><rect class="slot" x="40" y="68" width="32" height="24" rx="3"></rect><rect class="slot" x="80" y="68" width="32" height="24" rx="3"></rect><rect class="slot" x="120" y="68" width="32" height="24" rx="3"></rect>
+        <rect class="slot" x="0" y="102" width="32" height="24" rx="3"></rect><rect class="slot" x="40" y="102" width="32" height="24" rx="3"></rect><rect class="slot" x="80" y="102" width="32" height="24" rx="3"></rect><rect class="slot" x="120" y="102" width="32" height="24" rx="3"></rect>
+      </g>
+    </g>
+
+    <g transform="translate(809,132)">
+      <rect class="scheduler" x="0" y="0" width="220" height="210" rx="7"></rect>
+      <text x="110" y="30" text-anchor="middle" font-size="14" font-weight="600">Warp Scheduler 3</text>
+      <text class="mono muted" x="110" y="51" text-anchor="middle" font-size="11">16 resident warp slots</text>
+      <g transform="translate(34,72)">
+        <rect class="slot" x="0" y="0" width="32" height="24" rx="3"></rect><rect class="slot" x="40" y="0" width="32" height="24" rx="3"></rect><rect class="slot" x="80" y="0" width="32" height="24" rx="3"></rect><rect class="slot" x="120" y="0" width="32" height="24" rx="3"></rect>
+        <rect class="slot" x="0" y="34" width="32" height="24" rx="3"></rect><rect class="slot" x="40" y="34" width="32" height="24" rx="3"></rect><rect class="slot" x="80" y="34" width="32" height="24" rx="3"></rect><rect class="slot" x="120" y="34" width="32" height="24" rx="3"></rect>
+        <rect class="slot" x="0" y="68" width="32" height="24" rx="3"></rect><rect class="slot" x="40" y="68" width="32" height="24" rx="3"></rect><rect class="slot" x="80" y="68" width="32" height="24" rx="3"></rect><rect class="slot" x="120" y="68" width="32" height="24" rx="3"></rect>
+        <rect class="slot" x="0" y="102" width="32" height="24" rx="3"></rect><rect class="slot" x="40" y="102" width="32" height="24" rx="3"></rect><rect class="slot" x="80" y="102" width="32" height="24" rx="3"></rect><rect class="slot" x="120" y="102" width="32" height="24" rx="3"></rect>
+      </g>
+    </g>
+
+    <path class="arrow" marker-end="url(#occ-arrow)" d="M 160 342 L 160 382"></path>
+    <path class="arrow" marker-end="url(#occ-arrow)" d="M 413 342 L 413 382"></path>
+    <path class="arrow" marker-end="url(#occ-arrow)" d="M 666 342 L 666 382"></path>
+    <path class="arrow" marker-end="url(#occ-arrow)" d="M 919 342 L 919 382"></path>
+    <rect class="issue" x="45" y="392" width="990" height="54" rx="7"></rect>
+    <text x="540" y="416" text-anchor="middle" font-size="14" font-weight="600">每个 scheduler 从自己的 eligible warps 中选择指令</text>
+    <text class="mono muted" x="540" y="436" text-anchor="middle" font-size="11">64 resident contexts provide latency-hiding candidates; residency is not issue throughput</text>
+  </svg>
+</div>
+
+<p>64 是 warp execution context 的架构容量。每个 resident warp 需要程序计数器、active mask、scoreboard、同步状态和调度元数据，还要占用线程寄存器。第 65 个 warp 即使不使用 shared memory，也没有可分配的 warp slot。</p>
+
+<p><a href="https://docs.nvidia.com/cuda/archive/12.9.0/pdf/CUDA_C_Programming_Guide.pdf">CUDA Programming Guide 的 CC 9.0 章节</a>列出 H100 SM 的 4 个 warp scheduler，并说明 scheduler 会从分配给自己的 ready warp 中发射指令。64 个 resident warp 只提供候选上下文，单周期 issue 能力由 scheduler 和目标执行管线决定。</p>
+
+<p>公开规格定义了架构上限，但没有披露完整的电路预算。64 个 slot 已经与寄存器容量形成明确约束：H100 有 65536 个 32-bit registers；64 个 warp 全部常驻时共有 2048 个线程，平均每个线程最多分到 32 个寄存器。保持 register file 和 issue width 不变而增加 warp slot，常见 kernel 很难填满新增容量，scoreboard 和调度状态的成本却会继续上升。</p>
+
+<h2 id="model">2. Occupancy 计算模型</h2>
+
+<p>设每个 block 有 $T$ 个线程，warp size 为 32。一个 block 占用的 warp 数为：</p>
+
+<p>\[
+W_{\mathrm{block}}
+=
+\left\lceil\frac{T}{32}\right\rceil.
+\]</p>
+
+<p>每项 SM 资源都能给出一个 resident block 上限：</p>
+
+<p>\[
+B_{\mathrm{warps}}
+=
+\left\lfloor
+\frac{W_{\max}}{W_{\mathrm{block}}}
+\right\rfloor,
+\qquad
+B_{\mathrm{registers}}
+=
+\left\lfloor
+\frac{R_{\mathrm{SM}}}{R_{\mathrm{block}}^{\mathrm{alloc}}}
+\right\rfloor,
+\]</p>
+
+<p>\[
+B_{\mathrm{smem}}
+=
+\left\lfloor
+\frac{S_{\mathrm{SM}}}{S_{\mathrm{block}}^{\mathrm{alloc}}}
+\right\rfloor.
+\]</p>
+
+<p>再与架构 block slot 和 barrier 上限合并：</p>
+
+<p>\[
+B_{\mathrm{resident}}
+=
+\min\left(
+B_{\mathrm{warps}},
+B_{\mathrm{registers}},
+B_{\mathrm{smem}},
+B_{\mathrm{blocks}},
+B_{\mathrm{barriers}}
+\right).
+\]</p>
+
+<p>理论常驻 warp 数和理论 occupancy 分别为：</p>
+
+<p>\[
+W_{\mathrm{resident}}
+=
+B_{\mathrm{resident}}W_{\mathrm{block}},
+\qquad
+\mathrm{Occupancy}_{\mathrm{theoretical}}
+=
+\frac{W_{\mathrm{resident}}}{W_{\max}}.
+\]</p>
+
+<div class="note-box">
+  <p>寄存器和 shared memory 都有分配粒度。$R_{\mathrm{block}}^{\mathrm{alloc}}$ 与 $S_{\mathrm{block}}^{\mathrm{alloc}}$ 表示向硬件粒度取整后的实际分配量。临界点附近应使用 CUDA Occupancy Calculator 或 NCU，不能只算 <code>registers/thread × threads/block</code>。</p>
+</div>
+
+<p>Thread Block Cluster 还受到 cluster size 和 GPC placement 约束。Cluster kernel 应使用 <code>cudaOccupancyMaxActiveClusters()</code> 计算可同时运行的 cluster 数；普通的 per-SM 公式不足以描述这层调度。</p>
+
+<h2 id="example">3. H100 上的资源限制算例</h2>
+
+<p>考虑一个 H100 kernel：</p>
+
+<pre class="code">threads_per_block       = 256
+warps_per_block         = 8
+registers_per_thread    = 96
+shared_memory_per_block = 48 KiB</pre>
+
+<p>忽略不会成为瓶颈的 barrier，并且先按整数资源量计算：</p>
+
+<div class="table-scroll">
+<table class="note-table centered">
+  <thead>
+    <tr><th>资源</th><th>H100 每 SM 容量</th><th>每 block 用量</th><th>允许的 resident blocks</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Warp slots</td><td>64 warps</td><td>8 warps</td><td>$\lfloor64/8\rfloor=8$</td></tr>
+    <tr><td>Block slots</td><td>32 blocks</td><td>1 block</td><td>32</td></tr>
+    <tr><td>Registers</td><td>65536</td><td>$96\times256=24576$</td><td>$\lfloor65536/24576\rfloor=2$</td></tr>
+    <tr><td>Shared memory</td><td>228 KiB</td><td>48 KiB</td><td>$\lfloor228/48\rfloor=4$</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>寄存器给出的上限最小，所以一个 SM 最多常驻两个 block：</p>
+
+<p>\[
+B_{\mathrm{resident}}=2,
+\qquad
+W_{\mathrm{resident}}=2\times8=16,
+\qquad
+\mathrm{Occupancy}=\frac{16}{64}=25\%.
+\]</p>
+
+<p>同样是 256-thread block，达到 64 个 resident warp 需要同时放入 8 个 block。寄存器必须控制在约 32 registers/thread 以内，shared memory 也要控制在约 $228/8=28.5$ KiB/block 以内。分配粒度和系统保留空间可能进一步收紧边界。</p>
+
+<p>很小的 block 也会损失 occupancy。若每个 block 只有 32 个线程，warp 容量允许 64 个 block，但 H100 只有 32 个 block slot。最终只能常驻 32 个 warp，理论 occupancy 最高为 50%。</p>
+
+<h2 id="ncu">4. Nsight Compute 中的 occupancy limiter</h2>
+
+<p>NCU 的 <code>launch__occupancy_limit_*</code> 指标给出每项资源单独允许的 resident block 数。它们的单位都是 <code>block</code>。</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Metric</th><th>NCU UI 名称</th><th>含义</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>launch__occupancy_limit_warps</code></td><td>Block Limit Warps</td><td>仅考虑 warp slot 和 block size 时允许的 block 数</td></tr>
+    <tr><td><code>launch__occupancy_limit_blocks</code></td><td>Block Limit SM</td><td>SM 的架构 block slot 上限</td></tr>
+    <tr><td><code>launch__occupancy_limit_registers</code></td><td>Block Limit Registers</td><td>寄存器分配允许的 block 数</td></tr>
+    <tr><td><code>launch__occupancy_limit_shared_mem</code></td><td>Block Limit Shared Mem</td><td>静态、动态及 driver shared memory 分配允许的 block 数</td></tr>
+    <tr><td><code>launch__occupancy_limit_barriers</code></td><td>Block Limit Barriers</td><td>Kernel 使用的 barrier 资源允许的 block 数</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p><code>launch__occupancy_limit_warps</code> 的名字容易造成误读。它返回 block 数：</p>
+
+<p>\[
+\texttt{launch\_\_occupancy\_limit\_warps}
+=
+\left\lfloor
+\frac{W_{\max}}
+{\left\lceil T/32\right\rceil}
+\right\rfloor.
+\]</p>
+
+<p>H100 上的 256-thread block 占 8 个 warp，该 metric 的结果是 8 blocks，单位仍是 block。五个 limiter 的最小值决定理论 resident block 数。NCU 随后给出：</p>
+
+<pre class="code">Theoretical Active Warps per SM
+Theoretical Occupancy
+Achieved Active Warps per SM
+Achieved Occupancy</pre>
+
+<p><a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#launch-metrics">Nsight Compute Metrics Reference</a> 对这些 launch metrics 的定义与上述关系一致。<code>launch__occupancy_per_block_size</code>、<code>launch__occupancy_per_register_count</code> 和 <code>launch__occupancy_per_shared_mem_size</code> 则用于查看参数变化时的 active warp 数。</p>
+
+<h2 id="specs">5. 不同 compute capability 的 warp residency 规格</h2>
+
+<p>下表列出常见 GPU 对应的 SM 上限。各代 SM 都有 4 个 warp scheduler；<code>max warps/scheduler</code> 是 <code>max warps/SM</code> 在四个 scheduler 间的 residency 分区，也可通过 NCU device attribute 直接查询。</p>
+
+<div class="table-scroll">
+<table class="note-table centered">
+  <thead>
+    <tr>
+      <th>Compute capability</th>
+      <th>代表 GPU</th>
+      <th>Schedulers/SM</th>
+      <th>Max warps/scheduler</th>
+      <th>Max warps/SM</th>
+      <th>Max threads/SM</th>
+      <th>Max blocks/SM</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>7.5</td><td>T4</td><td>4</td><td>8</td><td>32</td><td>1024</td><td>16</td></tr>
+    <tr><td>8.0</td><td>A100、A30</td><td>4</td><td>16</td><td>64</td><td>2048</td><td>32</td></tr>
+    <tr><td>8.6</td><td>A10、A40</td><td>4</td><td>12</td><td>48</td><td>1536</td><td>16</td></tr>
+    <tr><td>8.7</td><td>Jetson Orin</td><td>4</td><td>12</td><td>48</td><td>1536</td><td>16</td></tr>
+    <tr><td>8.9</td><td>L4、L40、RTX 4090</td><td>4</td><td>12</td><td>48</td><td>1536</td><td>24</td></tr>
+    <tr><td>9.0</td><td>H100、H200、GH200</td><td>4</td><td>16</td><td>64</td><td>2048</td><td>32</td></tr>
+    <tr><td>10.0</td><td>B200、GB200</td><td>4</td><td>16</td><td>64</td><td>2048</td><td>32</td></tr>
+    <tr><td>10.3</td><td>B300、GB300</td><td>4</td><td>16</td><td>64</td><td>2048</td><td>32</td></tr>
+    <tr><td>12.x</td><td>RTX 50、RTX PRO Blackwell</td><td>4</td><td>12</td><td>48</td><td>1536</td><td>24</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>GPU 型号与 compute capability 的对应关系见 <a href="https://developer.nvidia.com/cuda-gpus">NVIDIA CUDA GPU Compute Capability</a>；每代的 resident warps、threads 和 blocks 上限见 <a href="https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html#device-and-streaming-multiprocessor-sm-information-per-compute-capability">CUDA Programming Guide 的 SM 规格表</a>。4 scheduler/SM 的组织由各 compute capability 的 architecture 章节给出，CC 8.x、9.0 和 10.x 均采用这一结构。</p>
+
+<div class="note-box warn">
+  <p><code>max warps/scheduler</code> 表示 scheduler 管理的常驻 warp 上限，与每周期 issue 的 warp 数无关。H100 的一个 scheduler 可以保留 16 个 warp 上下文，但每次 issue 只会从 eligible warp 中选择指令。</p>
+</div>
+
+<h2 id="achieved">6. 理论 occupancy 与实测 occupancy</h2>
+
+<p>Theoretical Occupancy 由 launch configuration 和静态资源分配计算。Achieved Occupancy 是 kernel 执行期间实际 active warps 的时间平均值。两者的差距通常来自：</p>
+
+<ul>
+  <li>Grid 规模不足，不能为每个 SM 提供足够的 block</li>
+  <li>尾波中的 block 数不足，即 tail effect</li>
+  <li>不同 block 或 warp 的执行时间不均衡</li>
+  <li>分支导致部分 warp 提前完成</li>
+  <li>Thread Block Cluster 的 placement 约束</li>
+  <li>并发 kernel、MPS 或资源分区改变了可用 SM 资源</li>
+</ul>
+
+<p>调优时先看理论值及其 limiter。理论 occupancy 很低，说明 block size、寄存器或 shared memory 需要调整；理论值高而 achieved occupancy 明显偏低，应检查 grid wave、负载均衡和 kernel 尾部。</p>
+
+<p>Occupancy 提供的是延迟隐藏空间。若 scheduler 已经持续找到 eligible warp，执行管线或内存带宽也已接近饱和，继续增加 occupancy 不会带来吞吐收益。为了提高 occupancy 强行限制寄存器，还可能产生 local-memory spilling。此时需要结合 Scheduler Statistics、Warp State Statistics 和 Compute/Memory Throughput 判断。</p>
+
+<h2 id="query">7. 查询硬件与 kernel 上限</h2>
+
+<p>CUDA Runtime 可以查询 threads/SM 和 warp size：</p>
+
+<pre class="code">cudaDeviceProp prop;
+cudaGetDeviceProperties(&amp;prop, device);
+
+int max_warps_per_sm =
+    prop.maxThreadsPerMultiProcessor / prop.warpSize;</pre>
+
+<p>设备型号和 compute capability 可以直接查询：</p>
+
+<pre class="code">nvidia-smi --query-gpu=name,compute_cap --format=csv</pre>
+
+<p>NCU 暴露了 scheduler 和 warp residency 属性：</p>
+
+<pre class="code">device__attribute_num_schedulers_per_multiprocessor
+device__attribute_max_warps_per_scheduler
+device__attribute_max_warps_per_multiprocessor
+device__attribute_limits_max_cta_per_sm</pre>
+
+<p>这些属性来自 CUDA driver，不需要额外的 replay pass。Kernel 自身的寄存器和 shared memory 用量可以从 Launch Statistics 与 Occupancy section 查看，也可以在编译时使用 <code>nvcc --resource-usage</code>。</p>
+
+<h2 id="refs">参考资料</h2>
+
+<ul>
+  <li><a href="https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html#occupancy">CUDA Programming Guide: Occupancy</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html">CUDA Programming Guide: Compute Capabilities</a></li>
+  <li><a href="https://developer.nvidia.com/cuda-gpus">NVIDIA CUDA GPU Compute Capability</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html#occupancy">Hopper Tuning Guide: Occupancy</a></li>
+  <li><a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#launch-metrics">Nsight Compute Profiling Guide: Launch Metrics</a></li>
+  <li><a href="https://docs.nvidia.com/nsight-compute/OccupancyCalculatorPythonInterface/index.html">Nsight Compute Occupancy Calculator Python Interface</a></li>
+</ul>
+
+</main>
+</div>
+</body>
+</html>
