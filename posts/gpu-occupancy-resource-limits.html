@@ -10,8 +10,8 @@
 <meta name="post:date"            content="2026-08-26">
 <meta name="post:tags"            content="GPU, CUDA, Occupancy, Nsight Compute">
 <meta name="post:tags_en"         content="GPU, CUDA, Occupancy, Nsight Compute">
-<meta name="post:reading"         content="13 分钟">
-<meta name="post:reading_en"      content="13 min">
+<meta name="post:reading"         content="15 分钟">
+<meta name="post:reading_en"      content="15 min">
 <meta name="post:summary"         content="从 SM 的常驻 warp slot 出发，推导 occupancy 的资源模型，解释 NCU 的 launch__occupancy_limit_* 指标，并整理各代 compute capability 的 warp residency 规格。">
 <meta name="post:summary_en"      content="Derives GPU occupancy from SM warp residency slots, explains Nsight Compute occupancy limit metrics, and compares warp residency specifications across compute capabilities.">
 <meta name="post:series"          content="gpu-programming-basics">
@@ -157,7 +157,7 @@
 \frac{W_{\mathrm{resident}}}{W_{\max}}.
 \]</p>
 
-<p>NCU 在 occupancy 语境里使用 <em>active warp</em>，它与 resident warp 指向同一类状态：warp 已经占用 SM 上的执行上下文，并且尚未结束。后续调度还要经过 eligible 和 issued 两个状态。</p>
+<p>NCU 在 occupancy 语境里使用 <em>active warp</em>，它与 resident warp 指向同一类状态：warp 已经占用 SM 上的执行上下文，并且尚未结束。在每个 scheduler cycle 上，active warp 分为 stalled 与 eligible；eligible warp 再分为 selected 与 not selected。</p>
 
 <div class="table-scroll">
 <table class="note-table">
@@ -168,12 +168,99 @@
     <tr><td>Resident / Active</td><td>执行上下文已经分配在 SM 上，warp 尚未完成</td><td>计入 occupancy</td></tr>
     <tr><td>Stalled</td><td>下一条指令在等待数据、同步或执行管线</td><td>仍然计入 occupancy</td></tr>
     <tr><td>Eligible</td><td>下一条指令及其目标管线已经 ready</td><td>是 scheduler 的候选项</td></tr>
-    <tr><td>Issued</td><td>scheduler 在当前 issue 时刻选中了该 warp</td><td>反映发射，不改变 occupancy 定义</td></tr>
+    <tr><td>Not Selected</td><td>Warp 已经 eligible，但 scheduler 本周期选择了另一个 warp</td><td>仍然计入 occupancy</td></tr>
+    <tr><td>Selected / Issued</td><td>Scheduler 在当前 issue 时刻选中该 warp，并发射一条或多条指令</td><td>反映发射，不改变 occupancy 定义</td></tr>
   </tbody>
 </table>
 </div>
 
-<p><a href="https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html#occupancy">CUDA Programming Guide</a> 给出的 occupancy 定义也是 active warps 与 SM 最大 active warps 的比例。一个 stalled warp 仍会占用寄存器和 warp slot，所以高 occupancy 可能同时伴随大量停顿。</p>
+<div class="diagram-frame">
+  <div class="diagram-title">Warp slot 生命周期与 scheduler 状态</div>
+  <svg class="diagram-svg" viewBox="0 0 1160 525" role="img" aria-label="Warp lifecycle showing active warps divided into stalled and eligible states, with eligible warps selected or not selected">
+    <defs>
+      <marker id="warp-state-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#71717a"></path>
+      </marker>
+    </defs>
+
+    <rect class="slot" x="30" y="192" width="175" height="82" rx="7"></rect>
+    <text x="118" y="225" text-anchor="middle" font-size="14" font-weight="600">Free warp slot</text>
+    <text class="mono muted" x="118" y="250" text-anchor="middle" font-size="11">not counted</text>
+
+    <rect class="resource" x="250" y="42" width="690" height="410" rx="9"></rect>
+    <text x="595" y="72" text-anchor="middle" font-size="15" font-weight="600">Active / Resident</text>
+    <text class="muted" x="595" y="94" text-anchor="middle" font-size="11">warp slot 已分配；区域内所有状态都计入 occupancy</text>
+
+    <rect class="issue" x="292" y="132" width="230" height="92" rx="7"></rect>
+    <text x="407" y="165" text-anchor="middle" font-size="14" font-weight="600">Stalled</text>
+    <text class="muted" x="407" y="188" text-anchor="middle" font-size="11">fetch / dependency / barrier</text>
+    <text class="muted" x="407" y="207" text-anchor="middle" font-size="11">pipeline unavailable</text>
+
+    <rect class="scheduler" x="650" y="132" width="230" height="92" rx="7"></rect>
+    <text x="765" y="165" text-anchor="middle" font-size="14" font-weight="600">Eligible</text>
+    <text class="muted" x="765" y="188" text-anchor="middle" font-size="11">instruction decoded</text>
+    <text class="muted" x="765" y="207" text-anchor="middle" font-size="11">dependencies and pipeline ready</text>
+
+    <rect class="slot" x="430" y="306" width="205" height="82" rx="7"></rect>
+    <text x="533" y="338" text-anchor="middle" font-size="14" font-weight="600">Not Selected</text>
+    <text class="muted" x="533" y="362" text-anchor="middle" font-size="11">another eligible warp won</text>
+
+    <rect class="scheduler" x="694" y="306" width="205" height="82" rx="7"></rect>
+    <text x="797" y="338" text-anchor="middle" font-size="14" font-weight="600">Selected / Issued</text>
+    <text class="muted" x="797" y="362" text-anchor="middle" font-size="11">instruction issued this cycle</text>
+
+    <rect class="slot" x="982" y="192" width="148" height="82" rx="7"></rect>
+    <text x="1056" y="225" text-anchor="middle" font-size="14" font-weight="600">Exited</text>
+    <text class="mono muted" x="1056" y="250" text-anchor="middle" font-size="11">slot released</text>
+
+    <path class="arrow" d="M205 233 L242 233" marker-end="url(#warp-state-arrow)"></path>
+    <text class="mono muted" x="224" y="218" text-anchor="middle" font-size="10">allocate</text>
+
+    <path class="arrow" d="M522 178 L642 178" marker-end="url(#warp-state-arrow)"></path>
+    <text class="mono muted" x="582" y="164" text-anchor="middle" font-size="10">becomes ready</text>
+
+    <path class="arrow" d="M707 224 C665 258, 604 276, 554 300" marker-end="url(#warp-state-arrow)"></path>
+    <text class="mono muted" x="624" y="265" text-anchor="middle" font-size="10">not chosen</text>
+
+    <path class="arrow" d="M797 224 L797 298" marker-end="url(#warp-state-arrow)"></path>
+    <text class="mono muted" x="836" y="266" text-anchor="middle" font-size="10">chosen</text>
+
+    <path class="arrow" d="M635 347 C665 347, 668 249, 715 228" marker-end="url(#warp-state-arrow)"></path>
+    <text class="mono muted" x="674" y="320" text-anchor="middle" font-size="10">next cycle</text>
+
+    <path class="arrow" d="M797 388 C797 432, 360 435, 360 224" marker-end="url(#warp-state-arrow)"></path>
+    <text class="mono muted" x="580" y="426" text-anchor="middle" font-size="10">next instruction is blocked</text>
+
+    <path class="arrow" d="M860 388 C925 418, 925 264, 835 224" marker-end="url(#warp-state-arrow)"></path>
+    <text class="mono muted" x="920" y="346" text-anchor="middle" font-size="10">next instruction ready</text>
+
+    <path class="arrow" d="M940 233 L974 233" marker-end="url(#warp-state-arrow)"></path>
+    <text class="mono muted" x="957" y="218" text-anchor="middle" font-size="10">exit</text>
+
+    <path class="arrow" d="M1056 274 C1056 486, 118 486, 118 282" marker-end="url(#warp-state-arrow)"></path>
+    <text class="mono muted" x="588" y="489" text-anchor="middle" font-size="10">hardware returns the context to the free-slot pool</text>
+  </svg>
+</div>
+
+<p>在一个 scheduler cycle 上，可以把这些集合关系写成：</p>
+
+<p>\[
+W_{\mathrm{active}}
+=
+W_{\mathrm{stalled}}
++
+W_{\mathrm{eligible}},
+\qquad
+W_{\mathrm{eligible}}
+=
+W_{\mathrm{selected}}
++
+W_{\mathrm{not\ selected}}.
+\]</p>
+
+<p><code>Selected</code> 更接近一次 issue 事件，而不是持续多个周期的 residency 状态。指令发射后，scheduler 会根据下一条指令重新判断该 warp 是 stalled 还是 eligible。<a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#sections-and-rules">Nsight Compute Scheduler Statistics</a> 也采用 active、eligible、issued 这三层口径。</p>
+
+<p><a href="https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html#occupancy">CUDA Programming Guide</a> 给出的 occupancy 定义是 active warps 与 SM 最大 active warps 的比例。一个 stalled warp 仍会占用寄存器和 warp slot，所以高 occupancy 可能同时伴随大量停顿。</p>
 
 <h2 id="h100-slots">1. H100 的 64 个 resident warp slot</h2>
 
@@ -520,7 +607,56 @@ Achieved Occupancy</pre>
 
 <h2 id="achieved">6. 理论 occupancy 与实测 occupancy</h2>
 
-<p>Theoretical Occupancy 由 launch configuration 和静态资源分配计算。Achieved Occupancy 是 kernel 执行期间实际 active warps 的时间平均值。两者的差距通常来自：</p>
+<p>Theoretical Occupancy 由 launch configuration 和静态资源分配计算。<code>Achieved Active Warps Per SM</code> 来自硬件对 resident warp 的动态计数，对应底层 metric：</p>
+
+<pre class="code">sm__warps_active.avg.per_cycle_active</pre>
+
+<p>设第 $i$ 个 SM 在第 $c$ 个 active cycle 上有 $W_{i,c}$ 个 resident warp。这个指标可以按下面的时间平均模型理解：</p>
+
+<p>\[
+\overline{W}_{\mathrm{active}}
+=
+\operatorname{avg}_{i\in\mathrm{SM}}
+\left(
+\frac{1}{C_i}
+\sum_{c=1}^{C_i} W_{i,c}
+\right).
+\]</p>
+
+<p>NCU 显示的 <code>Achieved Occupancy</code> 再用架构最大 resident warps/SM 对它做归一化：</p>
+
+<p>\[
+\mathrm{Achieved\ Occupancy}
+=
+\frac{
+\mathrm{Achieved\ Active\ Warps\ Per\ SM}
+}{W_{\max}}
+\times100\%.
+\]</p>
+
+<pre class="code">Achieved Active Warps Per SM
+    = sm__warps_active.avg.per_cycle_active
+
+Achieved Occupancy
+    = sm__warps_active.avg.pct_of_peak_sustained_active</pre>
+
+<p>例如 H100 的 $W_{\max}=64$。假设 80% 的 active cycles 有 64 个 active warp，剩余 20% 只有 16 个：</p>
+
+<p>\[
+\overline{W}_{\mathrm{active}}
+=0.8\times64+0.2\times16
+=54.4,
+\qquad
+\mathrm{Achieved\ Occupancy}
+=\frac{54.4}{64}
+=85\%.
+\]</p>
+
+<div class="note-box">
+  <p><code>per_cycle_active</code> 的分母是 SM active cycles，不是整个 GPU 的 wall-clock elapsed cycles。若需要判断 grid 是否覆盖了全部 SM，还要结合 <code>sm__cycles_active.avg.pct_of_peak_sustained_elapsed</code>。一个 stalled warp 仍属于 active warp，因此 Achieved Occupancy 不衡量 eligible warp 数量，也不衡量 issue efficiency。</p>
+</div>
+
+<p>Theoretical 与 Achieved Occupancy 的差距通常来自：</p>
 
 <ul>
   <li>Grid 规模不足，不能为每个 SM 提供足够的 block</li>
@@ -566,6 +702,8 @@ device__attribute_limits_max_cta_per_sm</pre>
   <li><a href="https://developer.nvidia.com/cuda-gpus">NVIDIA CUDA GPU Compute Capability</a></li>
   <li><a href="https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html#occupancy">Hopper Tuning Guide: Occupancy</a></li>
   <li><a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#launch-metrics">Nsight Compute Profiling Guide: Launch Metrics</a></li>
+  <li><a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#sections-and-rules">Nsight Compute Profiling Guide: Scheduler Statistics</a></li>
+  <li><a href="https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html#metric-comparison">Nsight Compute CLI: Metric Comparison</a></li>
   <li><a href="https://docs.nvidia.com/nsight-compute/OccupancyCalculatorPythonInterface/index.html">Nsight Compute Occupancy Calculator Python Interface</a></li>
 </ul>
 
