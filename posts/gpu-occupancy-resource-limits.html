@@ -10,8 +10,8 @@
 <meta name="post:date"            content="2026-08-26">
 <meta name="post:tags"            content="GPU, CUDA, Occupancy, Nsight Compute">
 <meta name="post:tags_en"         content="GPU, CUDA, Occupancy, Nsight Compute">
-<meta name="post:reading"         content="12 分钟">
-<meta name="post:reading_en"      content="12 min">
+<meta name="post:reading"         content="13 分钟">
+<meta name="post:reading_en"      content="13 min">
 <meta name="post:summary"         content="从 SM 的常驻 warp slot 出发，推导 occupancy 的资源模型，解释 NCU 的 launch__occupancy_limit_* 指标，并整理各代 compute capability 的 warp residency 规格。">
 <meta name="post:summary_en"      content="Derives GPU occupancy from SM warp residency slots, explains Nsight Compute occupancy limit metrics, and compares warp residency specifications across compute capabilities.">
 <meta name="post:series"          content="gpu-programming-basics">
@@ -378,6 +378,69 @@ W_{\mathrm{resident}}=2\times8=16,
 <p>同样是 256-thread block，达到 64 个 resident warp 需要同时放入 8 个 block。寄存器必须控制在约 32 registers/thread 以内，shared memory 也要控制在约 $228/8=28.5$ KiB/block 以内。分配粒度和系统保留空间可能进一步收紧边界。</p>
 
 <p>很小的 block 也会损失 occupancy。若每个 block 只有 32 个线程，warp 容量允许 64 个 block，但 H100 只有 32 个 block slot。最终只能常驻 32 个 warp，理论 occupancy 最高为 50%。</p>
+
+<h3 id="packing-effect">Block size 与整数装箱效应</h3>
+
+<p>Block size 与 theoretical occupancy 之间不是单调关系。SM 只能接纳完整的 block，剩余资源即使还能容纳若干 warp，也不能拆开下一个 block 填入。Block size 连续增加时，resident block 数按整数台阶下降，最终得到一条锯齿状曲线。</p>
+
+<p>仅考虑 warp slot 和 block slot 时：</p>
+
+<p>\[
+B_{\mathrm{resident}}^{\mathrm{warp}}
+=
+\min\left(
+B_{\max},
+\left\lfloor
+\frac{W_{\max}}{W_{\mathrm{block}}}
+\right\rfloor
+\right),
+\qquad
+W_{\mathrm{block}}
+=
+\left\lceil\frac{T}{32}\right\rceil.
+\]</p>
+
+<p>H100 的 $W_{\max}=64$、$B_{\max}=32$。假设寄存器、shared memory 和 barrier 都不构成限制，不同 block size 的装箱结果如下：</p>
+
+<div class="table-scroll">
+<table class="note-table centered">
+  <thead>
+    <tr><th>Threads/block</th><th>Warps/block</th><th>Resident blocks</th><th>Resident warps</th><th>Occupancy</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>32</td><td>1</td><td>32</td><td>32</td><td>50.0%</td></tr>
+    <tr><td>64</td><td>2</td><td>32</td><td>64</td><td>100.0%</td></tr>
+    <tr><td>256</td><td>8</td><td>8</td><td>64</td><td>100.0%</td></tr>
+    <tr><td>288</td><td>9</td><td>7</td><td>63</td><td>98.4%</td></tr>
+    <tr><td>352</td><td>11</td><td>5</td><td>55</td><td>85.9%</td></tr>
+    <tr><td>384</td><td>12</td><td>5</td><td>60</td><td>93.8%</td></tr>
+    <tr><td>416</td><td>13</td><td>4</td><td>52</td><td>81.3%</td></tr>
+    <tr><td>512</td><td>16</td><td>4</td><td>64</td><td>100.0%</td></tr>
+    <tr><td>544</td><td>17</td><td>3</td><td>51</td><td>79.7%</td></tr>
+    <tr><td>672</td><td>21</td><td>3</td><td>63</td><td>98.4%</td></tr>
+    <tr><td>704</td><td>22</td><td>2</td><td>44</td><td>68.8%</td></tr>
+    <tr><td>1024</td><td>32</td><td>2</td><td>64</td><td>100.0%</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>以 352-thread block 为例，每个 block 占 11 个 warp。一个 SM 可以放入 5 个完整 block，共 55 个 resident warp。余下 9 个 warp slot 小于一个 block 所需的 11 个 slot，只能闲置：</p>
+
+<p>\[
+\left\lfloor\frac{64}{11}\right\rfloor=5,
+\qquad
+\mathrm{Occupancy}
+=
+\frac{5\times11}{64}
+=
+85.9\%.
+\]</p>
+
+<p>Block 增大到 384 threads 后，每个 SM 仍可放入 5 个 block，resident warp 数升至 60。增大到 416 threads 时，单个 block 需要 13 个 warp，resident block 数从 5 降到 4，occupancy 随之落到 81.3%。同一 resident block 台阶内，block 变大通常会填入更多 warp；跨过装箱边界时，少放一个 block 会造成突降。</p>
+
+<p>这条曲线的转折点并不等间距，所以它不是严格的周期函数。寄存器和 shared memory 的分配粒度还会加入新的台阶：每个 block 的资源用量先向硬件粒度取整，再参与整数除法。NCU 中看到的 theoretical occupancy 是这些限制共同作用的结果。Achieved occupancy 若出现更明显的波动，还应检查 <a href="#achieved">grid wave 和 tail effect</a>。</p>
+
+<p>H100 的 64 warps/SM、32 blocks/SM 以及其他 occupancy 资源上限见 <a href="https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html#occupancy">NVIDIA Hopper Tuning Guide</a>。</p>
 
 <h2 id="ncu">4. Nsight Compute 中的 occupancy limiter</h2>
 
