@@ -1,0 +1,731 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPU MIO Throttle：队列反压、成因与诊断</title>
+<meta name="post:title"           content="GPU MIO Throttle：队列反压、成因与诊断">
+<meta name="post:title_en"        content="GPU MIO Throttle: Queue Backpressure, Causes, and Diagnosis">
+<meta name="post:slug"            content="gpu-mio-throttle-nsight-compute">
+<meta name="post:date"            content="2026-08-28">
+<meta name="post:tags"            content="GPU, CUDA, Nsight Compute, MIO Throttle, Performance">
+<meta name="post:tags_en"         content="GPU, CUDA, Nsight Compute, MIO Throttle, Performance">
+<meta name="post:reading"         content="13 分钟">
+<meta name="post:reading_en"      content="13 min">
+<meta name="post:summary"         content="MIO Throttle 是 MIO queue 无法接收下一条 shared-memory、special-math 或动态分支指令时的发射前等待。离散排队模型描述短时 burst 与排空能力的失配，NCU 与 SASS 证据用于判断性能影响。">
+<meta name="post:summary_en"      content="MIO Throttle is a pre-issue wait caused when the MIO instruction queue cannot accept a pending shared-memory, special-math, or dynamic-branch instruction. A discrete queueing model relates the stall to burst arrivals versus drain capacity, while Not-issued samples, SASS opcodes, and backend metrics determine whether the pressure affects kernel time.">
+<meta name="post:series"          content="gpu-programming-basics">
+<meta name="post:series_title"    content="GPU Programming Basics">
+<meta name="post:series_title_en" content="GPU Programming Basics">
+<meta name="post:series_order"    content="4">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(','\\)'], ['$','$']], displayMath: [['\\[','\\]'], ['$$','$$']] },
+    options: { skipHtmlTags: ['script', 'style', 'pre', 'code'] }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
+<script src="../lang-toggle.js" defer></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  .lead {
+    margin: -6px 0 30px;
+    color: var(--fg-muted);
+    font-size: 17px;
+    line-height: 1.8;
+  }
+  .table-scroll {
+    max-width: 100%;
+    margin: 18px 0 26px;
+    overflow-x: auto;
+  }
+  table.note-table {
+    width: 100%;
+    min-width: 820px;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  table.note-table th,
+  table.note-table td {
+    padding: 9px 12px;
+    text-align: left;
+    vertical-align: top;
+  }
+  .note-box {
+    margin: 18px 0 26px;
+    padding: 12px 16px;
+    border-left: 3px solid var(--accent);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    background: var(--accent-tint);
+  }
+  .note-box.warn {
+    border-left-color: #d97706;
+    background: rgba(217, 119, 6, 0.08);
+  }
+  .note-box p { margin: 6px 0; }
+  .diagram-frame {
+    max-width: 100%;
+    margin: 20px 0 30px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    box-sizing: border-box;
+  }
+  .diagram-title {
+    margin-bottom: 10px;
+    color: var(--fg-subtle);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  .diagram-svg {
+    display: block;
+    width: 100%;
+    min-width: 720px;
+    height: auto;
+  }
+  .diagram-svg text {
+    fill: var(--fg);
+    font-family: var(--font-sans);
+    letter-spacing: 0;
+  }
+  .diagram-svg .mono { font-family: var(--font-mono); }
+  .diagram-svg .muted { fill: var(--fg-muted); }
+  .diagram-svg .box { fill: var(--bg); stroke: var(--border-strong); stroke-width: 1.3; }
+  .diagram-svg .scheduler { fill: rgba(37, 99, 235, 0.10); stroke: #2563eb; }
+  .diagram-svg .queue { fill: rgba(190, 24, 93, 0.10); stroke: #be185d; }
+  .diagram-svg .unit { fill: rgba(5, 150, 105, 0.10); stroke: #059669; }
+  .diagram-svg .stall { fill: rgba(217, 119, 6, 0.10); stroke: #d97706; }
+  .diagram-svg .arrow { fill: none; stroke: var(--fg-muted); stroke-width: 1.5; }
+  .diagram-svg .association { fill: none; stroke: var(--fg-muted); stroke-width: 1.3; stroke-dasharray: 5 5; }
+  .diagram-svg .pressure { fill: none; stroke: #be185d; stroke-width: 2; }
+  main.content mjx-container[display="true"] {
+    max-width: 100%;
+    padding-bottom: 2px;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  @media (max-width: 720px) {
+    .lead { font-size: 16px; }
+    .diagram-frame { padding: 12px; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录 · TOC</div>
+    <div class="lang-zh">
+    <ul>
+      <li><a href="#zh-position">1. MIO 的发射前边界</a></li>
+      <li><a href="#zh-meaning">2. 动态 burst 与 queue 状态</a></li>
+      <li><a href="#zh-causes">3. 进入 MIO 的指令</a></li>
+      <li><a href="#zh-differences">4. 发射前反压与发射后等待</a></li>
+      <li><a href="#zh-example">5. 从 SASS 形态建立假设</a></li>
+      <li><a href="#zh-diagnosis">6. NCU 证据链</a></li>
+      <li><a href="#zh-optimize">7. 按成因优化</a></li>
+      <li><a href="#zh-refs">参考资料</a></li>
+    </ul>
+    </div>
+    <div class="lang-en">
+    <ul>
+      <li><a href="#en-position">1. The pre-issue MIO boundary</a></li>
+      <li><a href="#en-meaning">2. Dynamic bursts and queue state</a></li>
+      <li><a href="#en-causes">3. Instructions entering MIO</a></li>
+      <li><a href="#en-differences">4. Pre-issue pressure and post-issue waits</a></li>
+      <li><a href="#en-example">5. Building a hypothesis from SASS</a></li>
+      <li><a href="#en-diagnosis">6. NCU evidence chain</a></li>
+      <li><a href="#en-optimize">7. Cause-specific optimization</a></li>
+      <li><a href="#en-refs">References</a></li>
+    </ul>
+    </div>
+  </aside>
+
+<main class="content">
+
+<div class="lang-zh">
+
+<h1>GPU MIO Throttle：队列反压、成因与诊断</h1>
+
+<p class="lead">CUDA kernel 执行 shared-memory 访问、特殊数学运算或动态分支时，相应的 SASS 指令会进入 MIO（Memory Input/Output）路径。一个 SM 上的多个 resident warp 可能在相近 cycle 到达这类指令，warp scheduler 因而会在短时间内向同一执行路径集中提交工作。下游 instruction queue 负责吸收这段到达突发；当新指令的到达速度暂时超过 queue 的排空速度时，queue 会逐步填满。Nsight Compute 把由此产生的发射等待记录为 <code>MIO Throttle</code>。</p>
+
+<p>这种等待发生在指令发射之前。<strong>MIO Throttle 是 warp 的下一条指令需要进入 MIO，而 MIO instruction queue 暂时没有空位时形成的 stall。</strong>指令一旦发射，后续数据依赖便转由 scoreboard 等机制跟踪。本文沿用 <a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#warp-stall-reasons">Nsight Compute 2026.1</a> 的公开定义，并把 instruction queue 作为 profiler 可见的逻辑边界；队列深度、端口、仲裁与物理连接不属于本文的推断范围。</p>
+
+<h2 id="zh-position">1. MIO 的发射前边界</h2>
+
+<p>一条指令进入 eligible 集合，需要同时满足语义就绪和目标路径可接收两个条件。数据依赖与同步状态决定前一个条件，instruction queue 是否有空位决定后一个条件。MIO Throttle 对应接收条件暂时不满足：目标指令尚未发射，warp 仍处于 active 状态，却不能进入 eligible 集合。待指令成功发射后，consumer 对结果的等待才会表现为 Short Scoreboard 等完成依赖。下图把这两个阶段分开。</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">逻辑诊断模型：MIO instruction queue 满时，反压发生在指令发射之前</div>
+  <svg class="diagram-svg" viewBox="0 0 1040 460" role="img" aria-labelledby="mio-title mio-desc">
+    <title id="mio-title">MIO Throttle 逻辑队列反压</title>
+    <desc id="mio-desc">Warp scheduler 尝试向逻辑 MIO instruction queue 发射指令；队列已满时产生 MIO Throttle。虚线只表示 NCU 列出的指令类别，不表示物理连接。</desc>
+    <defs>
+      <marker id="mio-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+        <path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path>
+      </marker>
+      <marker id="mio-pressure-arrow" markerWidth="8" markerHeight="8" refX="1" refY="4" orient="auto">
+        <path d="M8,0 L0,4 L8,8 Z" fill="#be185d"></path>
+      </marker>
+    </defs>
+
+    <rect class="box scheduler" x="34" y="104" width="230" height="194" rx="5"></rect>
+    <text x="149" y="136" text-anchor="middle" font-size="17" font-weight="600">Warp Scheduler</text>
+    <rect class="box" x="66" y="164" width="166" height="38" rx="4"></rect>
+    <text class="mono" x="149" y="188" text-anchor="middle" font-size="12">warp 3: LDS</text>
+    <rect class="box" x="66" y="214" width="166" height="38" rx="4"></rect>
+    <text class="mono" x="149" y="238" text-anchor="middle" font-size="12">warp 7: MUFU.EX2</text>
+    <text class="muted" x="149" y="278" text-anchor="middle" font-size="12">下一条指令等待发射</text>
+
+    <rect class="box queue" x="390" y="72" width="250" height="258" rx="5"></rect>
+    <text x="515" y="104" text-anchor="middle" font-size="17" font-weight="600">MIO Instruction Queue</text>
+    <rect x="426" y="132" width="178" height="34" rx="3" fill="rgba(190,24,93,0.26)"></rect>
+    <rect x="426" y="176" width="178" height="34" rx="3" fill="rgba(190,24,93,0.26)"></rect>
+    <rect x="426" y="220" width="178" height="34" rx="3" fill="rgba(190,24,93,0.26)"></rect>
+    <rect x="426" y="264" width="178" height="34" rx="3" fill="rgba(190,24,93,0.26)"></rect>
+    <text class="mono" x="515" y="154" text-anchor="middle" font-size="11">shared-memory op</text>
+    <text class="mono" x="515" y="198" text-anchor="middle" font-size="11">special math op</text>
+    <text class="mono" x="515" y="242" text-anchor="middle" font-size="11">dynamic branch</text>
+    <text class="mono" x="515" y="286" text-anchor="middle" font-size="11">shared-memory op</text>
+    <text x="515" y="318" text-anchor="middle" font-size="12" font-weight="600" fill="#be185d">FULL</text>
+
+    <rect class="box unit" x="786" y="40" width="220" height="94" rx="5"></rect>
+    <text x="896" y="72" text-anchor="middle" font-size="15" font-weight="600">Shared-memory 指令</text>
+    <text class="muted" x="896" y="98" text-anchor="middle" font-size="12">LDS / STS 等</text>
+
+    <rect class="box unit" x="786" y="168" width="220" height="94" rx="5"></rect>
+    <text x="896" y="200" text-anchor="middle" font-size="15" font-weight="600">Special-math 指令</text>
+    <text class="muted" x="896" y="226" text-anchor="middle" font-size="12">例如 MUFU opcode</text>
+
+    <rect class="box unit" x="786" y="296" width="220" height="94" rx="5"></rect>
+    <text x="896" y="328" text-anchor="middle" font-size="15" font-weight="600">Dynamic-branch 指令</text>
+    <text class="muted" x="896" y="354" text-anchor="middle" font-size="12">例如 BRX / JMX</text>
+
+    <rect class="box stall" x="286" y="366" width="334" height="62" rx="5"></rect>
+    <text x="453" y="391" text-anchor="middle" font-size="15" font-weight="600">MIO Throttle</text>
+    <text class="muted" x="453" y="414" text-anchor="middle" font-size="12">warp active, but cannot issue this instruction</text>
+
+    <path class="pressure" d="M264 184 L384 184" marker-end="url(#mio-pressure-arrow)"></path>
+    <path class="association" d="M640 146 C704 146 720 90 780 90"></path>
+    <path class="association" d="M640 202 L780 214"></path>
+    <path class="association" d="M640 262 C704 270 720 340 780 340"></path>
+    <path class="arrow" d="M350 206 C320 278 328 332 388 362" marker-end="url(#mio-arrow)"></path>
+    <text class="muted" x="896" y="422" text-anchor="middle" font-size="11">NCU 文档列出的指令类别</text>
+    <text class="muted" x="896" y="440" text-anchor="middle" font-size="11">内部路由未公开</text>
+  </svg>
+</div>
+
+<p>这个逻辑边界也限定了图的解释范围：queue 只承载 <a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#warp-stall-reasons">公开 stall reason</a> 所表达的接收状态，以及文档列出的 shared memory、special math 和动态分支指令类别。NCU 的其他硬件模型还使用 <code>MIOC</code>；<a href="https://docs.nvidia.com/nsight-compute/2022.3/pdf/ProfilingGuide.pdf" target="_blank" rel="noopener">Nsight Compute 2022.3 Metrics Guide</a> 将其展开为 <em>Memory Input/Output Control</em>，但没有说明它与 MIO queue 的拓扑关系。因而，图中不把二者画成连续的硬件级。</p>
+
+<h2 id="zh-meaning">2. 动态 burst 与 queue 状态</h2>
+
+<p>明确发射边界以后，还需要解释 queue 如何从“可接收”变成“已满”。关键在于观察 burst 期间的 queue 状态，而不是只看整个 kernel 的平均指令率。把执行过程划分为宽度为 $\Delta$ 个 cycle 的窗口；$A_k$ 表示窗口 $k$ 内 scheduler 提供给 MIO 的指令需求，$D_k$ 表示同一窗口内从逻辑 queue 排出的条目，二者单位都是每个窗口的 warp-level instructions。$Q_k$ 是窗口开始时的 queue occupancy。于是，一个不指定物理端口和仲裁顺序的离散模型是：</p>
+
+<p>\[
+Q_{k+1}
+=
+\min\!\left(
+Q_{\max},
+\max\!\left(0, Q_k + A_k - D_k\right)
+\right).
+\]</p>
+
+<p>若定义窗口内的需求速率 $\lambda_k=A_k/\Delta$、服务速率 $\mu_k=D_k/\Delta$，则 $\lambda_k>\mu_k$ 只说明该窗口增加 queue occupancy。对于从窗口 $k$ 开始且中途没有排空的 burst，queue 是否填满取决于初始余量以及连续窗口中的累计净流入：</p>
+
+<p>\[
+\sum_{i=k}^{k+n-1}(A_i-D_i)
+\geq
+Q_{\max}-Q_k.
+\]</p>
+
+<p>这里的 $Q_{\max}$ 是概念容量，不是公开的硬件队列深度。当 occupancy 到达这个边界，而某个 warp 的下一条指令仍需要 MIO 时，模型进入 NCU 所定义的 queue-full 等待。多个 warp 形成的短 burst 可以满足累计条件，即使更长时间尺度上的平均 $\lambda$ 不大于平均 $\mu$。Profiler 能采样这种等待，却不能仅凭 aggregate metric 还原各窗口的 $A_k$、$D_k$ 或实际到达顺序。</p>
+
+<p>由此，MIO Throttle 描述的是发射需求相对于 queue 排出能力的压力，而非单条指令的数据延迟。这也解释了 occupancy 对该问题的双重影响：更多 resident warp 提供了额外的可调度工作，同时也可能提高 $A_k$。因此，当 MIO 服务速率已经构成限制时，增加 resident warp 仍可隐藏其他延迟，却不会扩大 MIO 的服务能力。两者的关系可结合<a href="gpu-occupancy-resource-limits.html">《GPU Occupancy 的驻留资源模型与性能含义》</a>中的 residency 模型理解。</p>
+
+<h2 id="zh-causes">3. 进入 MIO 的指令及其压力来源</h2>
+
+<p>排队模型中的 $A_k$ 和 $D_k$ 只有映射到具体指令后，才能转化为可诊断的原因。公开的 stall taxonomy 把 shared-memory instruction、special-math instruction 和 dynamic branch 列为 MIO 相关类别。因此，分析应先确认热点对应的 SASS opcode，再检查该类指令的到达速率和后端工作量。</p>
+
+<h3>3.1 Shared-memory 指令密度过高</h3>
+
+<p>连续的 shared-memory load/store 会快速向 MIO 路径提交工作。常见情形包括 fragment 搬运、shared-memory reduction、转置，以及同一数据被多次从 shared memory 读取。即使每次访问都没有 bank conflict，单位时间内的指令数仍可能超过队列和后端能够持续接收的速率。</p>
+
+<p>指令宽度也会改变压力。若同样的数据由多条窄 load/store 完成，scheduler 需要发射更多 MIO 指令。NVIDIA 对 shared-memory 场景给出的建议是减少低宽度操作，条件允许时合并为更少、更宽的访问。</p>
+
+<h3>3.2 Bank conflict 增加 wavefront</h3>
+
+<p>当 shared-memory 指令数量不足以解释热点时，wavefront 提供了下一层线索。NCU 的 <a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#source-metrics">Source Metrics</a> 分别报告 shared-memory instruction、实际 wavefront 和理想 wavefront；一条 warp-level 指令需要额外 wavefront 时，派生指标会把差额反映为 conflict。MIO Throttle 记录 queue-full 等待，而 wavefront 指标描述 shared-memory 操作的执行展开。若把额外 wavefront 视为有效服务速率下降，这仍是一项需要实验验证的排队推断，两个指标同时升高只能提供相关性。</p>
+
+<p>当 Not-issued 样本已经落在 shared-memory opcode 时，诊断再同时观察两组信号：</p>
+
+<ul>
+  <li><code>mio_throttle</code> 高且 bank-conflict 指标也高：layout、padding 或 swizzle 是合理候选。</li>
+  <li><code>mio_throttle</code> 高但 bank conflict 接近零：更可能是 shared 指令数量或宽度本身造成的吞吐压力。</li>
+</ul>
+
+<h3>3.3 特殊数学指令集中出现</h3>
+
+<p>Special-math instruction 构成了另一类 MIO 输入。其具体 opcode 取决于 GPU 架构和编译结果，SASS 中常见的形式是 <code>MUFU</code>。Softmax、归一化和激活函数可能在很短的区间内密集执行这类指令，因此这类计算即使不访问 shared memory，也可能出现 MIO Throttle。</p>
+
+<p>此时 shared-memory 指标不会给出对应证据。需要在 Source 页面检查 MIO 样本是否落在 <code>MUFU</code> 指令附近，并结合 Instruction Statistics 查看 opcode 与 pipe 分布。</p>
+
+<h3>3.4 动态分支增加 MIO 压力</h3>
+
+<p>控制流中的 MIO 压力对应 dynamic branch。官方文档列出的典型 SASS 指令包括 <code>BRX</code> 和 <code>JMX</code>；间接跳转、复杂 switch 或运行期计算目标地址的控制流可能生成这类指令。普通静态跳转则属于另一种情形。</p>
+
+<p>动态分支还可能伴随 <code>branch_resolving</code> 或 <code>no_instructions</code>。这几类 stall 反映不同阶段：MIO Throttle 表示分支指令进不了队列，branch resolving 表示目标仍在解析，no instructions 则可能和取指或 instruction-cache miss 有关。</p>
+
+<h3>3.5 并发 warp 形成集中到达</h3>
+
+<p>前几类原因关注单条指令及其后端工作，而 burst 还取决于多个 warp 的到达相位。在排队模型中，循环展开、更多 active warp 或多个 producer warp 同时推进，都可能让原本分散的 MIO 指令集中到达。此时总指令数未必增加，queue 仍可能被短时 burst 填满。由于普通 PC sampling 缺少时间分辨率，这种到达形态需要通过改变展开、指令间隔或 warp role 后重新测量。</p>
+
+<p>Warp specialization 下，producer warp 可能出现较多 MIO Throttle，而 consumer warp 仍在发射 tensor 或 FMA 指令。单看 stall 分布无法判断等待是否暴露到 kernel 时间；还要检查 scheduler 是否跳过 issue slot。</p>
+
+<h2 id="zh-differences">4. 发射前反压与发射后等待</h2>
+
+<p>确定热点 opcode 之后，还要判断等待发生在指令发射的哪一侧。队列反压表示目标指令尚未进入执行路径；结果依赖则表示 producer 已经发出，而 consumer 正在等待完成事件。这个时间边界决定了后续诊断应检查 instruction rate，还是转向 load-use 距离与结果延迟。</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Stall reason</th><th>发生阶段</th><th>典型含义</th><th>不能直接推出</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>mio_throttle</code></td><td>指令发射前</td><td>MIO instruction queue 已满</td><td>显存带宽已经饱和</td></tr>
+    <tr><td><code>short_scoreboard</code></td><td>指令发射后</td><td>等待 MIO 操作结果，常见于 shared memory、MUFU 或动态分支依赖</td><td>MIO queue 一定已满</td></tr>
+    <tr><td><code>lg_throttle</code></td><td>指令发射前</td><td>local/global memory instruction queue 压力</td><td>shared-memory 路径是瓶颈</td></tr>
+    <tr><td><code>long_scoreboard</code></td><td>指令发射后</td><td>等待 L1TEX 的 local/global/surface/texture 数据依赖</td><td>DRAM bandwidth 一定饱和</td></tr>
+    <tr><td><code>math_pipe_throttle</code></td><td>指令发射前</td><td>某条 math pipe 无法接收更多指令</td><td>等待某个运算结果</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>表中的 pre-issue / post-issue 分界也把本文放回完整的 stall 模型中：<a href="gpu-warp-stall-nsight-compute.html">《GPU Warp Stall 分析：调度状态、Nsight Compute 指标与源码归因》</a>说明 scheduler 状态与各类 stall 的关系，而<a href="gpu-scoreboard-dependency-mechanism.html">《GPU Scoreboard 机制：Warp 依赖跟踪、SASS 控制与 Long/Short Stall》</a>进一步展开 producer 发射后的依赖跟踪。</p>
+
+<h2 id="zh-example">5. 从 SASS 形态建立可验证假设</h2>
+
+<p>完成 pre-issue / post-issue 分类后，诊断需要回到目标 GPU 上实际执行的 SASS，因为它是连接队列模型与源码的中间层。编译器可能消除未使用结果、复用寄存器中的值、改变访问宽度或重排指令，因此源码中的连续 shared-memory load 或特殊函数调用只能提供候选位置。静态 SASS 邻接同样缺少多个 warp 的到达相位信息。诊断应先把 Not-issued MIO samples 落到实际 SASS，再依据采样所在的 opcode 类别提出假设。</p>
+
+<p>若热点落在 <code>LDS</code>、<code>STS</code> 或 <code>LDSM</code>，对照实验可以只改变 shared-memory 指令需求，例如复用已加载值，或在对齐与 layout 允许时把多条窄访问合成更少的宽访问。基线与变体必须保持输入、输出、block 配置和算法语义一致；计算结果要写入可观察的输出或参与后续可观察计算，并在反汇编中确认目标指令没有被 dead-code elimination 删除。</p>
+
+<p>完成代码变体后，需要把静态变化与运行时结果接起来：动态 shared opcode 数应按预期变化，wavefront 与 bank-conflict 指标给出后端响应，MIO Not-issued samples 在同一热点发生变化，kernel duration 则说明等待是否暴露为性能损失。只有这些观察沿同一方向支持“$A_k$ 减少或 $D_k$ 的有效压力降低”，静态指令形态才构成队列反压的因果证据。对 <code>MUFU</code> 或 <code>BRX</code>/<code>JMX</code> 也可沿用这套方法，只需替换相应的 opcode 计数和代码变体。</p>
+
+<h2 id="zh-diagnosis">6. 从 scheduler 到 SASS 的 NCU 证据链</h2>
+
+<p>SASS 热点给出了候选机制，完整诊断还要把它与 scheduler 的实际损失和后端工作量连接起来。证据链依次回答三个问题：MIO 等待是否造成未发射的 issue slot，样本集中在哪些 SASS 指令，相应后端是否存在足够的工作量。Warp State Statistics 中较大的 warp-cycles-per-issued-instruction 数值描述等待规模；scheduler 是否留下 issue gap，则由发射统计确认。</p>
+
+<h3>6.1 指标与统计口径</h3>
+
+<p>构建这条证据链时，先确认目标 GPU 与当前 NCU 版本提供的 metric。名称会随架构和版本变化，所以下面的字符串用于本机查询和匹配，不作为跨版本稳定 API：</p>
+
+<pre class="code">ncu --query-metrics | rg 'mio_throttle|short_scoreboard|shared_load|shared_store'</pre>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>用途</th><th>Metric</th><th>统计口径</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Warp State Statistics</td>
+      <td><code>ncu --query-metrics | rg 'warps_issue_stalled_mio_throttle'</code></td>
+      <td>在目标版本中查询 aggregate metric；UI 通常以每条已发射指令的平均 warp cycles 展示。</td>
+    </tr>
+    <tr>
+      <td>Source / PC sampling</td>
+      <td><code>smsp__pcsamp_warps_issue_stalled_mio_throttle</code></td>
+      <td>把 MIO Throttle 样本关联到程序计数器。</td>
+    </tr>
+    <tr>
+      <td>Not-issued sampling</td>
+      <td><code>smsp__pcsamp_warps_issue_stalled_mio_throttle_not_issued</code></td>
+      <td>只统计采样周期中 scheduler 没有发射指令的样本，更接近暴露出的 issue 损失。</td>
+    </tr>
+    <tr>
+      <td>MIO 结果依赖</td>
+      <td><code>smsp__pcsamp_warps_issue_stalled_short_scoreboard</code></td>
+      <td>把等待已发出 MIO 操作结果的样本关联到 PC，用来和队列反压分离。</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p>若样本指向 shared memory，再补充以下指标：</p>
+
+<pre class="code">smsp__sass_inst_executed_op_shared_ld.sum
+smsp__sass_inst_executed_op_shared_st.sum
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum
+l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum
+l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum</pre>
+
+<p>第一组统计执行了多少 shared load/store，第二组统计这些访问形成了多少 wavefront，第三组统计 bank conflict。这些名称同样需要用当前 NCU 的 <code>--query-metrics</code> 确认。Nsight Compute 2026.1 还定义了 <code>sass__inst_executed_per_opcode</code> 和 <code>sass__inst_executed_per_opcode_pipeline</code>；后者是 profiler 对 opcode pipe 的估算，不包含可在多个 pipe 执行的指令之动态分配。</p>
+
+<h3 id="zh-ui">6.2 在 NCU UI 中定位原因</h3>
+
+<ol>
+  <li><strong>Details → Scheduler Statistics：</strong>先看 issue slot 是否经常跳过，以及每个 scheduler 平均有多少 eligible warp。若 issue 基本持续，MIO stall 可能已被其他 warp 隐藏。</li>
+  <li><strong>Details → Warp State Statistics：</strong>确认 MIO Throttle 在每条已发射指令的 warp-cycle 中所占规模，并与 Short Scoreboard、LG Throttle、Long Scoreboard 比较。</li>
+  <li><strong>Source → Source and SASS：</strong>在 <a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/NsightCompute/index.html#source-page">Source 页</a>的 Navigate By 中选择 Warp Stall Sampling 或 Not-issued Samples，把 <code>mio_throttle</code> 样本落到 SASS 地址。</li>
+  <li><strong>检查 opcode：</strong><code>LDS</code>/<code>STS</code>/<code>LDSM</code> 指向 shared-memory 路径，<code>MUFU</code> 指向特殊数学，<code>BRX</code>/<code>JMX</code> 指向动态分支。</li>
+  <li><strong>Details → Memory Workload Analysis：</strong>只有热点属于 shared memory 时，才继续看 shared wavefront、bank conflict 和访问宽度。</li>
+  <li><strong>回到源码建立因果关系：</strong>修改一项机制后重新采集。MIO 指标下降但 kernel 时间不变，说明该 stall 可能原本已经被隐藏，或瓶颈转移到了其他 pipe。</li>
+</ol>
+
+<div class="note-box warn">
+  <p>PC sampling 是周期采样，不是每次 stall 的完整计数。All Samples 与 Not-issued Samples 还可能来自不同 profiling pass，数值不能逐项相减。它们适合定位热点，不适合当作精确的时间分解。</p>
+</div>
+
+<h2 id="zh-optimize">7. 按证据选择优化方法</h2>
+
+<p>当 issue 损失、SASS 热点和后端指标指向同一机制后，优化方向便可以由证据组合决定。下表把前文的四类成因分别映射到一个可验证改动，并保留每种改动可能引入的代价。</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>证据组合</th><th>更可能的原因</th><th>可验证的改动</th><th>主要代价</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>MIO 高；shared 指令数高；bank conflict 低</td>
+      <td>Shared-memory instruction-rate pressure</td>
+      <td>复用已加载值；在对齐与 layout 允许时采用更宽访问；减少重复 LDS/STS</td>
+      <td>寄存器占用可能上升</td>
+    </tr>
+    <tr>
+      <td>MIO 高；shared wavefront 与 bank conflict 同时高</td>
+      <td>Bank conflict 增加 wavefront；与 MIO 的因果关系待验证</td>
+      <td>padding、swizzle、改变线程到 bank 的映射</td>
+      <td>地址计算与 shared-memory 容量</td>
+    </tr>
+    <tr>
+      <td>MIO 样本集中在 <code>MUFU</code></td>
+      <td>Special-function burst</td>
+      <td>复用函数结果；降低不必要的超越函数调用；在误差允许时验证多项式/FMA 近似</td>
+      <td>数值误差与额外普通算术</td>
+    </tr>
+    <tr>
+      <td>MIO 样本集中在 <code>BRX</code>/<code>JMX</code></td>
+      <td>Dynamic-branch pressure</td>
+      <td>静态特化、简化间接跳转、重排控制流</td>
+      <td>代码体积与编译变体数量</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p>其中，shared-memory instruction-rate pressure 还可以通过改变搬运机制来处理。从 Hopper（compute capability 9.0）开始，<a href="https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/04-special-topics/async-copies.html#using-the-tensor-memory-accelerator-tma">TMA</a> 能够以 bulk asynchronous copy 搬运 global 与 shared memory 之间的 tensor，从而减少 scheduler 需要发射的数据搬运指令。相应代价是 tensor-map descriptor、同步以及对齐和 layout 约束；最终效果仍需由目标 kernel 的 SASS 与 NCU 报告确认。</p>
+
+<h2 id="zh-refs">参考资料</h2>
+
+<p>本文采用 Nsight Compute 2026.1 的 stall 与 source metric 定义。队列深度、物理连接以及 bank conflict 向 MIO 反压传播的具体机制没有公开证据，文中仅把后者作为需要实验验证的排队假设。</p>
+
+<ul>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#warp-stall-reasons" target="_blank" rel="noopener">Nsight Compute 2026.1 Profiling Guide: Warp Stall Reasons</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#source-metrics" target="_blank" rel="noopener">Nsight Compute 2026.1 Profiling Guide: Source Metrics</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#instructions-per-opcode-metrics" target="_blank" rel="noopener">Nsight Compute 2026.1 Profiling Guide: Instructions per Opcode Metrics</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/NsightCompute/index.html#source-page" target="_blank" rel="noopener">Nsight Compute 2026.1 User Interface: Source Page</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/NsightComputeCli/index.html#metrics-and-units" target="_blank" rel="noopener">Nsight Compute 2026.1 CLI: Metrics and Units</a></li>
+  <li><a href="https://docs.nvidia.com/nsight-compute/2022.3/pdf/ProfilingGuide.pdf" target="_blank" rel="noopener">Nsight Compute 2022.3 Metrics Guide: MIO and MIOC names</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/04-special-topics/async-copies.html#using-the-tensor-memory-accelerator-tma" target="_blank" rel="noopener">CUDA Programming Guide 13.3: Tensor Memory Accelerator</a></li>
+</ul>
+
+</div>
+
+<div class="lang-en">
+
+<h1>GPU MIO Throttle: Queue Backpressure, Causes, and Diagnosis</h1>
+
+<p class="lead">When a CUDA kernel executes a shared-memory access, special-math operation, or dynamic branch, the corresponding SASS instruction enters the MIO (Memory Input/Output) path. Several resident warps on an SM may reach these instructions within a short interval, causing the warp schedulers to concentrate work on the same execution path. A downstream instruction queue absorbs the burst. If arrivals temporarily outpace the queue's drain rate, its occupancy rises until new instructions must wait. Nsight Compute reports that issue wait as <code>MIO Throttle</code>.</p>
+
+<p>This wait occurs before instruction issue. <strong>MIO Throttle is the stall formed when a warp's next instruction requires MIO while the MIO instruction queue temporarily has no free entry.</strong> Once the instruction issues, mechanisms such as scoreboards take over the remaining data-dependency tracking. This article follows the public definition in <a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#warp-stall-reasons">Nsight Compute 2026.1</a> and treats the instruction queue as a profiler-visible logical boundary. Queue depth, ports, arbitration, and physical connections remain outside the article's inference boundary.</p>
+
+<h2 id="en-position">1. The pre-issue MIO boundary</h2>
+
+<p>An instruction enters the eligible set only when it is both semantically ready and acceptable to its target path. Data dependencies and synchronization state determine the first condition; a free instruction-queue entry determines the second. MIO Throttle corresponds to a temporary failure of the acceptance condition: the target instruction has not issued, and the warp remains active but cannot become eligible. After the instruction issues, a later consumer waiting for its result may instead enter a completion dependency such as Short Scoreboard. The diagram separates these two stages.</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">Logical diagnostic model: backpressure occurs before issue when the MIO instruction queue is full</div>
+  <svg class="diagram-svg" viewBox="0 0 1040 460" role="img" aria-labelledby="en-mio-title en-mio-desc">
+    <title id="en-mio-title">Logical MIO Throttle queue backpressure</title>
+    <desc id="en-mio-desc">A warp scheduler attempts to issue an instruction into the logical MIO instruction queue. MIO Throttle occurs when the queue is full. Dashed lines show instruction classes listed by Nsight Compute, not physical connections.</desc>
+    <defs>
+      <marker id="en-mio-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+        <path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path>
+      </marker>
+      <marker id="en-mio-pressure-arrow" markerWidth="8" markerHeight="8" refX="1" refY="4" orient="auto">
+        <path d="M8,0 L0,4 L8,8 Z" fill="#be185d"></path>
+      </marker>
+    </defs>
+
+    <rect class="box scheduler" x="34" y="104" width="230" height="194" rx="5"></rect>
+    <text x="149" y="136" text-anchor="middle" font-size="17" font-weight="600">Warp Scheduler</text>
+    <rect class="box" x="66" y="164" width="166" height="38" rx="4"></rect>
+    <text class="mono" x="149" y="188" text-anchor="middle" font-size="12">warp 3: LDS</text>
+    <rect class="box" x="66" y="214" width="166" height="38" rx="4"></rect>
+    <text class="mono" x="149" y="238" text-anchor="middle" font-size="12">warp 7: MUFU.EX2</text>
+    <text class="muted" x="149" y="278" text-anchor="middle" font-size="12">next instruction waits to issue</text>
+
+    <rect class="box queue" x="390" y="72" width="250" height="258" rx="5"></rect>
+    <text x="515" y="104" text-anchor="middle" font-size="17" font-weight="600">MIO Instruction Queue</text>
+    <rect x="426" y="132" width="178" height="34" rx="3" fill="rgba(190,24,93,0.26)"></rect>
+    <rect x="426" y="176" width="178" height="34" rx="3" fill="rgba(190,24,93,0.26)"></rect>
+    <rect x="426" y="220" width="178" height="34" rx="3" fill="rgba(190,24,93,0.26)"></rect>
+    <rect x="426" y="264" width="178" height="34" rx="3" fill="rgba(190,24,93,0.26)"></rect>
+    <text class="mono" x="515" y="154" text-anchor="middle" font-size="11">shared-memory op</text>
+    <text class="mono" x="515" y="198" text-anchor="middle" font-size="11">special math op</text>
+    <text class="mono" x="515" y="242" text-anchor="middle" font-size="11">dynamic branch</text>
+    <text class="mono" x="515" y="286" text-anchor="middle" font-size="11">shared-memory op</text>
+    <text x="515" y="318" text-anchor="middle" font-size="12" font-weight="600" fill="#be185d">FULL</text>
+
+    <rect class="box unit" x="786" y="40" width="220" height="94" rx="5"></rect>
+    <text x="896" y="72" text-anchor="middle" font-size="15" font-weight="600">Shared-memory instructions</text>
+    <text class="muted" x="896" y="98" text-anchor="middle" font-size="12">LDS / STS and variants</text>
+
+    <rect class="box unit" x="786" y="168" width="220" height="94" rx="5"></rect>
+    <text x="896" y="200" text-anchor="middle" font-size="15" font-weight="600">Special-math instructions</text>
+    <text class="muted" x="896" y="226" text-anchor="middle" font-size="12">MUFU opcodes, for example</text>
+
+    <rect class="box unit" x="786" y="296" width="220" height="94" rx="5"></rect>
+    <text x="896" y="328" text-anchor="middle" font-size="15" font-weight="600">Dynamic-branch instructions</text>
+    <text class="muted" x="896" y="354" text-anchor="middle" font-size="12">BRX / JMX, for example</text>
+
+    <rect class="box stall" x="286" y="366" width="334" height="62" rx="5"></rect>
+    <text x="453" y="391" text-anchor="middle" font-size="15" font-weight="600">MIO Throttle</text>
+    <text class="muted" x="453" y="414" text-anchor="middle" font-size="12">warp active, but cannot issue this instruction</text>
+
+    <path class="pressure" d="M264 184 L384 184" marker-end="url(#en-mio-pressure-arrow)"></path>
+    <path class="association" d="M640 146 C704 146 720 90 780 90"></path>
+    <path class="association" d="M640 202 L780 214"></path>
+    <path class="association" d="M640 262 C704 270 720 340 780 340"></path>
+    <path class="arrow" d="M350 206 C320 278 328 332 388 362" marker-end="url(#en-mio-arrow)"></path>
+    <text class="muted" x="896" y="422" text-anchor="middle" font-size="11">Instruction classes listed by NCU</text>
+    <text class="muted" x="896" y="440" text-anchor="middle" font-size="11">internal routing is undisclosed</text>
+  </svg>
+</div>
+
+<p>This logical boundary also limits how the diagram should be read. The queue represents the acceptance state in the <a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#warp-stall-reasons">public stall reason</a> and the documented shared-memory, special-math, and dynamic-branch instruction classes. Other NCU hardware models also use <code>MIOC</code>. The <a href="https://docs.nvidia.com/nsight-compute/2022.3/pdf/ProfilingGuide.pdf" target="_blank" rel="noopener">Nsight Compute 2022.3 Metrics Guide</a> expands the name as <em>Memory Input/Output Control</em> but does not define its topology relative to the MIO queue. The diagram therefore does not place them in consecutive hardware stages.</p>
+
+<h2 id="en-meaning">2. Dynamic bursts and queue state</h2>
+
+<p>With the issue boundary established, the next question is how an accepting queue becomes full. The useful quantity is queue state during a burst rather than the kernel-wide average instruction rate. Divide execution into windows of $\Delta$ cycles. Let $A_k$ be the MIO instruction demand offered by schedulers during window $k$, and let $D_k$ be the entries drained from the logical queue during that window; both are measured in warp-level instructions per window. Let $Q_k$ be queue occupancy at the start of the window. This gives a discrete model that assigns no physical port or arbitration order:</p>
+
+<p>\[
+Q_{k+1}
+=
+\min\!\left(
+Q_{\max},
+\max\!\left(0, Q_k + A_k - D_k\right)
+\right).
+\]</p>
+
+<p>Define the window demand rate as $\lambda_k=A_k/\Delta$ and service rate as $\mu_k=D_k/\Delta$. The condition $\lambda_k>\mu_k$ says only that occupancy rises during that window. For a burst beginning at window $k$ without the queue emptying in between, filling the queue depends on its initial headroom and cumulative net input across consecutive windows:</p>
+
+<p>\[
+\sum_{i=k}^{k+n-1}(A_i-D_i)
+\geq
+Q_{\max}-Q_k.
+\]</p>
+
+<p>Here, $Q_{\max}$ is a conceptual capacity, not a published queue depth. When occupancy reaches that boundary while a warp still offers another MIO instruction, the model enters the queue-full wait defined by NCU. A short burst from several warps can satisfy the cumulative condition even when long-run average $\lambda$ does not exceed average $\mu$. The profiler can sample the wait, but an aggregate metric cannot reconstruct $A_k$, $D_k$, or the physical arrival order.</p>
+
+<p>MIO Throttle therefore describes issue demand relative to queue drain capacity rather than the data latency of one instruction. This model also exposes occupancy's dual effect: more resident warps provide additional schedulable work, yet may raise $A_k$ at the same time. Once MIO service rate is the limiting resource, extra resident warps can still hide other latencies but do not increase MIO service capacity. The residency model in <a href="gpu-occupancy-resource-limits.html"><em>GPU Occupancy: Residency Resource Model and Performance Interpretation</em></a> provides the surrounding scheduler context.</p>
+
+<h2 id="en-causes">3. Instructions entering MIO and their pressure sources</h2>
+
+<p>The queueing variables $A_k$ and $D_k$ become diagnosable only after they are mapped to concrete instructions. The public stall taxonomy associates MIO with shared-memory operations, special math, and dynamic branches. Analysis therefore begins by identifying the SASS opcode at the hotspot, then examining the arrival rate and backend work associated with that instruction class.</p>
+
+<h3>3.1 High shared-memory instruction density</h3>
+
+<p>Back-to-back shared-memory loads and stores feed work into the MIO path quickly. Common examples include fragment movement, shared-memory reductions, transposes, and repeated reads of the same shared data. Even without bank conflicts, the instruction rate can exceed what the queue and backend can sustain.</p>
+
+<p>Instruction width also affects pressure. Moving the same data with many narrow loads or stores requires the scheduler to issue more MIO instructions. NVIDIA recommends reducing narrow shared-memory operations and combining them into fewer, wider accesses when alignment and layout permit.</p>
+
+<h3>3.2 Bank conflicts increase wavefronts</h3>
+
+<p>When shared-memory instruction count alone does not explain the hotspot, wavefronts provide the next layer of evidence. Nsight Compute <a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#source-metrics">Source Metrics</a> report shared-memory instructions, actual wavefronts, and ideal wavefronts separately. Derived metrics report the excess when one warp-level instruction requires additional wavefronts. MIO Throttle records a full-queue wait, whereas wavefront metrics describe how a shared-memory operation expands during execution. Interpreting extra wavefronts as lower effective service rate remains a queueing hypothesis to test; a rise in both metrics establishes correlation only.</p>
+
+<p>Once Not-issued samples have been localized to shared-memory opcodes, inspect both signal groups:</p>
+
+<ul>
+  <li>High <code>mio_throttle</code> with high bank-conflict metrics makes layout, padding, or swizzling reasonable candidates.</li>
+  <li>High <code>mio_throttle</code> with almost no bank conflicts points more directly to shared instruction count or width.</li>
+</ul>
+
+<h3>3.3 Bursts of special-math instructions</h3>
+
+<p>Special-math instructions form another source of MIO traffic. The concrete opcode depends on GPU architecture and compiler output, with <code>MUFU</code> being a common SASS form. Softmax, normalization, and activation functions can execute many such instructions in a short region, so these computations may show MIO Throttle even when they do not access shared memory.</p>
+
+<p>Shared-memory metrics provide no evidence for that case. Use the Source page to check whether MIO samples land near <code>MUFU</code> instructions, then inspect opcode and pipe distributions in Instruction Statistics.</p>
+
+<h3>3.4 Dynamic-branch pressure</h3>
+
+<p>Control-flow pressure on MIO is associated with dynamic branches. The public documentation lists SASS instructions such as <code>BRX</code> and <code>JMX</code>; indirect jumps, complicated switches, or control flow with runtime-computed targets can generate them. Ordinary static jumps are a separate case.</p>
+
+<p>Dynamic branches may also coincide with <code>branch_resolving</code> or <code>no_instructions</code>. These stalls belong to different stages: MIO Throttle means the branch instruction cannot enter the queue, branch resolving means the target is still being resolved, and no instructions can involve fetch or instruction-cache misses.</p>
+
+<h3>3.5 Concentrated arrivals from concurrent warps</h3>
+
+<p>The preceding causes concern individual instructions and backend work, while a burst also depends on arrival phase across warps. In the queueing model, loop unrolling, more active warps, or several producer warps making progress together may concentrate MIO arrivals that were previously spread out. The total instruction count can remain unchanged while the burst fills the queue. Because ordinary PC sampling lacks time resolution, this arrival pattern must be tested by changing unrolling, instruction spacing, or warp roles and collecting another report.</p>
+
+<p>With warp specialization, producer warps may show substantial MIO Throttle while consumer warps continue issuing tensor or FMA instructions. A stall distribution alone cannot show whether the wait is exposed in kernel time. Check whether the scheduler skips issue slots.</p>
+
+<h2 id="en-differences">4. Pre-issue pressure and post-issue waits</h2>
+
+<p>After identifying the hotspot opcode, diagnosis must locate the wait relative to instruction issue. Queue backpressure means that the target instruction has not entered its execution path; result dependence means that the producer has issued and a consumer is waiting for completion. This boundary determines whether the investigation should stay with instruction rate or move to load-use distance and result latency.</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Stall reason</th><th>Stage</th><th>Typical meaning</th><th>Does not establish</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>mio_throttle</code></td><td>Before issue</td><td>The MIO instruction queue is full</td><td>Saturated device-memory bandwidth</td></tr>
+    <tr><td><code>short_scoreboard</code></td><td>After issue</td><td>Waiting for an MIO operation, commonly shared memory, MUFU, or a dynamic-branch dependency</td><td>That the MIO queue is full</td></tr>
+    <tr><td><code>lg_throttle</code></td><td>Before issue</td><td>Pressure in a local/global memory instruction queue</td><td>A shared-memory bottleneck</td></tr>
+    <tr><td><code>long_scoreboard</code></td><td>After issue</td><td>Waiting for local/global/surface/texture data from L1TEX</td><td>Saturated DRAM bandwidth</td></tr>
+    <tr><td><code>math_pipe_throttle</code></td><td>Before issue</td><td>A math execution pipe cannot accept another instruction</td><td>Waiting for the result of a prior operation</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>The table's pre-issue / post-issue boundary also places MIO within the broader stall model. <a href="gpu-warp-stall-nsight-compute.html"><em>GPU Warp Stall Analysis: Scheduler States, Nsight Compute Metrics, and Source Attribution</em></a> relates stall reasons to scheduler state, while <a href="gpu-scoreboard-dependency-mechanism.html"><em>GPU Scoreboard Mechanism: Warp Dependency Tracking, SASS Control, and Long/Short Stalls</em></a> follows dependency tracking after the producer issues.</p>
+
+<h2 id="en-example">5. Building a testable hypothesis from SASS</h2>
+
+<p>After classifying the wait as pre-issue or post-issue, diagnosis returns to the actual SASS executed on the target GPU, which connects the queue model to source code. A compiler may eliminate unused results, reuse register-resident values, change access width, or reorder instructions, so consecutive shared-memory loads or special-function calls in source provide candidate locations only. Static SASS adjacency likewise lacks arrival-phase information across warps. Diagnosis should first map Not-issued MIO samples to actual SASS and then form a hypothesis from the sampled opcode class.</p>
+
+<p>If the hotspot lands on <code>LDS</code>, <code>STS</code>, or <code>LDSM</code>, a controlled comparison can change only shared-memory instruction demand: reuse an already loaded value, or combine narrow accesses into fewer wider accesses when alignment and layout allow. Keep input, output, block configuration, and algorithmic semantics fixed. Make the result reach an observable output or a later observable computation, and confirm in the disassembly that dead-code elimination did not remove the target instructions.</p>
+
+<p>After building the variant, connect the static change to runtime behavior. Dynamic shared opcode count should move as intended; wavefront and bank-conflict metrics show the backend response; MIO Not-issued samples reveal what happened at the same hotspot; and kernel duration shows whether the wait was exposed as a performance cost. Only consistent movement supporting a reduction in $A_k$ or effective pressure on $D_k$ makes the instruction pattern causal evidence for queue backpressure. The same method applies to <code>MUFU</code> or <code>BRX</code>/<code>JMX</code> after substituting the relevant opcode count and code variant.</p>
+
+<h2 id="en-diagnosis">6. Building an NCU evidence chain from scheduler to SASS</h2>
+
+<p>A SASS hotspot supplies a candidate mechanism; a complete diagnosis must connect it to scheduler loss and backend work. The evidence chain answers three questions in order: whether the MIO wait produces unissued issue slots, which SASS instructions receive the samples, and whether the corresponding backend shows enough work. A large warp-cycles-per-issued-instruction value in Warp State Statistics describes wait volume, while issue statistics determine whether the scheduler leaves issue gaps.</p>
+
+<h3>6.1 Metrics and counting semantics</h3>
+
+<p>To build that evidence chain, first confirm which metrics exist for the target GPU and installed NCU version. Names vary across architectures and releases, so the strings below are local query patterns rather than a stable cross-version API:</p>
+
+<pre class="code">ncu --query-metrics | rg 'mio_throttle|short_scoreboard|shared_load|shared_store'</pre>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Purpose</th><th>Metric</th><th>What it counts</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Warp State Statistics</td>
+      <td><code>ncu --query-metrics | rg 'warps_issue_stalled_mio_throttle'</code></td>
+      <td>Queries the aggregate metric in the target version. The UI usually reports average warp cycles per issued instruction.</td>
+    </tr>
+    <tr>
+      <td>Source / PC sampling</td>
+      <td><code>smsp__pcsamp_warps_issue_stalled_mio_throttle</code></td>
+      <td>Associates MIO Throttle samples with program counters.</td>
+    </tr>
+    <tr>
+      <td>Not-issued sampling</td>
+      <td><code>smsp__pcsamp_warps_issue_stalled_mio_throttle_not_issued</code></td>
+      <td>Counts samples where the scheduler issued no instruction in the sampled cycle, which is closer to exposed issue loss.</td>
+    </tr>
+    <tr>
+      <td>MIO result dependency</td>
+      <td><code>smsp__pcsamp_warps_issue_stalled_short_scoreboard</code></td>
+      <td>Associates waits for issued MIO operations with a PC, separating result dependence from queue backpressure.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p>If samples point to shared memory, add these metrics:</p>
+
+<pre class="code">smsp__sass_inst_executed_op_shared_ld.sum
+smsp__sass_inst_executed_op_shared_st.sum
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum
+l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum
+l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum
+l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum</pre>
+
+<p>The first pair counts executed shared loads and stores, the second counts their wavefronts, and the third counts bank conflicts. Confirm these names with <code>--query-metrics</code> in the installed NCU version. Nsight Compute 2026.1 also defines <code>sass__inst_executed_per_opcode</code> and <code>sass__inst_executed_per_opcode_pipeline</code>. The latter estimates an opcode's pipe assignment; it does not account for dynamic assignment when an instruction can execute on more than one pipe.</p>
+
+<h3 id="en-ui">6.2 Diagnosis in the NCU UI</h3>
+
+<ol>
+  <li><strong>Details → Scheduler Statistics:</strong> check skipped issue slots and average eligible warps per scheduler. If issue remains sustained, other warps may already hide the MIO stall.</li>
+  <li><strong>Details → Warp State Statistics:</strong> assess MIO Throttle in warp cycles per issued instruction and compare it with Short Scoreboard, LG Throttle, and Long Scoreboard.</li>
+  <li><strong>Source → Source and SASS:</strong> on the <a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/NsightCompute/index.html#source-page">Source page</a>, select Warp Stall Sampling or Not-issued Samples under Navigate By and map <code>mio_throttle</code> samples to SASS addresses.</li>
+  <li><strong>Inspect opcodes:</strong> <code>LDS</code>/<code>STS</code>/<code>LDSM</code> indicate shared memory, <code>MUFU</code> indicates special math, and <code>BRX</code>/<code>JMX</code> indicate dynamic branches.</li>
+  <li><strong>Details → Memory Workload Analysis:</strong> continue to shared wavefronts, bank conflicts, and access width only when the hotspot belongs to shared memory.</li>
+  <li><strong>Establish causality from source:</strong> change one mechanism and collect a new report. If the MIO metric falls but kernel time does not, the stall was probably hidden or the bottleneck moved elsewhere.</li>
+</ol>
+
+<div class="note-box warn">
+  <p>PC sampling is periodic sampling, not a complete count of every stall. All Samples and Not-issued Samples may also come from different profiling passes and cannot be subtracted item by item. Use them to locate hotspots, not as an exact decomposition of time.</p>
+</div>
+
+<h2 id="en-optimize">7. Evidence-driven optimization</h2>
+
+<p>Once issue loss, the SASS hotspot, and backend metrics point to the same mechanism, the evidence combination can select the optimization direction. The table maps the four causes above to one testable change while retaining the main cost introduced by each change.</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Evidence</th><th>Likely cause</th><th>Testable change</th><th>Main cost</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>High MIO; many shared instructions; few bank conflicts</td>
+      <td>Shared-memory instruction-rate pressure</td>
+      <td>Reuse loaded values, use wider aligned accesses when layout permits, and remove repeated LDS/STS</td>
+      <td>Higher register use</td>
+    </tr>
+    <tr>
+      <td>High MIO; high shared wavefronts and bank conflicts</td>
+      <td>Bank conflicts add wavefronts; causality with MIO remains to be tested</td>
+      <td>Add padding, apply a swizzle, or change lane-to-bank mapping</td>
+      <td>Address arithmetic and shared-memory capacity</td>
+    </tr>
+    <tr>
+      <td>MIO samples cluster on <code>MUFU</code></td>
+      <td>Special-function burst</td>
+      <td>Reuse function results, remove unnecessary transcendental calls, or validate polynomial/FMA approximations when the error budget permits</td>
+      <td>Numerical error and additional ordinary arithmetic</td>
+    </tr>
+    <tr>
+      <td>MIO samples cluster on <code>BRX</code>/<code>JMX</code></td>
+      <td>Dynamic-branch pressure</td>
+      <td>Use static specialization, simplify indirect jumps, or restructure control flow</td>
+      <td>Code size and number of compiled variants</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p>Shared-memory instruction-rate pressure can also be addressed by changing the movement mechanism. Starting with Hopper (compute capability 9.0), <a href="https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/04-special-topics/async-copies.html#using-the-tensor-memory-accelerator-tma">TMA</a> moves tensors between global and shared memory with bulk asynchronous copies, reducing the data-movement instructions that the scheduler must issue. The corresponding costs are tensor-map descriptors, synchronization, and alignment and layout constraints. The target kernel's SASS and Nsight Compute report must still confirm the effect on MIO pressure.</p>
+
+<h2 id="en-refs">References</h2>
+
+<p>This article uses the Nsight Compute 2026.1 definitions for stall and source metrics. Public evidence does not establish queue depth, physical connections, or a specific path from bank conflicts to MIO backpressure. The bank-conflict link is therefore presented only as a queueing hypothesis that requires an experiment.</p>
+
+<ul>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#warp-stall-reasons" target="_blank" rel="noopener">Nsight Compute 2026.1 Profiling Guide: Warp Stall Reasons</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#source-metrics" target="_blank" rel="noopener">Nsight Compute 2026.1 Profiling Guide: Source Metrics</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#instructions-per-opcode-metrics" target="_blank" rel="noopener">Nsight Compute 2026.1 Profiling Guide: Instructions per Opcode Metrics</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/NsightCompute/index.html#source-page" target="_blank" rel="noopener">Nsight Compute 2026.1 User Interface: Source Page</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/NsightComputeCli/index.html#metrics-and-units" target="_blank" rel="noopener">Nsight Compute 2026.1 CLI: Metrics and Units</a></li>
+  <li><a href="https://docs.nvidia.com/nsight-compute/2022.3/pdf/ProfilingGuide.pdf" target="_blank" rel="noopener">Nsight Compute 2022.3 Metrics Guide: MIO and MIOC names</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.3.0/cuda-programming-guide/04-special-topics/async-copies.html#using-the-tensor-memory-accelerator-tma" target="_blank" rel="noopener">CUDA Programming Guide 13.3: Tensor Memory Accelerator</a></li>
+</ul>
+
+</div>
+
+</main>
+</div>
+</body>
+</html>

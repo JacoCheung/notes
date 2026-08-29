@@ -12,8 +12,8 @@
 <meta name="post:tags_en"         content="Triton, JIT, Specialization, Kernel DSL">
 <meta name="post:reading"         content="14 分钟">
 <meta name="post:reading_en"      content="14 min">
-<meta name="post:summary"         content="沿 Triton kernel launch 路径说明 specialization descriptor、tl.constexpr、对齐属性、运行时与磁盘缓存，以及它和 autotune 的关系。">
-<meta name="post:summary_en"      content="Explains Triton's specialization descriptors, tl.constexpr, alignment attributes, runtime and disk caches, and the boundary between JIT specialization and autotuning.">
+<meta name="post:summary"         content="Triton JIT specialization 按参数类型、constexpr、对齐属性和编译选项划分等价类，同一 key 复用 kernel。固定版本源码表明 Tensor shape 不随普通 pointer 进入 key，两级 cache 与 autotune 共同决定变体数。">
+<meta name="post:summary_en"      content="Triton JIT specialization partitions calls into compilation-equivalence classes keyed by argument types, constexpr values, alignment properties, and compilation options. The pinned implementation shows why ordinary tensor shapes do not automatically enter pointer keys, how in-process and persistent caches are queried, and how specialization combines with autotune to determine variant count.">
 <meta name="post:series"          content="kernel-dsl">
 <meta name="post:series_title"    content="Kernel DSL">
 <meta name="post:series_title_en" content="Kernel DSL">
@@ -127,31 +127,49 @@
 <div class="layout">
   <aside class="toc">
     <div class="toc-title">目录 · TOC</div>
+    <div class="lang-zh">
     <ul>
-      <li><a href="#scope">0. JIT 与 specialization</a></li>
-      <li><a href="#launch">1. Kernel launch 路径</a></li>
-      <li><a href="#descriptor">2. 参数如何进入 key</a></li>
-      <li><a href="#constexpr">3. tl.constexpr</a></li>
-      <li><a href="#runtime">4. 运行时隐式特化</a></li>
-      <li><a href="#cache">5. 两级缓存</a></li>
-      <li><a href="#control">6. 控制变体数量</a></li>
-      <li><a href="#autotune">7. 与 autotune 的关系</a></li>
-      <li><a href="#inspect">8. 定位重复编译</a></li>
-      <li><a href="#refs">参考资料</a></li>
+      <li><a href="#zh-scope">0. Specialization 模型</a></li>
+      <li><a href="#zh-launch">1. Kernel launch 路径</a></li>
+      <li><a href="#zh-descriptor">2. Descriptor 与 specialization key</a></li>
+      <li><a href="#zh-constexpr">3. tl.constexpr</a></li>
+      <li><a href="#zh-runtime">4. 运行时隐式特化</a></li>
+      <li><a href="#zh-cache">5. 两级缓存</a></li>
+      <li><a href="#zh-control">6. 控制变体数量</a></li>
+      <li><a href="#zh-autotune">7. 与 autotune 的关系</a></li>
+      <li><a href="#zh-inspect">8. 定位重复编译</a></li>
+      <li><a href="#zh-refs">参考资料</a></li>
     </ul>
+    </div>
+    <div class="lang-en">
+    <ul>
+      <li><a href="#en-scope">0. Specialization model</a></li>
+      <li><a href="#en-launch">1. Kernel launch path</a></li>
+      <li><a href="#en-descriptor">2. Descriptors and specialization keys</a></li>
+      <li><a href="#en-constexpr">3. tl.constexpr</a></li>
+      <li><a href="#en-runtime">4. Implicit specialization</a></li>
+      <li><a href="#en-cache">5. Two cache levels</a></li>
+      <li><a href="#en-control">6. Controlling variants</a></li>
+      <li><a href="#en-autotune">7. Relationship to autotune</a></li>
+      <li><a href="#en-inspect">8. Diagnosing recompilation</a></li>
+      <li><a href="#en-refs">References</a></li>
+    </ul>
+    </div>
   </aside>
 
 <main class="content">
 
-<h1>Triton JIT Specialization 机制：参数特化、编译变体与缓存</h1>
+<div class="lang-zh">
 
-<p class="lead"><code>@triton.jit</code> 会在运行期把 Python 函数编译成 GPU kernel。每次 launch 之前，Triton 根据参数类型、编译期常量、对齐属性和编译选项构造 specialization key。key 相同就复用已有 kernel；key 不同则得到新的编译变体。理解这套规则，才能解释为什么两个形状不同的输入有时共用 kernel，有时又会触发编译。</p>
+<h1>Triton JIT Specialization <span style="white-space: nowrap">机制</span>：参数特化、编译变体与缓存</h1>
 
-<h2 id="scope">0. JIT 与 specialization</h2>
+<p class="lead">一个 Triton kernel 通常要处理多种 shape、dtype、地址对齐和 launch 配置。若每组运行时数值都重新编译，启动成本与缓存体积会迅速增长；若所有调用共用一份 binary，编译器又会失去 tile shape、常量分支和对齐信息。<code>@triton.jit</code> 通过 specialization 在两者之间划分编译等价类：参数类型、编译期常量、对齐属性和编译选项共同构成 key，同一个 key 复用已有 kernel，新的 key 生成新的编译变体。</p>
 
-<p>JIT 说明编译发生在运行期，specialization 说明编译器拿到了哪些静态信息。两者是不同概念。</p>
+<h2 id="zh-scope">0. Specialization 模型</h2>
 
-<p>普通 CUDA kernel 的参数值在编译时不可见。Triton 可以把一部分参数提升为编译期常量，也可以从普通运行时参数提取类型和对齐属性。于是，同一个 Python 函数会对应一组 GPU kernel：</p>
+<p>JIT 是在程序运行期间按需触发编译的执行模型；specialization 是用一组静态属性确定编译变体的划分规则。前者决定编译时机，后者决定哪些调用共享结果。</p>
+
+<p>普通 CUDA kernel 在 launch 时接收参数值，预先编译的设备代码只保留参数类型。Triton 可以把选定参数提升为编译期常量，也可以从普通运行时参数提取类型和对齐属性。于是，同一个 Python 函数会对应一组 GPU kernel：</p>
 
 <p>\[
 \text{Python JIT function}
@@ -159,9 +177,9 @@
 \{K_0,K_1,\ldots,K_n\}.
 \]</p>
 
-<p>每个 $K_i$ 都有自己的参数签名、常量、编译属性和 launch options。本文以 Triton main commit <a href="https://github.com/triton-lang/triton/tree/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7"><code>a2d75c0</code></a> 为基准。旧版本的整数特化规则与当前实现并不完全相同。</p>
+<p>每个 $K_i$ 都对应一组参数签名、常量、编译属性和 launch options。本文沿 Triton 固定版本 <a href="https://github.com/triton-lang/triton/tree/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7"><code>a2d75c0</code></a> 的 launch 路径展开；整数特化规则具有版本差异，旧版本需要按其对应源码解释。</p>
 
-<h2 id="launch">1. 从 kernel launch 到编译变体</h2>
+<h2 id="zh-launch">1. 从 kernel launch 到编译变体</h2>
 
 <pre class="code">@triton.jit
 def copy_kernel(
@@ -177,11 +195,13 @@ def copy_kernel(
 
 copy_kernel[(1,)](x, y, 1024, BLOCK=256)</pre>
 
-<p>装饰器先创建一个 <code>JITFunction</code>，记录 Python signature、函数源码、被调用的其他 JIT function 和使用到的全局值。真正的编译发生在 <code>kernel[grid](...)</code>。</p>
+<p>装饰器首先创建 <code>JITFunction</code>，记录 Python signature、函数源码、被调用的其他 JIT function 和使用到的全局值。程序执行 <code>kernel[grid](...)</code> 后，运行时才绑定本次参数并进入 specialization 与缓存查询。</p>
 
 <div class="diagram-frame">
   <div class="diagram-title">一次 Triton kernel launch 的 JIT 路径</div>
-  <svg class="diagram-svg" viewBox="0 0 1120 360" role="img" aria-label="Triton JIT specialization and cache flow">
+  <svg class="diagram-svg" viewBox="0 0 1120 360" role="img" aria-labelledby="zh-jit-flow-title zh-jit-flow-desc">
+    <title id="zh-jit-flow-title">一次 Triton kernel launch 的 specialization 与缓存查询流程</title>
+    <desc id="zh-jit-flow-desc">运行时绑定参数并生成 specialization descriptor，随后查询当前进程内 JITFunction 的 device cache；未命中时构造 ASTSource，并由编译器查询 persistent cache 或完成编译。</desc>
     <defs>
       <marker id="jit-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
         <path d="M 0 0 L 10 5 L 0 10 z" fill="#71717a"></path>
@@ -224,9 +244,9 @@ copy_kernel[(1,)](x, y, 1024, BLOCK=256)</pre>
 
 <p><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L733-L765"><code>JITFunction.run()</code></a> 先调用 binder 生成 specialization，再计算 key 并查询当前 device 的 kernel cache。cache miss 时，signature、constexpr 和属性被打包成 <code>ASTSource</code>，然后进入编译器。</p>
 
-<h2 id="descriptor">2. 参数如何进入 specialization key</h2>
+<h2 id="zh-descriptor">2. Descriptor 与 Specialization Key</h2>
 
-<p>Triton 不会简单地把所有 Python 参数做一次字符串序列化。<a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L397-L427"><code>create_function_from_signature()</code></a> 为每个参数生成 specialization descriptor。当前规则可以整理为：</p>
+<p>Specialization descriptor 是运行时参数映射到编译属性后的结构化表示。<a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L397-L427"><code>create_function_from_signature()</code></a> 按参数类别生成 descriptor，再由这些 descriptor 组成 key。固定版本中的规则可以整理为：</p>
 
 <div class="table-scroll">
 <table class="note-table">
@@ -246,14 +266,14 @@ copy_kernel[(1,)](x, y, 1024, BLOCK=256)</pre>
 </table>
 </div>
 
-<p>这组行为在 Triton 的 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/test/unit/runtime/test_specialize.py#L42-L87">specialization reference test</a> 中有一份可读性很高的 Python 对照实现。它还说明了两个容易误判的细节：</p>
+<p>Triton 的 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/test/unit/runtime/test_specialize.py#L42-L87">specialization reference test</a> 给出了对应的 Python 参考实现。由表中规则可以直接得到两个边界：</p>
 
 <ul>
   <li>普通 Tensor 参数不会自动把 shape 和 stride 放进 specialization key。kernel 看到的主要是 pointer 类型和对齐属性。</li>
   <li>普通整数并非每个数值都生成一个 kernel。当前实现主要按整数宽度和 backend 属性拆分，数值 1 会提升为 constexpr。</li>
 </ul>
 
-<h2 id="constexpr">3. <code>tl.constexpr</code> 的编译期语义</h2>
+<h2 id="zh-constexpr">3. <code>tl.constexpr</code> 的编译期语义</h2>
 
 <p><code>tl.constexpr</code> 按精确值进入 key，也会成为 <code>ASTSource.constants</code>。编译器因此可以在 AST 转 TTIR 之前就使用它：</p>
 
@@ -279,7 +299,7 @@ def reduce_kernel(
 
 <p>把任意数据维度都声明成 constexpr 则会迅速放大编译数量。若业务出现 40 种 sequence length，而 kernel 并不需要针对每个长度展开循环，那么 <code>N: tl.constexpr</code> 会产生 40 份近似的 binary。</p>
 
-<h2 id="runtime">4. 普通参数的隐式特化</h2>
+<h2 id="zh-runtime">4. 普通参数的隐式特化</h2>
 
 <p>即使参数没有标成 constexpr，Triton 仍会提取对优化有用的属性。当前通用 backend 用字母 <code>D</code> 表示 <code>tt.divisibility=16</code>：</p>
 
@@ -288,7 +308,7 @@ def reduce_kernel(
   <li>pointer 地址按 16 byte 对齐时，descriptor 带 <code>D</code>。</li>
 </ul>
 
-<p>实现位于 backend 的 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/backends/compiler.py#L73-L92"><code>get_int_specialization()</code> 与 <code>get_tensor_specialization()</code></a>。编译器可以利用这些属性减少 mask、选择向量化访问或简化地址计算。</p>
+<p>实现位于 backend 的 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/backends/compiler.py#L73-L92"><code>get_int_specialization()</code> 与 <code>get_tensor_specialization()</code></a>。这些属性为编译器提供消除 mask、选择向量化访问或简化地址计算的机会；某个具体 kernel 是否发生这些优化，仍要查看生成的 IR 或目标代码。</p>
 
 <p>继续使用前面的 <code>copy_kernel</code>，以下调用展示了 key 的拆分：</p>
 
@@ -313,13 +333,15 @@ def reduce_kernel(
   <p>launch grid 通常不是 specialization key 的一部分。若 <code>n</code> 是普通运行时整数，<code>grid=(triton.cdiv(n, BLOCK),)</code> 可以随调用变化而不触发编译。grid 使用的 <code>BLOCK</code> 本身是 constexpr，所以改变 <code>BLOCK</code> 仍会生成新变体。</p>
 </div>
 
-<h2 id="cache">5. 运行时缓存与编译缓存</h2>
+<h2 id="zh-cache">5. 运行时缓存与编译缓存</h2>
 
-<p>Triton 在这条路径上使用两级缓存，二者解决的问题不同。</p>
+<p>Descriptor 确定运行时 key 以后，查询依次经过进程内 cache 与 persistent cache。前者复用当前进程已经加载的 kernel 对象，后者复用跨进程保存的编译产物。</p>
 
 <div class="diagram-frame">
   <div class="diagram-title">Triton JIT 的两级缓存查询路径</div>
-  <svg class="diagram-svg" viewBox="0 0 1120 500" role="img" aria-label="Triton in-memory specialization cache and persistent disk cache flow">
+  <svg class="diagram-svg" viewBox="0 0 1120 500" role="img" aria-labelledby="zh-cache-flow-title zh-cache-flow-desc">
+    <title id="zh-cache-flow-title">Triton 进程内 specialization cache 与 persistent cache</title>
+    <desc id="zh-cache-flow-desc">运行时 key 先查询进程内 JITFunction cache；未命中后构造 ASTSource 并查询磁盘 persistent cache，只有再次未命中才执行完整编译并写回产物。</desc>
     <defs>
       <marker id="cache-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
         <path d="M 0 0 L 10 5 L 0 10 z" fill="#71717a"></path>
@@ -380,9 +402,9 @@ def reduce_kernel(
   </svg>
 </div>
 
-<h3>JITFunction 的 per-device cache</h3>
+<h3>JITFunction 的进程内 per-device cache</h3>
 
-<p>每个 <code>JITFunction</code> 为 device 保存一份 <code>kernel_cache</code>。运行时 key 由 specialization descriptor 和编译 options 组成：</p>
+<p>在一个 Python 进程内，每个 <code>JITFunction</code> 按 device 保存 <code>kernel_cache</code>。这一级 cache 的作用域是当前进程与对应的 <code>JITFunction</code>；运行时 key 由 specialization descriptor 和编译 options 组成：</p>
 
 <p>\[
 \text{runtime key}
@@ -404,9 +426,11 @@ def reduce_kernel(
   <li>backend target、编译 options 与会使缓存失效的环境变量</li>
 </ul>
 
-<p><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/compiler/compiler.py#L52-L81"><code>ASTSource.hash()</code></a> 负责 source 一侧，<a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/compiler/compiler.py#L226-L290"><code>compile()</code></a> 再加入 target 和 options，查询磁盘上的编译产物。新 Python 进程可以命中 persistent cache，不必重新跑完整 lowering pipeline。</p>
+<p><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/compiler/compiler.py#L52-L81"><code>ASTSource.hash()</code></a> 负责 source 一侧，<a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/compiler/compiler.py#L226-L290"><code>compile()</code></a> 再加入 target 和 options，随后查询磁盘上的编译产物。新 Python 进程命中 persistent cache 时，可以跳过完整 lowering 流程。</p>
 
-<h2 id="control">6. 控制 specialization 数量</h2>
+<p>磁盘 cache miss 有两类来源。Source、signature、constexpr、target、options 或参与 cache invalidation 的环境变量发生变化，会生成新的 persistent key；缓存目录不可访问、产物组不完整或 metadata 校验失败，则会让已有 key 无法恢复有效产物。</p>
+
+<h2 id="zh-control">6. 控制 specialization 数量</h2>
 
 <p>普通整数和 pointer 的隐式属性可能带来额外变体。若某个参数的取值很多，而 kernel 不依赖它的整除或对齐信息，可以关闭相应规则：</p>
 
@@ -426,9 +450,9 @@ def dynamic_kernel(x, y, n, BLOCK: tl.constexpr):
   <p>关闭 specialization 不会改变 kernel 的数学语义，但会减少编译器可用的静态信息。变体数量下降以后，某些形状可能失去向量化或无 mask 路径。它是编译时间、代码体积和运行性能之间的取舍。</p>
 </div>
 
-<h2 id="autotune">7. Specialization 与 autotune</h2>
+<h2 id="zh-autotune">7. Specialization 与 autotune</h2>
 
-<p><code>@triton.autotune</code> 负责在若干 <code>triton.Config</code> 之间测量和选型，specialization JIT 负责把每个候选配置编译成可执行 kernel。它们不是同一层缓存。</p>
+<p><code>@triton.autotune</code> 是在若干 <code>triton.Config</code> 之间测量并选择配置的搜索机制；specialization JIT 则把到达 launch 路径的参数与配置编译成可执行 kernel。Autotune 决定“选哪个配置”，specialization 决定“需要哪些编译变体”。</p>
 
 <pre class="code">@triton.autotune(
     configs=[
@@ -443,7 +467,7 @@ def kernel(x, y, n, BLOCK: tl.constexpr):
 
 <p>这里至少有两个 JIT 变体，因为 <code>BLOCK</code> 和 <code>num_warps</code> 都不同。autotune 的 <code>key=["n"]</code> 表示不同 <code>n</code> 可以分别选择胜出的 config；它不等于把 <code>n</code> 自动声明成 <code>tl.constexpr</code>。最终编译数量取决于候选 config、参数 specialization 和实际到达的输入组合。</p>
 
-<h2 id="inspect">8. 定位重复编译</h2>
+<h2 id="zh-inspect">8. 定位重复编译</h2>
 
 <p>出现首次迭代很慢或 cache 目录快速增长时，可以先检查三个位置：</p>
 
@@ -455,9 +479,9 @@ def kernel(x, y, n, BLOCK: tl.constexpr):
 
 <p><code>TRITON_CACHE_DIR</code> 可以指定 persistent cache 位置。<code>TRITON_KERNEL_DUMP=1</code> 会把各阶段 IR 写入 <code>TRITON_DUMP_DIR</code>，适合比较两个 specialization 的 TTIR 或 PTX。调试缓存命中时还可以使用 <code>TRITON_ALWAYS_COMPILE=1</code> 强制重编译；这些环境变量的当前定义在 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/knobs.py#L343-L363"><code>knobs.py</code></a> 中。</p>
 
-<p>实际排查时，先打印每次调用的 dtype、constexpr、<code>num_warps</code> 和关键整数的 <code>% 16</code> 结果，通常就能解释大部分重复编译。Tensor shape 本身不是普通 pointer 参数的 key，真正进入 key 的往往是显式传入的 shape 标量及其整除属性。</p>
+<p>实际排查时，可以记录每次调用的 dtype、constexpr、<code>num_warps</code>，再检查参与 shape 或 stride 计算的整数对 16 的余数。这些信息通常能解释大部分重复编译。Tensor shape 本身不是普通 pointer 参数的 key；进入 key 的通常是显式传入的 shape 标量及其整除属性。</p>
 
-<h2 id="refs">参考资料</h2>
+<h2 id="zh-refs">参考资料</h2>
 
 <ul>
   <li><a href="https://triton-lang.org/main/python-api/generated/triton.jit.html">Triton <code>triton.jit</code> API</a></li>
@@ -466,6 +490,342 @@ def kernel(x, y, n, BLOCK: tl.constexpr):
   <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/compiler/compiler.py">Triton compiler and persistent cache path</a></li>
   <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/backends/compiler.py">Triton backend specialization attributes</a></li>
 </ul>
+
+</div>
+
+<div class="lang-en">
+
+<h1>Triton JIT Specialization: Arguments, Kernel Variants, and Caching</h1>
+
+<p class="lead">A Triton kernel commonly serves many shapes, dtypes, address alignments, and launch configurations. Compiling every runtime value would inflate startup cost and cache size, while forcing every call through one binary would discard static tile shapes, constant branches, and alignment facts. <code>@triton.jit</code> uses specialization to partition calls into compilation-equivalence classes. Argument types, compile-time constants, alignment properties, and compilation options form the key; an existing key reuses its kernel, while a new key produces another compiled variant.</p>
+
+<h2 id="en-scope">0. Specialization Model</h2>
+
+<p>JIT is an execution model that triggers compilation on demand while the program runs. Specialization is the rule that maps a set of static properties to a compiled variant. The first determines when compilation occurs; the second determines which calls share its result.</p>
+
+<p>A conventional CUDA kernel receives argument values at launch, while its ahead-of-time device code retains only parameter types. Triton can promote selected arguments to compile-time constants and extract types and alignment properties from ordinary runtime arguments. One Python function can therefore represent a family of GPU kernels:</p>
+
+<p>\[
+\text{Python JIT function}
+\quad\longrightarrow\quad
+\{K_0,K_1,\ldots,K_n\}.
+\]</p>
+
+<p>Each $K_i$ corresponds to one argument signature, set of constants, compilation properties, and launch options. This article follows the launch path in pinned Triton revision <a href="https://github.com/triton-lang/triton/tree/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7"><code>a2d75c0</code></a>. Integer-specialization rules vary by release, so older versions should be read against their matching source.</p>
+
+<h2 id="en-launch">1. From Kernel Launch to a Compiled Variant</h2>
+
+<pre class="code">@triton.jit
+def copy_kernel(
+    x,
+    y,
+    n,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets &lt; n
+    values = tl.load(x + offsets, mask=mask)
+    tl.store(y + offsets, values, mask=mask)
+
+copy_kernel[(1,)](x, y, 1024, BLOCK=256)</pre>
+
+<p>The decorator first creates a <code>JITFunction</code> that records the Python signature, function source, called JIT functions, and referenced global values. When the program executes <code>kernel[grid](...)</code>, the runtime binds the current arguments and enters specialization and cache lookup.</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">JIT path for one Triton kernel launch</div>
+  <svg class="diagram-svg" viewBox="0 0 1120 360" role="img" aria-labelledby="en-jit-flow-title en-jit-flow-desc">
+    <title id="en-jit-flow-title">Specialization and cache lookup for one Triton kernel launch</title>
+    <desc id="en-jit-flow-desc">Runtime argument binding creates a specialization descriptor and queries the current process's per-JITFunction device cache. A miss constructs an ASTSource, after which the compiler queries persistent cache or compiles the kernel.</desc>
+    <defs>
+      <marker id="en-jit-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#71717a"></path>
+      </marker>
+    </defs>
+
+    <rect class="box" x="30" y="112" width="180" height="84" rx="7"></rect>
+    <text x="120" y="143" text-anchor="middle" font-size="14" font-weight="600">kernel[grid](args)</text>
+    <text class="mono muted" x="120" y="169" text-anchor="middle" font-size="11">bind args + options</text>
+
+    <path class="arrow" marker-end="url(#en-jit-arrow)" d="M 210 154 L 270 154"></path>
+    <rect class="box specialize" x="280" y="92" width="220" height="124" rx="7"></rect>
+    <text x="390" y="123" text-anchor="middle" font-size="14" font-weight="600">specialization descriptor</text>
+    <text class="mono muted" x="390" y="149" text-anchor="middle" font-size="11">type / constexpr / attrs</text>
+    <text class="mono muted" x="390" y="173" text-anchor="middle" font-size="11">num_warps / num_stages</text>
+    <text class="mono muted" x="390" y="197" text-anchor="middle" font-size="11">compute runtime key</text>
+
+    <path class="arrow" marker-end="url(#en-jit-arrow)" d="M 500 154 L 560 154"></path>
+    <rect class="box cache" x="570" y="112" width="190" height="84" rx="7"></rect>
+    <text x="665" y="143" text-anchor="middle" font-size="14" font-weight="600">per-device cache</text>
+    <text class="mono muted" x="665" y="169" text-anchor="middle" font-size="11">kernel_cache[key]</text>
+
+    <path class="arrow" marker-end="url(#en-jit-arrow)" d="M 760 135 C 820 82, 850 82, 895 82"></path>
+    <text class="muted" x="824" y="93" text-anchor="middle" font-size="11">miss</text>
+    <rect class="box compile" x="900" y="35" width="190" height="94" rx="7"></rect>
+    <text x="995" y="66" text-anchor="middle" font-size="14" font-weight="600">compile ASTSource</text>
+    <text class="mono muted" x="995" y="91" text-anchor="middle" font-size="11">TTIR → backend IR</text>
+    <text class="mono muted" x="995" y="112" text-anchor="middle" font-size="11">persistent cache</text>
+
+    <path class="arrow" marker-end="url(#en-jit-arrow)" d="M 760 174 C 820 235, 850 245, 895 245"></path>
+    <text class="muted" x="824" y="230" text-anchor="middle" font-size="11">hit</text>
+    <path class="arrow" marker-end="url(#en-jit-arrow)" d="M 995 129 L 995 196"></path>
+    <rect class="box run" x="900" y="205" width="190" height="80" rx="7"></rect>
+    <text x="995" y="237" text-anchor="middle" font-size="14" font-weight="600">launch compiled kernel</text>
+    <text class="mono muted" x="995" y="263" text-anchor="middle" font-size="11">grid is launch-time state</text>
+
+    <text class="muted" x="560" y="330" text-anchor="middle" font-size="12">One Python function may keep several specializations in the cache.</text>
+  </svg>
+</div>
+
+<p><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L733-L765"><code>JITFunction.run()</code></a> first invokes the binder to produce a specialization, computes the key, and queries the kernel cache for the current device. On a cache miss, Triton packages the signature, constexpr values, and properties into an <code>ASTSource</code> and passes it to the compiler.</p>
+
+<h2 id="en-descriptor">2. Descriptors and Specialization Keys</h2>
+
+<p>A specialization descriptor is a structured representation that maps a runtime argument to compilation properties. <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L397-L427"><code>create_function_from_signature()</code></a> builds one descriptor per argument and combines them into the key. The pinned revision follows these rules:</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Argument</th><th>Information placed in the signature</th><th>Split by exact value?</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>tl.constexpr</code></td><td><code>("constexpr", value)</code></td><td>Yes</td></tr>
+    <tr><td>Tensor / pointer</td><td>Pointer element dtype, const property, and alignment properties</td><td>Not by tensor contents or shape</td></tr>
+    <tr><td>Ordinary integer</td><td><code>i32</code>, <code>i64</code>, or <code>u64</code>, possibly with a divisibility property</td><td>Usually no; integer 1 is a special case</td></tr>
+    <tr><td>Ordinary float</td><td><code>fp32</code></td><td>No</td></tr>
+    <tr><td>Ordinary bool</td><td><code>u1</code></td><td>No</td></tr>
+    <tr><td><code>None</code></td><td>constexpr <code>None</code></td><td>Yes</td></tr>
+    <tr><td>tuple / namedtuple</td><td>Each member is processed recursively</td><td>Determined by the member rules</td></tr>
+    <tr><td>Called JIT function</td><td>The callee's source cache key</td><td>A callee change invalidates the cache</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Triton's <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/test/unit/runtime/test_specialize.py#L42-L87">specialization reference test</a> provides a Python reference model for this behavior. Two boundaries follow directly from those rules:</p>
+
+<ul>
+  <li>An ordinary tensor argument does not automatically add its shape and strides to the specialization key. The kernel primarily sees the pointer type and alignment properties.</li>
+  <li>An ordinary integer does not produce one kernel per numeric value. The current implementation mainly separates integer widths and backend properties; the value 1 is promoted to constexpr.</li>
+</ul>
+
+<h2 id="en-constexpr">3. Compile-Time Semantics of <code>tl.constexpr</code></h2>
+
+<p>A <code>tl.constexpr</code> argument enters the key by exact value and becomes part of <code>ASTSource.constants</code>. The compiler can use it before lowering the AST to TTIR:</p>
+
+<pre class="code">@triton.jit
+def reduce_kernel(
+    x,
+    y,
+    n,
+    BLOCK: tl.constexpr,
+    USE_FAST_PATH: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK)
+    values = tl.load(x + offsets, mask=offsets &lt; n)
+
+    if USE_FAST_PATH:
+        values = fast_transform(values)
+    else:
+        values = accurate_transform(values)
+
+    tl.store(y + offsets, values, mask=offsets &lt; n)</pre>
+
+<p><code>BLOCK=256</code> and <code>BLOCK=512</code> are separate compiled variants. So are <code>USE_FAST_PATH=True</code> and <code>False</code>; the branch not selected does not survive as a runtime branch. Loop counts, tile shapes, algorithmic branches, and dtype policies are suitable constexpr values because they alter program structure.</p>
+
+<p>Declaring every data dimension as constexpr can quickly multiply compilation work. If a workload contains 40 sequence lengths and the kernel does not need to unroll a distinct loop for each one, writing <code>N: tl.constexpr</code> creates 40 similar binaries.</p>
+
+<h2 id="en-runtime">4. Implicit Specialization of Ordinary Arguments</h2>
+
+<p>Even when an argument is not constexpr, Triton extracts properties that may help optimization. The current generic backend uses <code>D</code> to denote <code>tt.divisibility=16</code>:</p>
+
+<ul>
+  <li>An integer descriptor receives <code>D</code> when the value is divisible by 16.</li>
+  <li>A pointer descriptor receives <code>D</code> when the address is aligned to 16 bytes.</li>
+</ul>
+
+<p>The implementation is in the backend methods <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/backends/compiler.py#L73-L92"><code>get_int_specialization()</code> and <code>get_tensor_specialization()</code></a>. These properties give the compiler opportunities to remove masks, select vectorized accesses, or simplify address calculations. Whether a particular kernel realizes those optimizations must be verified in generated IR or target code.</p>
+
+<p>Using the earlier <code>copy_kernel</code>, the following calls show how keys split:</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Call</th><th><code>n</code> descriptor</th><th><code>x</code> descriptor</th><th><code>BLOCK</code></th><th>Reuses A?</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>A: <code>n=1024</code>, aligned pointer</td><td><code>i32 + D</code></td><td><code>*fp32 + D</code></td><td>256</td><td>Reference variant</td></tr>
+    <tr><td>B: <code>n=2048</code>, aligned pointer</td><td><code>i32 + D</code></td><td><code>*fp32 + D</code></td><td>256</td><td>Yes</td></tr>
+    <tr><td>C: <code>n=1000</code>, aligned pointer</td><td><code>i32</code></td><td><code>*fp32 + D</code></td><td>256</td><td>No</td></tr>
+    <tr><td>D: <code>n=1024</code>, unaligned pointer</td><td><code>i32 + D</code></td><td><code>*fp32</code></td><td>256</td><td>No</td></tr>
+    <tr><td>E: <code>n=1024</code>, aligned pointer</td><td><code>i32 + D</code></td><td><code>*fp32 + D</code></td><td>512</td><td>No</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>A and B have different runtime values but identical descriptors, so they share a kernel. C loses the integer-divisibility property, D loses the pointer-alignment property, and E changes a constexpr value. The five calls produce four variants.</p>
+
+<div class="note-box">
+  <p>The launch grid is normally not part of the specialization key. When <code>n</code> is an ordinary runtime integer, <code>grid=(triton.cdiv(n, BLOCK),)</code> may change between calls without triggering compilation. <code>BLOCK</code>, however, is constexpr, so changing it still creates a new variant.</p>
+</div>
+
+<h2 id="en-cache">5. Runtime Cache and Compilation Cache</h2>
+
+<p>Once the descriptor determines the runtime key, lookup proceeds through an in-process cache and then a persistent cache. The first reuses kernel objects already loaded by the current process; the second reuses compilation artifacts across processes.</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">Two-level cache lookup in Triton JIT</div>
+  <svg class="diagram-svg" viewBox="0 0 1120 500" role="img" aria-labelledby="en-cache-flow-title en-cache-flow-desc">
+    <title id="en-cache-flow-title">Triton in-process specialization cache and persistent cache</title>
+    <desc id="en-cache-flow-desc">The runtime key first queries a per-JITFunction cache in the current process. A miss constructs an ASTSource and queries persistent disk cache; only a second miss performs full compilation and writes artifacts back.</desc>
+    <defs>
+      <marker id="en-cache-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#71717a"></path>
+      </marker>
+    </defs>
+
+    <rect class="box" x="25" y="48" width="170" height="82" rx="7"></rect>
+    <text x="110" y="80" text-anchor="middle" font-size="14" font-weight="600">kernel[grid](args)</text>
+    <text class="mono muted" x="110" y="106" text-anchor="middle" font-size="11">bind arguments</text>
+
+    <path class="arrow" marker-end="url(#en-cache-arrow)" d="M 195 89 L 240 89"></path>
+    <rect class="box specialize" x="250" y="38" width="200" height="102" rx="7"></rect>
+    <text x="350" y="70" text-anchor="middle" font-size="14" font-weight="600">specialization</text>
+    <text class="mono muted" x="350" y="96" text-anchor="middle" font-size="11">types / constexpr / attrs</text>
+    <text class="mono muted" x="350" y="118" text-anchor="middle" font-size="11">compile options</text>
+
+    <path class="arrow" marker-end="url(#en-cache-arrow)" d="M 450 89 L 500 89"></path>
+    <rect class="box cache" x="510" y="38" width="200" height="102" rx="7"></rect>
+    <text x="610" y="70" text-anchor="middle" font-size="14" font-weight="600">in-memory cache</text>
+    <text class="mono muted" x="610" y="96" text-anchor="middle" font-size="11">per device / per process</text>
+    <text class="mono muted" x="610" y="118" text-anchor="middle" font-size="11">kernel_cache[runtime_key]</text>
+
+    <path class="arrow" marker-end="url(#en-cache-arrow)" d="M 710 78 C 845 78, 1018 214, 1018 346"></path>
+    <text class="muted" x="824" y="91" text-anchor="middle" font-size="11">hit</text>
+
+    <path class="arrow" marker-end="url(#en-cache-arrow)" d="M 610 140 L 610 208"></path>
+    <text class="muted" x="628" y="180" font-size="11">miss</text>
+    <rect class="box compile" x="510" y="218" width="200" height="102" rx="7"></rect>
+    <text x="610" y="250" text-anchor="middle" font-size="14" font-weight="600">build ASTSource</text>
+    <text class="mono muted" x="610" y="276" text-anchor="middle" font-size="11">source / signature / constants</text>
+    <text class="mono muted" x="610" y="298" text-anchor="middle" font-size="11">compute persistent key</text>
+
+    <path class="arrow" marker-end="url(#en-cache-arrow)" d="M 710 269 L 752 269"></path>
+    <rect class="box cache" x="762" y="218" width="200" height="102" rx="7"></rect>
+    <text x="862" y="250" text-anchor="middle" font-size="14" font-weight="600">persistent cache</text>
+    <text class="mono muted" x="862" y="276" text-anchor="middle" font-size="11">metadata group + binary</text>
+    <text class="mono muted" x="862" y="298" text-anchor="middle" font-size="11">TRITON_CACHE_DIR</text>
+
+    <path class="arrow" marker-end="url(#en-cache-arrow)" d="M 962 260 C 1000 270, 1018 310, 1018 346"></path>
+    <text class="muted" x="996" y="275" font-size="11">hit</text>
+
+    <path class="arrow" marker-end="url(#en-cache-arrow)" d="M 862 320 L 862 358"></path>
+    <text class="muted" x="880" y="344" font-size="11">miss</text>
+    <rect class="box compile" x="762" y="368" width="200" height="82" rx="7"></rect>
+    <text x="862" y="400" text-anchor="middle" font-size="14" font-weight="600">full compilation</text>
+    <text class="mono muted" x="862" y="426" text-anchor="middle" font-size="11">TTIR → TTGIR → binary</text>
+
+    <path class="arrow" marker-end="url(#en-cache-arrow)" d="M 962 409 L 968 409"></path>
+    <rect class="box run" x="978" y="358" width="125" height="102" rx="7"></rect>
+    <text x="1040" y="398" text-anchor="middle" font-size="14" font-weight="600">launch</text>
+    <text x="1040" y="419" text-anchor="middle" font-size="14" font-weight="600">kernel</text>
+    <text class="mono muted" x="1040" y="443" text-anchor="middle" font-size="10">load executable</text>
+
+    <path class="arrow" marker-end="url(#en-cache-arrow)" stroke-dasharray="5 5" d="M 780 368 C 720 348, 720 304, 762 291"></path>
+    <text class="muted" x="715" y="344" text-anchor="middle" font-size="11">write back</text>
+
+    <text class="muted" x="560" y="478" text-anchor="middle" font-size="12">An in-process miss only enters the compiler; a persistent-cache miss performs full compilation.</text>
+  </svg>
+</div>
+
+<h3><code>JITFunction</code> In-Process Per-Device Cache</h3>
+
+<p>Within one Python process, each <code>JITFunction</code> keeps a <code>kernel_cache</code> indexed by device. The scope of this cache is the current process and that <code>JITFunction</code>. Its runtime key consists of the specialization descriptor and compilation options:</p>
+
+<p>\[
+\text{runtime key}
+=
+(\text{specialization},\text{options}).
+\]</p>
+
+<p><code>num_warps</code>, <code>num_stages</code>, and <code>num_ctas</code> are options. Calls with identical arguments but different <code>num_warps</code> values still use separate kernels. See <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L611-L620"><code>compute_cache_key()</code></a> for key construction and lookup.</p>
+
+<h3>Compiler Persistent Cache</h3>
+
+<p>After an in-memory cache miss, Triton constructs an <code>ASTSource</code>. Its hash includes:</p>
+
+<ul>
+  <li>The source hash of the current function and its transitive dependencies</li>
+  <li>The argument signature</li>
+  <li>Exact constexpr values</li>
+  <li>Alignment and divisibility properties</li>
+  <li>The backend target, compilation options, and cache-invalidating environment variables</li>
+</ul>
+
+<p><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/compiler/compiler.py#L52-L81"><code>ASTSource.hash()</code></a> covers the source side. <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/compiler/compiler.py#L226-L290"><code>compile()</code></a> adds the target and options before querying compiled artifacts on disk. A new Python process that hits this persistent cache can skip the full lowering flow.</p>
+
+<p>Disk-cache misses come from two classes of change. Source, signature, constexpr values, target, options, or cache-invalidating environment variables produce a new persistent key. An inaccessible cache directory, incomplete artifact group, or failed metadata validation prevents an existing key from restoring a valid artifact.</p>
+
+<h2 id="en-control">6. Controlling the Number of Specializations</h2>
+
+<p>Implicit properties of ordinary integers and pointers may create extra variants. If an argument takes many values and the kernel does not rely on its divisibility or alignment, the corresponding rule can be disabled:</p>
+
+<pre class="code">@triton.jit(do_not_specialize=["n"])
+def dynamic_kernel(x, y, n, BLOCK: tl.constexpr):
+    ...</pre>
+
+<p><code>do_not_specialize</code> disables runtime value and alignment specialization for <code>n</code>. Different ordinary <code>i32 n</code> values then share a variant.</p>
+
+<pre class="code">@triton.jit(do_not_specialize_on_alignment=["n"])
+def dynamic_kernel(x, y, n, BLOCK: tl.constexpr):
+    ...</pre>
+
+<p><code>do_not_specialize_on_alignment</code> disables only alignment and divisibility properties. Other rules remain active; for example, the current implementation may still promote integer 1 to constexpr. Both arguments accept parameter names or positions. See <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L793-L829"><code>JITFunction.__init__()</code></a> for the initialization logic.</p>
+
+<div class="note-box warn">
+  <p>Disabling specialization does not alter the kernel's mathematical semantics, but it removes static information from the compiler. Fewer variants may cost some shapes their vectorized or mask-free path. The setting trades compilation time and code size against runtime performance.</p>
+</div>
+
+<h2 id="en-autotune">7. Specialization and Autotune</h2>
+
+<p><code>@triton.autotune</code> is a search mechanism that benchmarks and selects among several <code>triton.Config</code> candidates. Specialization JIT compiles the argument and configuration combinations that reach the launch path. Autotune decides which configuration wins; specialization determines which compiled variants are required.</p>
+
+<pre class="code">@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK": 128}, num_warps=4),
+        triton.Config({"BLOCK": 256}, num_warps=8),
+    ],
+    key=["n"],
+)
+@triton.jit
+def kernel(x, y, n, BLOCK: tl.constexpr):
+    ...</pre>
+
+<p>This example has at least two JIT variants because both <code>BLOCK</code> and <code>num_warps</code> differ. The autotune setting <code>key=["n"]</code> lets different <code>n</code> values choose different winning configurations; it does not automatically declare <code>n</code> as <code>tl.constexpr</code>. The final compilation count depends on candidate configurations, argument specialization, and the combinations that actually reach the kernel.</p>
+
+<h2 id="en-inspect">8. Diagnosing Repeated Compilation</h2>
+
+<p>When the first iteration is slow or the cache directory grows quickly, inspect three areas:</p>
+
+<ol>
+  <li>List every <code>tl.constexpr</code> and check whether it truly changes a tile, loop, or control-flow branch.</li>
+  <li>Check whether shape or stride arguments frequently cross divisibility-by-16 boundaries and whether pointers come from views with offsets.</li>
+  <li>Check autotune configurations and <code>num_warps</code> or <code>num_stages</code>; these settings also multiply compilation combinations.</li>
+</ol>
+
+<p><code>TRITON_CACHE_DIR</code> selects the persistent-cache location. <code>TRITON_KERNEL_DUMP=1</code> writes each IR stage under <code>TRITON_DUMP_DIR</code>, which is useful when comparing the TTIR or PTX of two specializations. <code>TRITON_ALWAYS_COMPILE=1</code> forces recompilation while debugging cache hits. The current definitions of these environment variables are in <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/knobs.py#L343-L363"><code>knobs.py</code></a>.</p>
+
+<p>A practical first step is to record dtype, constexpr values, and <code>num_warps</code> for each call, then inspect the remainder modulo 16 for integers used in shape or stride calculations. Those values usually explain most repeated compilation. The shape of a tensor is not itself part of the key for an ordinary pointer argument; explicit shape scalars and their divisibility properties are more often responsible.</p>
+
+<h2 id="en-refs">References</h2>
+
+<ul>
+  <li><a href="https://triton-lang.org/main/python-api/generated/triton.jit.html">Triton <code>triton.jit</code> API</a></li>
+  <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py">Triton runtime JIT implementation</a></li>
+  <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/test/unit/runtime/test_specialize.py">Triton specialization tests</a></li>
+  <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/compiler/compiler.py">Triton compiler and persistent cache path</a></li>
+  <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/backends/compiler.py">Triton backend specialization properties</a></li>
+</ul>
+
+</div>
 
 </main>
 </div>

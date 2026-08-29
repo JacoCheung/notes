@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NVIDIA GPU 指令发射与延迟隐藏机制</title>
+<meta name="post:title"           content="NVIDIA GPU 指令发射与延迟隐藏机制">
+<meta name="post:title_en"        content="NVIDIA GPU Instruction Issue and Latency Hiding">
+<meta name="post:slug"            content="gpu-instruction-issue-latency-hiding">
+<meta name="post:date"            content="2026-08-28">
+<meta name="post:tags"            content="GPU, CUDA, Warp Scheduler, Scoreboard, Nsight Compute, Latency Hiding">
+<meta name="post:tags_en"         content="GPU, CUDA, Warp Scheduler, Scoreboard, Nsight Compute, Latency Hiding">
+<meta name="post:reading"         content="15 分钟">
+<meta name="post:reading_en"      content="15 min">
+<meta name="post:summary"         content="单个 warp 按 SASS 顺序发射，编译器重排独立指令，scheduler 跨 warp 选择 eligible 工作，scoreboard 跟踪依赖。所有候选都无法填充 issue slot 时才形成 bubble，NCU sampling 与 scheduler 统计验证该条件。">
+<meta name="post:summary_en"      content="Per-warp issue follows final SASS order, while the compiler statically reorders independent work, the scheduler selects eligible work across resident warps, and scoreboards track runtime completion dependencies. Latency becomes an issue bubble only when no candidate fills the slot; Nsight Compute All and Not-issued samples require Scheduler Statistics for that conclusion.">
+<meta name="post:series"          content="gpu-programming-basics">
+<meta name="post:series_title"    content="GPU Programming Basics">
+<meta name="post:series_title_en" content="GPU Programming Basics">
+<meta name="post:series_order"    content="7">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(','\\)'], ['$','$']], displayMath: [['\\[','\\]'], ['$$','$$']] },
+    options: { skipHtmlTags: ['script', 'style', 'pre', 'code'] }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
+<script src="../lang-toggle.js" defer></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Geist+Mono:wght@400;500&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  main.content { max-width: 1060px; min-width: 0; padding: 56px 32px 96px; letter-spacing: 0; }
+  main.content h1,
+  main.content h2,
+  main.content h3 { letter-spacing: 0; }
+  .lead {
+    max-width: 84ch;
+    margin: -6px 0 30px;
+    color: var(--fg-muted);
+    font-size: 17px;
+    line-height: 1.8;
+  }
+  .table-scroll {
+    max-width: 100%;
+    margin: 18px 0 26px;
+    overflow-x: auto;
+  }
+  table.note-table {
+    width: 100%;
+    min-width: 820px;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  table.note-table th,
+  table.note-table td {
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    text-align: left;
+    vertical-align: top;
+  }
+  table.note-table th { background: var(--bg-elevated); font-weight: 600; }
+  .note-box {
+    margin: 18px 0 26px;
+    padding: 12px 16px;
+    border-left: 3px solid var(--accent);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    background: var(--accent-tint);
+  }
+  .note-box.warn {
+    border-left-color: #d97706;
+    background: rgba(217, 119, 6, 0.08);
+  }
+  .note-box p { margin: 6px 0; }
+  .diagram-frame {
+    max-width: 100%;
+    margin: 20px 0 30px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    box-sizing: border-box;
+  }
+  .diagram-title {
+    margin-bottom: 10px;
+    color: var(--fg-subtle);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  .diagram-svg {
+    display: block;
+    width: 100%;
+    min-width: 940px;
+    height: auto;
+  }
+  .diagram-svg text { fill: var(--fg); font-family: var(--font-sans); letter-spacing: 0; }
+  .diagram-svg .mono { font-family: var(--font-mono); }
+  .diagram-svg .muted { fill: var(--fg-muted); }
+  .diagram-svg .grid { stroke: var(--border); stroke-width: 1; }
+  .diagram-svg .issue { fill: rgba(5, 150, 105, 0.12); stroke: #059669; stroke-width: 1.2; }
+  .diagram-svg .wait { fill: rgba(190, 24, 93, 0.09); stroke: #be185d; stroke-width: 1.2; }
+  .diagram-svg .ready { fill: rgba(37, 99, 235, 0.10); stroke: #2563eb; stroke-width: 1.2; }
+  .diagram-svg .idle { fill: rgba(113, 113, 122, 0.06); stroke: #a1a1aa; stroke-width: 1; }
+  .diagram-svg .arrow { fill: none; stroke: #be185d; stroke-width: 1.5; }
+  main.content mjx-container[display="true"] {
+    max-width: 100%;
+    padding-bottom: 2px;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  @media (max-width: 960px) {
+    main.content { width: 100%; max-width: 100%; padding: 48px 20px 80px; }
+  }
+  @media (max-width: 720px) {
+    .lead { font-size: 16px; }
+    .diagram-frame { padding: 12px; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录 · TOC</div>
+    <div class="lang-zh">
+    <ul>
+      <li><a href="#zh-order">1. 发射顺序、完成顺序与 warp 调度</a></li>
+      <li><a href="#zh-example">2. 四条指令的发射过程</a></li>
+      <li><a href="#zh-hiding">3. 减少 issue bubble 的四类机制</a></li>
+      <li><a href="#zh-ncu">4. NCU 的两组 stall 采样</a></li>
+      <li><a href="#zh-cases">5. Long Scoreboard 诊断假设</a></li>
+      <li><a href="#zh-workflow">6. Issue bubble 的源码归因</a></li>
+      <li><a href="#zh-refs">参考资料</a></li>
+    </ul>
+    </div>
+    <div class="lang-en">
+    <ul>
+      <li><a href="#en-order">1. Issue order, completion order, and warp scheduling</a></li>
+      <li><a href="#en-example">2. Issue behavior of four instructions</a></li>
+      <li><a href="#en-hiding">3. Four mechanisms that reduce issue bubbles</a></li>
+      <li><a href="#en-ncu">4. Two NCU stall-sampling groups</a></li>
+      <li><a href="#en-cases">5. Long Scoreboard diagnostic hypotheses</a></li>
+      <li><a href="#en-workflow">6. Issue-bubble attribution workflow</a></li>
+      <li><a href="#en-refs">References</a></li>
+    </ul>
+    </div>
+  </aside>
+
+<main class="content">
+
+<div class="lang-zh">
+
+<h1>NVIDIA GPU 指令发射与延迟隐藏机制</h1>
+
+<p class="lead">CUDA kernel 编译为 SASS 后，每个 warp 沿当前控制路径上的指令序列向前推进。Warp scheduler 在每个 issue opportunity 从下一条指令已经 ready 的 warp 中选择 eligible 候选，并把指令送往相应的 execution pipe 或内存路径。若某个 warp 到达依赖尚未完成的 consumer，scoreboard 会暂时撤销它的 eligible 资格；此时，其他 resident warp 仍可接替发射。只有所有候选 warp 都无法填充 issue slot，等待才会暴露为 issue bubble。单 warp 的指令顺序、编译器安排的独立工作、跨 warp 调度和动态依赖检查共同决定了延迟能否被覆盖。</p>
+
+<h2 id="zh-order">1. 发射顺序、完成顺序与 warp 调度</h2>
+
+<p>GPU 的发射顺序、完成顺序和 warp 调度属于不同层级。CUDA Programming Guide 将 SM 描述为按顺序发射指令，并说明 GPU 不依赖分支预测和推测执行。在本文讨论的 scheduler 视角中，每个 warp 提供当前执行路径上的下一条 SASS 指令，同一 SM 上的多个 warp 则由 scheduler 交错推进。</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>层级</th><th>顺序由谁决定</th><th>运行时行为</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>单个 warp 的 SASS</td><td><code>ptxas</code> 生成最终指令序列</td><td>scheduler 检查该 warp 的下一条指令；这条指令被依赖或资源阻塞时，后面的指令不会动态越过它。</td></tr>
+    <tr><td>多个 resident warp</td><td>硬件 warp scheduler</td><td>每个 instruction issue cycle 选择一个 eligible warp，并按架构允许的宽度发射一条或多条指令。不同 warp 的指令因此交错出现。</td></tr>
+    <tr><td>同一 warp 中的独立工作</td><td>编译器静态调度</td><td>编译器可以在保持程序语义的前提下，把不相关的算术或 load 提前，形成 ILP。</td></tr>
+    <tr><td>执行完成与返回</td><td>各执行 pipe 和内存层次</td><td>较晚发射的短延迟算术可能先于较早发射的 global load 完成。这是 out-of-order completion，不是 scheduler 越过被阻塞的下一条指令。</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Scoreboard 把静态指令序列与动态完成时间连接起来。固定延迟算术的 producer-consumer 距离可以由编译器调度信息表达；global load、shared-memory load 等操作的完成时间取决于运行时状态，consumer 会等待相应的 scoreboard dependency。依赖满足后，该 warp 重新成为 eligible。</p>
+
+<p>依赖未满足时，scheduler 通过切换 warp 寻找可发射工作，而不是越过同一 warp 当前被阻塞的 SASS 指令。这一点构成了它与 CPU 式动态乱序窗口的边界。Volta 及之后的 Independent Thread Scheduling 改变了 divergence、yield 和 reconvergence 的粒度，并未给每个 warp 增加一个搜索后续独立指令的乱序窗口。</p>
+
+<p>固定延迟和可变延迟需要不同的依赖表达方式。公开专利 <a href="https://patents.google.com/patent/US9612836B2/en" target="_blank" rel="noopener">US9612836B2</a> 给出了一种具体实现：coupled pipe 表示已知完成距离的执行路径，decoupled pipe 表示完成距离不确定、发射与写回之间可以存在 FIFO 的路径，texture unit 和 load/store unit 是后者的示例。该实现利用编译器标注的 producer-consumer 控制信息和硬件 scoreboard 状态检查处理可变完成时间。</p>
+
+<div class="note-box warn">
+  <p><strong>证据边界：</strong>coupled/decoupled 是这份专利实施例中的实现术语，不是所有量产 GPU 的公开分类。专利中的 scoreboard 数量、计数方式、FIFO 和 <code>DEPBAR</code> 算法不能外推到任意架构。公开文档支持 in-order issue、动态依赖和 NCU stall 分类，但没有披露当前 GPU 完整的 scheduler queue、仲裁逻辑或 scoreboard 物理结构。</p>
+</div>
+
+<h2 id="zh-example">2. 四条指令的发射过程</h2>
+
+<p>下面这段 SASS 序列把静态排布、动态依赖和跨 warp 调度放到同一个例子中。假定 <code>ptxas</code> 最终保留了所示顺序：</p>
+
+<pre class="code">I0: LDG  R8,  [R2]
+I1: IADD R10, R11, R12
+I2: FFMA R16, R8,  R20   // RAW dependency on I0
+I3: IADD R21, R22, R23   // independent of R8</pre>
+
+<p><code>I0</code> 发射后，global load 在 L1TEX 与更下层的内存通路中继续执行。<code>I1</code> 不读取 <code>R8</code>，因此可以随后发射。到达 <code>I2</code> 时，scoreboard 若仍显示 <code>R8</code> 对应的结果未返回，该 warp 会被归为 Long Scoreboard stall。</p>
+
+<p><code>I3</code> 虽然不依赖 <code>R8</code>，却位于被阻塞的 <code>I2</code> 后面。通常的 per-warp 顺序发射模型不会在运行时扫描更远的指令并让 <code>I3</code> 越过 <code>I2</code>。此时 scheduler 转而检查其他 resident warp。等 <code>I0</code> 的完成信号解除依赖，原 warp 才能发射 <code>I2</code>，然后到达 <code>I3</code>。</p>
+
+<div class="note-box">
+  <p><strong>编译器仍可能改变这段最终顺序。</strong>如果数据依赖、控制流、别名关系和内存语义都允许，<code>ptxas</code> 可以把 <code>I3</code> 排到 <code>I2</code> 前面，甚至把 <code>I0</code> 提得更早。应以目标架构的 SASS 为准，而不是假定 CUDA C++ 或 PTX 的文本顺序就是最终发射顺序。</p>
+</div>
+
+<p>固定这段 SASS 顺序后，运行时能够利用的独立工作来自 <code>I1</code> 和其他 resident warp。下面的时间线展示 scheduler 如何在 Warp A 等待 <code>I0</code> 时发射 Warp B、Warp C，而不改变 Warp A 内部的顺序。</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">一个 warp 等待 LDG 时，scheduler 通过其他 resident warp 填充 issue slot</div>
+  <svg class="diagram-svg" viewBox="0 0 1120 500" role="img" aria-labelledby="zh-issue-title zh-issue-desc">
+    <title id="zh-issue-title">多 warp 延迟隐藏时间线</title>
+    <desc id="zh-issue-desc">Warp A 发射 LDG 和独立 IADD 后在 FFMA 等待。scheduler 在等待期间发射 Warp B 和 Warp C 的指令，直到 Warp A 的数据返回。</desc>
+    <defs>
+      <marker id="zh-wait-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+        <path d="M0,0 L8,4 L0,8 Z" fill="#be185d"></path>
+      </marker>
+    </defs>
+    <text x="28" y="32" font-size="12" class="muted">每一列表示一个示意 issue cycle；实际 issue 宽度与架构有关</text>
+    <g font-size="12" class="mono">
+      <text x="236" y="68" text-anchor="middle">c0</text><text x="336" y="68" text-anchor="middle">c1</text>
+      <text x="436" y="68" text-anchor="middle">c2</text><text x="536" y="68" text-anchor="middle">c3</text>
+      <text x="636" y="68" text-anchor="middle">c4</text><text x="736" y="68" text-anchor="middle">c5</text>
+      <text x="836" y="68" text-anchor="middle">c6</text><text x="936" y="68" text-anchor="middle">c7</text>
+    </g>
+    <g class="grid">
+      <path d="M186 80V438 M286 80V438 M386 80V438 M486 80V438 M586 80V438 M686 80V438 M786 80V438 M886 80V438 M986 80V438"></path>
+      <path d="M186 80H986 M186 170H986 M186 260H986 M186 350H986 M186 438H986"></path>
+    </g>
+    <g font-size="15" font-weight="600">
+      <text x="28" y="125">Warp A</text><text x="28" y="215">Warp B</text>
+      <text x="28" y="305">Warp C</text><text x="28" y="395">Scheduler 发射</text>
+    </g>
+    <rect class="issue" x="196" y="96" width="80" height="54" rx="4"></rect><text class="mono" x="236" y="128" text-anchor="middle" font-size="12">I0 LDG</text>
+    <rect class="issue" x="296" y="96" width="80" height="54" rx="4"></rect><text class="mono" x="336" y="128" text-anchor="middle" font-size="12">I1 IADD</text>
+    <rect class="wait" x="396" y="96" width="380" height="54" rx="4"></rect><text x="586" y="120" text-anchor="middle" font-size="12">I2 等待 R8 · Long Scoreboard</text><text x="586" y="139" text-anchor="middle" class="muted" font-size="11">I3 不能在运行时越过 I2</text>
+    <rect class="issue" x="796" y="96" width="80" height="54" rx="4"></rect><text class="mono" x="836" y="128" text-anchor="middle" font-size="12">I2 FFMA</text>
+    <rect class="issue" x="896" y="96" width="80" height="54" rx="4"></rect><text class="mono" x="936" y="128" text-anchor="middle" font-size="12">I3 IADD</text>
+
+    <rect class="ready" x="196" y="186" width="180" height="54" rx="4"></rect><text x="286" y="218" text-anchor="middle" font-size="12">eligible</text>
+    <rect class="issue" x="396" y="186" width="80" height="54" rx="4"></rect><text class="mono" x="436" y="218" text-anchor="middle" font-size="12">B0</text>
+    <rect class="issue" x="596" y="186" width="80" height="54" rx="4"></rect><text class="mono" x="636" y="218" text-anchor="middle" font-size="12">B1</text>
+    <rect class="issue" x="696" y="186" width="80" height="54" rx="4"></rect><text class="mono" x="736" y="218" text-anchor="middle" font-size="12">B2</text>
+
+    <rect class="ready" x="196" y="276" width="280" height="54" rx="4"></rect><text x="336" y="308" text-anchor="middle" font-size="12">eligible</text>
+    <rect class="issue" x="496" y="276" width="80" height="54" rx="4"></rect><text class="mono" x="536" y="308" text-anchor="middle" font-size="12">C0</text>
+
+    <g font-size="12" class="mono">
+      <rect class="issue" x="196" y="366" width="80" height="54" rx="4"></rect><text x="236" y="398" text-anchor="middle">A:I0</text>
+      <rect class="issue" x="296" y="366" width="80" height="54" rx="4"></rect><text x="336" y="398" text-anchor="middle">A:I1</text>
+      <rect class="issue" x="396" y="366" width="80" height="54" rx="4"></rect><text x="436" y="398" text-anchor="middle">B:B0</text>
+      <rect class="issue" x="496" y="366" width="80" height="54" rx="4"></rect><text x="536" y="398" text-anchor="middle">C:C0</text>
+      <rect class="issue" x="596" y="366" width="80" height="54" rx="4"></rect><text x="636" y="398" text-anchor="middle">B:B1</text>
+      <rect class="issue" x="696" y="366" width="80" height="54" rx="4"></rect><text x="736" y="398" text-anchor="middle">B:B2</text>
+      <rect class="issue" x="796" y="366" width="80" height="54" rx="4"></rect><text x="836" y="398" text-anchor="middle">A:I2</text>
+      <rect class="issue" x="896" y="366" width="80" height="54" rx="4"></rect><text x="936" y="398" text-anchor="middle">A:I3</text>
+    </g>
+    <path class="arrow" d="M276 92 C390 48, 700 48, 826 91" marker-end="url(#zh-wait-arrow)"></path>
+    <text x="548" y="48" text-anchor="middle" fill="#be185d" font-size="12">LDG 返回并解除 dependency</text>
+  </svg>
+</div>
+
+<h2 id="zh-hiding">3. 减少 issue bubble 的四类机制</h2>
+
+<p>图中的 c2 至 c5 是 Warp A 的等待区间，Warp B 和 Warp C 的指令填入其中后，scheduler 仍能持续利用 issue slot。这种重叠就是 latency hiding；当所有候选 warp 都无法提供可发射指令时，等待才表现为 issue bubble。减少 bubble 的方法由此分为两类：前三项增加与等待重叠的可发射工作，第四项直接缩短 producer latency。</p>
+
+<ol>
+  <li><strong>更多 eligible warps：</strong>提高合理范围内的 occupancy，让 scheduler 在一个 warp 等待时还有其他 warp 可选。occupancy 只提供 resident warp 上限；寄存器、shared memory 和 block 装箱仍可能减少实际候选数。</li>
+  <li><strong>增加 ILP：</strong>展开循环、并行维护多个 accumulator，或让编译器把独立地址计算和算术放到 consumer 前面。ILP 会增加 live range，过度展开可能因寄存器压力降低 occupancy。</li>
+  <li><strong>预取与分阶段重叠：</strong>把 load 提前到消费位置之前，或使用双缓冲，使当前 tile 的计算与下一 tile 的搬运重叠。预取距离必须覆盖延迟，同时不能把队列和寄存器占满。</li>
+  <li><strong>降低 producer latency：</strong>改善 coalescing 与局部性、提高 cache hit rate、减少 shared-memory bank conflict，或把复用数据放入更近的存储层。这个方向减少等待本身，不属于延迟隐藏。</li>
+</ol>
+
+<p>这些机制分别作用于不同层级：<a href="gpu-occupancy-resource-limits.html">GPU Occupancy 的驻留资源模型与性能含义</a>解释 resident warp 的资源上限，<a href="gpu-scoreboard-dependency-mechanism.html">GPU Scoreboard 机制</a>展开动态依赖与 SASS 控制语义，<a href="gpu-warp-stall-nsight-compute.html">GPU Warp Stall 分析</a>则把依赖等待放回完整的 stall 分类和 Source/SASS 归因流程。</p>
+
+<h2 id="zh-ncu">4. Nsight Compute 的两组 stall 采样</h2>
+
+<p>延迟隐藏发生在 scheduler 层，因此需要同时观察“某个 warp 正在等待”和“该 scheduler 是否仍能发射其他工作”。<a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#warp-stall-reasons" target="_blank" rel="noopener">Nsight Compute 13.3 Metrics Reference</a> 用两组 source-level warp stall sampling 提供这两个视角：</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>NCU 视图</th><th>Long Scoreboard metric</th><th>采样条件</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Warp Stall Sampling (All Samples)</td><td><code>smsp__pcsamp_warps_issue_stalled_long_scoreboard</code></td><td>采样到 warp 正在等待 L1TEX scoreboard dependency 即计数，不要求 scheduler 在同一周期空发射。</td></tr>
+    <tr><td>Warp Stall Sampling (Not-issued Samples)</td><td><code>smsp__pcsamp_warps_issue_stalled_long_scoreboard_not_issued</code></td><td>只在该 warp scheduler 没有发射任何指令的周期计数；该组指标要求 compute capability 7.0 或更高。</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>普通 Long Scoreboard 样本可以与另一个 warp 的成功发射同时出现，它用于定位经常等待的程序位置。Not-issued 把观察限制在该 warp scheduler 没有发射指令的周期，因此更接近 issue bubble，但仍不能证明 Long Scoreboard 是唯一原因；同一时刻可能还有其他 warp 受 barrier、fetch 或 execution-pipe throttle 限制。</p>
+
+<div class="note-box warn">
+  <p><strong>推断边界：</strong>这些指标来自周期性统计采样，只覆盖被采样到的 warp 和周期。NCU UI 明确提示 All 和 Not-issued 可能在不同 profiling pass 采集，数值并不严格相关；不同视图中的原始 sample count 或归一化百分比都不能直接相除。两组视图用于建立“等待可能已被覆盖”或“等待可能与 issue bubble 重合”的诊断假设，完整归因还需要 Scheduler Statistics 和 SASS 证据。</p>
+</div>
+
+<p>在 Source 页面，可以切换 <strong>Warp Stall Sampling (All Samples)</strong> 和 <strong>Warp Stall Sampling (Not-issued Samples)</strong>，再按 source 或 SASS 行排序。Scoreboard 的 <strong>Attributed Stalls</strong> 会把 not-issued Long/Short 样本归因到 producer 行；实际停住的是 consumer，因此 producer 和当前高亮的 stalled instruction 可能不是同一行。</p>
+
+<h2 id="zh-cases">5. Long Scoreboard 的诊断假设</h2>
+
+<p>由于两组 sample count 不能直接换算，诊断应分别使用 All 与 Not-issued 视图内部的 hotspot 排名，由此建立两类待检验模式。Scheduler Statistics 再用 <code>smsp__issue_active</code>、eligible warps 和 skipped issue slots 判断等待是否暴露到发射吞吐；比较应来自同一 kernel 配置与稳定的重复采集。</p>
+
+<h3>5.1 假设 A：该 PC 在 All 视图靠前，未进入 Not-issued 热点</h3>
+
+<p>All 视图把该 PC 排在前列，说明采样经常在这里观察到等待；它没有进入 Not-issued 视图的主要热点，则提供“其他工作可能覆盖了等待”的候选解释。若 <code>smsp__issue_active</code> 保持较高、eligible warps 通常非零且 skipped issue slots 较少，TLP 或 ILP 覆盖等待的解释才得到加强。此时继续提高 occupancy 未必有收益，还可能降低 cache locality。</p>
+
+<h3>5.2 假设 B：同一 PC 在两个视图中均为热点</h3>
+
+<p>同一 PC 在两个视图中都进入热点集合，支持“Long Scoreboard 等待可能与 issue bubble 重合”的假设。只有 <code>smsp__issue_active</code> 偏低、eligible warps 不足且 skipped issue slots 明显时，访存延迟暴露到 issue 吞吐的判断才得到加强。随后再检查 ILP、occupancy、预取距离、coalescing 和 cache miss；若同时有 throttle 或 barrier，还要结合其 not-issued 热点和 pipe 利用率确定优先级。</p>
+
+<h2 id="zh-workflow">6. Issue bubble 的源码归因流程</h2>
+
+<p>上述两类模式只确定了候选 PC。要把 issue bubble 归因到具体机制，还需把 scheduler 统计、Source 采样、SASS 依赖和内存系统指标串成同一条证据链：</p>
+
+<ol>
+  <li>先看 Scheduler Statistics。Issue active 偏低、eligible warps 不足且 skipped issue slots 明显，共同表明 scheduler 缺少可发射工作。</li>
+  <li>在 Source 页面分别检查 All 与 Not-issued。All 用于定位频繁等待，Not-issued 用于提出与发射空洞重合的候选位置。</li>
+  <li>切换到 SASS，确认 stalled consumer、scoreboard producer 以及两者之间已有多少独立指令。不要只看 CUDA 源码行。</li>
+  <li>区分 latency、queue backpressure 和 bandwidth。Long Scoreboard 是完成依赖；<code>lg_throttle</code>/<code>tex_throttle</code> 是发射队列反压；DRAM 接近峰值才支持带宽瓶颈判断。</li>
+  <li>一次只改变一个因素，例如预取距离、unroll、block size 或数据布局，并重新核对寄存器数、occupancy、cache hit rate 和 kernel time。</li>
+</ol>
+
+<h2 id="zh-refs">参考资料</h2>
+
+<ul>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.2.0/pdf/CUDA_C_Programming_Guide.pdf" target="_blank" rel="noopener">NVIDIA CUDA Programming Guide 13.2：SIMT Execution Model 与 Hardware Multithreading</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/03-advanced/advanced-kernel-programming.html#hardware-multithreading" target="_blank" rel="noopener">CUDA Programming Guide 13.2：Hardware Multithreading</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#warp-stall-reasons" target="_blank" rel="noopener">Nsight Compute 13.3 Profiling Guide：Warp Stall Reasons</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#warp-stall-reasons-not-issued" target="_blank" rel="noopener">Nsight Compute 13.3 Profiling Guide：Warp Stall Reasons (Not Issued)</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/NsightCompute/index.html#source-page" target="_blank" rel="noopener">Nsight Compute 13.3 User Guide：Source Page</a></li>
+  <li><a href="https://patents.google.com/patent/US9612836B2/en" target="_blank" rel="noopener">US9612836B2：System, method, and computer program product for implementing software-based scoreboarding</a></li>
+  <li><a href="https://forums.developer.nvidia.com/t/do-consecutive-ld-global-instructions-have-an-order/302611/2" target="_blank" rel="noopener">NVIDIA Developer Forums：单 warp 顺序发射与连续 global load</a></li>
+  <li><a href="https://forums.developer.nvidia.com/t/ptx-instructions-are-reordered/197973/2" target="_blank" rel="noopener">NVIDIA Developer Forums：ptxas 静态指令调度</a></li>
+</ul>
+
+</div>
+
+<div class="lang-en">
+
+<h1>NVIDIA GPU Instruction Issue and Latency Hiding</h1>
+
+<p class="lead">After a CUDA kernel is compiled to SASS, each warp advances through the instruction sequence on its current control-flow path. At every issue opportunity, the warp scheduler selects among eligible warps whose next instruction is ready and sends the chosen instruction toward the corresponding execution pipe or memory path. When a warp reaches a consumer whose dependency is still outstanding, the scoreboard temporarily removes that warp from the eligible set, while other resident warps may continue issuing. The wait becomes an issue bubble only when no candidate warp can fill the issue slot. Per-warp instruction order, compiler-scheduled independent work, cross-warp scheduling, and dynamic dependency checks together determine whether latency is covered.</p>
+
+<h2 id="en-order">1. Issue order, completion order, and warp scheduling</h2>
+
+<p>Issue order, completion order, and warp scheduling belong to different layers of GPU execution. The CUDA Programming Guide describes SMs as issuing instructions in order and explains that GPUs do not rely on branch prediction or speculative execution. From the scheduler perspective used here, each warp supplies the next SASS instruction on its current execution path, while the scheduler interleaves multiple warps resident on the same SM.</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Level</th><th>Who determines order</th><th>Runtime behavior</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>SASS within one warp</td><td><code>ptxas</code> emits the final sequence</td><td>The scheduler checks the warp's next instruction. If it is blocked by a dependency or resource, later instructions do not dynamically pass it.</td></tr>
+    <tr><td>Resident warps</td><td>Hardware warp scheduler</td><td>At each instruction issue cycle, the scheduler selects one eligible warp and issues one or more instructions as the architecture permits. Instructions from different warps are interleaved.</td></tr>
+    <tr><td>Independent work in one warp</td><td>Static compiler scheduling</td><td>The compiler may move independent arithmetic or loads earlier while preserving program semantics, exposing ILP.</td></tr>
+    <tr><td>Execution completion</td><td>Execution pipes and the memory hierarchy</td><td>A later short-latency arithmetic instruction may finish before an earlier global load. This is out-of-order completion, not dynamic issue past a blocked next instruction.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>The scoreboard connects the static instruction stream to dynamic completion time. Fixed-latency producer-consumer spacing can be represented in compiler scheduling controls. Completion of global and shared-memory loads depends on runtime conditions, so a consumer waits for the relevant scoreboard dependency. Once the dependency clears, the warp becomes eligible again.</p>
+
+<p>When a dependency is outstanding, the scheduler finds issuable work by switching warps rather than bypassing the blocked SASS instruction in the same warp. This behavior sets the boundary with a CPU-style dynamic out-of-order window. Independent Thread Scheduling since Volta changes the granularity of divergence, yielding, and reconvergence, but does not give each warp a window that searches later instructions for independent work.</p>
+
+<p>Fixed and variable latency require different dependency representations. Public patent <a href="https://patents.google.com/patent/US9612836B2/en" target="_blank" rel="noopener">US9612836B2</a> gives one concrete implementation: a coupled pipe has a known completion distance, whereas a decoupled pipe has an unknown completion distance and may include a FIFO between dispatch and execution. Texture and load/store units are examples of the latter. The embodiment handles variable completion time with compiler-marked producer-consumer controls and hardware scoreboard-state checks.</p>
+
+<div class="note-box warn">
+  <p><strong>Evidence boundary:</strong> coupled and decoupled are implementation terms from this patent embodiment, not a published classification for every shipping GPU. Its scoreboard count, counter behavior, FIFOs, and <code>DEPBAR</code> algorithm cannot be projected onto arbitrary architectures. Public documentation supports in-order issue, dynamic dependencies, and NCU stall categories, but does not disclose the complete scheduler queues, arbitration policy, or physical scoreboard implementation of current GPUs.</p>
+</div>
+
+<h2 id="en-example">2. Issue behavior of four instructions</h2>
+
+<p>The following SASS sequence places static layout, dynamic dependencies, and cross-warp scheduling in one example. Assume that <code>ptxas</code> preserves the shown order in the final binary:</p>
+
+<pre class="code">I0: LDG  R8,  [R2]
+I1: IADD R10, R11, R12
+I2: FFMA R16, R8,  R20   // RAW dependency on I0
+I3: IADD R21, R22, R23   // independent of R8</pre>
+
+<p>After <code>I0</code> issues, the global load continues through L1TEX and possibly lower levels of the memory hierarchy. <code>I1</code> does not read <code>R8</code>, so it can issue next. When the warp reaches <code>I2</code>, a pending result for <code>R8</code> makes the warp report a Long Scoreboard stall.</p>
+
+<p>Although <code>I3</code> is independent of <code>R8</code>, it appears after the blocked <code>I2</code>. The usual per-warp in-order issue model does not scan farther ahead and dynamically issue <code>I3</code> first. The scheduler checks other resident warps instead. When completion of <code>I0</code> clears the dependency, the original warp can issue <code>I2</code> and then reach <code>I3</code>.</p>
+
+<div class="note-box">
+  <p><strong>The compiler may still change the final order.</strong> If data dependencies, control flow, aliasing, and memory semantics permit, <code>ptxas</code> can place <code>I3</code> before <code>I2</code> or move <code>I0</code> earlier. Inspect SASS for the target architecture rather than assuming that CUDA C++ or PTX text order is the issue order.</p>
+</div>
+
+<p>With this SASS order fixed, the independent work available at runtime comes from <code>I1</code> and other resident warps. The timeline below shows the scheduler issuing work from Warps B and C while Warp A waits for <code>I0</code>, without changing Warp A's internal order.</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">Other resident warps fill issue slots while one warp waits for an LDG dependency</div>
+  <svg class="diagram-svg" viewBox="0 0 1120 500" role="img" aria-labelledby="en-issue-title en-issue-desc">
+    <title id="en-issue-title">Multi-warp latency-hiding timeline</title>
+    <desc id="en-issue-desc">Warp A issues an LDG and an independent IADD, then waits at the dependent FFMA. The scheduler issues work from Warps B and C until Warp A's data returns.</desc>
+    <defs>
+      <marker id="en-wait-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+        <path d="M0,0 L8,4 L0,8 Z" fill="#be185d"></path>
+      </marker>
+    </defs>
+    <text x="28" y="32" font-size="12" class="muted">Each column is a schematic issue cycle; actual issue width is architecture-dependent</text>
+    <g font-size="12" class="mono">
+      <text x="236" y="68" text-anchor="middle">c0</text><text x="336" y="68" text-anchor="middle">c1</text>
+      <text x="436" y="68" text-anchor="middle">c2</text><text x="536" y="68" text-anchor="middle">c3</text>
+      <text x="636" y="68" text-anchor="middle">c4</text><text x="736" y="68" text-anchor="middle">c5</text>
+      <text x="836" y="68" text-anchor="middle">c6</text><text x="936" y="68" text-anchor="middle">c7</text>
+    </g>
+    <g class="grid">
+      <path d="M186 80V438 M286 80V438 M386 80V438 M486 80V438 M586 80V438 M686 80V438 M786 80V438 M886 80V438 M986 80V438"></path>
+      <path d="M186 80H986 M186 170H986 M186 260H986 M186 350H986 M186 438H986"></path>
+    </g>
+    <g font-size="15" font-weight="600">
+      <text x="28" y="125">Warp A</text><text x="28" y="215">Warp B</text>
+      <text x="28" y="305">Warp C</text><text x="28" y="395">Scheduler issue</text>
+    </g>
+    <rect class="issue" x="196" y="96" width="80" height="54" rx="4"></rect><text class="mono" x="236" y="128" text-anchor="middle" font-size="12">I0 LDG</text>
+    <rect class="issue" x="296" y="96" width="80" height="54" rx="4"></rect><text class="mono" x="336" y="128" text-anchor="middle" font-size="12">I1 IADD</text>
+    <rect class="wait" x="396" y="96" width="380" height="54" rx="4"></rect><text x="586" y="120" text-anchor="middle" font-size="12">I2 waits for R8 · Long Scoreboard</text><text x="586" y="139" text-anchor="middle" class="muted" font-size="11">I3 cannot dynamically pass I2</text>
+    <rect class="issue" x="796" y="96" width="80" height="54" rx="4"></rect><text class="mono" x="836" y="128" text-anchor="middle" font-size="12">I2 FFMA</text>
+    <rect class="issue" x="896" y="96" width="80" height="54" rx="4"></rect><text class="mono" x="936" y="128" text-anchor="middle" font-size="12">I3 IADD</text>
+
+    <rect class="ready" x="196" y="186" width="180" height="54" rx="4"></rect><text x="286" y="218" text-anchor="middle" font-size="12">eligible</text>
+    <rect class="issue" x="396" y="186" width="80" height="54" rx="4"></rect><text class="mono" x="436" y="218" text-anchor="middle" font-size="12">B0</text>
+    <rect class="issue" x="596" y="186" width="80" height="54" rx="4"></rect><text class="mono" x="636" y="218" text-anchor="middle" font-size="12">B1</text>
+    <rect class="issue" x="696" y="186" width="80" height="54" rx="4"></rect><text class="mono" x="736" y="218" text-anchor="middle" font-size="12">B2</text>
+
+    <rect class="ready" x="196" y="276" width="280" height="54" rx="4"></rect><text x="336" y="308" text-anchor="middle" font-size="12">eligible</text>
+    <rect class="issue" x="496" y="276" width="80" height="54" rx="4"></rect><text class="mono" x="536" y="308" text-anchor="middle" font-size="12">C0</text>
+
+    <g font-size="12" class="mono">
+      <rect class="issue" x="196" y="366" width="80" height="54" rx="4"></rect><text x="236" y="398" text-anchor="middle">A:I0</text>
+      <rect class="issue" x="296" y="366" width="80" height="54" rx="4"></rect><text x="336" y="398" text-anchor="middle">A:I1</text>
+      <rect class="issue" x="396" y="366" width="80" height="54" rx="4"></rect><text x="436" y="398" text-anchor="middle">B:B0</text>
+      <rect class="issue" x="496" y="366" width="80" height="54" rx="4"></rect><text x="536" y="398" text-anchor="middle">C:C0</text>
+      <rect class="issue" x="596" y="366" width="80" height="54" rx="4"></rect><text x="636" y="398" text-anchor="middle">B:B1</text>
+      <rect class="issue" x="696" y="366" width="80" height="54" rx="4"></rect><text x="736" y="398" text-anchor="middle">B:B2</text>
+      <rect class="issue" x="796" y="366" width="80" height="54" rx="4"></rect><text x="836" y="398" text-anchor="middle">A:I2</text>
+      <rect class="issue" x="896" y="366" width="80" height="54" rx="4"></rect><text x="936" y="398" text-anchor="middle">A:I3</text>
+    </g>
+    <path class="arrow" d="M276 92 C390 48, 700 48, 826 91" marker-end="url(#en-wait-arrow)"></path>
+    <text x="548" y="48" text-anchor="middle" fill="#be185d" font-size="12">LDG returns and clears the dependency</text>
+  </svg>
+</div>
+
+<h2 id="en-hiding">3. Four mechanisms that reduce issue bubbles</h2>
+
+<p>Cycles c2 through c5 in the diagram are Warp A's wait interval. Instructions from Warps B and C fill that interval, allowing the scheduler to keep using issue slots. This overlap is latency hiding; the wait becomes an issue bubble when every candidate warp lacks an issuable instruction. The mechanisms below therefore fall into two groups: the first three add work that can overlap the wait, while the fourth directly shortens producer latency.</p>
+
+<ol>
+  <li><strong>More eligible warps:</strong> raise occupancy within a useful range so the scheduler has alternatives while one warp waits. Occupancy supplies only a residency ceiling; registers, shared memory, and block packing determine the actual candidates.</li>
+  <li><strong>More ILP:</strong> unroll loops, keep independent accumulators, or let the compiler place address calculations and arithmetic before a consumer. ILP extends live ranges, so excessive unrolling can lower occupancy through register pressure.</li>
+  <li><strong>Prefetching and staged overlap:</strong> move loads ahead of consumption or use double buffering to overlap computation on one tile with movement of the next. Prefetch distance must cover latency without exhausting registers or queues.</li>
+  <li><strong>Lower producer latency:</strong> improve coalescing and locality, raise cache hit rates, reduce shared-memory bank conflicts, or place reused data in a nearer storage level. This reduces the wait itself and is latency reduction rather than latency hiding.</li>
+</ol>
+
+<p>These mechanisms act at different levels. <a href="gpu-occupancy-resource-limits.html">GPU Occupancy: Residency Resource Model and Performance Interpretation</a> derives resident-warp limits, <a href="gpu-scoreboard-dependency-mechanism.html">GPU Scoreboard Mechanism</a> covers dynamic dependencies and SASS control semantics, and <a href="gpu-warp-stall-nsight-compute.html">GPU Warp Stall Analysis</a> places dependency waits in the full stall taxonomy and Source/SASS attribution workflow.</p>
+
+<h2 id="en-ncu">4. Two Nsight Compute stall-sampling groups</h2>
+
+<p>Latency hiding occurs at the scheduler level, so measurement must capture both a warp's wait and whether its scheduler can still issue other work. The <a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#warp-stall-reasons" target="_blank" rel="noopener">Nsight Compute 13.3 Metrics Reference</a> provides those perspectives through two source-level warp-stall sampling groups:</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>NCU view</th><th>Long Scoreboard metric</th><th>Sampling condition</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Warp Stall Sampling (All Samples)</td><td><code>smsp__pcsamp_warps_issue_stalled_long_scoreboard</code></td><td>Counts a sampled warp waiting on an L1TEX scoreboard dependency regardless of whether the scheduler issued another instruction in that cycle.</td></tr>
+    <tr><td>Warp Stall Sampling (Not-issued Samples)</td><td><code>smsp__pcsamp_warps_issue_stalled_long_scoreboard_not_issued</code></td><td>Counts only cycles in which that warp scheduler issued no instruction. This metric group requires compute capability 7.0 or later.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>A regular Long Scoreboard sample can coexist with a successful issue from another warp and is useful for locating program positions that wait frequently. Not-issued restricts observations to cycles where that warp scheduler issued nothing, so it is closer to an issue bubble. It still does not prove that Long Scoreboard was the only cause: other resident warps may simultaneously be blocked by barriers, fetch, or execution-pipe throttling.</p>
+
+<div class="note-box warn">
+  <p><strong>Inference boundary:</strong> these metrics come from periodic statistical sampling and cover only the sampled warps and cycles. The NCU UI warns that All and Not-issued data can be collected in different profiling passes, so their values do not strictly correlate. Neither raw sample counts nor normalized percentages from the two views can be divided directly. The views establish hypotheses that a wait may be covered or may coincide with an issue bubble; complete attribution also requires Scheduler Statistics and SASS evidence.</p>
+</div>
+
+<p>In the Source page, switch between <strong>Warp Stall Sampling (All Samples)</strong> and <strong>Warp Stall Sampling (Not-issued Samples)</strong>, then rank source or SASS rows. Scoreboard <strong>Attributed Stalls</strong> assigns not-issued Long/Short samples to the producer location. The blocked instruction is the consumer, so the attributed producer and the currently stalled instruction can be different rows.</p>
+
+<h2 id="en-cases">5. Long Scoreboard diagnostic hypotheses</h2>
+
+<p>Because sample counts from the two groups cannot be converted directly, diagnosis should rank hotspots within the All and Not-issued views separately. Those rankings produce two testable patterns. Scheduler Statistics then uses <code>smsp__issue_active</code>, eligible warps, and skipped issue slots to determine whether the wait is exposed to issue throughput. Comparisons should use stable repeated collections of the same kernel configuration.</p>
+
+<h3>5.1 Hypothesis A: the PC ranks highly in All but not among Not-issued hotspots</h3>
+
+<p>A high rank in the All view shows that sampling often observes a wait at this PC. Its absence from the main Not-issued hotspots suggests that other work may cover the wait. The TLP or ILP explanation becomes stronger when <code>smsp__issue_active</code> remains high, eligible warps are usually nonzero, and skipped issue slots remain low. Raising occupancy further may then provide little benefit and can reduce cache locality.</p>
+
+<h3>5.2 Hypothesis B: the same PC is a hotspot in both views</h3>
+
+<p>When the same PC enters the hotspot set in both views, Long Scoreboard waits may coincide with issue bubbles. The exposed-latency interpretation becomes stronger only when <code>smsp__issue_active</code> is low, eligible warps are scarce, and skipped issue slots are substantial. Then inspect ILP, occupancy, prefetch distance, coalescing, and cache misses. Concurrent throttle or barrier hotspots and execution-pipe utilization still determine whether Long Scoreboard is the leading cause.</p>
+
+<h2 id="en-workflow">6. Issue-bubble attribution workflow</h2>
+
+<p>The two patterns above identify candidate PCs. Attributing an issue bubble to a concrete mechanism requires scheduler statistics, Source sampling, SASS dependencies, and memory-system metrics to form one evidence chain:</p>
+
+<ol>
+  <li>Start with Scheduler Statistics. Low issue active, scarce eligible warps, and substantial skipped issue slots together show that the scheduler lacks issuable work.</li>
+  <li>Inspect All and Not-issued separately in the Source page. All locates frequent waits; Not-issued proposes candidate locations that coincide with issue gaps.</li>
+  <li>Move to SASS and identify the stalled consumer, its scoreboard producer, and the independent instructions already placed between them. Do not rely only on CUDA source lines.</li>
+  <li>Separate latency, queue backpressure, and bandwidth. Long Scoreboard is a completion dependency; <code>lg_throttle</code>/<code>tex_throttle</code> indicate issue-queue backpressure; near-peak DRAM traffic supports a bandwidth diagnosis.</li>
+  <li>Change one factor at a time, such as prefetch distance, unrolling, block size, or layout, then recheck registers, occupancy, cache hit rate, and kernel time.</li>
+</ol>
+
+<h2 id="en-refs">References</h2>
+
+<ul>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.2.0/pdf/CUDA_C_Programming_Guide.pdf" target="_blank" rel="noopener">NVIDIA CUDA Programming Guide 13.2: SIMT Execution Model and Hardware Multithreading</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/03-advanced/advanced-kernel-programming.html#hardware-multithreading" target="_blank" rel="noopener">CUDA Programming Guide 13.2: Hardware Multithreading</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#warp-stall-reasons" target="_blank" rel="noopener">Nsight Compute 13.3 Profiling Guide: Warp Stall Reasons</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#warp-stall-reasons-not-issued" target="_blank" rel="noopener">Nsight Compute 13.3 Profiling Guide: Warp Stall Reasons (Not Issued)</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/NsightCompute/index.html#source-page" target="_blank" rel="noopener">Nsight Compute 13.3 User Guide: Source Page</a></li>
+  <li><a href="https://patents.google.com/patent/US9612836B2/en" target="_blank" rel="noopener">US9612836B2: System, method, and computer program product for implementing software-based scoreboarding</a></li>
+  <li><a href="https://forums.developer.nvidia.com/t/do-consecutive-ld-global-instructions-have-an-order/302611/2" target="_blank" rel="noopener">NVIDIA Developer Forums: in-order warp issue and consecutive global loads</a></li>
+  <li><a href="https://forums.developer.nvidia.com/t/ptx-instructions-are-reordered/197973/2" target="_blank" rel="noopener">NVIDIA Developer Forums: static instruction scheduling by ptxas</a></li>
+</ul>
+
+</div>
+
+</main>
+</div>
+</body>
+</html>

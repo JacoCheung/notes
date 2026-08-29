@@ -88,6 +88,7 @@
     language.title = lang === 'en' ? 'Switch to Chinese' : '切换为英文';
     setThemeLabel(theme);
     updatePostMeta();
+    renderSeriesNavigation();
   }
 
   function createNavigation() {
@@ -140,8 +141,85 @@
 
   function moveTocIntoReadingOrder(main, header) {
     if (!header || header.parentElement !== main) return;
-    const toc = document.querySelector('.layout > aside.toc, body > nav.toc, .layout > nav.toc');
+    const toc = document.querySelector(
+      '.layout > aside.toc, body > nav.toc, .layout > nav.toc, body > #toc, .layout > #toc'
+    );
     if (toc && toc.parentElement !== main) header.insertAdjacentElement('afterend', toc);
+  }
+
+  let seriesNavigation = null;
+  let seriesPosts = [];
+
+  function renderSeriesNavigation() {
+    if (!seriesNavigation || !seriesPosts.length) return;
+
+    const title = seriesNavigation.querySelector('.post-series-title');
+    const list = seriesNavigation.querySelector('.post-series-list');
+    const currentSlug = meta('slug');
+    const seriesTitle = lang === 'en'
+      ? (meta('series_title_en') || meta('series_title'))
+      : meta('series_title');
+
+    seriesNavigation.setAttribute('aria-label', lang === 'en' ? 'Posts in this series' : '同系列文章');
+    title.textContent = seriesTitle;
+    list.replaceChildren();
+
+    seriesPosts.forEach((post, index) => {
+      const item = document.createElement('li');
+      const order = document.createElement('span');
+      const postTitle = lang === 'en' ? (post.title_en || post.title) : post.title;
+      const isCurrent = post.slug === currentSlug;
+
+      item.className = isCurrent ? 'current' : '';
+      order.className = 'post-series-order';
+      order.textContent = String(index + 1).padStart(2, '0');
+      item.appendChild(order);
+
+      if (isCurrent) {
+        const current = document.createElement('span');
+        current.className = 'post-series-current';
+        current.textContent = postTitle;
+        current.title = postTitle;
+        current.setAttribute('aria-current', 'page');
+        item.appendChild(current);
+      } else {
+        const link = document.createElement('a');
+        link.href = `${post.slug}.html`;
+        link.textContent = postTitle;
+        link.title = postTitle;
+        item.appendChild(link);
+      }
+
+      list.appendChild(item);
+    });
+  }
+
+  async function createSeriesNavigation() {
+    const series = meta('series');
+    const toc = document.querySelector('aside.toc, nav.toc, #toc');
+    if (!series || !toc) return;
+
+    try {
+      const response = await fetch(new URL('../posts.json', window.location.href));
+      if (!response.ok) return;
+      const posts = await response.json();
+      seriesPosts = posts
+        .filter(post => post.series === series)
+        .sort((left, right) => {
+          const order = (left.series_order || 0) - (right.series_order || 0);
+          return order || left.date.localeCompare(right.date) || left.title.localeCompare(right.title);
+        });
+      if (!seriesPosts.length) return;
+
+      seriesNavigation = document.createElement('section');
+      seriesNavigation.className = 'post-series-nav';
+      seriesNavigation.setAttribute('aria-label', lang === 'en' ? 'Posts in this series' : '同系列文章');
+      seriesNavigation.innerHTML = `
+        <div class="post-series-title"></div>
+        <ol class="post-series-list"></ol>`;
+      toc.appendChild(seriesNavigation);
+      renderSeriesNavigation();
+    } catch (_) {}
   }
 
   function addHeadingAnchors(main) {
@@ -216,6 +294,7 @@
       moveTocIntoReadingOrder(main, header);
       addHeadingAnchors(main);
     }
+    createSeriesNavigation();
     attachTocTracking();
     createBackToTop();
   }

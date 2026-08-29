@@ -3,17 +3,17 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>用 AOTI 把 PyTorch 模型部署到 CUDA C++ runtime</title>
-<meta name="post:title"           content="用 AOTI 把 PyTorch 模型部署到 CUDA C++ runtime">
-<meta name="post:title_en"        content="Deploying a PyTorch Model to a CUDA C++ Runtime via AOT Inductor">
+<title>PyTorch AOTInductor 的 CUDA C++ 部署与运行时机制</title>
+<meta name="post:title"           content="PyTorch AOTInductor 的 CUDA C++ 部署与运行时机制">
+<meta name="post:title_en"        content="CUDA C++ Deployment and Runtime Mechanics of PyTorch AOTInductor">
 <meta name="post:slug"            content="aoti-cuda-deployment">
 <meta name="post:date"            content="2026-06-03">
 <meta name="post:tags"            content="PyTorch, AOTInductor, 部署, CUDA">
 <meta name="post:tags_en"         content="PyTorch, AOT Inductor, Deployment, CUDA">
 <meta name="post:reading"         content="35 分钟">
 <meta name="post:reading_en"      content="35 min">
-<meta name="post:summary"         content="纯 PyTorch 工具链把模型部署成 CUDA C++ 可加载 .pt2 包的完整流程:torch.export → torch._inductor.aoti_compile_and_package → C++ AOTIModelPackageLoader。 用一个同时含 native op(Linear / GELU)与 custom op(torch.library.custom_op)的玩具模型走通,每个阶段深入 torch 内部源码与对应 libtorch_*.so 路径。">
-<meta name="post:summary_en"      content="An end-to-end walkthrough of deploying a PyTorch model to a CUDA C++ runtime using only the PyTorch toolchain: torch.export → torch._inductor.aoti_compile_and_package → C++ AOTIModelPackageLoader. Worked through a toy model that mixes native ops (Linear, GELU) and a custom op (torch.library.custom_op), with each phase tracing into the relevant PyTorch source files and libtorch_*.so libraries.">
+<meta name="post:summary"         content="AOTInductor 离线完成模型捕获、lowering、GPU kernel 生成与 .pt2 打包，再由匹配版本的 libtorch C++ loader 执行。PyTorch v2.12.0 的调用链界定 archive、runner 和 custom op 的双阶段契约；文件名、ELF 依赖及生成符号不属于稳定 ABI。">
+<meta name="post:summary_en"      content="AOTInductor moves model capture, lowering, GPU-kernel generation, and packaging into an offline stage, leaving deployment to execute a .pt2 artifact through a matching libtorch C++ loader. The PyTorch v2.12.0 call path defines the compile-time and runtime contracts for archives, runners, and custom operators, while internal file names, ELF dependencies, and generated symbols remain version-dependent rather than stable ABI.">
 <meta name="post:series"          content="pytorch-guide">
 <meta name="post:series_title"    content="PyTorch 实践指南">
 <meta name="post:series_title_en" content="PyTorch Guide">
@@ -48,7 +48,7 @@
     <div class="toc-title">目录 · TOC</div>
     <div class="lang-zh">
     <ul>
-      <li><a href="#zh-1">1. 为什么需要 AOTI</a></li>
+      <li><a href="#zh-1">1. AOTI 的部署边界</a></li>
       <li><a href="#zh-2">2. 端到端流程</a></li>
       <li><a href="#zh-3">3. 例子模型</a></li>
       <li><a href="#zh-4">4. 阶段 1:torch.export</a></li>
@@ -57,13 +57,13 @@
       <li><a href="#zh-7">7. 阶段 4:打包成 .pt2</a></li>
       <li><a href="#zh-8">8. 阶段 5:C++ runtime 加载</a></li>
       <li><a href="#zh-9">9. Custom op 的处理细节</a></li>
-      <li><a href="#zh-10">10. 坑与边界</a></li>
+      <li><a href="#zh-10">10. 部署约束与版本边界</a></li>
       <li><a href="#zh-refs">参考资料</a></li>
     </ul>
     </div>
     <div class="lang-en">
     <ul>
-      <li><a href="#en-1">1. Why AOTI</a></li>
+      <li><a href="#en-1">1. AOTI's Deployment Boundary</a></li>
       <li><a href="#en-2">2. End-to-end flow</a></li>
       <li><a href="#en-3">3. The example model</a></li>
       <li><a href="#en-4">4. Phase 1: torch.export</a></li>
@@ -72,7 +72,7 @@
       <li><a href="#en-7">7. Phase 4: .pt2 packaging</a></li>
       <li><a href="#en-8">8. Phase 5: C++ runtime</a></li>
       <li><a href="#en-9">9. Custom op handling</a></li>
-      <li><a href="#en-10">10. Pitfalls</a></li>
+      <li><a href="#en-10">10. Deployment Constraints and Version Boundaries</a></li>
       <li><a href="#en-refs">References</a></li>
     </ul>
     </div>
@@ -83,24 +83,28 @@
 <!-- ============================= 中文版 ============================= -->
 <div class="lang-zh">
 
-<h1>用 AOTI 把 PyTorch 模型部署到 CUDA C++ runtime</h1>
+<h1>PyTorch AOTInductor 的 CUDA C++ 部署与运行时机制</h1>
 
-<h2 id="zh-1">1. 为什么需要 AOTI</h2>
+<p class="lead">PyTorch 模型从开发环境进入 C++ 服务时，编译时工作、模型资产和运行时依赖必须重新划分。AOTInductor 把模型捕获、Inductor lowering、GPU kernel 生成和打包放到离线阶段，再由 C++ loader 装载产物并执行。这个边界决定了 <code>.pt2</code> 的内容、运行进程所需的 libtorch 组件，以及 custom op 在编译期和运行期必须分别提供的契约。</p>
 
-<p>生产环境部署 PyTorch 模型常见的三个痛点:</p>
+<p class="small">本文的 API、文件路径与运行时调用链按公开的 <a href="https://github.com/pytorch/pytorch/tree/v2.12.0">PyTorch <code>v2.12.0</code> 源码</a>和 <a href="https://docs.pytorch.org/docs/2.12/user_guide/torch_compiler/torch.compiler_aot_inductor.html">2.12 AOTInductor 文档</a>核对。<code>torch._inductor</code>、<code>.pt2</code> 包内容和生成符号都可能随版本或编译配置变化;文中的伪代码与流程图是源码阅读模型,不是稳定 ABI 或固定文件清单。</p>
+
+<h2 id="zh-1">1. AOTI 的部署边界</h2>
+
+<p>AOTI 面向具有以下约束的部署环境：</p>
 
 <ul>
-  <li><strong>不想带 Python runtime</strong>:推理服务、模拟器、嵌入式环境往往只允许 C++/Rust binary,带 CPython + 整个 PyTorch wheel 既臃肿又增加依赖面。</li>
-  <li><strong>不想要 JIT 编译开销</strong>:<code>torch.compile</code> 第一次跑会做 dynamo trace + Inductor codegen + Triton 编 cubin,延迟几秒到几十秒。 生产场景要冷启动友好。</li>
-  <li><strong>不想绕 TorchScript / ONNX 中转</strong>:TorchScript 早就停更,ONNX 需要双工具链对齐,custom op 难落地。 想要一条"纯 PyTorch"的部署路径。</li>
+  <li><strong>C++ 运行进程：</strong>推理服务、模拟器或嵌入式环境以 C++ binary 作为入口，并希望从运行路径中移除 CPython。</li>
+  <li><strong>离线编译：</strong><code>torch.compile</code> 首次执行涉及 Dynamo 捕获、Inductor codegen 与 GPU binary 编译；部署构建需要提前承担这部分成本。</li>
+  <li><strong>保留 PyTorch 编译语义：</strong><a href="https://docs.pytorch.org/docs/2.12/jit.html">PyTorch 2.12 文档</a>已将 TorchScript 标记为 deprecated，ONNX 也要求导出端与运行端共同支持相同的算子语义。AOTI 延续 <code>torch.export</code> 与 Inductor 的编译路径。</li>
 </ul>
 
-<p><strong>AOT Inductor(AOTI)</strong> 是 PyTorch 2.4+ 对应的方案:</p>
+<p><strong>AOTInductor（AOTI）</strong> 是把 <code>ExportedProgram</code> 编译为 PT2 archive，并由 libtorch C++ loader 执行该 archive 的部署路径。在本文固定的 PyTorch 2.12 版本中，这条路径分为：</p>
 
 <ul>
-  <li>在 Python 端 <strong>一次性</strong> 把 <code>torch.export</code> 出来的图喂给 Inductor,提前完成所有 codegen(包括 Triton kernel → cubin)和链接</li>
-  <li>产物是一个 <strong>独立的 <code>.pt2</code> 包</strong>(本质是 zip),里头打包了模型权重、glue C++ 编出的 <code>.so</code>、每个 Triton kernel 的 cubin、元数据</li>
-  <li>C++ 端只链 <code>libtorch_cpu.so</code> + <code>libtorch_cuda.so</code>,用 <code>torch::inductor::AOTIModelPackageLoader</code> 加载 <code>.pt2</code> 跑推理 —— <strong>不需要 Python interpreter</strong></li>
+  <li>Python 构建端把 <code>torch.export</code> 得到的图交给 Inductor，完成目标配置所需的 codegen、编译与打包。</li>
+  <li>构建产物是 <strong><code>.pt2</code> archive</strong>。具体成员随配置变化，可包含模型库、C++/object 产物、Triton cubin、权重、常量和 ProxyExecutor 元数据。</li>
+  <li>C++ 端链接与构建端版本匹配的 libtorch，并用 <code>torch::inductor::AOTIModelPackageLoader</code> 加载 archive。官方示例通过 <code>${TORCH_LIBRARIES}</code> 链接，执行路径不依赖 Python interpreter 或 <code>libtorch_python</code>。</li>
 </ul>
 
 <h2 id="zh-2">2. 端到端流程</h2>
@@ -128,16 +132,16 @@
 
   <rect class="flow-box artifact" x="680" y="30"  width="180" height="60"/>
   <text x="770" y="55" text-anchor="middle" font-size="12" font-weight="600">model.pt2</text>
-  <text x="770" y="74" text-anchor="middle" font-size="11" fill="var(--fg-muted)">zip: .so + cubins + weights</text>
+  <text x="770" y="74" text-anchor="middle" font-size="11" fill="var(--fg-muted)">编译产物、模型资产与元数据</text>
 
   <!-- bottom row: C++ runtime -->
   <rect class="flow-box runtime" x="240" y="200" width="180" height="60"/>
   <text x="330" y="225" text-anchor="middle" font-size="12" font-weight="600">AOTIModelPackageLoader</text>
-  <text x="330" y="244" text-anchor="middle" font-size="11" fill="var(--fg-muted)">C++ from libtorch_*.so</text>
+  <text x="330" y="244" text-anchor="middle" font-size="11" fill="var(--fg-muted)">libtorch C++ loader API</text>
 
   <rect class="flow-box runtime" x="460" y="200" width="180" height="60"/>
   <text x="550" y="225" text-anchor="middle" font-size="12" font-weight="600">loader.run(inputs)</text>
-  <text x="550" y="244" text-anchor="middle" font-size="11" fill="var(--fg-muted)">cuLaunchKernel(cubin)</text>
+  <text x="550" y="244" text-anchor="middle" font-size="11" fill="var(--fg-muted)">调用编译后的模型入口</text>
 
   <rect class="flow-box runtime" x="680" y="200" width="180" height="60"/>
   <text x="770" y="225" text-anchor="middle" font-size="12" font-weight="600">CUDA output tensors</text>
@@ -162,17 +166,11 @@
 </svg>
 </div>
 
-<p>核心观察:</p>
-
-<ol>
-  <li><strong>Python 端只跑一次</strong>:跑 export + aoti_compile_and_package,得到 <code>.pt2</code>。 这一步要 GPU(因为 Inductor 用 GPU 编 Triton kernel),但产物 <code>.pt2</code> 可以拷到任何同架构 GPU 的机器上跑。</li>
-  <li><strong>C++ 端零 Python</strong>:只需要 libtorch + CUDA driver/runtime。 加载 <code>.pt2</code> 就拿到一个跟原 Module 等价的可调用对象。</li>
-  <li><strong>权重打在 .pt2 内</strong>:不需要单独的 weights 文件,部署只移动一个 artifact。</li>
-</ol>
+<p>图中的上半部分在 Python 构建环境完成模型捕获、lowering、编译与 archive 打包，下半部分则由 C++ 运行进程加载同一份 archive 并调用模型入口。一份同时包含 native op、可融合 pointwise op 和 custom op 的例子模型沿这条路径依次经过 export、Inductor lowering、Triton codegen、<code>.pt2</code> 打包和 C++ 加载，由此显露五个阶段各自处理的对象。</p>
 
 <h2 id="zh-3">3. 例子模型</h2>
 
-<p>构造一个混合 native op 与 custom op 的模型:</p>
+<p>下面的模型同时包含 native op、可融合 pointwise op 和 custom op，三类节点会在后续 lowering 中进入不同路径：</p>
 
 <pre class="code"><span class="cm"># model.py</span>
 <span class="kw">import</span> torch
@@ -180,7 +178,7 @@
 
 <span class="cm"># --- 1) 注册一个 custom op ---</span>
 <span class="cm"># 语义: y = x * scale + bias_per_channel</span>
-<span class="cm"># 用 torch.library.custom_op 注册(PyTorch 2.4+ 公开稳定 API)</span>
+<span class="cm"># 用 PyTorch 2.12 的 torch.library.custom_op 注册</span>
 @torch.library.custom_op(<span class="cm">"mylib::scale_add"</span>, mutates_args=())
 <span class="kw">def</span> scale_add(x: torch.Tensor, scale: <span class="kw">float</span>, bias: torch.Tensor) -&gt; torch.Tensor:
     <span class="kw">return</span> x * scale + bias
@@ -194,27 +192,27 @@
 <span class="kw">class</span> ToyModel(nn.Module):
     <span class="kw">def</span> __init__(self):
         <span class="kw">super</span>().__init__()
-        self.fc1 = nn.Linear(128, 256)        <span class="cm"># native: aten::linear → cuBLAS</span>
+        self.fc1 = nn.Linear(128, 256)        <span class="cm"># native: aten::linear / aten::mm</span>
         self.fc2 = nn.Linear(256, 64)
         self.bias = nn.Parameter(torch.randn(64))
 
     <span class="kw">def</span> forward(self, x: torch.Tensor) -&gt; torch.Tensor:
-        h = self.fc1(x)                       <span class="cm"># native, fused by Inductor</span>
+        h = self.fc1(x)                       <span class="cm"># native GEMM</span>
         h = torch.nn.functional.gelu(h)       <span class="cm"># native, fusible elementwise</span>
         h = self.fc2(h)                       <span class="cm"># native</span>
         h = torch.ops.mylib.scale_add(h, 2.0, self.bias)  <span class="cm"># custom op</span>
-        <span class="kw">return</span> h.relu()                       <span class="cm"># native, fused with scale_add output</span>
+        <span class="kw">return</span> h.relu()                       <span class="cm"># native pointwise op</span>
 
 model = ToyModel().eval().cuda()
 example_inputs = (torch.randn(4, 128, device=<span class="cm">"cuda"</span>),)
 </pre>
 
-<p>算子选择的考量:</p>
+<p>每组算子承担一个观察点：</p>
 
 <ul>
-  <li><strong><code>nn.Linear</code></strong> → Inductor 走 ATen 的 <code>aten::linear</code> / <code>aten::mm</code>,实际调用 cuBLAS;Inductor 不为 GEMM 单独生成 Triton</li>
-  <li><strong><code>F.gelu</code> + <code>scale_add</code> + <code>.relu()</code></strong>:都是 elementwise,Inductor 通常把这一连串<strong>融合进一个 Triton kernel</strong></li>
-  <li><strong><code>scale_add</code></strong>:custom op,正好检验 AOTI 怎么处理用户自定义算子</li>
+  <li><strong><code>nn.Linear</code></strong> 会落到 <code>aten::linear</code> / <code>aten::mm</code> 等矩阵乘路径。常规 CUDA 配置通常调用外部 GEMM 库；具体 backend 与生成代码取决于版本、shape 和编译配置，应以生成源码为准</li>
+  <li><strong><code>F.gelu</code> 与 <code>.relu()</code></strong> 都可进入 Inductor 的 pointwise lowering；中间的 <code>scale_add</code> 是 opaque custom op，默认会阻断跨 op 融合</li>
+  <li><strong><code>scale_add</code></strong> 以 operator schema 进入 FX graph，用来追踪 AOTI 对用户自定义算子的编译和运行时契约。</li>
 </ul>
 
 <h2 id="zh-4">4. 阶段 1:<code>torch.export</code></h2>
@@ -250,12 +248,12 @@ ep = export(model, example_inputs, dynamic_shapes=dynamic_shapes)
     <span class="kw">return</span> (relu,)
 </pre>
 
-<p>注意几件事:</p>
+<p>这份 exported graph 建立了三个后续条件：</p>
 
 <ul>
-  <li><strong>所有 op 已经 normalize 成 <code>torch.ops.{namespace}.{op}.{overload}</code> 形式</strong>。 没有 Python 控制流的痕迹,没有 <code>nn.Module</code> 的状态属性。</li>
-  <li><strong>权重被提升为 graph input</strong>(<code>p_fc1_weight</code> 等),通过 <code>ep.state_dict</code> / <code>ep.constants</code> 关联回原来的 Parameter 名字。</li>
-  <li><strong>custom op <code>mylib::scale_add</code> 出现在图里</strong>,跟 ATen op 平级 —— 这就是 Inductor 后面能识别它的前提。</li>
+  <li>算子以 <code>torch.ops.{namespace}.{op}.{overload}</code> 形式出现在图中，Python 控制流已按 export 语义转换或约束。</li>
+  <li>权重被提升为 graph input（如 <code>p_fc1_weight</code>），并通过 <code>ep.state_dict</code> / <code>ep.constants</code> 关联到原 Parameter。</li>
+  <li>Custom op <code>mylib::scale_add</code> 与 ATen op 处在同一 FX graph 中，Inductor 因而能够把它识别为一个 operator node。</li>
 </ul>
 
 <h3>4.2 内部流程</h3>
@@ -269,7 +267,7 @@ ep = export(model, example_inputs, dynamic_shapes=dynamic_shapes)
   <li><strong>Graph signature 抽取</strong>:把 graph 的输入分类为(user inputs / parameters / buffers / tokens),输出分类为(user outputs / mutated buffers),形成 <code>ExportSignature</code>。</li>
 </ol>
 
-<p>涉及的关键 PyTorch 源码:</p>
+<p>这些步骤对应以下 PyTorch 源码:</p>
 
 <table>
   <thead><tr><th>路径</th><th>角色</th></tr></thead>
@@ -284,13 +282,13 @@ ep = export(model, example_inputs, dynamic_shapes=dynamic_shapes)
   </tbody>
 </table>
 
-<p>对应到 [[pytorch-shared-libs]] 那张图:export 阶段调用的 C++ 都在 <code>libtorch_python.so</code> 里(Dynamo C hook、FakeTensor 的 dispatcher 接入点 <code>PythonFallbackKernel</code>),底层 dispatch 走 <code>libtorch_cpu.so</code> 的 ATen 注册表。</p>
+<p>结合<a href="pytorch-shared-libs.html">《PyTorch Linux 共享库的构建与加载关系》</a>来看，export 阶段会使用 <code>libtorch_python.so</code> 中的 Python/C++ 桥，而 dispatcher 与 ATen core 位于 libtorch core 侧；具体 ELF 依赖仍以安装产物为准。</p>
 
 <h2 id="zh-5">5. 阶段 2:Inductor lowering</h2>
 
 <h3>5.1 API 用法</h3>
 
-<p>从 ExportedProgram 编出 <code>.pt2</code> 的最小调用:</p>
+<p>将 ExportedProgram 编译并打包为 <code>.pt2</code> 的最小调用如下：</p>
 
 <pre class="code"><span class="kw">import</span> torch._inductor
 
@@ -306,12 +304,12 @@ package_path = torch._inductor.aoti_compile_and_package(
 <span class="cm"># package_path == "model.pt2"</span>
 </pre>
 
-<p>这一调用内部完成三件事:</p>
+<p>这一调用完成三项工作：</p>
 
 <ol>
-  <li>把 ExportedProgram 的 FX graph 喂给 Inductor compiler frontend</li>
-  <li>Inductor 把图 lower 成调用 ATen + 生成的 Triton kernel 的 C++ glue 代码</li>
-  <li>编出 <code>.so</code>,跟 cubin、权重、元数据一起打成 <code>.pt2</code></li>
+  <li>将 ExportedProgram 的 FX graph 交给 Inductor compiler frontend。</li>
+  <li>Inductor 将图 lower 为 ATen 调用、生成的 Triton kernel 以及对应的 C++ glue code。</li>
+  <li>系统工具链生成 <code>.so</code>，AOTI 再将其与 cubin、权重和元数据共同打包为 <code>.pt2</code>。</li>
 </ol>
 
 <h3>5.2 Inductor 内部:Native op vs Custom op vs Fused kernel</h3>
@@ -324,8 +322,8 @@ package_path = torch._inductor.aoti_compile_and_package(
     <tr>
       <td><strong>Native heavyweight</strong></td>
       <td><code>aten::linear</code>, <code>aten::matmul</code>, <code>aten::conv2d</code></td>
-      <td>不 codegen,直接调 ATen API</td>
-      <td>C++ 里 <code>aoti_torch_call_dispatcher("aten::linear", ...)</code> → cuBLAS / cuDNN</td>
+      <td>通常 lower 到外部 ATen/库调用或对应 AOTI shim;具体形式由算子和配置决定</td>
+      <td>生成的外部调用或 <code>aoti_torch_*</code> shim;应以生成源码为准</td>
     </tr>
     <tr>
       <td><strong>Fusible elementwise / reduction</strong></td>
@@ -336,31 +334,32 @@ package_path = torch._inductor.aoti_compile_and_package(
     <tr>
       <td><strong>Custom op</strong></td>
       <td><code>mylib::scale_add</code></td>
-      <td>默认 fallback 成"调原 C++/Python 实现",**也可手动注册 lowering 把它融进 Triton**</td>
-      <td>看下面</td>
+      <td>默认保持 opaque;AOT 模式下可由 ProxyExecutor 调已注册的 dispatcher 实现,也可提供 decomposition/lowering</td>
+      <td><code>aoti_torch_proxy_executor_call_function(...)</code> 或显式 lowering</td>
     </tr>
   </tbody>
 </table>
 
 <p>对应本例,Inductor 把 graph lower 成下面形态的伪 C++:</p>
 
-<pre class="code"><span class="cm">// AOTI 生成的 model.cpp (示意,真名是 aoti_kernel.cpp / model.so 主体)</span>
-<span class="kw">extern</span> <span class="kw">"C"</span> AOTIRuntimeError model_main(
-    AOTITensorHandle* input_handles,
-    AOTITensorHandle* output_handles, ...)
+<pre class="code"><span class="cm">// AOTI 生成代码的逻辑示意;类名和 helper 名不是稳定接口</span>
+AOTIRuntimeError AOTInductorModel::_run_impl(
+    AtenTensorHandle* input_handles,
+    AtenTensorHandle* output_handles,
+    AOTIProxyExecutorHandle proxy_executor, ...)
 {
-    <span class="cm">// 1) aten::linear → cuBLAS</span>
-    auto buf0 = call_aten_op(<span class="cm">"aten::linear"</span>, x, fc1_weight, fc1_bias);
+    <span class="cm">// 1) aten::linear → 生成的外部调用,通常最终使用 cuBLAS</span>
+    auto buf0 = generated_linear_call(x, fc1_weight, fc1_bias);
 
     <span class="cm">// 2) Inductor fused triton kernel: gelu + linear_1 是分开两次调用</span>
     <span class="cm">//    因为 linear_1 又是 cuBLAS,夹在两个 elementwise 之间。</span>
     auto buf1 = empty_strided_cuda({4, 256}, ...);
     triton_poi_fused_gelu_0(buf0, buf1, ...);     <span class="cm">// elementwise gelu</span>
 
-    auto buf2 = call_aten_op(<span class="cm">"aten::linear"</span>, buf1, fc2_weight, fc2_bias);
+    auto buf2 = generated_linear_call(buf1, fc2_weight, fc2_bias);
 
     <span class="cm">// 3) 默认 custom op 是 opaque 调用;只有显式 decomposition / lowering / triton_op 才能进入融合</span>
-    auto buf3 = call_custom_op(<span class="cm">"mylib::scale_add"</span>, buf2, scale, bias);
+    aoti_torch_proxy_executor_call_function(proxy_executor, op_index, ...);
 
     <span class="cm">// 4) relu 仍可作为普通 aten pointwise 被 lowering 成 Triton kernel</span>
     auto buf4 = empty_strided_cuda({4, 64}, ...);
@@ -371,9 +370,11 @@ package_path = torch._inductor.aoti_compile_and_package(
 }
 </pre>
 
-<p>关键点:<strong><code>torch.library.custom_op</code> 默认是 compiler-visible 但语义 opaque 的 op</strong>。<code>register_fake</code> 让 <code>torch.export</code> / FakeTensor propagation 能知道输出 shape / dtype / device,但不会让 Inductor 自动看穿 Python 函数体,也不会自动把它当 pointwise 融进 Triton。 若希望 <code>scale_add</code> 与后续 <code>relu</code> 融合,需要显式提供 decomposition / lowering rule,或使用 <code>torch.library.triton_op</code> 这类 compiler-visible Triton wrapper(详见 §9)。</p>
+<p>这段生成代码是便于阅读的逻辑模型。<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/_inductor/codegen/cpp_wrapper_cpu.py">PyTorch <code>v2.12.0</code> 的 codegen</a>为 AOT mode fallback 生成 <code>ProxyExecutor</code> 路径；同文件中的 <code>aoti_torch_call_dispatcher</code> 服务于 non-AOT 的 StableIValue 兼容路径。</p>
 
-<h3>5.3 关键文件 & 对应的 .so</h3>
+<p><code>torch.library.custom_op</code> 注册的是 compiler-visible、语义 opaque 的 operator node。<code>register_fake</code> 为 <code>torch.export</code> 和 FakeTensor propagation 提供输出 shape、dtype 与 device；decomposition、lowering rule 或 <code>torch.library.triton_op</code> 这类 compiler-visible wrapper 则负责向 Inductor 暴露可融合语义。只有后一类集成才能把 <code>scale_add</code> 与后续 <code>relu</code> 合入同一 Triton kernel（详见第九节）。</p>
+
+<h3>5.3 源码模块与 shared library 边界</h3>
 
 <table>
   <thead><tr><th>文件 / 模块</th><th>做什么</th></tr></thead>
@@ -389,17 +390,17 @@ package_path = torch._inductor.aoti_compile_and_package(
   </tbody>
 </table>
 
-<p>这一阶段完全在 Python 里跑,但产物(C++ 源)最终要靠 <strong>系统的 <code>g++</code></strong> 编成 <code>.so</code>(默认在 <code>/tmp/torchinductor_$USER/</code> 下落地)。 编出的 <code>.so</code> 链接 <code>libtorch_cpu.so</code> + <code>libtorch_cuda.so</code> + <code>libcudart.so</code>。</p>
+<p>这一阶段由 Python 驱动，但生成的 C++ 源仍需系统编译器构建为共享库；默认临时目录通常位于 <code>/tmp/torchinductor_$USER/</code>。最终 ELF 的 <code>DT_NEEDED</code> 取决于 PyTorch 构建方式、目标设备和链接参数，不能预先固定为某三项库；应检查实际编译命令或对产物运行 <code>readelf -d</code>。</p>
 
 <h2 id="zh-6">6. 阶段 3:Triton codegen + cubin</h2>
 
-<p>Inductor 决定生成 Triton kernel 后,实际的 Python → cubin 编译走 <code>triton</code> 这个外部 pip 包(<strong>不在 libtorch_*.so 里</strong>,详见 [[pytorch-shared-libs]] §3.6 的 OpenAI Triton 基建说明)。 流程是:</p>
+<p>Inductor 为某组节点选择 Triton codegen 后，Python 到 cubin 的编译由外部 <code>triton</code> 包完成。PyTorch 共享库中的 Python 桥与 runtime 分工可参见<a href="pytorch-shared-libs.html">《PyTorch Linux 共享库的构建与加载关系》</a>。生成路径依次为：</p>
 
 <ol>
   <li>Inductor 把生成的 Triton kernel 源(Python 文本)写到 <code>/tmp/torchinductor_$USER/&lt;hash&gt;/triton_poi_fused_scale_add_relu_1.py</code> 之类的位置</li>
   <li>调 <code>triton.jit</code> 触发 Triton compiler:Python AST → Triton IR → MLIR → PTX → cubin</li>
-  <li>cubin 写到 <code>~/.triton/cache/</code>,同时 Inductor 在自己的 <code>~/.cache/torch/inductor/</code> 里记一份指向</li>
-  <li>cubin 的字节流被嵌入到 AOTI <code>.so</code> 的 <code>.rodata</code> section(<code>embed_kernel_binary=True</code>)或者单独存放在 <code>.pt2</code> 的 <code>data/cubins/</code> 子目录里</li>
+  <li>Triton 与 Inductor 会缓存编译中间产物；缓存根目录可由环境和配置改变，不能把某个本机目录视为包格式的一部分</li>
+  <li>GPU binary 可以按编译配置嵌入模型库或作为配套文件进入 PT2 archive；具体成员和路径不是稳定 ABI</li>
 </ol>
 
 <p>生成的典型 Triton kernel 形如:</p>
@@ -427,60 +428,46 @@ package_path = torch._inductor.aoti_compile_and_package(
     tl.store(out_ptr0 + xindex, tmp4, xmask)
 </pre>
 
-<p>只有在你额外提供 decomposition / lowering rule,或用 <code>torch.library.triton_op</code> 让实现对 compiler 可见之后,才会看到上面这种 fused kernel。此时 <code>* scale + bias</code> 与后面的 <code>relu</code> 可以合并成一次 load → compute → store。单独的 <code>register_fake</code> 不提供这层语义。</p>
+<p>当 decomposition、lowering rule 或 <code>torch.library.triton_op</code> 向 compiler 暴露 <code>scale_add</code> 的内部表达时，<code>* scale + bias</code> 与后续 <code>relu</code> 可以形成上面的 fused kernel，并合并为一次 load → compute → store。<code>register_fake</code> 仍只承担抽象执行和元数据推断。</p>
 
-<p>cubin 的产物路径:</p>
+<p>在常见默认配置中可以观察到类似的缓存路径，但它们只用于诊断，不属于部署接口:</p>
 
 <pre class="code">~/.triton/cache/&lt;hash&gt;/triton_poi_fused_scale_add_relu_1.cubin   <span class="cm"># Triton 自己缓存</span>
 ~/.cache/torch/inductor/&lt;hash&gt;/triton_poi_fused_scale_add_relu_1.{py,cubin,json}
                                                                 <span class="cm"># Inductor 缓存 + metadata</span>
 </pre>
 
-<p>JSON 文件记录了 launch parameters(num_warps, num_stages, shared memory bytes, grid 计算公式),AOTI 把它嵌进生成的 C++ 代码里供 <code>cuLaunchKernel</code> 调用。</p>
+<p>配套 metadata 可记录 <code>num_warps</code>、<code>num_stages</code>、shared-memory 大小与 grid 计算等 launch 信息。其承载位置与 runtime 调用形式均属于版本相关实现。</p>
 
 <h2 id="zh-7">7. 阶段 4:打包成 <code>.pt2</code></h2>
 
-<p><code>.pt2</code> 文件本质是 <strong>一个 zip 包</strong>。 用 <code>unzip -l model.pt2</code> 查看结构:</p>
+<p><code>.pt2</code> 是 zip 容器。以下只展示 PyTorch <code>v2.12.0</code> 打包器使用的逻辑目录;生成文件名和是否携带源码、对象文件或独立 GPU binary 由编译配置决定:</p>
 
-<pre class="code">$ unzip -l model.pt2
-Archive:  model.pt2
-   Length      Date    Time    Name
----------  ---------- -----   ----
-        0  2026-06-03 12:00   data/
-        0  2026-06-03 12:00   data/aotinductor/
-   245760  2026-06-03 12:00   data/aotinductor/model/   <span class="cm"># 上面 lower 的 C++ 编出的 .so</span>
-                                    c<hash>.so
-        0  2026-06-03 12:00   data/constants/
-   131072  2026-06-03 12:00   data/constants/L__fc1_weight.bin   <span class="cm"># fc1.weight</span>
-      512  2026-06-03 12:00   data/constants/L__fc1_bias.bin
-    65536  2026-06-03 12:00   data/constants/L__fc2_weight.bin
-      256  2026-06-03 12:00   data/constants/L__fc2_bias.bin
-      256  2026-06-03 12:00   data/constants/L__bias.bin                   <span class="cm"># self.bias</span>
-     2048  2026-06-03 12:00   data/cubins/triton_poi_fused_gelu_0.cubin
-     3072  2026-06-03 12:00   data/cubins/triton_poi_fused_scale_add_relu_1.cubin
-      512  2026-06-03 12:00   data/aotinductor/model/metadata.json
-        ...
-</pre>
+<pre class="code">data/aotinductor/model/&lt;generated-files&gt;
+data/aotinductor/model/&lt;model&gt;.so
+data/aotinductor/model/weights_config.json   <span class="cm"># 使用独立权重时</span>
+data/weights/&lt;weight-files&gt;
+data/constants/&lt;constant-files&gt;
+archive_format
+archive_version</pre>
 
-<p>(如果开了 <code>embed_kernel_binary=True</code>,<code>data/cubins/</code> 这一层会被并进 <code>.so</code> 的 <code>.rodata</code>,只剩一个 <code>.so</code> 文件)</p>
-
-<p>关键文件:</p>
+<p>Triton codegen 涉及以下文件:</p>
 
 <table>
   <thead><tr><th>文件</th><th>内容</th></tr></thead>
   <tbody>
-    <tr><td><code>data/aotinductor/model/c&lt;hash&gt;.so</code></td><td>主入口,包含 model_main、aten op dispatch 调用、cubin 加载逻辑</td></tr>
-    <tr><td><code>data/cubins/*.cubin</code></td><td>每个 Triton kernel 的预编译 GPU 二进制(SM-specific)</td></tr>
-    <tr><td><code>data/constants/*.bin</code></td><td>所有 Parameter / buffer 的原始字节,按 FQN 命名</td></tr>
-    <tr><td><code>data/aotinductor/model/metadata.json</code></td><td>input/output schema、cubin launch 参数、版本号</td></tr>
+    <tr><td><code>data/aotinductor/&lt;model&gt;/</code></td><td>AOTI 生成文件;打包器可接收 <code>.so</code>、<code>.cpp</code>、对象文件及配套 JSON</td></tr>
+    <tr><td><code>data/weights/</code></td><td>按打包策略保存或去重后的模型权重</td></tr>
+    <tr><td><code>data/constants/</code></td><td>tensor constants 与 custom objects 等 payload</td></tr>
+    <tr><td><code>archive_format</code> / <code>archive_version</code></td><td>PT2 archive 格式标识</td></tr>
   </tbody>
 </table>
 
-<p>打包代码在 <code>torch/_inductor/package/</code> 下,核心是 <code>torch._inductor.package.package_aoti</code> 函数。 zip 的 layout 跟 <code>torch.export.save</code> 的 <code>.pt2</code> 格式一致 —— 这两套是同一个 artifact 概念,只是装的内容不同(普通 export 装 FX graph + state_dict,AOTI 装编译产物 + cubin + constants)。</p>
+<p>打包代码位于 <code>torch/_inductor/package/</code>，核心入口是 <code>torch._inductor.package.package_aoti</code>。AOTI package 与 <code>torch.export.save</code> 都使用 PT2 archive 规范，但 payload 目录和必需成员不同：前者保存编译产物及相关模型资产，后者保存 exported program。两者不应按同一份内部文件清单解析。</p>
 
 <h2 id="zh-8">8. 阶段 5:C++ runtime 加载</h2>
 
-<h3>8.1 完整 C++ 代码</h3>
+<h3>8.1 C++ loader 示例</h3>
 
 <pre class="code"><span class="cm">// runner.cpp</span>
 <span class="kw">#include</span> &lt;torch/torch.h&gt;
@@ -525,76 +512,70 @@ g++ -std=c++17 -O3 \
     -L$TORCH_DIR/lib \
     -Wl,-rpath,$TORCH_DIR/lib \
     runner.cpp -o runner \
-    -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -ltorch_python
+    -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda
 
 ./runner model.pt2
 </pre>
 
-<p>(生产场景一般不链 <code>libtorch_python</code>,这里链是因为 <code>AOTIModelPackageLoader</code> 的实现目前还在 libtorch_python 里;<strong>下一节会说</strong>。)</p>
+<p>这段命令是 Linux CUDA 构建示意。官方教程更推荐通过 CMake 的 <code>${TORCH_LIBRARIES}</code> 使用匹配版本的 libtorch。PyTorch <code>v2.12.0</code> 将 package loader 和通用 runner 列入 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/build_variables.bzl"><code>inductor_core_resources</code></a>,不需要为它链接 <code>libtorch_python</code>。</p>
 
-<h3>8.3 内部细节</h3>
+<h3>8.3 Package 加载序列</h3>
 
-<p><code>AOTIModelPackageLoader</code> 构造函数的步骤:</p>
+<p>按 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/inductor/aoti_package/model_package_loader.cpp"><code>model_package_loader.cpp</code></a>,构造过程可以概括为:</p>
 
 <ol>
-  <li>用 zip 库打开 <code>.pt2</code>,把 <code>data/aotinductor/model/c&lt;hash&gt;.so</code> 解压到临时目录</li>
-  <li><code>dlopen()</code> 这个 <code>.so</code>,拿到 <code>model_main</code> 符号</li>
-  <li>把 <code>data/constants/*.bin</code> 反序列化成 CUDA Tensor(用 <code>cudaMemcpy</code> 拷到 GPU)</li>
-  <li>把 <code>data/cubins/*.cubin</code>(或者 <code>.so</code> 内嵌的 cubin)注册给 CUDA driver:<code>cuModuleLoadData(cubin_bytes)</code> → <code>cuModuleGetFunction(name)</code>,得到 <code>CUfunction</code> handle</li>
-  <li>用 metadata.json 里的 launch parameter 配置每个 kernel handle</li>
+  <li>读取 archive 目录,把目标模型目录及相关 constants 解压到临时目录</li>
+  <li>若包内已有 <code>.so</code> 就直接使用;否则可根据包内 <code>.cpp</code>、对象文件与 compile options 生成 <code>.so</code></li>
+  <li>读取 AOTI metadata 中的 device key,从 runner registry 选择对应 device runner</li>
+  <li>把模型 <code>.so</code>、runner 数量、device 与生成文件目录交给 runner;若存在 weight blob,再更新 constant buffer</li>
 </ol>
 
 <p><code>loader.run(inputs)</code> 的步骤:</p>
 
 <ol>
-  <li>把 input <code>at::Tensor</code> 包成 <code>AOTITensorHandle</code>(C-ABI wrapper),配上 strides / shape / dtype</li>
-  <li>调 <code>model_main(input_handles, output_handles, constants, ...)</code></li>
-  <li><code>model_main</code> 内部:
-    <ul>
-      <li>遇到 native op → 调 <code>aoti_torch_call_dispatcher("aten::linear", ...)</code> → libtorch_cpu 的 dispatcher → libtorch_cuda 的 CUDA backend → cuBLAS</li>
-      <li>遇到 Triton kernel → <code>cuLaunchKernel(triton_poi_fused_*_handle, grid, ...)</code></li>
-    </ul>
-  </li>
-  <li>把 output handle 转回 <code>at::Tensor</code>,返回</li>
+  <li>把输入 <code>at::Tensor</code> 转成 <code>AtenTensorHandle</code> 数组</li>
+  <li>调用模型容器导出的 <code>AOTInductorModelContainerRun</code>(或 single-threaded 变体),同时传入 stream 与可选 <code>ProxyExecutor</code></li>
+  <li>把返回的 tensor handles 转回 <code>at::Tensor</code></li>
 </ol>
 
-<p>关键 PyTorch 源码(对应 [[pytorch-shared-libs]] §3.6 列的 <code>libtorch_python.so</code> 里 Inductor / Triton 基建那一块):</p>
+<p><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/inductor/aoti_runner/model_container_runner.cpp"><code>model_container_runner.cpp</code></a> 通过 <code>AOTInductorModelContainerCreateWithDevice</code>、<code>AOTInductorModelContainerRun</code> 等导出符号进入 model-container C ABI。Triton/CUDA kernel 的装载和启动由生成产物及对应 runner 完成，因此具体形式取决于编译配置。</p>
+
+<p>包加载链对应以下公开源码;共享库归属可结合<a href="pytorch-shared-libs.html">《PyTorch Linux 共享库的构建与加载关系》</a>核对:</p>
 
 <table>
   <thead><tr><th>路径</th><th>角色</th></tr></thead>
   <tbody>
-    <tr><td><code>torch/csrc/inductor/aoti_package/model_package_loader.{h,cpp}</code></td><td><code>AOTIModelPackageLoader</code> 实现</td></tr>
-    <tr><td><code>torch/csrc/inductor/aoti_runner/model_container_runner.cpp</code></td><td>底层 <code>AOTIModelContainerRunner</code></td></tr>
+    <tr><td><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/inductor/aoti_package/model_package_loader.cpp"><code>torch/csrc/inductor/aoti_package/model_package_loader.cpp</code></a></td><td><code>AOTIModelPackageLoader</code> 实现;属于 core resources</td></tr>
+    <tr><td><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/inductor/aoti_runner/model_container_runner.cpp"><code>torch/csrc/inductor/aoti_runner/model_container_runner.cpp</code></a></td><td>加载模型库并解析 model-container C ABI</td></tr>
     <tr><td><code>torch/csrc/inductor/aoti_runner/model_container_runner_cuda.cpp</code></td><td>CUDA 特化 runner(在 <code>libtorch_cuda.so</code>)</td></tr>
     <tr><td><code>torch/csrc/inductor/aoti_torch/shim_common.cpp</code></td><td>C-ABI shim 的 host-side 实现</td></tr>
     <tr><td><code>torch/csrc/inductor/aoti_torch/shim_cuda.cpp</code></td><td>CUDA 版 shim(在 <code>libtorch_cuda.so</code>)</td></tr>
-    <tr><td><code>torch/csrc/inductor/static_launcher/cuda.cpp</code></td><td>Triton kernel 静态 launcher,在 <code>libtorch_python.so</code></td></tr>
-  </tbody>
+</tbody>
 </table>
 
-<p>所以一次 <code>loader.run()</code> 跨了这几个 .so:<code>libtorch_python</code>(loader 入口)→ <code>libtorch_cpu</code>(C-ABI shim 主体 + ATen dispatcher)→ <code>libtorch_cuda</code>(CUDA dispatcher + cuLaunchKernel)→ <code>.pt2</code> 解出的临时 <code>.so</code>(model_main 主逻辑)→ 内嵌的 cubin。</p>
+<p>把这些文件连起来，运行时路径是：libtorch core 中的 package loader 解包并选择 runner，通用 runner 动态加载模型 <code>.so</code> 并调用 model-container C ABI，CUDA runner 与生成模型再使用相应 CUDA runtime 和 shim。最终 ELF 边界与 kernel launch 形式由构建配置和生成产物共同决定。</p>
 
 <h2 id="zh-9">9. Custom op 的处理细节</h2>
 
-<p>例子里的 <code>scale_add</code> 虽然语义简单(elementwise)且有 fake impl,但这只满足 export / shape 推断要求;<strong>它不会因此自动被 Inductor inline</strong>。 生产场景中 custom op 通常有三种处理策略:</p>
+<p>Custom op 需要同时满足图捕获、编译 lowering 和运行时实现三类契约。示例中的 <code>scale_add</code> 已通过 fake impl 满足 export 与 shape 推断，后续集成则根据是否保留 external call、是否向 Inductor 暴露语义，以及运行进程是否包含 Python 分为三种路径。</p>
 
 <h3>9.1 策略 A:让 Inductor 把它当 fallback(默认)</h3>
 
-<p>不做任何额外注册时,Inductor 看到 <code>mylib::scale_add</code> 默认会:</p>
+<p>默认 fallback 把 <code>mylib::scale_add</code> 保留为 external operator call：</p>
 
 <ul>
-  <li>不内联到 Triton</li>
-  <li>在 AOTI 生成的 C++ 里插一行 <code>aoti_torch_call_dispatcher("mylib::scale_add", ...)</code></li>
-  <li>运行时由 dispatcher 走到注册了这个 op 的 backend 实现</li>
+  <li>Inductor 在 AOT 模式下生成 external fallback，并把调用描述写入 <code>.pt2</code>，供 <code>ProxyExecutor</code> 使用。</li>
+  <li>运行时由 ProxyExecutor 查找已注册的 operator 实现；固定版本的 archive spec 将调用描述保存为可选 JSON。</li>
+  <li>该节点维持 opaque 边界，因此相邻 Triton pointwise kernel 在它的两侧分别生成。</li>
 </ul>
 
-<p>但 custom op 的实现是 Python 函数,C++ runtime 加载不到 Python。 这条路径要么:</p>
+<p>本例的 eager 实现仍是 Python 函数，无 Python 的 C++ runtime 不能执行它。部署时有两种选择：</p>
 <ul>
   <li>把 op 用 C++ 重写并通过 <code>TORCH_LIBRARY_IMPL</code> 注册给对应 DispatchKey,然后让 C++ runner 链接你的实现 <code>.so</code></li>
-  <li>或者在 Python 部署路径里用 <code>register_kernel("cuda")</code> / <code>device_types=["cuda"]</code> 提供 CUDA kernel;但纯 C++ AOTI runtime 仍需要前一条那样的 C++/CUDA dispatcher 注册</li>
+  <li>在有 Python 的加载路径中注册 Python/CUDA 实现；这不会自动让同一实现出现在无 Python 的 C++ 进程中</li>
 </ul>
 
-<h3>9.2 策略 B:注册 lowering 让 Inductor inline 它(推荐用于 elementwise / 简单 reduction)</h3>
+<h3>9.2 策略 B：注册版本相关的 Inductor lowering</h3>
 
 <pre class="code"><span class="kw">from</span> torch._inductor <span class="kw">import</span> lowering
 
@@ -604,11 +585,11 @@ g++ -std=c++17 -O3 \
     <span class="kw">return</span> lowering.add(lowering.mul(x, scale), bias)
 </pre>
 
-<p>这一步之后,Inductor 才能把 <code>scale_add</code> 视作两个原语的组合,并跟周围 elementwise 一起 fuse。注意:这不是 <code>torch.library.custom_op</code> 或 <code>register_fake</code> 自动完成的事;fake impl 只负责抽象执行/形状推断。</p>
+<p>显式 lowering 可以让当前 Inductor 版本把 <code>scale_add</code> 表达为内部原语，并与相邻 elementwise 进行 fusion。<code>torch._inductor.lowering</code> 是内部接口，注册代码必须跟随所用 PyTorch 版本维护；<code>register_fake</code> 只负责抽象执行与元数据推断。</p>
 
-<h3>9.3 策略 C:写一个完整的 Triton 实现并注册</h3>
+<h3>9.3 策略 C：为 Python 运行路径注册 Triton 实现</h3>
 
-<p>复杂 op(例如自定义 attention kernel)的稳妥做法是<strong>把 Triton kernel 也跟着 op 注册</strong>:</p>
+<p>下面的 <code>register_kernel("cuda")</code> 让 custom op 在 Python 进程中调用 Triton kernel：</p>
 
 <pre class="code"><span class="kw">import</span> triton
 <span class="kw">import</span> triton.language <span class="kw">as</span> tl
@@ -631,26 +612,26 @@ g++ -std=c++17 -O3 \
     <span class="kw">return</span> out
 </pre>
 
-<p>Inductor 看到 custom op 已有 Triton kernel 实现时直接调用,跳过 fallback。 这条路径适合已有手工优化 kernel 的场景。</p>
+<p>这项注册提供运行时实现，但不会自动把 custom op 的内部 Triton 调用暴露给 Inductor，也不足以支持无 Python 的 C++ runtime。需要 compiler-visible tracing 时应使用该版本公开的 <code>torch.library.triton_op</code> 方案；需要纯 C++ AOTI fallback 时仍要提供可在 C++ 进程加载的实现。</p>
 
-<h3>9.4 第三方 op 只暴露 pybind、没注册到 dispatcher 怎么办</h3>
+<h3>9.4 仅暴露 pybind 的第三方 op 接入路径</h3>
 
-<p>实战里 flash-attn / xformers / 早期 apex 这类第三方库的算子常常<strong>只通过 pybind 暴露 Python 函数</strong>,既没用 <code>TORCH_LIBRARY</code> 注册 schema,也没用 <code>TORCH_LIBRARY_IMPL</code> 注册 backend。 这种调用 Dynamo 看不见(直接 graph break),自然也走不进 AOTI。</p>
+<p>若第三方 CUDA 入口只暴露为普通 pybind 函数，没有注册 operator schema、fake 实现和 C++ backend，PyTorch 编译栈就缺少稳定的组合契约。Dynamo 对具体函数的处理可能是 graph break、拒绝导出或依赖额外规则，不能把任意 pybind 调用视为可直接部署的 op。</p>
 
-<p>缺什么一目了然:</p>
+<p>两种入口在编译栈中的契约如下：</p>
 
 <table>
   <thead><tr><th>能力</th><th>pybind 函数</th><th>TORCH_LIBRARY op</th></tr></thead>
   <tbody>
     <tr><td>进入 <code>torch.ops.ns.op</code> 命名空间</td><td>✗</td><td>✓</td></tr>
-    <tr><td>Dynamo 能 trace</td><td><strong>✗(graph break)</strong></td><td>✓</td></tr>
-    <tr><td>FakeTensor / Meta 推 shape</td><td>✗</td><td>✓</td></tr>
-    <tr><td><code>torch.export</code> 进 FX graph</td><td>✗</td><td>✓</td></tr>
-    <tr><td>AOTI 在 C++ runtime 能调</td><td><strong>✗</strong></td><td>✓</td></tr>
+    <tr><td>Dynamo 能 trace</td><td>依函数和规则而定</td><td>有合适注册时可 trace</td></tr>
+    <tr><td>FakeTensor / Meta 推 shape</td><td>没有 operator-level contract</td><td>需要 fake/meta 实现</td></tr>
+    <tr><td><code>torch.export</code> 进 FX graph</td><td>没有通用保证</td><td>满足 export contract 时可以</td></tr>
+    <tr><td>AOTI 在 C++ runtime 能调</td><td>无直接保证</td><td>还需 C++ 可加载的 backend 实现</td></tr>
   </tbody>
 </table>
 
-<p>对 AOTI 部署有意义的解法是<strong>两步并行</strong>:</p>
+<p>面向无 Python 的 AOTI 部署，需要同时建立编译期和运行期契约：</p>
 
 <h4>第一步:Python 端用 <code>custom_op</code> 把 pybind 函数包成 op</h4>
 
@@ -669,9 +650,9 @@ g++ -std=c++17 -O3 \
     <span class="kw">return</span> torch.empty_like(q)
 </pre>
 
-<p>这一步做完,Dynamo / export 在 FX graph 里看到的就是 <code>torch.ops.mylib.fa_fwd</code>。 AOTI lowering 时把它当成不可分解的原子调用,生成形如 <code>aoti_torch_call_dispatcher("mylib::fa_fwd", ...)</code> 的 C++。</p>
+<p>这一步让 Dynamo / export 在 FX graph 中看到 <code>torch.ops.mylib.fa_fwd</code>。PyTorch v2.12.0 的 AOT fallback 通过 ProxyExecutor 描述该 external call；对应 JSON 会按 PT2 archive 规范写入包中。</p>
 
-<p><strong>但</strong>:实现还在 Python 里,C++ runtime 加载 <code>.pt2</code> 时这个符号根本不存在,运行会在 dispatcher 查找处崩。 所以还要第二步。</p>
+<p>Python 包装本身不会进入无 Python 的部署进程，因此仍要提供并加载 C++/CUDA operator 实现。</p>
 
 <h4>第二步:用 <code>TORCH_LIBRARY</code> 写一个 C++ shim,链进 runner</h4>
 
@@ -710,11 +691,11 @@ TORCH_LIBRARY_IMPL(mylib, CUDA, m) {
     -o libfa_shim.so
 </pre>
 
-<p>C++ runner 里在<strong>构造 <code>AOTIModelPackageLoader</code> 之前</strong> dlopen 它,让 <code>TORCH_LIBRARY</code> 的全局构造函数把 <code>fa_fwd</code> 注册进 dispatcher:</p>
+<p>C++ runner 应在构造 <code>AOTIModelPackageLoader</code> 前加载该库，使 <code>TORCH_LIBRARY</code> 的静态注册先完成。下面使用 <code>RTLD_NOW | RTLD_LOCAL</code>；若第三方依赖要求全局符号可见性，再根据其装载约定选择 <code>RTLD_GLOBAL</code>：</p>
 
 <pre class="code"><span class="kw">#include</span> &lt;dlfcn.h&gt;
 <span class="cm">// ...</span>
-<span class="kw">void</span>* shim = dlopen(<span class="cm">"./libfa_shim.so"</span>, RTLD_LAZY | RTLD_GLOBAL);
+<span class="kw">void</span>* shim = dlopen(<span class="cm">"./libfa_shim.so"</span>, RTLD_NOW | RTLD_LOCAL);
 <span class="kw">if</span> (!shim) { std::cerr &lt;&lt; dlerror() &lt;&lt; <span class="cm">"\n"</span>; <span class="kw">return</span> 1; }
 
 torch::inductor::AOTIModelPackageLoader loader(<span class="cm">"model.pt2"</span>);
@@ -726,43 +707,44 @@ torch::inductor::AOTIModelPackageLoader loader(<span class="cm">"model.pt2"</spa
 <table>
   <thead><tr><th>需求</th><th>方案</th></tr></thead>
   <tbody>
-    <tr><td>仅 <code>torch.compile</code> 跑通,不部署</td><td><code>torch._dynamo.allow_in_graph(third_party_fn)</code>;Dynamo 把它当 opaque FX node,不 graph break。 <strong>不能 export,不能 AOTI</strong></td></tr>
+    <tr><td>仅 <code>torch.compile</code> 跑通,不部署</td><td>按第三方函数类型选择 custom op、<code>triton_op</code> 或项目提供的 integration；<code>allow_in_graph</code> 不是 AOTI 可部署性的证明</td></tr>
     <tr><td><code>torch.export</code> / FX 化</td><td>第一步 <code>custom_op</code> + <code>register_fake</code></td></tr>
     <tr><td>AOTI 打 .pt2 + 纯 C++ 部署</td><td>第一步 + 第二步(C++ shim + dlopen)</td></tr>
   </tbody>
 </table>
 
-<h4>具体踩过的几个坑</h4>
+<h4>集成约束</h4>
 
 <ol>
-  <li><strong>schema 必须前后一致</strong>:Python 端 <code>custom_op</code> 与 C++ 端 <code>TORCH_LIBRARY</code> 注册的参数类型、数量、返回值要完全对齐,否则 <code>aoti_torch_call_dispatcher</code> 查不到对应 overload。</li>
-  <li><strong>in-place 改输入要声明 <code>mutates_args</code></strong>:flash-attn varlen 之类的 op 经常带 <code>out</code> 输出参数原地写,要写 <code>mutates_args=("out",)</code>,否则 functionalization 会乱序。</li>
-  <li><strong>autograd 不自动接</strong>:<code>custom_op</code> 默认无 backward,推理场景可以省略,训练要 <code>fa_fwd.register_autograd(setup_context=..., backward=...)</code>。</li>
-  <li><strong>shim 必须先 dlopen</strong>:<code>libfa_shim.so</code> 的 dlopen 必须在 <code>AOTIModelPackageLoader</code> 构造之前,且用 <code>RTLD_GLOBAL</code>(否则 dispatcher 注册不到全局符号表),否则 AOTI runner 启动时找不到 op,报 "Could not run 'mylib::fa_fwd' with arguments from the 'CUDA' backend"。</li>
-  <li><strong>不要在 Python 端只写 pybind 调用就 export</strong>:第三方函数对 Dynamo 是不可符号化的外部调用,直接 export 100% 失败。 加 <code>custom_op</code> 包装是绕不开的一步。</li>
+  <li><strong>schema 必须前后一致：</strong>Python 端 <code>custom_op</code> 与部署进程中的 C++ 注册必须描述同一个 operator schema，否则 ProxyExecutor/dispatcher 无法按预期调用实现。</li>
+  <li><strong>in-place 改输入要声明 <code>mutates_args</code>：</strong>带 <code>out</code> 参数的 op 应准确声明写入对象，例如 <code>mutates_args=("out",)</code>；否则 functionalization 可能按错误的纯函数语义建模该算子。</li>
+  <li><strong>训练场景需显式注册 autograd 公式：</strong><code>custom_op</code> 默认不包含 backward 定义；训练时使用 <code>fa_fwd.register_autograd(setup_context=..., backward=...)</code> 注册，纯推理部署可以省略该步骤。</li>
+  <li><strong>先完成 operator 注册：</strong>无论采用静态链接还是 <code>dlopen</code>，模型执行前都要让目标 backend 实现进入 dispatcher。是否需要 <code>RTLD_GLOBAL</code> 取决于库的符号依赖，不是 <code>TORCH_LIBRARY</code> 的统一要求。</li>
+  <li><strong>不要把普通 pybind 可调用性等同于可导出性：</strong>先用 custom-op 或项目提供的编译集成建立 schema、fake/meta 和运行时实现，再实际运行 export/AOTI 测试。</li>
 </ol>
 
-<h2 id="zh-10">10. 坑与边界</h2>
+<h2 id="zh-10">10. 部署约束与版本边界</h2>
 
 <ol>
-  <li><strong>SM 兼容性</strong>:cubin 是 SM-specific 的(sm_80 / sm_90 / sm_90a)。 export 机器和部署机器的 GPU 必须 SM 等级一致或部署机器更新。 想跨 SM,要么编 PTX(<code>aot_inductor.embed_cubin=False</code> 用 ptx 由 driver JIT),要么按目标 SM 多打几份包。</li>
-  <li><strong>PyTorch 版本绑定</strong>:<code>.pt2</code> 跟编译它的 PyTorch 版本绑定(C-ABI shim 名字 / signature 可能有 minor break),最好部署机器装相同 minor 版本的 libtorch。</li>
-  <li><strong>Dynamic shape</strong>:<code>export</code> 时用 <code>Dim</code> 声明动态维度。 不声明的话部署时输入 shape 必须跟 example 完全一致,否则 dispatch 会失败。 max-autotune 在 dynamic shape 下会扩展 cubin 数量(每个 size bucket 一份)。</li>
+  <li><strong>GPU 目标兼容性：</strong>包内可能包含面向特定 SM 的 cubin，也可能包含其它生成物。部署前应检查 archive 和编译配置，并在每种目标 GPU 上验证；“部署 GPU 更新”本身不是兼容保证。</li>
+  <li><strong>PyTorch 版本：</strong>本文不把 <code>.pt2</code> 或内部 AOTI C ABI 视为跨版本稳定接口。最稳妥的基线是构建端与运行端使用匹配的 PyTorch/libtorch 版本。</li>
+  <li><strong>Dynamic shape：</strong>需要变化的维度应在 export 时用 <code>Dim</code> 声明。未声明的维度通常按示例输入专门化，运行时检查可能拒绝不匹配的 size、dtype 或 stride。</li>
   <li><strong>Custom op 必须有 fake impl</strong>:没注册 <code>register_fake</code> 的 custom op export 时直接报错。</li>
-  <li><strong>State / 控制流</strong>:模型里有 Python 循环(被 Dynamo unroll 处理)、可变状态(<code>list.append</code>)等会让 export 失败或行为意外。 用 <code>torch.cond</code> / <code>torch.while_loop</code> 显式表达。</li>
-  <li><strong>首次编译耗时</strong>:export + aoti_compile_and_package 在大模型上整体耗时 1 到 10 分钟(Inductor lowering 与 Triton autotune 占主要时间)。 此步骤只跑一次,部署阶段加载为秒级。</li>
-  <li><strong>不要链 libtorch_python(理想状态)</strong>:目前 <code>AOTIModelPackageLoader</code> 实现的部分还在 <code>libtorch_python.so</code>,要在不带 Python 的环境里跑得纯净,需要拷一份不依赖 Python 的 libtorch(<code>BUILD_LIBTORCHLESS</code> 模式)。 这条路径仍在 PyTorch 社区演进,PyTorch 2.5+ 已基本可行,具体细节依装的版本而定。</li>
+  <li><strong>State / 控制流：</strong>Python 控制流和可变状态能否导出取决于 export 支持范围。需要保留动态控制流时，应采用该版本支持的 higher-order operator，并通过目标输入集验证。</li>
+  <li><strong>构建和加载成本：</strong>耗时取决于模型、目标、autotune 与缓存状态。应分别测量 export、AOTI 编译、打包和冷加载，不能套用固定分钟数或秒数。</li>
+  <li><strong>Python-free runtime：</strong>PyTorch v2.12.0 官方 C++ 示例通过 <code>${TORCH_LIBRARIES}</code> 链接 AOTI loader，不要求 Python interpreter。最终动态库集合应以 CMake link line 和部署产物的 ELF 依赖为准。</li>
 </ol>
 
 <h2 id="zh-refs">参考资料</h2>
 
 <ul>
-  <li>PyTorch 官方 AOTI 教程:<a href="https://pytorch.org/docs/stable/torch.compiler_aot_inductor.html" target="_blank" rel="noopener">torch.compiler_aot_inductor</a></li>
-  <li>torch.export API:<a href="https://pytorch.org/docs/stable/export.html" target="_blank" rel="noopener">torch.export</a></li>
-  <li>torch.library custom op:<a href="https://pytorch.org/docs/stable/library.html" target="_blank" rel="noopener">torch.library</a></li>
-  <li>本系列前作 [[pytorch-shared-libs]]:Inductor / Triton 基建在 libtorch_*.so 里的具体分布</li>
-  <li>本系列前作 [[pytorch-dispatcher]]:ATen op dispatcher 的全栈视角</li>
-  <li>PyTorch 源码关键位置:<code>torch/_inductor/aot_inductor/</code>、<code>torch/_inductor/package/</code>、<code>torch/csrc/inductor/aoti_*/</code></li>
+  <li><a href="https://docs.pytorch.org/docs/2.12/user_guide/torch_compiler/torch.compiler_aot_inductor.html" target="_blank" rel="noopener">PyTorch 2.12 AOTInductor 教程</a></li>
+  <li><a href="https://docs.pytorch.org/docs/2.12/user_guide/torch_compiler/export/pt2_archive.html" target="_blank" rel="noopener">PyTorch 2.12 PT2 Archive Spec</a></li>
+  <li><a href="https://docs.pytorch.org/docs/2.12/export.html" target="_blank" rel="noopener"><code>torch.export</code> API</a></li>
+  <li><a href="https://docs.pytorch.org/docs/2.12/library.html" target="_blank" rel="noopener"><code>torch.library</code> API</a></li>
+  <li><a href="pytorch-shared-libs.html">PyTorch Linux 共享库的构建与加载关系</a></li>
+  <li><a href="pytorch-dispatcher.html">PyTorch Dispatcher：从算子 Schema 到 CUDA Kernel</a></li>
+  <li>PyTorch 源码位置:<code>torch/_inductor/aot_inductor/</code>、<code>torch/_inductor/package/</code>、<code>torch/csrc/inductor/aoti_*/</code></li>
 </ul>
 
 <hr>
@@ -772,39 +754,87 @@ torch::inductor::AOTIModelPackageLoader loader(<span class="cm">"model.pt2"</spa
 <!-- ============================= 英文版 ============================= -->
 <div class="lang-en">
 
-<h1>Deploying a PyTorch Model to a CUDA C++ Runtime via AOT Inductor</h1>
+<h1>CUDA C++ Deployment and Runtime Mechanics of PyTorch AOTInductor</h1>
 
-<h2 id="en-1">1. Why AOTI</h2>
+<p class="lead">Moving a PyTorch model from a development environment into a C++ service requires an explicit division between compile-time work, model assets, and runtime dependencies. AOTInductor places model capture, Inductor lowering, GPU-kernel generation, and packaging in an offline stage, then executes the result through a C++ loader. This boundary determines the contents of a <code>.pt2</code> package, the libtorch components required by the deployment process, and the separate compile-time and runtime contracts required by custom operators.</p>
 
-<p>Three production-deployment pain points usually push PyTorch users away from a pure Python runtime:</p>
+<p class="small">APIs, source paths, and runtime call chains in this article were checked against the public <a href="https://github.com/pytorch/pytorch/tree/v2.12.0">PyTorch <code>v2.12.0</code> source</a> and the <a href="https://docs.pytorch.org/docs/2.12/user_guide/torch_compiler/torch.compiler_aot_inductor.html">2.12 AOTInductor documentation</a>. <code>torch._inductor</code>, <code>.pt2</code> contents, and generated symbols can change with version and build configuration; the pseudocode and diagrams are source-reading models, not a stable ABI or fixed file manifest.</p>
+
+<h2 id="en-1">1. AOTI's Deployment Boundary</h2>
+
+<p>AOTI targets deployments with three recurring constraints:</p>
 
 <ul>
-  <li><strong>You do not want a Python runtime in production.</strong> Inference services, simulators, embedded environments often constrain you to C++ or Rust binaries; shipping CPython plus the whole PyTorch wheel is bulky and grows the dependency surface.</li>
-  <li><strong>You do not want JIT compilation latency.</strong> <code>torch.compile</code> on first run does Dynamo trace + Inductor codegen + Triton cubin compilation, which can add seconds to tens of seconds. Production wants cold-start to be cheap.</li>
-  <li><strong>You do not want to round-trip through TorchScript or ONNX.</strong> TorchScript is in maintenance mode, ONNX requires two toolchains to agree, and custom ops are hard to push through either. A "pure PyTorch" deployment path is more appealing.</li>
+  <li><strong>A native serving process.</strong> Inference services, simulators, and embedded environments may standardize on C++ or Rust binaries, making a Python interpreter an avoidable runtime dependency.</li>
+  <li><strong>Predictable cold start.</strong> <code>torch.compile</code> performs Dynamo tracing, Inductor code generation, and Triton binary compilation on its first execution. Moving these steps offline removes that compilation work from service startup.</li>
+  <li><strong>PyTorch compiler semantics across the deployment boundary.</strong> The <a href="https://docs.pytorch.org/docs/2.12/jit.html">PyTorch 2.12 documentation</a> marks TorchScript as deprecated. ONNX introduces a separate exporter/runtime contract, whereas AOTI keeps graph export and lowering within the PyTorch compiler stack.</li>
 </ul>
 
-<p><strong>AOT Inductor (AOTI)</strong> is PyTorch 2.4+'s answer:</p>
+<p><strong>AOTInductor (AOTI)</strong> is PyTorch's ahead-of-time deployment path for compiling an exported program into packaged native artifacts that a matching libtorch runtime can load. In the pinned PyTorch 2.12 release, the path has three stages:</p>
 
 <ul>
-  <li>On the Python side, you run <code>torch.export</code> once and feed the result into Inductor, which produces all the codegen ahead of time (including Triton-kernel-to-cubin compilation) and links it.</li>
-  <li>The output is a <strong>self-contained <code>.pt2</code> package</strong> (a zip under the hood) containing the model weights, the C++ glue library, every Triton kernel's cubin, and metadata.</li>
-  <li>On the C++ side, you only link <code>libtorch_cpu.so</code> and <code>libtorch_cuda.so</code> and use <code>torch::inductor::AOTIModelPackageLoader</code> to load the <code>.pt2</code> and run inference. <strong>No Python interpreter is involved at runtime.</strong></li>
+  <li>On the Python side, <code>torch.export</code> captures the graph and Inductor performs the code generation, compilation, and packaging required by the selected target configuration.</li>
+  <li>The output is a <strong><code>.pt2</code> archive</strong>. Its members depend on configuration and may include model libraries, C++ or object files, Triton cubins, weights, constants, and ProxyExecutor metadata.</li>
+  <li>On the C++ side, link the libtorch distribution matching the compiler version and use <code>torch::inductor::AOTIModelPackageLoader</code> to load the <code>.pt2</code>. The official C++ example uses <code>${TORCH_LIBRARIES}</code>; runtime does not require a Python interpreter or <code>libtorch_python</code>.</li>
 </ul>
 
 <h2 id="en-2">2. End-to-end flow</h2>
 
-<p>See the diagram in the ZH section above. Key takeaways:</p>
+<div class="flow-frame">
+<svg viewBox="0 0 880 360" width="880" height="360" role="img" aria-labelledby="aoti-en-flow-title aoti-en-flow-desc">
+  <title id="aoti-en-flow-title">AOTInductor build and deployment flow</title>
+  <desc id="aoti-en-flow-desc">Python exports and compiles a module into a PT2 archive. A C++ process loads that archive through libtorch and runs the compiled model.</desc>
+  <defs>
+    <marker id="flow-arrow-head-en" viewBox="-2 -4 8 8" refX="6" refY="0" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M-2,-4 L6,0 L-2,4 z" fill="var(--fg-subtle)"/>
+    </marker>
+  </defs>
 
-<ol>
-  <li><strong>The Python side runs once.</strong> You run export and aoti_compile_and_package to produce a <code>.pt2</code>. A GPU is required at this stage because Inductor uses it to compile Triton kernels, but the resulting <code>.pt2</code> can be copied to any same-architecture GPU machine.</li>
-  <li><strong>The C++ side needs zero Python.</strong> All you need is libtorch plus the CUDA driver/runtime. Loading the <code>.pt2</code> gives you a callable that is equivalent to the original module.</li>
-  <li><strong>Weights are packed inside the <code>.pt2</code>.</strong> No separate weights file is needed; deployment moves a single artifact.</li>
-</ol>
+  <rect class="flow-box" x="20" y="30" width="180" height="60"/>
+  <text x="110" y="55" text-anchor="middle" font-size="12" font-weight="600">nn.Module + custom op</text>
+  <text x="110" y="74" text-anchor="middle" font-size="11" fill="var(--fg-muted)">Python module</text>
+
+  <rect class="flow-box" x="240" y="30" width="180" height="60"/>
+  <text x="330" y="55" text-anchor="middle" font-size="12" font-weight="600">torch.export.export()</text>
+  <text x="330" y="74" text-anchor="middle" font-size="11" fill="var(--fg-muted)">ExportedProgram (FX)</text>
+
+  <rect class="flow-box" x="460" y="30" width="180" height="60"/>
+  <text x="550" y="55" text-anchor="middle" font-size="12" font-weight="600">aoti_compile_and_package()</text>
+  <text x="550" y="74" text-anchor="middle" font-size="11" fill="var(--fg-muted)">Inductor lowering and code generation</text>
+
+  <rect class="flow-box artifact" x="680" y="30" width="180" height="60"/>
+  <text x="770" y="55" text-anchor="middle" font-size="12" font-weight="600">model.pt2</text>
+  <text x="770" y="74" text-anchor="middle" font-size="11" fill="var(--fg-muted)">compiled artifacts, assets, metadata</text>
+
+  <rect class="flow-box runtime" x="240" y="200" width="180" height="60"/>
+  <text x="330" y="225" text-anchor="middle" font-size="12" font-weight="600">AOTIModelPackageLoader</text>
+  <text x="330" y="244" text-anchor="middle" font-size="11" fill="var(--fg-muted)">libtorch C++ loader API</text>
+
+  <rect class="flow-box runtime" x="460" y="200" width="180" height="60"/>
+  <text x="550" y="225" text-anchor="middle" font-size="12" font-weight="600">loader.run(inputs)</text>
+  <text x="550" y="244" text-anchor="middle" font-size="11" fill="var(--fg-muted)">compiled model entry point</text>
+
+  <rect class="flow-box runtime" x="680" y="200" width="180" height="60"/>
+  <text x="770" y="225" text-anchor="middle" font-size="12" font-weight="600">CUDA output tensors</text>
+  <text x="770" y="244" text-anchor="middle" font-size="11" fill="var(--fg-muted)">at::Tensor</text>
+
+  <path class="flow-arrow" style="marker-end:url(#flow-arrow-head-en)" d="M200 60 L240 60"/>
+  <path class="flow-arrow" style="marker-end:url(#flow-arrow-head-en)" d="M420 60 L460 60"/>
+  <path class="flow-arrow" style="marker-end:url(#flow-arrow-head-en)" d="M640 60 L680 60"/>
+  <path class="flow-arrow" style="marker-end:url(#flow-arrow-head-en)" d="M770 90 L770 160 L330 160 L330 200"/>
+  <path class="flow-arrow" style="marker-end:url(#flow-arrow-head-en)" d="M420 230 L460 230"/>
+  <path class="flow-arrow" style="marker-end:url(#flow-arrow-head-en)" d="M640 230 L680 230"/>
+  <text x="550" y="155" text-anchor="middle" font-size="11" fill="var(--fg-subtle)">deploy the archive to the C++ host</text>
+  <text x="20" y="20" font-size="11" fill="var(--accent)" font-weight="600">Python build environment</text>
+  <text x="240" y="190" font-size="11" fill="#d97706" font-weight="600">C++ deployment environment</text>
+</svg>
+</div>
+
+<p>The upper half of the diagram performs model capture, lowering, compilation, and archive packaging in the Python build environment. The lower half loads that archive in the C++ runtime and invokes the compiled model entry point. The example that follows traces the same path through five stages: export, Inductor lowering, Triton code generation, <code>.pt2</code> packaging, and C++ loading.</p>
 
 <h2 id="en-3">3. The example model</h2>
 
-<p>A toy module that deliberately mixes native ops and a custom op:</p>
+<p>The example combines native operators, fusible pointwise operators, and a custom operator. These three node categories enter different lowering paths:</p>
 
 <pre class="code"><span class="cm"># model.py</span>
 <span class="kw">import</span> torch
@@ -812,7 +842,7 @@ torch::inductor::AOTIModelPackageLoader loader(<span class="cm">"model.pt2"</spa
 
 <span class="cm"># --- 1) Register a custom op ---</span>
 <span class="cm"># Semantics: y = x * scale + bias_per_channel</span>
-<span class="cm"># Registered via torch.library.custom_op (the stable public API since PyTorch 2.4).</span>
+<span class="cm"># Registered with torch.library.custom_op in PyTorch 2.12.</span>
 @torch.library.custom_op(<span class="cm">"mylib::scale_add"</span>, mutates_args=())
 <span class="kw">def</span> scale_add(x: torch.Tensor, scale: <span class="kw">float</span>, bias: torch.Tensor) -&gt; torch.Tensor:
     <span class="kw">return</span> x * scale + bias
@@ -826,7 +856,7 @@ torch::inductor::AOTIModelPackageLoader loader(<span class="cm">"model.pt2"</spa
 <span class="kw">class</span> ToyModel(nn.Module):
     <span class="kw">def</span> __init__(self):
         <span class="kw">super</span>().__init__()
-        self.fc1 = nn.Linear(128, 256)        <span class="cm"># native: aten::linear → cuBLAS</span>
+        self.fc1 = nn.Linear(128, 256)        <span class="cm"># native: aten::linear / aten::mm</span>
         self.fc2 = nn.Linear(256, 64)
         self.bias = nn.Parameter(torch.randn(64))
 
@@ -838,12 +868,12 @@ torch::inductor::AOTIModelPackageLoader loader(<span class="cm">"model.pt2"</spa
         <span class="kw">return</span> h.relu()
 </pre>
 
-<p>The op choices are intentional:</p>
+<p>Each operator group exposes one part of the compilation path:</p>
 
 <ul>
-  <li><strong><code>nn.Linear</code></strong>: Inductor lowers it to <code>aten::linear</code> / <code>aten::mm</code>, which dispatches to cuBLAS. Inductor does not generate a Triton kernel for GEMM.</li>
-  <li><strong><code>F.gelu</code> + <code>scale_add</code> + <code>.relu()</code></strong>: all elementwise; Inductor will almost certainly fuse them into a single Triton kernel.</li>
-  <li><strong><code>scale_add</code></strong>: a custom op that lets us check how AOTI handles user-defined operators.</li>
+  <li><strong><code>nn.Linear</code></strong>: this reaches matrix-multiplication paths such as <code>aten::linear</code> and <code>aten::mm</code>. A normal CUDA configuration commonly uses an external GEMM library, but the exact backend depends on the release, shape, and compiler configuration; inspect the generated source.</li>
+  <li><strong><code>F.gelu</code> and <code>.relu()</code></strong>: both have pointwise lowerings. The intervening opaque <code>scale_add</code> custom op blocks cross-op fusion unless a decomposition or compiler-visible lowering is supplied.</li>
+  <li><strong><code>scale_add</code></strong>: a custom operator whose schema, abstract implementation, compiler lowering, and deployment implementation can be examined separately.</li>
 </ul>
 
 <h2 id="en-4">4. Phase 1: <code>torch.export</code></h2>
@@ -872,12 +902,12 @@ ep = export(model, example_inputs, dynamic_shapes={<span class="cm">"x"</span>: 
     <span class="kw">return</span> (relu,)
 </pre>
 
-<p>Observations:</p>
+<p>The exported graph establishes three conditions for the later stages:</p>
 
 <ul>
-  <li>Every op is normalised into <code>torch.ops.{namespace}.{op}.{overload}</code> form. No Python control flow, no <code>nn.Module</code> attribute access.</li>
-  <li>Weights are <strong>lifted into graph inputs</strong> (<code>p_fc1_weight</code> etc.), with the mapping back to the original Parameter names tracked in <code>ep.state_dict</code> / <code>ep.constants</code>.</li>
-  <li>The <strong>custom op</strong> <code>mylib::scale_add</code> sits in the graph alongside ATen ops; this is what lets Inductor recognise it later.</li>
+  <li>Every operator is normalized into <code>torch.ops.{namespace}.{op}.{overload}</code> form, giving the graph an operator-level representation independent of Python module attribute access.</li>
+  <li>Weights are <strong>lifted into graph inputs</strong> (<code>p_fc1_weight</code> and related values), while <code>ep.state_dict</code> and <code>ep.constants</code> retain the mapping to the original state.</li>
+  <li>The custom operator <code>mylib::scale_add</code> appears beside ATen operators, so later compiler stages can identify its schema even though its body remains opaque.</li>
 </ul>
 
 <h3>4.2 Internals</h3>
@@ -906,7 +936,7 @@ ep = export(model, example_inputs, dynamic_shapes={<span class="cm">"x"</span>: 
   </tbody>
 </table>
 
-<p>Cross-referenced against the [[pytorch-shared-libs]] graph: the C++ pieces invoked during export are all inside <code>libtorch_python.so</code> (the Dynamo C hook and the FakeTensor dispatcher entry through <code>PythonFallbackKernel</code>); underlying op dispatch goes through the ATen registration table in <code>libtorch_cpu.so</code>.</p>
+<p>In terms of <a href="pytorch-shared-libs.html"><i>Build and Load Relationships of PyTorch Linux Shared Libraries</i></a>, export uses Python/C++ bridges from <code>libtorch_python.so</code>, while the dispatcher and ATen core live on the libtorch side. Exact ELF dependencies remain artifact-specific.</p>
 
 <h2 id="en-5">5. Phase 2: Inductor lowering</h2>
 
@@ -936,8 +966,8 @@ package_path = torch._inductor.aoti_compile_and_package(
     <tr>
       <td><strong>Heavyweight native</strong></td>
       <td><code>aten::linear</code>, <code>aten::matmul</code>, <code>aten::conv2d</code></td>
-      <td>No codegen; call ATen directly</td>
-      <td>C++ <code>aoti_torch_call_dispatcher("aten::linear", ...)</code> → cuBLAS / cuDNN</td>
+      <td>Usually lower to an external ATen/library call or an AOTI shim; exact form depends on the op and configuration</td>
+      <td>Generated external call or <code>aoti_torch_*</code> shim; inspect the generated source</td>
     </tr>
     <tr>
       <td><strong>Fusible elementwise / reduction</strong></td>
@@ -948,27 +978,28 @@ package_path = torch._inductor.aoti_compile_and_package(
     <tr>
       <td><strong>Custom op</strong></td>
       <td><code>mylib::scale_add</code></td>
-      <td>Default fallback: call the registered backend impl. <strong>Can also be inlined into Triton via a lowering rule</strong></td>
-      <td>See below</td>
+      <td>Opaque by default; in AOT mode a ProxyExecutor can invoke a registered dispatcher implementation, or an explicit decomposition/lowering can be supplied</td>
+      <td><code>aoti_torch_proxy_executor_call_function(...)</code> or explicit lowering</td>
     </tr>
   </tbody>
 </table>
 
 <p>For this example, Inductor produces roughly the following pseudo-C++:</p>
 
-<pre class="code"><span class="cm">// AOTI-generated model.cpp (sketch; actual file is aoti_kernel.cpp / model.so main body)</span>
-<span class="kw">extern</span> <span class="kw">"C"</span> AOTIRuntimeError model_main(
-    AOTITensorHandle* input_handles,
-    AOTITensorHandle* output_handles, ...)
+<pre class="code"><span class="cm">// Logical sketch of generated AOTI code; class/helper names are not stable APIs</span>
+AOTIRuntimeError AOTInductorModel::_run_impl(
+    AtenTensorHandle* input_handles,
+    AtenTensorHandle* output_handles,
+    AOTIProxyExecutorHandle proxy_executor, ...)
 {
-    auto buf0 = call_aten_op(<span class="cm">"aten::linear"</span>, x, fc1_weight, fc1_bias);   <span class="cm">// cuBLAS</span>
+    auto buf0 = generated_linear_call(x, fc1_weight, fc1_bias);   <span class="cm">// commonly reaches cuBLAS</span>
 
     auto buf1 = empty_strided_cuda({4, 256}, ...);
     triton_poi_fused_gelu_0(buf0, buf1, ...);                             <span class="cm">// elementwise gelu</span>
 
-    auto buf2 = call_aten_op(<span class="cm">"aten::linear"</span>, buf1, fc2_weight, fc2_bias); <span class="cm">// cuBLAS</span>
+    auto buf2 = generated_linear_call(buf1, fc2_weight, fc2_bias); <span class="cm">// commonly reaches cuBLAS</span>
 
-    auto buf3 = call_custom_op(<span class="cm">"mylib::scale_add"</span>, buf2, scale, bias); <span class="cm">// opaque custom op call</span>
+    aoti_torch_proxy_executor_call_function(proxy_executor, op_index, ...); <span class="cm">// opaque fallback</span>
 
     auto buf4 = empty_strided_cuda({4, 64}, ...);
     triton_poi_fused_relu_1(buf3, buf4, ...);                            <span class="cm">// lowered aten::relu</span>
@@ -978,9 +1009,11 @@ package_path = torch._inductor.aoti_compile_and_package(
 }
 </pre>
 
-<p>Key observation: <strong><code>torch.library.custom_op</code> creates a compiler-visible but semantically opaque op by default</strong>. <code>register_fake</code> gives <code>torch.export</code> / FakeTensor propagation the output shape, dtype, and device, but it does not make Inductor inspect the Python body or automatically treat the op as pointwise. If you want <code>scale_add</code> to fuse with the following <code>relu</code>, provide an explicit decomposition / lowering rule, or use a compiler-visible Triton wrapper such as <code>torch.library.triton_op</code> (see §9).</p>
+<p>This sketch models the control flow rather than a stable generated ABI. In the <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/_inductor/codegen/cpp_wrapper_cpu.py">PyTorch <code>v2.12.0</code> code generator</a>, AOT-mode fallbacks use a <code>ProxyExecutor</code>; <code>aoti_torch_call_dispatcher</code> in the same file serves a separate, non-AOT StableIValue-compatible path.</p>
 
-<h3>5.3 Key files and corresponding .so</h3>
+<p>A <strong>compiler-visible, semantically opaque custom operator</strong> is an operator whose schema and abstract metadata are available to the compiler while its computation remains an external call. <code>torch.library.custom_op</code> creates that boundary by default, and <code>register_fake</code> supplies the output shape, dtype, and device for export and FakeTensor propagation. Fusion with the following <code>relu</code> requires an explicit decomposition or lowering rule, or a compiler-visible Triton wrapper such as <code>torch.library.triton_op</code> (see §9).</p>
+
+<h3>5.3 Source Modules and Shared-Library Boundaries</h3>
 
 <table>
   <thead><tr><th>File / module</th><th>Role</th></tr></thead>
@@ -996,17 +1029,17 @@ package_path = torch._inductor.aoti_compile_and_package(
   </tbody>
 </table>
 
-<p>This phase is all Python, but the generated C++ ends up being compiled by the system <code>g++</code> into a <code>.so</code> (in <code>/tmp/torchinductor_$USER/</code> by default). The produced <code>.so</code> links <code>libtorch_cpu.so</code>, <code>libtorch_cuda.so</code>, and <code>libcudart.so</code>.</p>
+<p>Python drives this phase, but the generated C++ still has to be compiled into a shared library by the system toolchain; the default temporary root is commonly under <code>/tmp/torchinductor_$USER/</code>. The final ELF <code>DT_NEEDED</code> entries depend on the PyTorch build, target device, and link flags. Inspect the emitted link command or run <code>readelf -d</code> on the artifact instead of assuming a fixed three-library set.</p>
 
 <h2 id="en-6">6. Phase 3: Triton codegen + cubin</h2>
 
-<p>Once Inductor decides to generate a Triton kernel, the Python-to-cubin compilation goes through the external <code>triton</code> pip package (<strong>not part of libtorch_*.so</strong>; see [[pytorch-shared-libs]] §3.6 on OpenAI Triton infrastructure). The flow:</p>
+<p>After Inductor selects Triton code generation for a fused region, the external <code>triton</code> package compiles the generated Python source into a GPU binary. This stage sits between Inductor scheduling and AOTI packaging; <a href="pytorch-shared-libs.html"><i>Build and Load Relationships of PyTorch Linux Shared Libraries</i></a> describes the corresponding boundary between Python compiler components and runtime libraries.</p>
 
 <ol>
   <li>Inductor writes the generated Triton source (Python text) to a path like <code>/tmp/torchinductor_$USER/&lt;hash&gt;/triton_poi_fused_scale_add_relu_1.py</code>.</li>
   <li>It invokes <code>triton.jit</code> to trigger compilation: Python AST → Triton IR → MLIR → PTX → cubin.</li>
-  <li>The cubin lands in <code>~/.triton/cache/</code>, with Inductor keeping a pointer to it under <code>~/.cache/torch/inductor/</code>.</li>
-  <li>The cubin bytes are either embedded in the AOTI <code>.so</code>'s <code>.rodata</code> section (<code>embed_kernel_binary=True</code>) or kept as separate files under <code>data/cubins/</code> inside the <code>.pt2</code>.</li>
+  <li>Triton and Inductor cache compiler intermediates. Their cache roots can be changed by environment and configuration and are not part of the package format.</li>
+  <li>The GPU binary may be embedded in the model library or packaged as a companion file, depending on compiler configuration. Archive member names are not a stable ABI.</li>
 </ol>
 
 <p>A typical generated kernel looks like:</p>
@@ -1030,51 +1063,43 @@ package_path = torch._inductor.aoti_compile_and_package(
     tl.store(out_ptr0 + xindex, tmp4, xmask)
 </pre>
 
-<p>You only see this fused kernel after providing an explicit decomposition / lowering rule, or after wrapping the implementation in a compiler-visible API such as <code>torch.library.triton_op</code>. In that case, <code>* scale + bias</code> and the trailing <code>relu</code> can collapse into one load → compute → store pass. A standalone <code>register_fake</code> declaration does not carry that semantic decomposition.</p>
+<p>This fused form requires Inductor to see the computation through an explicit decomposition or lowering rule, or through a compiler-visible API such as <code>torch.library.triton_op</code>. With that semantic information, <code>* scale + bias</code> and the trailing <code>relu</code> can collapse into one load → compute → store pass. A standalone <code>register_fake</code> declaration supplies abstract metadata only.</p>
 
-<p>Cubin artifact locations:</p>
+<p>Common default configurations may expose paths like these. They are diagnostic cache locations, not deployment interfaces:</p>
 
 <pre class="code">~/.triton/cache/&lt;hash&gt;/triton_poi_fused_scale_add_relu_1.cubin
 ~/.cache/torch/inductor/&lt;hash&gt;/triton_poi_fused_scale_add_relu_1.{py,cubin,json}
 </pre>
 
-<p>The JSON records launch parameters (num_warps, num_stages, shared memory bytes, the grid formula). AOTI embeds these into the generated C++ for the <code>cuLaunchKernel</code> call.</p>
+<p>Companion metadata may record launch information such as <code>num_warps</code>, <code>num_stages</code>, shared-memory size, and the grid formula. Its storage location and the runtime launch path are version-specific implementation details.</p>
 
 <h2 id="en-7">7. Phase 4: <code>.pt2</code> packaging</h2>
 
-<p>A <code>.pt2</code> is just a zip. <code>unzip -l model.pt2</code>:</p>
+<p>A <code>.pt2</code> is a zip container. The following shows only the logical directories used by the PyTorch <code>v2.12.0</code> packager; generated names and the presence of source, object files, or standalone GPU binaries depend on compiler configuration:</p>
 
-<pre class="code">$ unzip -l model.pt2
-   Length      Date    Time    Name
----------  ---------- -----   ----
-   245760  2026-06-03 12:00   data/aotinductor/model/c<hash>.so
-   131072  2026-06-03 12:00   data/constants/L__fc1_weight.bin
-      512  2026-06-03 12:00   data/constants/L__fc1_bias.bin
-    65536  2026-06-03 12:00   data/constants/L__fc2_weight.bin
-      256  2026-06-03 12:00   data/constants/L__fc2_bias.bin
-      256  2026-06-03 12:00   data/constants/L__bias.bin
-     2048  2026-06-03 12:00   data/cubins/triton_poi_fused_gelu_0.cubin
-     3072  2026-06-03 12:00   data/cubins/triton_poi_fused_scale_add_relu_1.cubin
-      512  2026-06-03 12:00   data/aotinductor/model/metadata.json
-</pre>
-
-<p>(With <code>embed_kernel_binary=True</code>, <code>data/cubins/</code> is rolled into the <code>.so</code>'s <code>.rodata</code> and the package collapses to just one <code>.so</code>.)</p>
+<pre class="code">data/aotinductor/model/&lt;generated-files&gt;
+data/aotinductor/model/&lt;model&gt;.so
+data/aotinductor/model/weights_config.json   <span class="cm"># when external weights are used</span>
+data/weights/&lt;weight-files&gt;
+data/constants/&lt;constant-files&gt;
+archive_format
+archive_version</pre>
 
 <table>
   <thead><tr><th>File</th><th>Content</th></tr></thead>
   <tbody>
-    <tr><td><code>data/aotinductor/model/c&lt;hash&gt;.so</code></td><td>Main entry; holds <code>model_main</code>, ATen dispatch calls, cubin loader</td></tr>
-    <tr><td><code>data/cubins/*.cubin</code></td><td>Pre-compiled GPU binary per Triton kernel (SM-specific)</td></tr>
-    <tr><td><code>data/constants/*.bin</code></td><td>Raw bytes for every Parameter / buffer, named by FQN</td></tr>
-    <tr><td><code>data/aotinductor/model/metadata.json</code></td><td>Input/output schema, cubin launch parameters, version</td></tr>
+    <tr><td><code>data/aotinductor/&lt;model&gt;/</code></td><td>AOTI-generated files; the packager can accept a <code>.so</code>, <code>.cpp</code>, object files, and companion JSON</td></tr>
+    <tr><td><code>data/weights/</code></td><td>Model weights stored or deduplicated according to packaging policy</td></tr>
+    <tr><td><code>data/constants/</code></td><td>Tensor constants, custom objects, and related payloads</td></tr>
+    <tr><td><code>archive_format</code> / <code>archive_version</code></td><td>PT2 archive format markers</td></tr>
   </tbody>
 </table>
 
-<p>The packaging code lives in <code>torch/_inductor/package/</code>; the core is <code>torch._inductor.package.package_aoti</code>. The zip layout mirrors the regular <code>torch.export.save</code> <code>.pt2</code> format: the two are the same artifact concept, only with different contents (vanilla export packs FX graph plus state_dict; AOTI packs compiled artifacts plus cubins plus constants).</p>
+<p>The packaging code lives in <code>torch/_inductor/package/</code>, centred on <code>torch._inductor.package.package_aoti</code>. AOTI packages and <code>torch.export.save</code> both follow the PT2 archive specification, but their payload directories and required members differ: the former carries compiled artifacts and model assets, while the latter carries an exported program. Consumers should not parse both with one assumed internal file list.</p>
 
 <h2 id="en-8">8. Phase 5: C++ runtime</h2>
 
-<h3>8.1 Full C++ runner</h3>
+<h3>8.1 C++ Loader Example</h3>
 
 <pre class="code"><span class="cm">// runner.cpp</span>
 <span class="kw">#include</span> &lt;torch/torch.h&gt;
@@ -1113,72 +1138,66 @@ g++ -std=c++17 -O3 \
     -L$TORCH_DIR/lib \
     -Wl,-rpath,$TORCH_DIR/lib \
     runner.cpp -o runner \
-    -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -ltorch_python
+    -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda
 
 ./runner model.pt2
 </pre>
 
-<p>(Production deployments typically avoid linking <code>libtorch_python</code>; the dependency is shown here because the <code>AOTIModelPackageLoader</code> implementation still lives in libtorch_python today. See the pitfalls.)</p>
+<p>This command is illustrative for a Linux CUDA build. The official tutorial prefers CMake with <code>${TORCH_LIBRARIES}</code> from a matching libtorch release. PyTorch <code>v2.12.0</code> lists the package loader and generic runner under <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/build_variables.bzl"><code>inductor_core_resources</code></a>; they do not require <code>libtorch_python</code>.</p>
 
-<h3>8.3 What actually happens</h3>
+<h3>8.3 Package loading sequence</h3>
 
-<p><code>AOTIModelPackageLoader</code> constructor:</p>
+<p>According to <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/inductor/aoti_package/model_package_loader.cpp"><code>model_package_loader.cpp</code></a>, construction can be summarized as follows:</p>
 
 <ol>
-  <li>Opens the <code>.pt2</code> with a zip library and extracts <code>data/aotinductor/model/c&lt;hash&gt;.so</code> to a temp directory.</li>
-  <li><code>dlopen()</code>s that <code>.so</code> and resolves the <code>model_main</code> symbol.</li>
-  <li>Deserialises <code>data/constants/*.bin</code> into CUDA tensors (via <code>cudaMemcpy</code>).</li>
-  <li>Registers each cubin (either from <code>data/cubins/*.cubin</code> or embedded in the <code>.so</code>) with the CUDA driver: <code>cuModuleLoadData(cubin_bytes)</code> → <code>cuModuleGetFunction(name)</code>, yielding <code>CUfunction</code> handles.</li>
-  <li>Configures launch parameters per handle from metadata.json.</li>
+  <li>Read the archive directory and extract the selected model directory plus related constants to a temporary directory.</li>
+  <li>Use an existing <code>.so</code>, or compile one from packaged <code>.cpp</code>, object files, and compile options.</li>
+  <li>Read the AOTI device key from metadata and select a device runner from the runner registry.</li>
+  <li>Pass the model <code>.so</code>, runner count, device, and generated-file directory to that runner; update the constant buffer if a weight blob is present.</li>
 </ol>
 
 <p><code>loader.run(inputs)</code>:</p>
 
 <ol>
-  <li>Wraps each input <code>at::Tensor</code> as an <code>AOTITensorHandle</code> (C-ABI) carrying strides, shape, and dtype.</li>
-  <li>Calls <code>model_main(input_handles, output_handles, constants, ...)</code>.</li>
-  <li>Inside <code>model_main</code>:
-    <ul>
-      <li>Each native op uses <code>aoti_torch_call_dispatcher("aten::linear", ...)</code> → libtorch_cpu dispatcher → libtorch_cuda CUDA backend → cuBLAS.</li>
-      <li>Each Triton kernel uses <code>cuLaunchKernel(triton_poi_fused_*_handle, grid, ...)</code>.</li>
-    </ul>
-  </li>
-  <li>Converts output handles back to <code>at::Tensor</code> and returns them.</li>
+  <li>Convert input <code>at::Tensor</code> objects to an <code>AtenTensorHandle</code> array.</li>
+  <li>Call the model container's exported <code>AOTInductorModelContainerRun</code> function (or its single-threaded variant), passing the stream and optional <code>ProxyExecutor</code>.</li>
+  <li>Convert returned tensor handles back to <code>at::Tensor</code>.</li>
 </ol>
 
-<p>Relevant PyTorch source (the Inductor / Triton infrastructure inside <code>libtorch_python.so</code> covered in [[pytorch-shared-libs]] §3.6):</p>
+<p><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/inductor/aoti_runner/model_container_runner.cpp"><code>model_container_runner.cpp</code></a> resolves model-container C ABI exports such as <code>AOTInductorModelContainerCreateWithDevice</code> and <code>AOTInductorModelContainerRun</code>. The generated artifact owns the version-specific loading and launch path for Triton or CUDA kernels.</p>
+
+<p>The relevant public sources are below; see <a href="pytorch-shared-libs.html"><i>Build and Load Relationships of PyTorch Linux Shared Libraries</i></a> for shared-library boundaries:</p>
 
 <table>
   <thead><tr><th>Path</th><th>Role</th></tr></thead>
   <tbody>
-    <tr><td><code>torch/csrc/inductor/aoti_package/model_package_loader.{h,cpp}</code></td><td><code>AOTIModelPackageLoader</code> implementation</td></tr>
-    <tr><td><code>torch/csrc/inductor/aoti_runner/model_container_runner.cpp</code></td><td>Underlying <code>AOTIModelContainerRunner</code></td></tr>
+    <tr><td><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/inductor/aoti_package/model_package_loader.cpp"><code>torch/csrc/inductor/aoti_package/model_package_loader.cpp</code></a></td><td><code>AOTIModelPackageLoader</code>; part of the core resources</td></tr>
+    <tr><td><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/inductor/aoti_runner/model_container_runner.cpp"><code>torch/csrc/inductor/aoti_runner/model_container_runner.cpp</code></a></td><td>Loads the model library and resolves the model-container C ABI</td></tr>
     <tr><td><code>torch/csrc/inductor/aoti_runner/model_container_runner_cuda.cpp</code></td><td>CUDA-specialised runner (in <code>libtorch_cuda.so</code>)</td></tr>
     <tr><td><code>torch/csrc/inductor/aoti_torch/shim_common.cpp</code></td><td>C-ABI shim host-side</td></tr>
     <tr><td><code>torch/csrc/inductor/aoti_torch/shim_cuda.cpp</code></td><td>CUDA shim (in <code>libtorch_cuda.so</code>)</td></tr>
-    <tr><td><code>torch/csrc/inductor/static_launcher/cuda.cpp</code></td><td>Triton static launcher, in <code>libtorch_python.so</code></td></tr>
-  </tbody>
+</tbody>
 </table>
 
-<p>So a single <code>loader.run()</code> crosses several .so boundaries: <code>libtorch_python</code> (loader entry) → <code>libtorch_cpu</code> (C-ABI shim plus ATen dispatcher) → <code>libtorch_cuda</code> (CUDA dispatcher and cuLaunchKernel) → the temp <code>.so</code> extracted from the <code>.pt2</code> (the <code>model_main</code> body) → the embedded cubins.</p>
+<p>The resulting call chain has three layers: the package loader in libtorch core extracts the archive and selects a runner; the generic runner dynamically loads the model <code>.so</code> and invokes the model-container C ABI; the CUDA runner and generated model use the required CUDA runtime and shims. Exact ELF boundaries and kernel-launch forms remain properties of the selected build and generated artifact.</p>
 
 <h2 id="en-9">9. Custom op handling details</h2>
 
-<p>The <code>scale_add</code> example is simple and has a fake impl, but that only satisfies export / abstract-execution requirements; <strong>it does not make Inductor inline the op automatically</strong>. Real-world custom ops usually follow one of three handling strategies.</p>
+<p>A custom operator crosses three distinct contracts: its schema identifies the operation, its fake implementation supports export and abstract execution, and its lowering or runtime implementation supplies executable semantics. The <code>scale_add</code> example uses these contracts to distinguish three integration strategies.</p>
 
 <h3>9.1 Strategy A: let Inductor fall back (default)</h3>
 
-<p>Without any extra registration, Inductor sees <code>mylib::scale_add</code> and:</p>
+<p>With the schema and fake implementation alone, Inductor treats <code>mylib::scale_add</code> as an opaque external operation:</p>
 
 <ul>
-  <li>Does not inline it into Triton.</li>
-  <li>Emits a literal <code>aoti_torch_call_dispatcher("mylib::scale_add", ...)</code> in the AOTI-generated C++.</li>
-  <li>At runtime the dispatcher routes to whichever backend the op is registered against.</li>
+  <li>The operation remains outside Triton fusion regions.</li>
+  <li>AOT mode emits an external fallback and packages its call description for <code>ProxyExecutor</code>.</li>
+  <li>At runtime, ProxyExecutor invokes the registered operator implementation; the pinned PT2 archive specification stores these calls in an optional JSON file.</li>
 </ul>
 
-<p>But the op's implementation here is a Python function, which the C++ runtime cannot reach. For a pure C++ AOTI runner, rewrite the op in C++/CUDA and register it via <code>TORCH_LIBRARY_IMPL</code> for the right DispatchKey, then link or <code>dlopen</code> that implementation <code>.so</code> before loading the package. <code>register_kernel("cuda")</code> / <code>device_types=["cuda"]</code> helps Python-side execution, but it does not by itself make the kernel available to a Python-free C++ runtime.</p>
+<p>A Python-free AOTI runner therefore needs a loadable C++ or CUDA implementation registered through <code>TORCH_LIBRARY_IMPL</code> for the appropriate DispatchKey. The runner links or <code>dlopen</code>s that implementation before loading the package. By comparison, <code>register_kernel("cuda")</code> or <code>device_types=["cuda"]</code> supplies an implementation to a Python process and does not establish the C++ runtime registration.</p>
 
-<h3>9.2 Strategy B: register a lowering so Inductor inlines it (best for elementwise / simple reduction)</h3>
+<h3>9.2 Strategy B: register a version-specific Inductor lowering</h3>
 
 <pre class="code"><span class="kw">from</span> torch._inductor <span class="kw">import</span> lowering
 
@@ -1187,11 +1206,11 @@ g++ -std=c++17 -O3 \
     <span class="kw">return</span> lowering.add(lowering.mul(x, scale), bias)
 </pre>
 
-<p>After this explicit registration, Inductor can treat <code>scale_add</code> as a composition of primitives and fuse it with surrounding elementwise ops. This is not automatic behavior from <code>torch.library.custom_op</code> or <code>register_fake</code>; the fake impl is for abstract execution and shape inference.</p>
+<p>After this explicit registration, the pinned Inductor version can express <code>scale_add</code> in its internal IR and fuse it with surrounding elementwise ops. <code>torch._inductor.lowering</code> is an internal API and must be maintained with the selected PyTorch version. A fake implementation remains limited to abstract execution and metadata inference.</p>
 
-<h3>9.3 Strategy C: ship a Triton implementation along with the op</h3>
+<h3>9.3 Strategy C: register a Triton implementation for Python execution</h3>
 
-<p>For heavier ops (e.g. a custom attention kernel), the cleanest path is to <strong>register a Triton kernel alongside the op</strong>:</p>
+<p>The following <code>register_kernel("cuda")</code> implementation lets the custom op call a Triton kernel in a Python process:</p>
 
 <pre class="code"><span class="kw">import</span> triton
 <span class="kw">import</span> triton.language <span class="kw">as</span> tl
@@ -1214,26 +1233,26 @@ g++ -std=c++17 -O3 \
     <span class="kw">return</span> out
 </pre>
 
-<p>Inductor sees the registered Triton kernel and calls it directly, bypassing any fallback. This path suits "already hand-optimised Triton kernels."</p>
+<p>This registration supplies a runtime implementation; it does not automatically expose the Triton body to Inductor and is not sufficient for a Python-free C++ runtime. Use the pinned release's <code>torch.library.triton_op</code> integration when compiler-visible tracing is required. A standalone AOTI fallback still needs an implementation that the C++ process can load.</p>
 
 <h3>9.4 Third-party ops exposed only through pybind, never registered with the dispatcher</h3>
 
-<p>In practice, libraries like flash-attn, xformers, and early apex frequently expose their CUDA ops <strong>only as pybind functions</strong>: no <code>TORCH_LIBRARY</code> schema, no <code>TORCH_LIBRARY_IMPL</code> backend. Dynamo cannot see these calls (it graph-breaks at them), and they cannot enter AOTI.</p>
+<p>A plain pybind CUDA entry without an operator schema, fake implementation, and C++ backend lacks the integration contract expected by the PyTorch compiler stack. Depending on the function and tracing rules, Dynamo may graph-break, reject export, or require an explicit integration; pybind callability alone does not make an operation deployable through AOTI.</p>
 
-<p>What is missing:</p>
+<p>The integration contracts differ as follows:</p>
 
 <table>
   <thead><tr><th>Capability</th><th>pybind function</th><th>TORCH_LIBRARY op</th></tr></thead>
   <tbody>
     <tr><td>Accessible as <code>torch.ops.ns.op</code></td><td>✗</td><td>✓</td></tr>
-    <tr><td>Dynamo traces it</td><td><strong>✗ (graph break)</strong></td><td>✓</td></tr>
-    <tr><td>FakeTensor / meta shape inference</td><td>✗</td><td>✓</td></tr>
-    <tr><td>Enters the FX graph in <code>torch.export</code></td><td>✗</td><td>✓</td></tr>
-    <tr><td>Callable from the AOTI C++ runtime</td><td><strong>✗</strong></td><td>✓</td></tr>
+    <tr><td>Dynamo traces it</td><td>Depends on the function and tracing rules</td><td>Traceable with the required registrations</td></tr>
+    <tr><td>FakeTensor / meta shape inference</td><td>No operator-level contract</td><td>Requires a fake/meta implementation</td></tr>
+    <tr><td>Enters the FX graph in <code>torch.export</code></td><td>No general guarantee</td><td>Yes when the export contract is satisfied</td></tr>
+    <tr><td>Callable from the AOTI C++ runtime</td><td>No direct guarantee</td><td>Also requires a loadable C++ backend implementation</td></tr>
   </tbody>
 </table>
 
-<p>The AOTI-ready fix is a <strong>two-step solution</strong>.</p>
+<p>Python-free AOTI deployment needs both a compile-time contract and a runtime implementation.</p>
 
 <h4>Step 1: wrap the pybind call in <code>custom_op</code> on the Python side</h4>
 
@@ -1252,9 +1271,9 @@ g++ -std=c++17 -O3 \
     <span class="kw">return</span> torch.empty_like(q)
 </pre>
 
-<p>After this step, Dynamo and export see <code>torch.ops.mylib.fa_fwd</code> in the FX graph. AOTI lowering treats it as an atomic, non-decomposable call and emits <code>aoti_torch_call_dispatcher("mylib::fa_fwd", ...)</code> in the generated C++.</p>
+<p>After this step, Dynamo and export see <code>torch.ops.mylib.fa_fwd</code> in the FX graph. In PyTorch v2.12.0, AOT fallback describes the external call through ProxyExecutor and packages the corresponding JSON according to the PT2 archive specification.</p>
 
-<p><strong>But</strong>: the implementation is still in Python. When the C++ runtime loads the <code>.pt2</code>, the symbol does not exist; execution crashes at the dispatcher lookup. Hence step 2.</p>
+<p>The Python wrapper itself is not available in a Python-free deployment process, so the runtime still needs a C++/CUDA operator implementation.</p>
 
 <h4>Step 2: write a <code>TORCH_LIBRARY</code> C++ shim and link it into the runner</h4>
 
@@ -1293,11 +1312,11 @@ TORCH_LIBRARY_IMPL(mylib, CUDA, m) {
     -o libfa_shim.so
 </pre>
 
-<p>In the C++ runner, dlopen the shim <strong>before</strong> constructing <code>AOTIModelPackageLoader</code> so the <code>TORCH_LIBRARY</code> global constructors register <code>fa_fwd</code> into the dispatcher first:</p>
+<p>Load the shim before constructing <code>AOTIModelPackageLoader</code> so its <code>TORCH_LIBRARY</code> static registration completes first. This example uses <code>RTLD_NOW | RTLD_LOCAL</code>; use <code>RTLD_GLOBAL</code> only when the third-party library's symbol-visibility contract requires it:</p>
 
 <pre class="code"><span class="kw">#include</span> &lt;dlfcn.h&gt;
 <span class="cm">// ...</span>
-<span class="kw">void</span>* shim = dlopen(<span class="cm">"./libfa_shim.so"</span>, RTLD_LAZY | RTLD_GLOBAL);
+<span class="kw">void</span>* shim = dlopen(<span class="cm">"./libfa_shim.so"</span>, RTLD_NOW | RTLD_LOCAL);
 <span class="kw">if</span> (!shim) { std::cerr &lt;&lt; dlerror() &lt;&lt; <span class="cm">"\n"</span>; <span class="kw">return</span> 1; }
 
 torch::inductor::AOTIModelPackageLoader loader(<span class="cm">"model.pt2"</span>);
@@ -1309,43 +1328,44 @@ torch::inductor::AOTIModelPackageLoader loader(<span class="cm">"model.pt2"</spa
 <table>
   <thead><tr><th>Need</th><th>Approach</th></tr></thead>
   <tbody>
-    <tr><td><code>torch.compile</code> only, no deployment</td><td><code>torch._dynamo.allow_in_graph(third_party_fn)</code>; Dynamo treats the call as an opaque FX node and stops graph-breaking. <strong>Cannot export, cannot AOTI.</strong></td></tr>
+    <tr><td><code>torch.compile</code> only, no deployment</td><td>Use a custom op, <code>triton_op</code>, or the project's integration as appropriate; <code>allow_in_graph</code> alone does not prove AOTI deployability.</td></tr>
     <tr><td><code>torch.export</code> / FX</td><td>Step 1 (<code>custom_op</code> + <code>register_fake</code>)</td></tr>
     <tr><td>AOTI <code>.pt2</code> + pure C++ deployment</td><td>Step 1 + Step 2 (Python custom_op plus a C++ shim dlopened by the runner)</td></tr>
   </tbody>
 </table>
 
-<h4>Pitfalls observed in practice</h4>
+<h4>Integration constraints</h4>
 
 <ol>
-  <li><strong>Schema must match on both sides.</strong> The argument types, count, and return signature of the Python <code>custom_op</code> and the C++ <code>TORCH_LIBRARY</code> registration must be identical, otherwise <code>aoti_torch_call_dispatcher</code> cannot resolve the overload.</li>
-  <li><strong>Declare <code>mutates_args</code> for in-place outputs.</strong> Ops like flash-attn varlen write into an <code>out</code> parameter; missing <code>mutates_args=("out",)</code> confuses functionalization and produces out-of-order memory effects.</li>
-  <li><strong>Autograd is not automatic.</strong> <code>custom_op</code> has no backward by default; for training, register it with <code>fa_fwd.register_autograd(setup_context=..., backward=...)</code>. Inference-only deployment can ignore this.</li>
-  <li><strong>Shim load order matters.</strong> <code>libfa_shim.so</code> must be dlopened before <code>AOTIModelPackageLoader</code>'s constructor and with <code>RTLD_GLOBAL</code> (otherwise dispatcher registration does not reach the global symbol table). If the shim loads too late, AOTI startup fails with "Could not run 'mylib::fa_fwd' with arguments from the 'CUDA' backend".</li>
-  <li><strong>Do not skip the wrapper.</strong> Calling the pybind function directly and then running <code>torch.export</code> always fails: Dynamo cannot symbolise an external function. The <code>custom_op</code> wrapper is non-optional.</li>
+  <li><strong>Schema must match on both sides.</strong> The Python <code>custom_op</code> and deployment-time C++ registration must describe the same operator schema so ProxyExecutor and the dispatcher can invoke the expected implementation.</li>
+  <li><strong>Declare <code>mutates_args</code> for in-place outputs.</strong> An operator with an <code>out</code> parameter should identify the written argument, for example <code>mutates_args=("out",)</code>. Otherwise, functionalization may model the operator with incorrect pure-function semantics.</li>
+  <li><strong>Training requires an explicit autograd formula.</strong> A <code>custom_op</code> has no backward definition by default. Register one with <code>fa_fwd.register_autograd(setup_context=..., backward=...)</code>; inference-only deployment can omit this step.</li>
+  <li><strong>Complete operator registration before execution.</strong> Whether linked statically or loaded with <code>dlopen</code>, the target backend implementation must be registered before the model runs. <code>RTLD_GLOBAL</code> is a dependency-specific choice, not a universal <code>TORCH_LIBRARY</code> requirement.</li>
+  <li><strong>Do not equate pybind callability with exportability.</strong> Establish the schema, fake/meta behavior, and runtime implementation through a supported integration, then run export and AOTI tests on the actual target.</li>
 </ol>
 
-<h2 id="en-10">10. Pitfalls</h2>
+<h2 id="en-10">10. Deployment Constraints and Version Boundaries</h2>
 
 <ol>
-  <li><strong>SM compatibility.</strong> Cubins are SM-specific (sm_80 / sm_90 / sm_90a). The export machine and the deployment machine must share an SM level (or the deployment machine must be newer). For cross-SM portability, emit PTX (<code>aot_inductor.embed_cubin=False</code>) and let the driver JIT it, or build separate packages per target SM.</li>
-  <li><strong>PyTorch version pinning.</strong> A <code>.pt2</code> is bound to the PyTorch version that built it (the C-ABI shim signatures can break on minor versions). Match libtorch minor versions between build and deployment.</li>
-  <li><strong>Dynamic shapes.</strong> Declare dynamic dims via <code>Dim</code> at export. Otherwise deployment inputs must match the example shapes exactly. With <code>max_autotune</code> in dynamic-shape mode, expect the cubin count to grow (one bucket per size class).</li>
+  <li><strong>GPU target compatibility.</strong> An archive may contain cubins for particular SM targets as well as other generated files. Inspect the archive and compile configuration, then validate every deployment GPU; a newer GPU alone does not guarantee compatibility.</li>
+  <li><strong>PyTorch version pinning.</strong> This article does not treat <code>.pt2</code> or the internal AOTI C ABI as a cross-version stable interface. Matching PyTorch/libtorch versions are the conservative deployment baseline.</li>
+  <li><strong>Dynamic shapes.</strong> Declare dimensions that may vary through <code>Dim</code> during export. Other dimensions are normally specialized from the example inputs, and runtime checks may reject mismatched size, dtype, or stride.</li>
   <li><strong>Custom op must have a fake impl.</strong> A custom op without <code>register_fake</code> fails export outright.</li>
-  <li><strong>State / control flow.</strong> Python loops (Dynamo unrolls them), mutable state (<code>list.append</code>) etc. can fail export or change behaviour. Use <code>torch.cond</code> / <code>torch.while_loop</code> for explicit control flow.</li>
-  <li><strong>First-run cost.</strong> Export plus aoti_compile_and_package can take 1 to 10 minutes for sizable models (Inductor lowering and Triton autotuning dominate). It runs once; deployment loads in seconds.</li>
-  <li><strong>Avoid linking libtorch_python (ideally).</strong> The <code>AOTIModelPackageLoader</code> implementation still resides in <code>libtorch_python.so</code> at the time of writing, so a truly Python-free environment needs a Python-less libtorch build (the <code>BUILD_LIBTORCHLESS</code> path). The community is still shaking this out; PyTorch 2.5+ has the bones in place, but details vary by exact version.</li>
+  <li><strong>State and control flow.</strong> Export support for Python control flow and mutable state is version- and pattern-dependent. Use supported higher-order operators for dynamic control flow and validate the target input set.</li>
+  <li><strong>Build and load cost.</strong> Timing depends on the model, target, autotuning, and cache state. Measure export, AOTI compilation, packaging, and cold loading separately instead of assuming fixed minute or second ranges.</li>
+  <li><strong>Python-free runtime.</strong> The PyTorch v2.12.0 C++ tutorial links the AOTI loader through <code>${TORCH_LIBRARIES}</code> without requiring a Python interpreter. Determine the final shared-library set from the CMake link line and the deployed artifact's ELF dependencies.</li>
 </ol>
 
 <h2 id="en-refs">References</h2>
 
 <ul>
-  <li>PyTorch AOTI tutorial: <a href="https://pytorch.org/docs/stable/torch.compiler_aot_inductor.html" target="_blank" rel="noopener">torch.compiler_aot_inductor</a></li>
-  <li>torch.export API: <a href="https://pytorch.org/docs/stable/export.html" target="_blank" rel="noopener">torch.export</a></li>
-  <li>torch.library custom ops: <a href="https://pytorch.org/docs/stable/library.html" target="_blank" rel="noopener">torch.library</a></li>
-  <li>Predecessor [[pytorch-shared-libs]]: where Inductor / Triton infrastructure lives across the libtorch_*.so libraries.</li>
-  <li>Predecessor [[pytorch-dispatcher]]: full-stack view of ATen op dispatch.</li>
-  <li>Key source locations: <code>torch/_inductor/aot_inductor/</code>, <code>torch/_inductor/package/</code>, <code>torch/csrc/inductor/aoti_*/</code>.</li>
+  <li><a href="https://docs.pytorch.org/docs/2.12/user_guide/torch_compiler/torch.compiler_aot_inductor.html" target="_blank" rel="noopener">PyTorch 2.12 AOTInductor tutorial</a></li>
+  <li><a href="https://docs.pytorch.org/docs/2.12/user_guide/torch_compiler/export/pt2_archive.html" target="_blank" rel="noopener">PyTorch 2.12 PT2 Archive Spec</a></li>
+  <li><a href="https://docs.pytorch.org/docs/2.12/export.html" target="_blank" rel="noopener"><code>torch.export</code> API</a></li>
+  <li><a href="https://docs.pytorch.org/docs/2.12/library.html" target="_blank" rel="noopener"><code>torch.library</code> custom-op API</a></li>
+  <li><a href="pytorch-shared-libs.html">Build and Load Relationships of PyTorch Linux Shared Libraries</a></li>
+  <li><a href="pytorch-dispatcher.html">PyTorch Dispatcher: From Operator Schema to CUDA Kernel</a></li>
+  <li>PyTorch source locations: <code>torch/_inductor/aot_inductor/</code>, <code>torch/_inductor/package/</code>, <code>torch/csrc/inductor/aoti_*/</code>.</li>
 </ul>
 
 <hr>

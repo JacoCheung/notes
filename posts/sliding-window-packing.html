@@ -3,33 +3,28 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sliding Window 的 packing 陷阱</title>
-<meta name="post:title"           content="Sliding Window 的 packing 陷阱">
-<meta name="post:title_en"        content="Sliding Window's Packing Trap">
+<title>Sliding Window Attention 的 Packing 边界与样本隔离</title>
+<meta name="post:title"           content="Sliding Window Attention 的 Packing 边界与样本隔离">
+<meta name="post:title_en"        content="Packing Boundaries and Sample Isolation in Sliding Window Attention">
 <meta name="post:slug"            content="sliding-window-packing">
 <meta name="post:date"            content="2026-06-04">
 <meta name="post:tags"            content="LLM, Attention, 训练, FlashAttention">
 <meta name="post:tags_en"         content="LLM, Attention, Training, FlashAttention">
 <meta name="post:reading"         content="12 分钟">
 <meta name="post:reading_en"      content="12 min">
-<meta name="post:summary"         content="Sliding window attention 的单层感受野只看 W 个 token,但 L 层叠加后实际感受野 ≈ L·(W-1)+1。这一点直接决定:把多条训练样本拼成长序列后,只靠 SWA 不能保证跨样本隔离,必须用 document mask / cu_seqlens。本文用两层 / 6-token diagram 把这件事讲透,并给出 FlashAttention 的正确 API。">
-<meta name="post:summary_en"      content="A single SWA layer only sees W tokens, but L stacked layers reach an effective receptive field of L·(W-1)+1. Consequence: packing multiple training samples into one sequence is NOT safe under SWA alone, you need a document mask via cu_seqlens. This note walks through a 2-layer, 6-token diagram and gives the right FlashAttention API.">
+<meta name="post:summary"         content="Sequence packing 提高 token 利用率，SWA 只限制层内依赖，不编码样本边界。L 层因果 SWA 的感受野上界为 L(W-1)+1；document mask 或 cu_seqlens 必须切断跨样本路径，保证 packed attention 的样本隔离。">
+<meta name="post:summary_en"      content="Sequence packing improves token utilization, while Sliding Window Attention constrains only local dependencies within each layer and does not encode sample ownership. The maximum theoretical receptive field of L causal SWA layers is L(W-1)+1; document masks or cu_seqlens must disconnect packed samples to preserve attention equivalence with separate execution.">
 <meta name="post:series"          content="llm-arch">
 <meta name="post:series_title"    content="LLM Attention 与实现">
 <meta name="post:series_title_en" content="LLM Attention and Implementations">
 <meta name="post:series_order"    content="2">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
-<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
-  onload="renderMathInElement(document.body, {
-    delimiters: [
-      {left: '$$', right: '$$', display: true},
-      {left: '\\[', right: '\\]', display: true},
-      {left: '$',  right: '$',  display: false},
-      {left: '\\(', right: '\\)', display: false}
-    ],
-    throwOnError: false
-  });"></script>
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(','\\)'], ['$','$']], displayMath: [['\\[','\\]'], ['$$','$$']] },
+    options: { skipHtmlTags: ['script', 'style', 'pre', 'code'] }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
@@ -132,25 +127,25 @@
     <div class="toc-title">目录 · TOC</div>
     <div class="lang-zh">
     <ul>
-      <li><a href="#zh-intro">1. 引言</a></li>
-      <li><a href="#zh-single">2. 单层 SWA:直接感受野</a></li>
-      <li><a href="#zh-multi">3. 两层 SWA:实际感受野扩大</a></li>
-      <li><a href="#zh-formula">4. 通用公式</a></li>
-      <li><a href="#zh-packing">5. Packing 训练:跨样本污染</a></li>
-      <li><a href="#zh-docmask">6. 正确做法:document mask</a></li>
-      <li><a href="#zh-check">7. 实操 checklist</a></li>
+      <li><a href="#zh-intro">1. 问题设定</a></li>
+      <li><a href="#zh-single">2. 单层窗口的直接感受野</a></li>
+      <li><a href="#zh-multi">3. 层间传播与有效感受野</a></li>
+      <li><a href="#zh-formula">4. 感受野上界</a></li>
+      <li><a href="#zh-packing">5. Packing 训练中的跨样本污染</a></li>
+      <li><a href="#zh-docmask">6. 文档边界编码</a></li>
+      <li><a href="#zh-check">7. 等价性验证</a></li>
       <li><a href="#zh-refs">参考资料</a></li>
     </ul>
     </div>
     <div class="lang-en">
     <ul>
-      <li><a href="#en-intro">1. Intro</a></li>
-      <li><a href="#en-single">2. Single-layer SWA</a></li>
-      <li><a href="#en-multi">3. Two-layer SWA</a></li>
-      <li><a href="#en-formula">4. The general formula</a></li>
+      <li><a href="#en-intro">1. Problem setting</a></li>
+      <li><a href="#en-single">2. Direct receptive field</a></li>
+      <li><a href="#en-multi">3. Cross-layer propagation</a></li>
+      <li><a href="#en-formula">4. Receptive-field bound</a></li>
       <li><a href="#en-packing">5. Packed training: cross-sample contamination</a></li>
-      <li><a href="#en-docmask">6. The fix: document mask</a></li>
-      <li><a href="#en-check">7. Practical checklist</a></li>
+      <li><a href="#en-docmask">6. Encoding document boundaries</a></li>
+      <li><a href="#en-check">7. Equivalence checks</a></li>
       <li><a href="#en-refs">References</a></li>
     </ul>
     </div>
@@ -175,34 +170,34 @@
 <!-- ===================== ZH ===================== -->
 <div class="lang-zh">
 
-<h1>Sliding Window 的 packing 陷阱</h1>
+<h1>Sliding Window Attention 的 Packing 边界与样本隔离</h1>
 
-<p style="color: var(--fg-muted); font-style: italic;">LLM Attention 与实现 · Part 2</p>
+<p class="lead">Sequence packing 把多条短样本拼入同一个 token buffer，以提高有效 token 比例；Sliding Window Attention（SWA）把每层的注意力限制在局部窗口内。训练系统同时采用两者时，需要保留一项基本语义：每条样本的输出与梯度只能依赖本样本。SWA 描述局部位置关系，packing 则引入文档边界，两种约束作用在不同层面。</p>
 
-<h2 id="zh-intro">1. 引言</h2>
+<h2 id="zh-intro">1. 问题设定</h2>
 
-<p>Sliding Window Attention(SWA)单层只让每个 token 看自己前 $W-1$ 个 token,接口干净:Mistral、Gemma、Phi-3 都靠它把训练序列推到 32K+。但和另一个常见做法 <strong>sequence packing</strong>(多条短样本拼成一条长序列以省 padding)组合后,会出现一个不易察觉的等价性陷阱:</p>
+<p>对于因果 SWA，窗口宽度 \(W\) 表示一个 token 在单层中可以读取自身及前 \(W-1\) 个位置。Sequence packing 则把若干独立样本首尾相接，并用一组连续存储承载它们。若 attention mask 只编码因果关系和窗口距离，算子看到的是一个长序列，其中没有样本归属这一维信息。</p>
 
-<p class="callout bad"><strong>只靠 SWA "自然分隔"不同样本不安全。</strong> 多层 attention 的实际感受野会越过窗口,把别的样本信息混入当前样本。数学上不再等价于独立训练。</p>
+<p>独立训练等价性要求 packed 计算图在样本边界处保持断开。单层窗口限制只约束一跳 attention edge；模型堆叠多层后，这些局部 edge 会组成更长的依赖路径。因此，边界两侧即使没有一次跨越整个窗口的 attention，信息仍可能逐层传播到另一条样本。</p>
 
-<p>下面用 6 token、2 层、$W=3$ 的最小例子拆开这件事,再给出实际可用的修复:FlashAttention 的 <code>cu_seqlens</code> / document mask。</p>
+<p>下面使用 6 个 token、2 层和 \(W=3\) 的最小例子追踪这条路径，再把结果对应到 FlashAttention 的 <code>cu_seqlens</code> 与 document mask。</p>
 
 </div>
 
 <!-- ===================== EN ===================== -->
 <div class="lang-en">
 
-<h1>Sliding Window's Packing Trap</h1>
+<h1>Packing Boundaries and Sample Isolation in Sliding Window Attention</h1>
 
-<p style="color: var(--fg-muted); font-style: italic;">LLM Attention and Implementations · Part 2</p>
+<p class="lead">Sequence packing concatenates short samples into one token buffer to raise the fraction of useful tokens. Sliding Window Attention (SWA) restricts attention in each layer to a local neighborhood. A training system that combines them must preserve a basic semantic invariant: the outputs and gradients of one sample may depend only on that sample. SWA describes positional locality, whereas packing introduces document boundaries; the two constraints operate at different levels.</p>
 
-<h2 id="en-intro">1. Intro</h2>
+<h2 id="en-intro">1. Problem setting</h2>
 
-<p>Sliding Window Attention (SWA) limits each token to its previous $W-1$ neighbors per layer. The interface is clean, and Mistral, Gemma, and Phi-3 all use it to push training context to 32K+. Combined with the other common practice of <strong>sequence packing</strong> (concatenating short samples into one long sequence to save padding), it has a subtle equivalence trap:</p>
+<p>For causal SWA, a window width \(W\) lets each token read itself and the previous \(W-1\) positions in one layer. Sequence packing places several independent samples back to back in contiguous storage. When the attention mask encodes only causality and window distance, the operator sees one long sequence with no notion of sample ownership.</p>
 
-<p class="callout bad"><strong>SWA alone does not "naturally separate" samples.</strong> The multi-layer effective receptive field reaches past the window and silently mixes information across samples. Mathematically, the result is no longer equivalent to training each sample independently.</p>
+<p>Equivalence with independent training requires the packed computation graph to remain disconnected at every sample boundary. A per-layer window constrains only one-hop attention edges. Once layers are stacked, those local edges compose into longer dependency paths, allowing information to cross a boundary without any single attention operation spanning the full distance.</p>
 
-<p>The smallest example that exposes the issue uses 6 tokens, 2 layers, and $W=3$. The fix that holds up in practice is FlashAttention's <code>cu_seqlens</code> / document mask.</p>
+<p>The smallest example below uses six tokens, two layers, and \(W=3\) to trace such a path, then connects the result to FlashAttention's <code>cu_seqlens</code> and document masks.</p>
 
 </div>
 
@@ -211,17 +206,17 @@
 <!-- ===================== ZH ===================== -->
 <div class="lang-zh">
 
-<h2 id="zh-single">2. 单层 SWA:直接感受野</h2>
+<h2 id="zh-single">2. 单层窗口的直接感受野</h2>
 
-<p>设序列 <code>abcdef</code>,窗口 $W = 3$,因果 mask(只看自己 + 前 2 个)。一层 SWA 把 <code>act₀</code>(输入 activation)变成 <code>act₁</code>。 对位置 4 的 <code>d</code> 而言,直接 attend 的 K/V 来自 <code>act₀</code> 中索引 [d-2, d] = $\{b, c, d\}$:</p>
+<p>设序列为 <code>abcdef</code>，窗口 \(W=3\)，并采用因果 mask。一层 SWA 把输入 activation \(\mathrm{act}_0\) 变成 \(\mathrm{act}_1\)。位置 4 的 <code>d</code> 直接读取 \(\mathrm{act}_0\) 中的 \(\{b,c,d\}\)，这三个位置构成它在该层的直接感受野。</p>
 
 </div>
 
 <div class="lang-en">
 
-<h2 id="en-single">2. Single-layer SWA: the direct receptive field</h2>
+<h2 id="en-single">2. The direct receptive field of one layer</h2>
 
-<p>Take sequence <code>abcdef</code> with window $W = 3$ and a causal mask (self + 2 previous). One SWA layer maps <code>act₀</code> to <code>act₁</code>. For position 4 (<code>d</code>), the K/V it directly attends to come from indices [d-2, d] in <code>act₀</code>, i.e. $\{b, c, d\}$:</p>
+<p>Consider <code>abcdef</code> with \(W=3\) and a causal mask. One SWA layer maps the input activation \(\mathrm{act}_0\) to \(\mathrm{act}_1\). Position 4, <code>d</code>, reads \(\{b,c,d\}\) from \(\mathrm{act}_0\); these three positions form its direct receptive field in that layer.</p>
 
 </div>
 
@@ -269,13 +264,13 @@
 <!-- ===================== ZH ===================== -->
 <div class="lang-zh">
 
-<p>同一个窗口约束放进 attention mask 矩阵看(行 $= Q$,列 $= K$,允许 attend 的格子打亮):SWA + 因果合起来是一条<strong>沿对角线、宽度为 $W$ 的下三角带</strong>。 对角线之上是因果 mask;对角线下方超过 $W-1$ 行的位置是窗口 mask:</p>
+<p>把同一约束写成 attention mask 矩阵时，行对应 \(Q\)，列对应 \(K\)。因果条件保留下三角区域，窗口条件再将距离超过 \(W-1\) 的位置移除，最终得到一条沿对角线展开、宽度为 \(W\) 的下三角带。</p>
 
 </div>
 
 <div class="lang-en">
 
-<p>The same window constraint, viewed as the attention mask matrix (rows $= Q$, cols $= K$, allowed cells filled): SWA combined with causal forms a <strong>lower-triangular band of width $W$ along the diagonal</strong>. Above the diagonal is the causal mask; more than $W-1$ rows below the diagonal is the window mask:</p>
+<p>In matrix form, rows correspond to \(Q\) and columns to \(K\). Causality retains the lower triangle, and the window condition removes positions farther than \(W-1\). The resulting attention region is a lower-triangular band of width \(W\) along the diagonal.</p>
 
 </div>
 
@@ -373,21 +368,21 @@
 <!-- ===================== ZH ===================== -->
 <div class="lang-zh">
 
-<h2 id="zh-multi">3. 两层 SWA:实际感受野扩大</h2>
+<h2 id="zh-multi">3. 层间传播与有效感受野</h2>
 
-<p>加一层。 <code>act₁</code> 经同一个 SWA 操作得到 <code>act₂</code>。 对 <code>act₂</code> 的 <code>d</code>,直接 attend 仍是 <code>act₁</code> 的 $\{b, c, d\}$,单层窗口看起来依然是 3。 但 <code>act₁</code> 里的 <code>b</code> 上一层已经 attend 过 <code>act₀</code> 的 $\{a, b\}$(<code>b</code> 在 act₀ 是位置 2,$[b-2, b] = [a, b]$;<code>a</code> 之前没有 token)。 这条路径让 <code>a</code> 的信息也进入 <code>act₂</code> 的 <code>d</code>。</p>
+<p>第二层把 <code>act₁</code> 变成 <code>act₂</code>。此时 <code>d</code> 仍只直接读取 <code>act₁</code> 的 $\{b,c,d\}$，窗口宽度没有变化。不过，<code>act₁</code> 中的 <code>b</code> 已在上一层读取 <code>act₀</code> 的 $\{a,b\}$。沿着 \(a \rightarrow b \rightarrow d\) 这条两跳路径，<code>a</code> 的信息进入了 <code>act₂</code> 的 <code>d</code>。</p>
 
-<p>结果:<strong><code>act₂</code> 的 <code>d</code> 实际感受野是 <code>act₀</code> 的 $\{a, b, c, d\}$,而不是 $\{b, c, d\}$</strong>。 单层窗口在多层叠加后被放大。</p>
+<p>于是，<code>act₂</code> 中 <code>d</code> 相对于 <code>act₀</code> 的有效感受野扩展为 $\{a,b,c,d\}$。直接感受野描述一层内的 edge，有效感受野则描述多层计算图中可达的输入位置。</p>
 
 </div>
 
 <div class="lang-en">
 
-<h2 id="en-multi">3. Two-layer SWA: the effective receptive field grows</h2>
+<h2 id="en-multi">3. Cross-layer propagation and the effective receptive field</h2>
 
-<p>Add a second layer. <code>act₁</code> goes through the same SWA op and becomes <code>act₂</code>. For <code>d</code> at <code>act₂</code>, the direct attendees are still $\{b, c, d\}$ in <code>act₁</code>, so the per-layer window still looks like 3. But <code>b</code> at <code>act₁</code> already attended to $\{a, b\}$ from <code>act₀</code> on the previous layer (<code>b</code> sits at position 2, $[b-2, b] = [a, b]$, clamped at the start). That path carries <code>a</code>'s information into <code>d</code> at <code>act₂</code>.</p>
+<p>A second layer maps <code>act₁</code> to <code>act₂</code>. Position <code>d</code> still reads only $\{b,c,d\}$ directly from <code>act₁</code>, so the per-layer window remains unchanged. However, <code>b</code> in <code>act₁</code> already read $\{a,b\}$ from <code>act₀</code>. The two-hop path \(a \rightarrow b \rightarrow d\) therefore carries information from <code>a</code> into <code>d</code> at <code>act₂</code>.</p>
 
-<p>The result: <strong>the effective receptive field of <code>d</code> at <code>act₂</code> is $\{a, b, c, d\}$ in <code>act₀</code>, not $\{b, c, d\}$</strong>. The per-layer window is amplified by stacking.</p>
+<p>The effective receptive field of <code>d</code> at <code>act₂</code>, measured against <code>act₀</code>, is therefore $\{a,b,c,d\}$. The direct receptive field names the edges in one layer; the effective receptive field names the input positions reachable through the stacked computation graph.</p>
 
 </div>
 
@@ -445,10 +440,10 @@
     <text x="20" y="3" class="legend-text">target d</text>
 
     <rect x="100" y="-8" width="14" height="14" fill="var(--accent-tint)" stroke="var(--accent)" stroke-width="2"/>
-    <text x="120" y="3" class="legend-text">直接感受野 / direct</text>
+    <text x="120" y="3" class="legend-text">direct receptive field</text>
 
     <rect x="280" y="-8" width="14" height="14" fill="var(--accent-tint)" fill-opacity="0.45" stroke="var(--accent)" stroke-width="1.4" stroke-dasharray="4 3"/>
-    <text x="300" y="3" class="legend-text">间接感受野 / indirect</text>
+    <text x="300" y="3" class="legend-text">indirect receptive field</text>
 
     <line x1="490" y1="-1" x2="514" y2="-1" class="arrow"/>
     <text x="520" y="3" class="legend-text">act₁ → act₂</text>
@@ -463,15 +458,15 @@
 <!-- ===================== ZH ===================== -->
 <div class="lang-zh">
 
-<h2 id="zh-formula">4. 通用公式:L 层 SWA 的实际感受野</h2>
+<h2 id="zh-formula">4. \(L\) 层 SWA 的感受野上界</h2>
 
-<p>从 Fig 3 的逻辑外推。 一层向后看 $W-1$ 个 token,堆 $L$ 层后,某个 token 能间接看到的最远位置:</p>
+<p>每一层最多把依赖范围向前扩展 \(W-1\) 个位置。忽略序列起点截断后，堆叠 \(L\) 层得到的最大理论感受野为：</p>
 
 <div style="text-align:center; margin: 14px 0; font-size: 16px;">
   $$\text{ERF}(L, W) \;=\; L \cdot (W - 1) + 1 \quad \text{token}$$
 </div>
 
-<p>("ERF" = effective receptive field) 例如:</p>
+<p>其中 ERF 表示 effective receptive field。下表列出几个窗口与层数配置：</p>
 
 <table class="swa-table">
   <thead><tr><th>L 层</th><th>W=3</th><th>W=4096(Mistral)</th><th>W=8192</th></tr></thead>
@@ -483,15 +478,15 @@
   </tbody>
 </table>
 
-<p>Mistral 7B 单层窗口只有 4096,32 层叠起来理论 ERF 约 131K token。 信号沿层衰减得很快,模型对远端 token 的实际表征能力有限。 但<strong>训练梯度上的跨样本污染不依赖于表征质量</strong>:只要 ERF 越过样本边界,梯度路径就成立。</p>
+<p>表中的数值是计算图连通性给出的最大理论范围，描述依赖路径可以延伸多远。模型对远端上下文的实际利用程度可能更小；一旦该范围越过样本边界，图中便存在跨样本路径，而具体梯度值仍由参数、激活和算子共同决定。</p>
 
 </div>
 
 <div class="lang-en">
 
-<h2 id="en-formula">4. The general formula</h2>
+<h2 id="en-formula">4. The receptive-field bound for \(L\) layers</h2>
 
-<p>Extrapolating Fig 3: one SWA layer reaches $W-1$ tokens back, $L$ stacked layers reach an effective receptive field of:</p>
+<p>Each layer can extend dependency reach by at most \(W-1\) positions. Ignoring truncation at the start of the sequence, \(L\) stacked layers have the following maximum theoretical receptive field:</p>
 
 <div style="text-align:center; margin: 14px 0; font-size: 16px;">
   $$\text{ERF}(L, W) \;=\; L \cdot (W - 1) + 1 \quad \text{tokens}$$
@@ -507,7 +502,7 @@
   </tbody>
 </table>
 
-<p>Mistral 7B's per-layer window is only 4096, but 32 stacked layers reach a theoretical ERF of about 131K tokens. Signal decays sharply across layers, so the model represents distant tokens poorly in practice. <strong>The gradient on cross-sample contamination does not care about representation quality</strong>: once the ERF crosses a sample boundary, the gradient path exists.</p>
+<p>These values give the maximum graph-theoretic range: they describe how far a dependency path can extend. A model may use less of the distant context in practice. Once the range crosses a sample boundary, the graph contains a cross-sample path, while its gradient value still depends on parameters, activations, and operators.</p>
 
 </div>
 
@@ -516,9 +511,9 @@
 <!-- ===================== ZH ===================== -->
 <div class="lang-zh">
 
-<h2 id="zh-packing">5. Packing 训练:跨样本污染怎么发生</h2>
+<h2 id="zh-packing">5. Packing 训练中的跨样本污染</h2>
 
-<p>训练时为了避免短样本浪费 padding,常把多条样本拼成一条。假设两条样本 <code>ABC</code> 和 <code>BCD</code>,各自训练时只对最后一个 token 算 loss(causal LM 自回归 next-token loss 的简化版)。 拼成 <code>ABCBCD</code>(6 token,跟前面 abcdef 同长),用 SWA $W=3$、2 层、因果 mask 跑。 Fig 4 把"act₂ 中第二条样本的 D"做 target:</p>
+<p>把两条独立样本 <code>ABC</code> 与 <code>BCD</code> 拼成 <code>ABCBCD</code>，并分别只在末尾 token 上计算 loss，便得到与前文同样长度的 6-token 例子。现在使用 \(W=3\) 的因果 SWA 运行两层，并把第二条样本在 <code>act₂</code> 中的 <code>D</code> 作为目标。样本边界位于位置 3 与位置 4 之间。</p>
 
 </div>
 
@@ -526,7 +521,7 @@
 
 <h2 id="en-packing">5. Packed training: where the contamination happens</h2>
 
-<p>To avoid wasting padding on short samples, training pipelines often concatenate samples into one long sequence. Suppose two samples <code>ABC</code> and <code>BCD</code>, each computing loss on its last token (a simplified causal LM next-token loss). Concatenate them into <code>ABCBCD</code> (6 tokens, same length as <code>abcdef</code> above) and run with $W=3$ causal SWA and 2 layers. Fig 4 takes the <code>D</code> from the second sample at <code>act₂</code> as the target:</p>
+<p>Concatenate two independent samples, <code>ABC</code> and <code>BCD</code>, into <code>ABCBCD</code>, and compute loss only at the final token of each sample. This produces the same six-token length used above. Run two layers of causal SWA with \(W=3\), taking the <code>D</code> of the second sample at <code>act₂</code> as the target. The sample boundary lies between positions 3 and 4.</p>
 
 </div>
 
@@ -604,7 +599,7 @@
     <text x="32" y="3" class="legend-text">legal: act₁ → act₂</text>
 
     <line x1="200" y1="-1" x2="224" y2="-1" class="arrow bad indirect"/>
-    <text x="232" y="3" class="legend-text bad">cross-sample leak: act₀ → act₁ 越过样本边界</text>
+    <text x="232" y="3" class="legend-text bad">cross-sample leak: act₀ → act₁ crosses boundary</text>
   </g>
 </svg>
 <figcaption>Fig 4 · packing 训练 · sample-1 的 {B, C} 通过 act₁ 的 B(被污染节点)流入 act₂ 的 D</figcaption>
@@ -613,33 +608,33 @@
 <!-- ===================== ZH ===================== -->
 <div class="lang-zh">
 
-<p>具体追踪:</p>
+<p>这条跨边界路径可以逐层展开：</p>
 
 <ul>
-  <li>位置 4 的 <code>B</code>(sample 2)在 act₁ 是用 act₀ 的 [pos 2, pos 3, pos 4] = $\{B_{s1}, C_{s1}, B_{s2}\}$ 算出来的 —— <strong>sample 1 的 <code>B</code> 和 <code>C</code> 已经混进去</strong>。</li>
-  <li>位置 6 的 <code>D</code> 在 act₂ 是用 act₁ 的 [pos 4, pos 5, pos 6] = $\{B_{s1+s2 \, \text{mix}}, C_{s2}, D_{s2}\}$ 算的。</li>
-  <li><strong>结果</strong>:sample 1 的 $\{B, C\}$(图里红色块)的梯度沿这条路径传到 <code>D</code> 的 logit,训练梯度不再等于"BCD 独立训练时的梯度"。 <code>A</code> 在 2 层 + $W=3$ 的设置下恰好落在 D 的 ERF 边界外(ERF = $L(W-1)+1 = 5$,A 距 D 5 个 token);再加一层就会被吸进来。</li>
+  <li>位置 4 的 <code>B</code> 属于 sample 2，但它在 <code>act₁</code> 中读取 <code>act₀</code> 的位置 2、3、4，即 $\{B_{s1},C_{s1},B_{s2}\}$。跨样本依赖在第一层已经形成。</li>
+  <li>位置 6 的 <code>D</code> 在 <code>act₂</code> 中读取 <code>act₁</code> 的位置 4、5、6，即 $\{B_{s1+s2 \, \text{mix}},C_{s2},D_{s2}\}$。第一层的混合 activation 因而继续流向目标。</li>
+  <li>Sample 1 的 $\{B,C\}$ 由此进入 <code>D</code> 的 logit 及其反向路径，所得梯度与单独训练 <code>BCD</code> 时不同。在两层、\(W=3\) 的配置中，位置 1 的 <code>A</code> 位于 5-token ERF 之外；再增加一层后，依赖范围会覆盖它。</li>
 </ul>
 
-<p>另一面,模型看到的"局部上下文"<strong>是两条样本的 token 混合</strong> —— 注意力分布 / 隐藏状态包含跨样本统计,模型可能学到"sample 2 的 B 之后跟 sample 2 的 C"这种偶然 co-occurrence,污染数据分布。</p>
+<p>这条路径同时改变前向统计。第二条样本边界附近的 attention 分布和 hidden state 会包含 sample 1 的 token，模型因而接触到训练数据中原本不存在的跨文档邻接关系，例如 \(C_{s1} \rightarrow B_{s2}\)。</p>
 
-<p>这条结论<strong>无法靠调小 $W$ 绕过</strong>。 ERF 公式 $L(W-1)+1$ 对 $L$ 和 $W$ 都单调增,缩小 $W$ 只是让每层步长变小,堆够层之后仍然越过样本边界。 反过来,$W$ 越大、$L$ 越深,污染越严重。</p>
+<p>窗口缩小会降低每层扩展的步长，但不会编码样本边界。只要层数使 \(L(W-1)+1\) 覆盖边界，跨样本路径便会出现；更大的 \(W\) 或更深的 \(L\) 会扩大可能受影响的范围。</p>
 
 </div>
 
 <div class="lang-en">
 
-<p>Tracing it step by step:</p>
+<p>The cross-boundary path unfolds one layer at a time:</p>
 
 <ul>
-  <li>Position 4 (<code>B</code> in sample 2) at <code>act₁</code> is computed from <code>act₀</code> positions [2, 3, 4] = $\{B_{s1}, C_{s1}, B_{s2}\}$. <strong>Sample 1's <code>B</code> and <code>C</code> are already mixed in.</strong></li>
-  <li>Position 6 (<code>D</code>) at <code>act₂</code> is computed from <code>act₁</code> positions [4, 5, 6] = $\{B_{s1+s2 \, \text{mixed}}, C_{s2}, D_{s2}\}$.</li>
-  <li><strong>Result</strong>: gradient from sample 1's $\{B, C\}$ (red cells in the figure) flows into <code>D</code>'s logit; the training gradient is no longer equal to the gradient BCD would receive on its own. <code>A</code> happens to fall just outside D's ERF in this 2-layer, $W=3$ case (ERF = $L(W-1)+1 = 5$ and A sits 5 tokens from D); one more layer pulls it in.</li>
+  <li>Position 4, <code>B</code> in sample 2, reads positions 2, 3, and 4 of <code>act₀</code> when producing <code>act₁</code>: $\{B_{s1},C_{s1},B_{s2}\}$. The first cross-sample dependency is created in this layer.</li>
+  <li>Position 6, <code>D</code>, then reads positions 4, 5, and 6 of <code>act₁</code>: $\{B_{s1+s2 \, \text{mixed}},C_{s2},D_{s2}\}$. The mixed activation from the first layer now reaches the target.</li>
+  <li>Sample 1's $\{B,C\}$ consequently enters the logit and backward path of <code>D</code>, producing a different gradient from independent training on <code>BCD</code>. With two layers and \(W=3\), position 1, <code>A</code>, remains outside the five-token ERF; one additional layer brings it into range.</li>
 </ul>
 
-<p>Separately, the "local context" the model sees becomes <strong>a mixture of two samples' tokens</strong>. Attention distributions and hidden states pick up cross-sample statistics, and the model can latch onto accidental co-occurrences ("sample 2's B is often followed by sample 2's C") that corrupt the underlying data distribution.</p>
+<p>The forward statistics change as well. Attention distributions and hidden states near the second sample's boundary include tokens from sample 1, exposing the model to cross-document adjacencies that do not exist in the original data, such as \(C_{s1} \rightarrow B_{s2}\).</p>
 
-<p>Shrinking $W$ does not bypass the problem. The ERF formula $L(W-1)+1$ is monotonic in both $L$ and $W$; a smaller $W$ only reduces the per-layer step, and enough layers still cross the boundary. Larger $W$ and deeper $L$ make the leakage worse, not the other way around.</p>
+<p>A smaller window reduces the expansion per layer but does not encode sample boundaries. A cross-sample path appears whenever \(L(W-1)+1\) reaches across a boundary; increasing \(W\) or \(L\) expands the range that may be affected.</p>
 
 </div>
 
@@ -648,9 +643,9 @@
 <!-- ===================== ZH ===================== -->
 <div class="lang-zh">
 
-<h2 id="zh-docmask">6. 正确做法:document mask / <code>cu_seqlens</code></h2>
+<h2 id="zh-docmask">6. 文档边界编码：document mask 与 <code>cu_seqlens</code></h2>
 
-<p>必须显式告诉 attention "样本边界在哪",让跨边界的 attention 分数变成 $-\infty$。 在 attention 矩阵层面,等价于把矩阵切成<strong>块对角(block-diagonal)</strong>:</p>
+<p>Document mask 是按样本归属限制 attention edge 的 mask。它把每条样本对应的因果 attention 子矩阵放在对角块内，并把跨块分数设为 \(-\infty\)。于是 softmax 后的跨样本权重为零，packed attention 在边界处保持断开。</p>
 
 <pre class="code">      A B C B C D
    A [• . . . . .]    sample 1 内部:三角形
@@ -662,7 +657,7 @@
         ↑
    sample 1 / 2 边界,× 全部 mask 掉</pre>
 
-<p>FlashAttention 的 <code>flash_attn_varlen_func</code> 原生支持,用 <code>cu_seqlens</code>(cumulative sequence lengths)告诉 kernel 切在哪:</p>
+<p>FlashAttention 的 <code>flash_attn_varlen_func</code> 用 <code>cu_seqlens</code>（cumulative sequence lengths）表示各条序列在 packed buffer 中的起止位置：</p>
 
 <pre class="code"><span class="kw">from</span> flash_attn <span class="kw">import</span> flash_attn_varlen_func
 
@@ -678,17 +673,17 @@ out = flash_attn_varlen_func(
     window_size=(<span class="num">2</span>, <span class="num">0</span>),    <span class="cm"># 因果 + SWA,W=3 → left=W-1=2</span>
 )</pre>
 
-<p>FA kernel 内部把每段 K/V 当成独立 attention 计算,块对角之外的 K/V block <strong>连 load 都不做</strong>,数学上严格等价于"分别 forward 两条序列",计算量也按各自序列长度算。</p>
+<p><code>cu_seqlens</code> 把 packed buffer 描述成多条独立序列。对于 attention 算子，这与逐条计算后再拼接输出等价。整张模型计算图还包含位置编码、dropout 随机数及其它可能跨 token 或 batch element 聚合的算子，它们也需要满足同一隔离条件。</p>
 
-<p>Document mask + SWA 是 <strong>Mistral / Mixtral 训练栈的标准配方</strong>,Megatron-LM 通过 <code>reset_attention_mask=True</code> + <code>reset_position_ids=True</code> 自动构造,HF Transformers 通过 <code>attention_mask</code> + 段 ID 显式传递。</p>
+<p>Megatron-LM 的 <code>reset_attention_mask</code> 在 EOD 后切断对前一 document 的 attention，<code>reset_position_ids</code> 则独立控制位置编号。普通二维 padding mask 通常只描述有效长度，无法表达一个 packed buffer 内部的多个 document 边界；训练框架必须提供 block-diagonal mask 或等价的 varlen metadata。</p>
 
 </div>
 
 <div class="lang-en">
 
-<h2 id="en-docmask">6. The fix: document mask / <code>cu_seqlens</code></h2>
+<h2 id="en-docmask">6. Encoding document boundaries with masks and <code>cu_seqlens</code></h2>
 
-<p>You must explicitly tell attention "where the sample boundaries are" and force cross-boundary attention scores to $-\infty$. At the attention-matrix level this is equivalent to making the matrix <strong>block-diagonal</strong>:</p>
+<p>A document mask restricts attention edges by sample ownership. It places the causal attention matrix of each sample in a diagonal block and sets cross-block scores to \(-\infty\). Their softmax weights become zero, leaving the packed attention graph disconnected at every boundary.</p>
 
 <pre class="code">      A B C B C D
    A [• . . . . .]    inside sample 1: a triangle
@@ -700,7 +695,7 @@ out = flash_attn_varlen_func(
         ↑
    sample 1 / 2 boundary, × is masked out</pre>
 
-<p>FlashAttention's <code>flash_attn_varlen_func</code> supports this natively via <code>cu_seqlens</code> (cumulative sequence lengths):</p>
+<p>FlashAttention's <code>flash_attn_varlen_func</code> uses <code>cu_seqlens</code>, or cumulative sequence lengths, to encode where each sequence begins and ends in the packed buffer:</p>
 
 <pre class="code"><span class="kw">from</span> flash_attn <span class="kw">import</span> flash_attn_varlen_func
 
@@ -716,9 +711,9 @@ out = flash_attn_varlen_func(
     window_size=(<span class="num">2</span>, <span class="num">0</span>),    <span class="cm"># causal + SWA, W=3 → left=W-1=2</span>
 )</pre>
 
-<p>The FA kernel treats each K/V segment as an independent attention computation. K/V blocks outside the block-diagonal are <strong>not even loaded</strong>. The math is strictly equivalent to "forward each sequence separately," and the compute matches per-sequence cost.</p>
+<p><code>cu_seqlens</code> describes the packed buffer as several independent sequences. For the attention operator, this is equivalent to evaluating each sequence separately and concatenating the outputs. The complete model graph also contains positional encoding, dropout RNG, and possibly other operators that aggregate across tokens or batch elements; those operations must preserve the same isolation.</p>
 
-<p>Document mask + SWA is the <strong>standard recipe in the Mistral / Mixtral training stack</strong>. Megatron-LM constructs it automatically via <code>reset_attention_mask=True</code> + <code>reset_position_ids=True</code>. HF Transformers passes it explicitly via the <code>attention_mask</code> with segment IDs.</p>
+<p>Megatron-LM's <code>reset_attention_mask</code> cuts attention across EOD boundaries, while <code>reset_position_ids</code> controls position numbering independently. A conventional 2D padding mask usually describes valid lengths and cannot represent several document boundaries inside one packed buffer. The training stack therefore needs a block-diagonal mask or equivalent variable-length metadata.</p>
 
 </div>
 
@@ -727,90 +722,88 @@ out = flash_attn_varlen_func(
 <!-- ===================== ZH ===================== -->
 <div class="lang-zh">
 
-<h2 id="zh-check">7. 实操 checklist</h2>
+<h2 id="zh-check">7. 等价性验证</h2>
 
 <table class="swa-table">
-  <thead><tr><th>配置</th><th>等价于独立训练?</th><th>说明</th></tr></thead>
+  <thead><tr><th>配置</th><th>Attention 隔离</th><th>说明</th></tr></thead>
   <tbody>
-    <tr><td>拼接 + 普通因果 mask</td><td>❌</td><td>跨样本完全可见(连一层就漏)</td></tr>
-    <tr><td>拼接 + 因果 + SWA(单层)</td><td>⚠️</td><td>短样本"看起来"等价;堆层后失效</td></tr>
-    <tr><td>拼接 + 因果 + SWA(多层)</td><td>❌</td><td>本节例子,ERF ≈ $L(W-1)+1$ 跨边界</td></tr>
-    <tr><td>拼接 + <code>cu_seqlens</code>(document mask)</td><td>✅</td><td>块对角,严格等价</td></tr>
-    <tr><td>拼接 + <code>cu_seqlens</code> + SWA</td><td>✅</td><td>Mistral 训练的标准配方</td></tr>
+    <tr><td>拼接 + 普通因果 mask</td><td>❌</td><td>第一层即可读取前一条样本</td></tr>
+    <tr><td>拼接 + 因果 + SWA（单层）</td><td>❌</td><td>窗口覆盖边界时立即产生跨样本 edge</td></tr>
+    <tr><td>拼接 + 因果 + SWA（多层）</td><td>❌</td><td>有效感受野按 \(L(W-1)+1\) 扩展</td></tr>
+    <tr><td>拼接 + <code>cu_seqlens</code>（document mask）</td><td>✅</td><td>attention 子图按样本形成对角块</td></tr>
+    <tr><td>拼接 + <code>cu_seqlens</code> + SWA</td><td>✅</td><td>每条样本内部继续采用局部窗口</td></tr>
   </tbody>
 </table>
 
-<p>怎么自查:</p>
+<p>验证工作应覆盖 attention metadata、位置语义和 loss 语义：</p>
 
 <ul>
-  <li><strong>训练框架</strong>:
+  <li><strong>训练框架：</strong>
     <ul>
-      <li>Megatron-LM:打开 <code>--reset-attention-mask --reset-position-ids</code>;数据 pipeline 用 <code>&lt;eod&gt;</code> 切样本</li>
-      <li>HF Transformers:检查 <code>position_ids</code> 是否在样本边界归零(<code>0,1,2,0,1,2,...</code>),而不是单调递增;<code>attention_mask</code> 是否含段信息</li>
-      <li>NeMo / Megatron-Core:用 <code>packed_seq_params</code> 传 <code>cu_seqlens</code></li>
-      <li>直接用 FA:确认调用的是 <code>flash_attn_varlen_func</code> 而不是 <code>flash_attn_func</code></li>
+      <li>Megatron-LM 使用 <code>--reset-attention-mask</code>，并通过 <code>&lt;eod&gt;</code> 标记数据边界；<code>--reset-position-ids</code> 是否启用取决于位置编码和目标等价性。</li>
+      <li>HF Transformers 需要确认具体 model/backend 是否接收 block-diagonal mask 或 varlen metadata；普通 padding mask 无法表达 packed document 边界。</li>
+      <li>直接调用 FlashAttention 时，varlen packed 输入对应 <code>flash_attn_varlen_func</code>。</li>
     </ul>
   </li>
-  <li><strong>debug 方法</strong>:训练 step 中 print 一下 attention mask 的形状 / 非零分布。整张 mask 是单一三角形,基本可以判定 document mask 没生效;正确的块对角应该在样本边界处看到明显的"断"。</li>
-  <li><strong>RoPE 位置编码</strong>:每段样本的 <code>position_ids</code> 必须从 0 重启,否则就算 attention 切对了,RoPE 也会让 sample 2 用 "全局位置 3"的 phase rotation,跟独立训练时 sample 2 用"局部位置 0"不等价。</li>
-  <li><strong>loss mask</strong>:padding token 和不算 loss 的位置在 loss 上 mask 掉是另一回事,跟 attention mask 互相独立 —— 两者都要正确。</li>
+  <li><strong>Mask 结构：</strong>打印 attention mask 的形状与非零分布。单一大三角形表示所有 token 属于同一序列；按样本隔离的 mask 应在边界处形成清晰断点。</li>
+  <li><strong>位置编码：</strong>绝对位置编码通常需要在边界重置，才能复现逐样本执行。标准 RoPE 的 attention score 对单个 segment 内的统一位置平移具有不变性，具体配置仍应结合模型实现核对。</li>
+  <li><strong>Loss mask：</strong>loss mask 决定哪些位置贡献训练目标，attention mask 决定 hidden state 可以读取哪些位置。两者承担不同语义，需要分别验证。</li>
 </ul>
 
-<p class="callout"><strong>一行总结</strong>:packing 训练用 SWA 时,<strong>必须</strong>同时挂 <code>cu_seqlens</code> 或 segment-aware <code>attention_mask</code>;SWA 本身不切样本。</p>
+<p>至此可以看出，packing 的正确性条件来自样本边界，而窗口只规定样本内部的局部连接。训练系统需要用 <code>cu_seqlens</code> 或 segment-aware <code>attention_mask</code> 编码前者，再由 SWA 决定每个对角块内部的可见范围。</p>
 
 <h2 id="zh-refs">参考资料</h2>
 
 <ul>
-  <li><a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noopener">FlashAttention</a> · <code>flash_attn_varlen_func</code> 的 <code>cu_seqlens</code> + <code>window_size</code> 文档</li>
-  <li><a href="https://arxiv.org/abs/2310.06825" target="_blank" rel="noopener">Mistral 7B</a> · SWA + document mask 的训练设置</li>
+  <li><a href="https://github.com/Dao-AILab/flash-attention/blob/ce088ab9ce0fc0434dcd8afa0a791da9fcc3a820/flash_attn/flash_attn_interface.py#L1391-L1483" target="_blank" rel="noopener">FlashAttention 固定版本源码</a> · <code>flash_attn_varlen_func</code> 的 <code>cu_seqlens</code> 与 <code>window_size</code> contract(核对于 2026-08-28)</li>
+  <li><a href="https://arxiv.org/abs/2310.06825" target="_blank" rel="noopener">Mistral 7B</a> · SWA 结构与窗口设置;该论文不作为 document packing 实现的证据</li>
   <li><a href="https://arxiv.org/abs/2004.05150" target="_blank" rel="noopener">Longformer</a> · 最早把 sliding window attention 引入 transformer 的工作</li>
-  <li><a href="https://github.com/NVIDIA/Megatron-LM" target="_blank" rel="noopener">Megatron-LM</a> · <code>reset_attention_mask</code> / <code>reset_position_ids</code> 的实现</li>
-  <li>[[llm-attention-zoo]] · 本系列 Part 1,SWA 在 attention 变体家族里的位置</li>
+  <li><a href="https://github.com/NVIDIA/Megatron-LM/blob/21bbbe616db4858d46f348d6224bb56c5ddae1f7/megatron/core/datasets/gpt_dataset.py#L800-L872" target="_blank" rel="noopener">Megatron-LM 固定版本源码</a> · <code>reset_attention_mask</code> / <code>reset_position_ids</code> 的独立实现(核对于 2026-08-28)</li>
+  <li><a href="llm-attention-zoo.html">LLM Attention 机制分类与模型谱系</a> · SWA 在 attention 机制分类中的位置</li>
 </ul>
 
 </div>
 
 <div class="lang-en">
 
-<h2 id="en-check">7. Practical checklist</h2>
+<h2 id="en-check">7. Equivalence checks</h2>
 
 <table class="swa-table">
-  <thead><tr><th>Configuration</th><th>Equivalent to independent training?</th><th>Notes</th></tr></thead>
+  <thead><tr><th>Configuration</th><th>Attention isolation</th><th>Notes</th></tr></thead>
   <tbody>
-    <tr><td>Concat + plain causal mask</td><td>❌</td><td>Cross-sample fully visible (leaks even in one layer)</td></tr>
-    <tr><td>Concat + causal + SWA (1 layer)</td><td>⚠️</td><td>Looks equivalent for short samples; fails with depth</td></tr>
-    <tr><td>Concat + causal + SWA (multi-layer)</td><td>❌</td><td>This note's example; ERF ≈ $L(W-1)+1$ crosses boundary</td></tr>
-    <tr><td>Concat + <code>cu_seqlens</code> (document mask)</td><td>✅</td><td>Block-diagonal, strictly equivalent</td></tr>
-    <tr><td>Concat + <code>cu_seqlens</code> + SWA</td><td>✅</td><td>Standard Mistral training recipe</td></tr>
+    <tr><td>Concat + plain causal mask</td><td>❌</td><td>The first layer can read the preceding sample</td></tr>
+    <tr><td>Concat + causal + SWA (one layer)</td><td>❌</td><td>A window that reaches the boundary creates a cross-sample edge immediately</td></tr>
+    <tr><td>Concat + causal + SWA (multiple layers)</td><td>❌</td><td>The effective receptive field expands as \(L(W-1)+1\)</td></tr>
+    <tr><td>Concat + <code>cu_seqlens</code> (document mask)</td><td>✅</td><td>Each sample forms a diagonal attention subgraph</td></tr>
+    <tr><td>Concat + <code>cu_seqlens</code> + SWA</td><td>✅</td><td>The local window remains active within each sample</td></tr>
   </tbody>
 </table>
 
-<p>How to self-check:</p>
+<p>Validation should cover attention metadata, position semantics, and loss semantics:</p>
 
 <ul>
-  <li><strong>Training framework</strong>:
+  <li><strong>Training framework:</strong>
     <ul>
-      <li>Megatron-LM: turn on <code>--reset-attention-mask --reset-position-ids</code>; the data pipeline cuts samples on <code>&lt;eod&gt;</code></li>
-      <li>HF Transformers: verify <code>position_ids</code> reset to 0 at sample boundaries (<code>0,1,2,0,1,2,...</code>) rather than running monotonically; verify <code>attention_mask</code> carries segment info</li>
-      <li>NeMo / Megatron-Core: pass <code>cu_seqlens</code> via <code>packed_seq_params</code></li>
-      <li>Calling FA directly: confirm you call <code>flash_attn_varlen_func</code>, not <code>flash_attn_func</code></li>
+      <li>Megatron-LM uses <code>--reset-attention-mask</code> together with <code>&lt;eod&gt;</code> data boundaries. Whether <code>--reset-position-ids</code> is also required depends on positional encoding and the target notion of equivalence.</li>
+      <li>For HF Transformers, verify that the model and backend accept a block-diagonal mask or variable-length metadata. A regular padding mask cannot represent packed document boundaries.</li>
+      <li>Direct FlashAttention calls use <code>flash_attn_varlen_func</code> for variable-length packed input.</li>
     </ul>
   </li>
-  <li><strong>Debug</strong>: print the attention mask's shape and nonzero distribution mid-step. A single triangle is a strong sign the document mask was dropped. A correct block-diagonal mask shows clear "breaks" at sample boundaries.</li>
-  <li><strong>RoPE</strong>: per-sample <code>position_ids</code> must restart from 0; otherwise even with attention sliced correctly, RoPE applies sample-2 at "global position 3" rather than "local position 0," and the equivalence breaks at the positional encoding layer.</li>
-  <li><strong>Loss mask</strong>: masking padding tokens or non-loss positions out of the loss is a separate concern from the attention mask; both have to be correct independently.</li>
+  <li><strong>Mask structure:</strong> inspect the shape and nonzero distribution of the attention mask. One large triangle treats all tokens as a single sequence; an isolated mask has visible breaks at sample boundaries.</li>
+  <li><strong>Position encoding:</strong> absolute position embeddings usually need a boundary reset to reproduce per-sample execution. Standard RoPE attention scores are invariant to a uniform position shift within one segment, so the required setting depends on the model implementation.</li>
+  <li><strong>Loss mask:</strong> a loss mask selects positions that contribute training targets, while an attention mask selects positions visible to hidden states. Validate these two semantics independently.</li>
 </ul>
 
-<p class="callout"><strong>One-line summary</strong>: when packing under SWA, <code>cu_seqlens</code> or a segment-aware <code>attention_mask</code> <strong>must</strong> also be passed. SWA alone does not slice samples.</p>
+<p>Packing correctness follows from document boundaries, while SWA defines local connectivity inside each document. A training system first encodes boundaries with <code>cu_seqlens</code> or a segment-aware <code>attention_mask</code>, then applies the sliding window within each diagonal block.</p>
 
 <h2 id="en-refs">References</h2>
 
 <ul>
-  <li><a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noopener">FlashAttention</a>: docs for <code>flash_attn_varlen_func</code> with <code>cu_seqlens</code> and <code>window_size</code></li>
-  <li><a href="https://arxiv.org/abs/2310.06825" target="_blank" rel="noopener">Mistral 7B</a>: SWA + document mask training setup</li>
+  <li><a href="https://github.com/Dao-AILab/flash-attention/blob/ce088ab9ce0fc0434dcd8afa0a791da9fcc3a820/flash_attn/flash_attn_interface.py#L1391-L1483" target="_blank" rel="noopener">Pinned FlashAttention source</a>: <code>flash_attn_varlen_func</code> contract for <code>cu_seqlens</code> and <code>window_size</code> (checked 2026-08-28)</li>
+  <li><a href="https://arxiv.org/abs/2310.06825" target="_blank" rel="noopener">Mistral 7B</a>: SWA architecture and window configuration; not evidence for a document-packing implementation</li>
   <li><a href="https://arxiv.org/abs/2004.05150" target="_blank" rel="noopener">Longformer</a>: the original work introducing sliding window attention into transformers</li>
-  <li><a href="https://github.com/NVIDIA/Megatron-LM" target="_blank" rel="noopener">Megatron-LM</a>: implementation of <code>reset_attention_mask</code> / <code>reset_position_ids</code></li>
-  <li>[[llm-attention-zoo]]: Part 1 of this series, placing SWA inside the attention variant family</li>
+  <li><a href="https://github.com/NVIDIA/Megatron-LM/blob/21bbbe616db4858d46f348d6224bb56c5ddae1f7/megatron/core/datasets/gpt_dataset.py#L800-L872" target="_blank" rel="noopener">Pinned Megatron-LM source</a>: independent implementation of <code>reset_attention_mask</code> and <code>reset_position_ids</code> (checked 2026-08-28)</li>
+  <li><a href="llm-attention-zoo.html">LLM Attention Mechanisms: A Taxonomy and Model Lineage</a>: where SWA sits in the attention taxonomy</li>
 </ul>
 
 </div>

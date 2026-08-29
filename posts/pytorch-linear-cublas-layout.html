@@ -3,17 +3,17 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>torch linear 和 layout</title>
-<meta name="post:title"           content="torch linear 和 layout">
-<meta name="post:title_en"        content="torch linear and layout">
+<title>PyTorch Linear 与 cuBLAS GEMM 的布局对应</title>
+<meta name="post:title"           content="PyTorch Linear 与 cuBLAS GEMM 的布局对应">
+<meta name="post:title_en"        content="PyTorch Linear and cuBLAS GEMM Layout Mapping">
 <meta name="post:slug"            content="pytorch-linear-cublas-layout">
 <meta name="post:date"            content="2026-07-20">
 <meta name="post:tags"            content="PyTorch, cuBLAS, Linear, GEMM">
 <meta name="post:tags_en"         content="PyTorch, cuBLAS, Linear, GEMM">
-<meta name="post:reading"         content="2 分钟">
-<meta name="post:reading_en"      content="2 min">
-<meta name="post:summary"         content="torch linear 的 torch 视角、cuBLAS 视角、layout 和 reduce axis 对照。">
-<meta name="post:summary_en"      content="A compact table for torch linear shapes, cuBLAS layout, and reduce axis.">
+<meta name="post:reading"         content="4 分钟">
+<meta name="post:reading_en"      content="4 min">
+<meta name="post:summary"         content="row-major Tensor 与 cuBLAS column-major 接口会把同一缓冲区解释为转置矩阵，profiler 的 TN、NT、NN 不能直接按 Linear 公式读取。该变换确定前向、wgrad、dgrad 的操作数与规约轴；结论限于二维连续布局，不代表 ATen 的 backend 选择。">
+<meta name="post:summary_en"      content="PyTorch Linear's row-major tensors and the cuBLAS column-major interface interpret the same buffer as transposed matrix views, so profiler labels such as TN, NT, and NN cannot be read directly from model equations. The view transformation determines operand order, transpose modes, and reduction axes for forward, wgrad, and dgrad under contiguous two-dimensional assumptions, independent of ATen's backend choice.">
 <meta name="post:series"          content="pytorch-internals">
 <meta name="post:series_title"    content="PyTorch 内部机制">
 <meta name="post:series_title_en" content="PyTorch Internals">
@@ -35,14 +35,13 @@
   @media (max-width: 920px) { main.content { padding: 48px 20px 80px; } }
   .note-card {
     background: #e8f4ff;
-    border-radius: 16px;
-    padding: 22px 28px;
-    margin: 0 0 72px;
+    border-radius: 6px;
+    padding: 14px 18px;
+    margin: 18px 0 28px;
     color: #222;
-    font-size: 21px;
-    line-height: 1.8;
+    font-size: 15px;
+    line-height: 1.65;
   }
-  .note-card .bulb { margin-right: 12px; }
   .note-card strong { font-weight: 700; }
   .table-scroll {
     overflow-x: auto;
@@ -78,12 +77,16 @@
     <div class="toc-title">目录 · TOC</div>
     <div class="lang-zh">
     <ul>
-      <li><a href="#zh-table">torch linear 和 layout</a></li>
+      <li><a href="#zh-model">同一缓冲区的两种矩阵视图</a></li>
+      <li><a href="#zh-table">Linear 前向与反向的 GEMM</a></li>
+      <li><a href="#zh-refs">参考资料</a></li>
     </ul>
     </div>
     <div class="lang-en">
     <ul>
-      <li><a href="#en-table">torch linear and layout</a></li>
+      <li><a href="#en-model">Two matrix views of one buffer</a></li>
+      <li><a href="#en-table">GEMMs in Linear forward and backward</a></li>
+      <li><a href="#en-refs">References</a></li>
     </ul>
     </div>
   </aside>
@@ -92,105 +95,149 @@
 
 <div class="lang-zh">
 
-<div class="note-card">
-  <div><span class="bulb">💡</span>torch 中的 shape 和 cuBLAS 的 shape 是转置的关系,因此 torch 中 \(A * B\) 在 cuBLAS 中是 \(B * A\)</div>
-  <div><strong>\(\mathrm{d}w\) 永远是 <code>nt</code></strong></div>
-</div>
+<h1>PyTorch Linear 与 cuBLAS GEMM 的布局对应</h1>
 
-<h1 id="zh-table">torch linear 和 layout</h1>
+<p><code>torch.nn.Linear</code> 在模型代码中接收 row-major Tensor，底层 GEMM 接口却可能按另一套布局约定描述同一块内存。分析 profiler 中的 <code>TN</code>、<code>NT</code> 或 <code>NN</code> 时，需要先把 PyTorch 的矩阵公式转换到 cuBLAS 的 column-major 视图。这个转换同时决定操作数顺序、transpose mode 和求和规约维度。</p>
+
+<h2 id="zh-model">同一缓冲区的两种矩阵视图</h2>
+
+<p>为隔离布局问题，下面只讨论二维、实数、contiguous row-major Tensor，并省略 bias。记 \(X\in\mathbb{R}^{m\times k}\)、\(W\in\mathbb{R}^{n\times k}\)、\(Y\in\mathbb{R}^{m\times n}\)。对任意 row-major 矩阵 \(Z\)，用 \(\widehat{Z}\) 表示 cuBLAS 对同一缓冲区的 column-major 解释。若 \(Z\) 的 shape 是 \(a\times b\)，那么：</p>
+
+<p>\[
+\widehat{Z}=Z^{\mathsf T}\in\mathbb{R}^{b\times a}.
+\]</p>
+
+<p>因此，row-major 公式 \(C=AB\) 对应的 column-major 输出是 \(\widehat{C}=C^{\mathsf T}=B^{\mathsf T}A^{\mathsf T}\)。这里的转置只改变矩阵视图，不复制或重排缓冲区。Linear 的三组公式都可以沿用这条等式推导。</p>
+
+<h2 id="zh-table">Linear 前向与反向的 GEMM</h2>
+
+<p>表中的两个字母依次表示 cuBLAS 的 <code>transa</code> 与 <code>transb</code>。字母 <code>N</code> 保持 column-major 矩阵不变，<code>T</code> 对它转置。</p>
 
 <div class="table-scroll">
 <table class="note-table">
   <thead>
     <tr>
-      <th>torch 视角</th>
-      <th>text</th>
-      <th>cuBLAS 视角</th>
-      <th>layout</th>
-      <th>reduce axis</th>
-      <th>remark</th>
+      <th>目标</th>
+      <th>PyTorch row-major 公式</th>
+      <th>同一输出缓冲区的 cuBLAS column-major 公式</th>
+      <th>cuBLAS 操作数</th>
+      <th>transpose mode</th>
+      <th>reduction axis</th>
     </tr>
   </thead>
   <tbody>
     <tr>
-      <td>\(x * w^t\)</td>
       <td>前向</td>
-      <td>\(w^t * x\)</td>
-      <td><code>tn</code></td>
-      <td>k (input dim)</td>
-      <td></td>
+      <td>\(Y=XW^{\mathsf T}\)</td>
+      <td>\(\widehat{Y}=WX^{\mathsf T}=\operatorname{op}_{T}(\widehat{W})\operatorname{op}_{N}(\widehat{X})\)</td>
+      <td><code>A=w</code>, <code>B=x</code></td>
+      <td><code>TN</code></td>
+      <td>\(k\), input dimension</td>
     </tr>
     <tr>
-      <td>\(\mathrm{d}w^t = x^t * \mathrm{d}y\)</td>
-      <td>反向</td>
-      <td>\(\mathrm{d}w = x * \mathrm{d}y^t\)</td>
-      <td><code>nt</code></td>
-      <td>m (batch)</td>
-      <td>实际要求的是 \(\mathrm{d}w = \mathrm{d}y^t * x\)</td>
+      <td>weight gradient</td>
+      <td>\(\mathrm{d}W=\mathrm{d}Y^{\mathsf T}X\)</td>
+      <td>\(\widehat{\mathrm{d}W}=X^{\mathsf T}\mathrm{d}Y=\operatorname{op}_{N}(\widehat{X})\operatorname{op}_{T}(\widehat{\mathrm{d}Y})\)</td>
+      <td><code>A=x</code>, <code>B=dy</code></td>
+      <td><code>NT</code></td>
+      <td>\(m\), flattened batch dimension</td>
     </tr>
     <tr>
-      <td>\(\mathrm{d}x = \mathrm{d}y * w^{tt}\)</td>
-      <td>反向</td>
-      <td>\(\mathrm{d}x = w * \mathrm{d}y\)</td>
-      <td><code>nn</code></td>
-      <td>n (output dim)</td>
-      <td></td>
+      <td>input gradient</td>
+      <td>\(\mathrm{d}X=\mathrm{d}Y W\)</td>
+      <td>\(\widehat{\mathrm{d}X}=W^{\mathsf T}\mathrm{d}Y^{\mathsf T}=\operatorname{op}_{N}(\widehat{W})\operatorname{op}_{N}(\widehat{\mathrm{d}Y})\)</td>
+      <td><code>A=w</code>, <code>B=dy</code></td>
+      <td><code>NN</code></td>
+      <td>\(n\), output dimension</td>
     </tr>
   </tbody>
 </table>
 </div>
+
+<p>transpose mode 描述交换操作数之后，cuBLAS 如何解释 <code>A</code> 与 <code>B</code>。以 wgrad 为例，PyTorch 计算 \(\mathrm{d}W=\mathrm{d}Y^{\mathsf T}X\)，同一输出缓冲区的 column-major 视图则保存 \(\widehat{\mathrm{d}W}=X^{\mathsf T}\mathrm{d}Y\)。调用顺序由此变为 <code>A=x</code>、<code>B=dy</code>，mode 为 <code>NT</code>；乘积沿 flattened batch 维 \(m\) 求和。</p>
+
+<p>这张表是一组布局假设下的代数映射，不证明某次 PyTorch 运行选择了特定 GEMM backend 或 kernel。ATen 可以根据 dtype、shape、stride 和平台选择 cuBLASLt 或其他实现；非 contiguous 输入也可能先产生副本或采用不同 leading dimension。cuBLASLt 可以通过 matrix layout descriptor 明确指定 row-major 布局，此时不需要套用这里的操作数交换。</p>
+
+<h2 id="zh-refs">参考资料</h2>
+
+<ul>
+  <li><a href="https://docs.pytorch.org/docs/2.12/generated/torch.nn.Linear.html" target="_blank" rel="noopener">PyTorch 2.12 <code>torch.nn.Linear</code></a>：\(y=xA^t+b\) 与 weight shape。</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.0.0/cublas/index.html#data-layout" target="_blank" rel="noopener">NVIDIA cuBLAS 13.0: Data Layout</a>：cuBLAS API 的 column-major 约定，以及 cuBLASLt 对 matrix layout 的扩展。</li>
+</ul>
 
 </div>
 
 <div class="lang-en">
 
-<div class="note-card">
-  <div><span class="bulb">💡</span>The torch shape and the cuBLAS shape are transposed. So \(A * B\) in torch becomes \(B * A\) in cuBLAS.</div>
-  <div><strong>\(\mathrm{d}w\) is always <code>nt</code></strong></div>
-</div>
+<h1>PyTorch Linear and cuBLAS GEMM Layout Mapping</h1>
 
-<h1 id="en-table">torch linear and layout</h1>
+<p><code>torch.nn.Linear</code> receives row-major tensors in model code, while the underlying GEMM interface may describe the same memory through a different layout convention. Interpreting profiler labels such as <code>TN</code>, <code>NT</code>, and <code>NN</code> therefore begins by translating the PyTorch equations into cuBLAS column-major views. That translation determines the operand order, transpose mode, and reduction dimension together.</p>
+
+<h2 id="en-model">Two matrix views of one buffer</h2>
+
+<p>To isolate the layout issue, assume two-dimensional, real-valued, contiguous row-major tensors and omit the bias. Let \(X\in\mathbb{R}^{m\times k}\), \(W\in\mathbb{R}^{n\times k}\), and \(Y\in\mathbb{R}^{m\times n}\). For a row-major matrix \(Z\), let \(\widehat{Z}\) denote the column-major matrix that cuBLAS sees in the same buffer. If \(Z\) has shape \(a\times b\), then:</p>
+
+<p>\[
+\widehat{Z}=Z^{\mathsf T}\in\mathbb{R}^{b\times a}.
+\]</p>
+
+<p>A row-major product \(C=AB\) consequently becomes \(\widehat{C}=C^{\mathsf T}=B^{\mathsf T}A^{\mathsf T}\) in the column-major view. This transpose changes only the matrix interpretation; it does not copy or rearrange the buffer. The same identity derives all three Linear equations below.</p>
+
+<h2 id="en-table">GEMMs in Linear forward and backward</h2>
+
+<p>The two mode letters denote cuBLAS <code>transa</code> and <code>transb</code>, in that order. Letter <code>N</code> leaves a column-major matrix unchanged, while <code>T</code> transposes it.</p>
 
 <div class="table-scroll">
 <table class="note-table">
   <thead>
     <tr>
-      <th>torch view</th>
-      <th>text</th>
-      <th>cuBLAS view</th>
-      <th>layout</th>
-      <th>reduce axis</th>
-      <th>remark</th>
+      <th>Target</th>
+      <th>PyTorch row-major equation</th>
+      <th>cuBLAS column-major equation for the same output buffer</th>
+      <th>cuBLAS operands</th>
+      <th>Transpose mode</th>
+      <th>Reduction axis</th>
     </tr>
   </thead>
   <tbody>
     <tr>
-      <td>\(x * w^t\)</td>
       <td>forward</td>
-      <td>\(w^t * x\)</td>
-      <td><code>tn</code></td>
-      <td>k (input dim)</td>
-      <td></td>
+      <td>\(Y=XW^{\mathsf T}\)</td>
+      <td>\(\widehat{Y}=WX^{\mathsf T}=\operatorname{op}_{T}(\widehat{W})\operatorname{op}_{N}(\widehat{X})\)</td>
+      <td><code>A=w</code>, <code>B=x</code></td>
+      <td><code>TN</code></td>
+      <td>\(k\), input dimension</td>
     </tr>
     <tr>
-      <td>\(\mathrm{d}w^t = x^t * \mathrm{d}y\)</td>
-      <td>backward</td>
-      <td>\(\mathrm{d}w = x * \mathrm{d}y^t\)</td>
-      <td><code>nt</code></td>
-      <td>m (batch)</td>
-      <td>the actual requested value is \(\mathrm{d}w = \mathrm{d}y^t * x\)</td>
+      <td>weight gradient</td>
+      <td>\(\mathrm{d}W=\mathrm{d}Y^{\mathsf T}X\)</td>
+      <td>\(\widehat{\mathrm{d}W}=X^{\mathsf T}\mathrm{d}Y=\operatorname{op}_{N}(\widehat{X})\operatorname{op}_{T}(\widehat{\mathrm{d}Y})\)</td>
+      <td><code>A=x</code>, <code>B=dy</code></td>
+      <td><code>NT</code></td>
+      <td>\(m\), flattened batch dimension</td>
     </tr>
     <tr>
-      <td>\(\mathrm{d}x = \mathrm{d}y * w^{tt}\)</td>
-      <td>backward</td>
-      <td>\(\mathrm{d}x = w * \mathrm{d}y\)</td>
-      <td><code>nn</code></td>
-      <td>n (output dim)</td>
-      <td></td>
+      <td>input gradient</td>
+      <td>\(\mathrm{d}X=\mathrm{d}Y W\)</td>
+      <td>\(\widehat{\mathrm{d}X}=W^{\mathsf T}\mathrm{d}Y^{\mathsf T}=\operatorname{op}_{N}(\widehat{W})\operatorname{op}_{N}(\widehat{\mathrm{d}Y})\)</td>
+      <td><code>A=w</code>, <code>B=dy</code></td>
+      <td><code>NN</code></td>
+      <td>\(n\), output dimension</td>
     </tr>
   </tbody>
 </table>
 </div>
+
+<p>The transpose mode describes how cuBLAS interprets <code>A</code> and <code>B</code> after the operands have been swapped. For wgrad, PyTorch computes \(\mathrm{d}W=\mathrm{d}Y^{\mathsf T}X\), while the column-major view of the same output buffer stores \(\widehat{\mathrm{d}W}=X^{\mathsf T}\mathrm{d}Y\). The call consequently uses <code>A=x</code>, <code>B=dy</code>, and mode <code>NT</code>, with reduction over the flattened batch dimension \(m\).</p>
+
+<p>This table is an algebraic mapping under explicit layout assumptions. It does not establish which GEMM backend or kernel a particular PyTorch run selects. ATen may choose cuBLASLt or another implementation according to dtype, shape, stride, and platform; non-contiguous inputs may also require a copy or different leading dimensions. cuBLASLt can describe row-major matrices directly, so its calls do not require this operand swap.</p>
+
+<h2 id="en-refs">References</h2>
+
+<ul>
+  <li><a href="https://docs.pytorch.org/docs/2.12/generated/torch.nn.Linear.html" target="_blank" rel="noopener">PyTorch 2.12 <code>torch.nn.Linear</code></a>: \(y=xA^t+b\) and the weight shape.</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.0.0/cublas/index.html#data-layout" target="_blank" rel="noopener">NVIDIA cuBLAS 13.0: Data Layout</a>: the cuBLAS column-major convention and cuBLASLt matrix-layout extension.</li>
+</ul>
 
 </div>
 

@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Python Import 机制笔记：绝对导入 vs 相对导入</title>
-<meta name="post:title"      content="Python Import 机制：绝对导入 vs 相对导入">
+<title>Python Import 机制：绝对导入与相对导入</title>
+<meta name="post:title"      content="Python Import 机制：绝对导入与相对导入">
 <meta name="post:title_en"   content="Python Import Mechanism: Absolute vs Relative">
 <meta name="post:slug"       content="python-imports">
 <meta name="post:date"       content="2026-05-14">
@@ -12,8 +12,8 @@
 <meta name="post:tags_en"    content="Python, Module System, Engineering">
 <meta name="post:reading"    content="15 分钟">
 <meta name="post:reading_en" content="15 min">
-<meta name="post:summary"    content="从 module / package / __init__.py / namespace package 等基础概念入手,梳理 sys.path、__name__、__package__ 在 import 解析中的角色,配合 4 个典型例子与 6 个常见报错,讲清绝对导入 vs 相对导入的选型边界。">
-<meta name="post:summary_en" content="Notes on Python's import system: module / package / __init__.py / namespace-package basics; the role of sys.path, __name__, and __package__ in resolution; 4 worked examples and 6 common error cases; plus a checklist for choosing between absolute and relative imports.">
+<meta name="post:summary"    content="Python import 解析模块全名与 package 上下文，磁盘相对位置不足以确定导入结果。Python 3.14 中，sys.modules、sys.path、__spec__.parent 与 package.__path__ 共同决定绝对/相对名称和 namespace package 的查找，也解释了直接运行与 python -m 的差异。">
+<meta name="post:summary_en" content="Python import resolution operates on fully qualified module names and package context; relative file placement alone does not determine the result. Under Python 3.14 semantics, sys.modules, sys.path, __spec__.parent, and package.__path__ jointly resolve absolute and relative names, namespace packages, and the behavioral difference between direct file execution and python -m.">
 <meta name="post:series"          content="programmer-essentials">
 <meta name="post:series_title"    content="程序员必备清单">
 <meta name="post:series_title_en" content="Programmer Essentials">
@@ -29,40 +29,40 @@
     <div class="toc-title">目录</div>
     <div class="toc">
 <ul>
-<li><a href="#1">1. 基础概念</a><ul>
-<li><a href="#module">Module（模块）</a></li>
-<li><a href="#package">Package（包）</a></li>
-<li><a href="#__init__py">__init__.py 的作用</a></li>
-<li><a href="#packagetop-level-package">顶级 package（top-level package）</a></li>
-<li><a href="#namespace-packagepep-420">Namespace package（PEP 420）</a></li>
+<li><a href="#zh-1">1. 基础概念</a><ul>
+<li><a href="#zh-module">Module（模块）</a></li>
+<li><a href="#zh-package">Package（包）</a></li>
+<li><a href="#zh-__init__py">__init__.py 的作用</a></li>
+<li><a href="#zh-packagetop-level-package">顶级 package（top-level package）</a></li>
+<li><a href="#zh-namespace-packagepep-420">Namespace package（PEP 420）</a></li>
 </ul>
 </li>
-<li><a href="#2-import">2. import 是怎么工作的</a><ul>
-<li><a href="#syspath">sys.path 决定能找到什么</a></li>
-<li><a href="#__name__-__package__">__name__ 和 __package__</a></li>
-<li><a href="#vs">绝对导入 vs 相对导入</a></li>
-<li><a href="#dotted-name">dotted name 是怎么一段段解析的</a></li>
-<li><a href="#import">import 的两个隐藏副作用</a></li>
-<li><a href="#package_1">同名子模块 / 同名顶级 package 的歧义</a></li>
+<li><a href="#zh-2-import">2. import 的解析流程</a><ul>
+<li><a href="#zh-syspath">sys.path 决定能找到什么</a></li>
+<li><a href="#zh-__name__-__package__">__name__ 和 __package__</a></li>
+<li><a href="#zh-vs">绝对导入 vs 相对导入</a></li>
+<li><a href="#zh-dotted-name">dotted name 的逐段解析</a></li>
+<li><a href="#zh-import">import 对 package 命名空间的写入</a></li>
+<li><a href="#zh-package_1">同名子模块 / 同名顶级 package 的歧义</a></li>
 </ul>
 </li>
-<li><a href="#3">3. 典型例子</a><ul>
-<li><a href="#1-module">例 1：同目录导入兄弟 module</a></li>
-<li><a href="#2-package">例 2：从兄弟 package 导入</a></li>
-<li><a href="#3-package">例 3：从兄弟 package 的下一级导入</a></li>
-<li><a href="#4">例 4：脚本入口</a></li>
+<li><a href="#zh-3">3. 典型例子</a><ul>
+<li><a href="#zh-1-module">例 1：同目录导入兄弟 module</a></li>
+<li><a href="#zh-2-package">例 2：从兄弟 package 导入</a></li>
+<li><a href="#zh-3-package">例 3：从兄弟 package 的下一级导入</a></li>
+<li><a href="#zh-4">例 4：脚本入口</a></li>
 </ul>
 </li>
-<li><a href="#4_1">4. 反例（常见报错）</a><ul>
-<li><a href="#1importerror-attempted-relative-import-with-no-known-parent-package">反例 1：ImportError: attempted relative import with no known parent package</a></li>
-<li><a href="#2modulenotfounderror-no-module-named-app">反例 2：ModuleNotFoundError: No module named 'app'</a></li>
-<li><a href="#3importerror-attempted-relative-import-beyond-top-level-package">反例 3：ImportError: attempted relative import beyond top-level package</a></li>
-<li><a href="#4__init__py-import-importerror-cannot-import-name-x">反例 4：__init__.py 里循环 import → ImportError: cannot import name 'X'</a></li>
-<li><a href="#5-syspath0">反例 5：被 sys.path[0] 偷换的"假顶级"</a></li>
-<li><a href="#6-namespace-package-__init__py">反例 6：给 namespace package 补了 __init__.py</a></li>
+<li><a href="#zh-4_1">4. 常见错误及其成因</a><ul>
+<li><a href="#zh-1importerror-attempted-relative-import-with-no-known-parent-package">错误 1：ImportError: attempted relative import with no known parent package</a></li>
+<li><a href="#zh-2modulenotfounderror-no-module-named-app">错误 2：ModuleNotFoundError: No module named 'app'</a></li>
+<li><a href="#zh-3importerror-attempted-relative-import-beyond-top-level-package">错误 3：ImportError: attempted relative import beyond top-level package</a></li>
+<li><a href="#zh-4__init__py-import-importerror-cannot-import-name-x">错误 4：__init__.py 循环 import → ImportError: cannot import name 'X'</a></li>
+<li><a href="#zh-5-syspath0">错误 5：sys.path[0] 改变顶级 package 可见性</a></li>
+<li><a href="#zh-6-namespace-package-__init__py">错误 6：__init__.py 使 namespace composition 失效</a></li>
 </ul>
 </li>
-<li><a href="#5">5. 检查清单</a></li>
+<li><a href="#zh-5">5. 检查清单</a></li>
 </ul>
 </div>
 
@@ -70,28 +70,29 @@
   </aside>
   <main class="content">
     <div class="lang-zh">
-    <h1 id="python-import-vs">Python Import 机制笔记：绝对导入 vs 相对导入<a class="headerlink" href="#python-import-vs" title="Permanent link">#</a></h1>
-<h2 id="1">1. 基础概念<a class="headerlink" href="#1" title="Permanent link">#</a></h2>
-<h3 id="module">Module（模块）<a class="headerlink" href="#module" title="Permanent link">#</a></h3>
-<p>一个 <code>.py</code> 文件就是一个 module。被 <code>import</code> 之后，会变成一个 module 对象，加进 <code>sys.modules</code> 缓存里，避免重复执行。</p>
-<h3 id="package">Package（包）<a class="headerlink" href="#package" title="Permanent link">#</a></h3>
-<p>一个 <strong>包含 <code>__init__.py</code> 的目录</strong> 就是一个 package（"regular package"）。它本身也是一个 module 对象，但额外有 <code>__path__</code> 属性，能继续装下层子 module / 子 package。</p>
+    <h1 id="zh-python-import-vs">Python Import 机制：绝对导入与相对导入</h1>
+<p class="lead">Python 的 import 系统处理的是模块名称和 package 上下文，而不是文件路径本身。解释器先识别当前模块的运行时身份，再结合 <code>sys.modules</code>、<code>sys.path</code> 与 package 的 <code>__path__</code> 解析目标名称。由此可以统一解释绝对导入、相对导入、namespace package，以及直接运行文件与 <code>python -m</code> 之间的行为差异。</p>
 <blockquote>
-<p>PEP 420 之后还有一种 <strong>namespace package</strong>：目录里没有 <code>__init__.py</code>，可以跨多个物理目录拼接。它是真实生产场景里会踩到的坑，单独成节展开（见下面"Namespace package"小节）。</p>
+<p><strong>版本范围：</strong>本文按 Python 3.14 的语言参考描述。相对导入对 <code>__package__</code> 的兼容处理带有明确版本边界，见下文。</p>
 </blockquote>
-<h3 id="__init__py"><code>__init__.py</code> 的作用<a class="headerlink" href="#__init__py" title="Permanent link">#</a></h3>
+<h2 id="zh-1">1. 基础概念<a class="headerlink" href="#zh-1" title="Permanent link">#</a></h2>
+<h3 id="zh-module">Module（模块）<a class="headerlink" href="#zh-module" title="Permanent link">#</a></h3>
+<p>一个 <code>.py</code> 文件通常可作为 source module 加载；module 也可能来自扩展库、内建模块或自定义 loader。首次 <code>import</code> 后，module 对象会进入 <code>sys.modules</code>。只要对应缓存项仍在，普通的重复导入就不会再次执行模块代码。</p>
+<h3 id="zh-package">Package（包）<a class="headerlink" href="#zh-package" title="Permanent link">#</a></h3>
+<p>Package 是带有 <code>__path__</code> 的 module，因此 import 系统可以沿这些搜索位置继续查找子 module 与子 package。磁盘上包含 <code>__init__.py</code> 的目录通常形成 regular package；PEP 420 namespace package 则由 finder 根据同名目录动态组织。</p>
+<h3 id="zh-__init__py"><code>__init__.py</code> 的作用<a class="headerlink" href="#zh-__init__py" title="Permanent link">#</a></h3>
 <ol>
 <li><strong>标记</strong>：让目录被当作 regular package 识别。</li>
 <li><strong>初始化代码</strong>：第一次 <code>import pkg</code> 时执行一次（即使只是 <code>from pkg.a import x</code> 也会先执行 <code>pkg/__init__.py</code>）。</li>
 <li><strong>re-export 门面</strong>：常见用法是在里面 <code>from .a import Foo</code>，让外面可以直接写 <code>from pkg import Foo</code>。</li>
 <li><strong>定义 <code>__all__</code></strong>：控制 <code>from pkg import *</code> 暴露哪些名字。</li>
 </ol>
-<h3 id="packagetop-level-package">顶级 package（top-level package）<a class="headerlink" href="#packagetop-level-package" title="Permanent link">#</a></h3>
-<p><strong><code>sys.path</code> 里某条目录的直接子项</strong> —— 如果它是个带 <code>__init__.py</code> 的目录，那它就是一个顶级 package。</p>
+<h3 id="zh-packagetop-level-package">顶级 package（top-level package）<a class="headerlink" href="#zh-packagetop-level-package" title="Permanent link">#</a></h3>
+<p>顶级 package 是 import 系统从某个 <code>sys.path</code> 条目直接解析出的 package；它既可以是 regular package，也可以是 namespace package。</p>
 <p>举例：<code>sys.path</code> 里有 <code>/home/me/proj</code>，而 <code>/home/me/proj/app/__init__.py</code> 存在，那 <code>app</code> 就是顶级 package。<code>app.pkg</code>、<code>app.pkg.sub</code> 是它的子 package，但<strong>不是</strong>顶级。</p>
-<p>判断"谁是顶级"完全取决于 <code>sys.path</code>，跟磁盘上的目录嵌套<strong>没有必然关系</strong>。</p>
-<h3 id="namespace-packagepep-420">Namespace package（PEP 420）<a class="headerlink" href="#namespace-packagepep-420" title="Permanent link">#</a></h3>
-<p>目录里<strong>没有 <code>__init__.py</code></strong>，但 Python 仍然把它当成一个 package。它和 regular package 的核心区别：</p>
+<p>顶级 package 的边界由 <code>sys.path</code> 的条目决定。同一目录结构在不同启动位置或安装方式下，可能得到不同的顶级名称。</p>
+<h3 id="zh-namespace-packagepep-420">Namespace package（PEP 420）<a class="headerlink" href="#zh-namespace-packagepep-420" title="Permanent link">#</a></h3>
+<p>Namespace package 是一种由多个 namespace portion 共同提供搜索位置的 package。PathFinder 在父路径的多个条目中收集同名目录，并把它们组织为可动态更新的 <code>__path__</code>；这些共享层级不放置 <code>__init__.py</code>。它与 regular package 的差异如下：</p>
 <table>
 <thead>
 <tr>
@@ -109,12 +110,12 @@
 <tr>
 <td><code>__file__</code></td>
 <td>有</td>
-<td>没有</td>
+<td>没有可代表整个包的单一路径；实现可能不设置或设为 <code>None</code></td>
 </tr>
 <tr>
 <td><code>__path__</code></td>
-<td>普通 list</td>
-<td><code>_NamespacePath</code>（可由多个物理目录拼成）</td>
+<td>子模块搜索位置序列</td>
+<td>可动态合并多个 portion 的定制 iterable；CPython 中常显示为 <code>_NamespacePath</code></td>
 </tr>
 <tr>
 <td>用途</td>
@@ -123,24 +124,27 @@
 </tr>
 </tbody>
 </table>
-<p>典型场景：<code>fbgemm_gpu/experimental/</code> 这种 hub-style 目录故意不放 <code>__init__.py</code>——这样 <code>fbgemm_gpu_experimental_hstu</code>、<code>fbgemm_gpu_experimental_gen_ai</code> 等独立 wheel 可以各自往 <code>site-packages/fbgemm_gpu/experimental/&lt;name&gt;/</code> 装自己的子 package，运行时 Python 把它们合并成同一个 <code>fbgemm_gpu.experimental</code> 命名空间。</p>
-<p><strong>关键约束</strong>：只要任何一个 wheel 在这个目录里塞进 <code>__init__.py</code>，它立刻退化成 regular package，从此别的 wheel 再往里装的子目录就<strong>不再被识别</strong>了（见反例 6）。</p>
+<p>典型场景：两个发行包分别在 <code>/env/a/acme/plugins/</code> 与 <code>/env/b/acme/plugins/</code> 提供子 package，并故意不在共享层级放 <code>__init__.py</code>。当两个父路径都在搜索路径中时，Python 可把这些 portion 合并为同一个 <code>acme.plugins</code> 命名空间。</p>
+<p>跨路径合并要求匹配项都以 namespace portion 参与。PathFinder 一旦在扫描中找到同名 regular package，便返回该 package；其它位置的 namespace portion 不再并入它。错误 6 展示了这一规则如何改变可见的子 package。</p>
 <hr />
-<h2 id="2-import">2. import 是怎么工作的<a class="headerlink" href="#2-import" title="Permanent link">#</a></h2>
-<h3 id="syspath"><code>sys.path</code> 决定能找到什么<a class="headerlink" href="#syspath" title="Permanent link">#</a></h3>
-<p><code>import X</code> 的本质是：解释器拿 <code>X</code> 这个点分名字，去 <code>sys.modules</code> 找；找不到就让 finder 沿 <code>sys.path</code> 找顶级 package，再顺着子 package 的 <code>__path__</code> 一层一层往下找。</p>
-<p><code>sys.path</code> 的常见来源：
-- 启动脚本所在目录（<code>python a.py</code> → <code>a.py</code> 的目录被插到 <code>sys.path[0]</code>）
-- <code>python -m pkg.mod</code> → <strong>当前工作目录</strong>被插到 <code>sys.path[0]</code>（这是 <code>-m</code> 和直接跑文件最大的区别之一）
-- <code>PYTHONPATH</code> 环境变量
-- 安装的 site-packages</p>
-<h3 id="__name__-__package__"><code>__name__</code> 和 <code>__package__</code><a class="headerlink" href="#__name__-__package__" title="Permanent link">#</a></h3>
-<p>每个 module 都有这两个属性，决定相对导入怎么解析。</p>
+<h2 id="zh-2-import">2. import 的解析流程<a class="headerlink" href="#zh-2-import" title="Permanent link">#</a></h2>
+<h3 id="zh-syspath"><code>sys.path</code> 决定能找到什么<a class="headerlink" href="#zh-syspath" title="Permanent link">#</a></h3>
+<p>解析 <code>import X</code> 时，解释器先在 <code>sys.modules</code> 中查找点分名称 <code>X</code>。缓存未命中时，finder 沿 <code>sys.path</code> 解析顶级名称，再沿每一级 package 的 <code>__path__</code> 继续搜索。</p>
+<p><code>sys.path</code> 的常见来源包括：</p>
+<ul>
+<li>启动脚本所在目录；执行 <code>python a.py</code> 时，<code>a.py</code> 的目录进入 <code>sys.path[0]</code>。</li>
+<li>执行 <code>python -m pkg.mod</code> 时的当前工作目录。</li>
+<li><code>PYTHONPATH</code> 环境变量。</li>
+<li>解释器配置的 site-packages。</li>
+</ul>
+<h3 id="zh-__name__-__package__"><code>__name__</code>、<code>__spec__.parent</code> 和 <code>__package__</code><a class="headerlink" href="#zh-__name__-__package__" title="Permanent link">#</a></h3>
+<p><code>__name__</code> 标识模块名；在 Python 3.14 中，显式相对导入优先以 <code>__spec__.parent</code> 确定所属 package。</p>
 <table>
 <thead>
 <tr>
 <th>启动方式</th>
 <th><code>__name__</code></th>
+<th><code>__spec__.parent</code></th>
 <th><code>__package__</code></th>
 </tr>
 </thead>
@@ -148,52 +152,55 @@
 <tr>
 <td><code>python app/pkg/a.py</code>（直接跑文件）</td>
 <td><code>"__main__"</code></td>
+<td><code>__spec__ is None</code></td>
 <td><code>None</code> 或 <code>""</code></td>
 </tr>
 <tr>
 <td><code>python -m app.pkg.a</code>（按模块跑）</td>
 <td><code>"__main__"</code></td>
 <td><code>"app.pkg"</code></td>
+<td><code>"app.pkg"</code></td>
 </tr>
 <tr>
 <td>被别处 <code>import app.pkg.a</code></td>
 <td><code>"app.pkg.a"</code></td>
 <td><code>"app.pkg"</code></td>
+<td><code>"app.pkg"</code></td>
 </tr>
 </tbody>
 </table>
-<p><strong>相对导入（<code>from . import x</code>）只看 <code>__package__</code></strong>：以它为起点，每多一个点退一层。如果 <code>__package__</code> 是 <code>None</code>/<code>""</code>，相对导入直接失败。</p>
-<p>这就是为什么直接 <code>python a.py</code> 跑一个包里的文件，里面的 <code>from . import b</code> 会立刻报错——它根本不知道自己属于哪个 package。</p>
-<h3 id="vs">绝对导入 vs 相对导入<a class="headerlink" href="#vs" title="Permanent link">#</a></h3>
+<p>Python 3.14 的显式相对导入以 <code>__spec__.parent</code> 为 package 起点；<code>__package__</code> 在前者未设置时提供兼容回退。该回退自 Python 3.13 起弃用，并计划在 Python 3.15 移除。每增加一个前导点，解析位置便从起点向上移动一级。</p>
+<p>直接用 <code>python a.py</code> 运行包内文件时，<code>__main__.__spec__</code> 通常为 <code>None</code>，也没有可用的 package 回退值，因此 <code>from . import b</code> 无法确定起点。</p>
+<h3 id="zh-vs">绝对导入 vs 相对导入<a class="headerlink" href="#zh-vs" title="Permanent link">#</a></h3>
 <ul>
-<li><strong>绝对导入</strong>：<code>from app.pkg import b</code>，从 <code>sys.path</code> 根开始找完整路径。可读性好，跨 package 移动文件后基本不用改。</li>
-<li><strong>相对导入</strong>：<code>from . import b</code>、<code>from ..sib import e</code>，基于 <code>__package__</code> 算。重命名顶级 package 时不用改，但<strong>不能跨出顶级</strong>，并且不能在脚本入口里用。</li>
+<li><strong>绝对导入</strong>：<code>from app.pkg import b</code>，从 <code>sys.path</code> 根开始解析完整名称。目标来源更明确，但 package 被重命名或移动后仍需更新引用。</li>
+<li><strong>相对导入</strong>：<code>from . import b</code>、<code>from ..sib import e</code>，基于当前模块的 package 上下文计算。它不能跨出顶级 package；直接按文件启动的脚本通常没有这个上下文，而通过 <code>-m</code> 启动的入口模块可以使用。</li>
 </ul>
 <p>PEP 8 推荐绝对导入；相对导入用于 package <strong>内部</strong> 同辈/近亲互引。</p>
-<h3 id="dotted-name">dotted name 是怎么一段段解析的<a class="headerlink" href="#dotted-name" title="Permanent link">#</a></h3>
+<h3 id="zh-dotted-name">dotted name 的逐段解析<a class="headerlink" href="#zh-dotted-name" title="Permanent link">#</a></h3>
 <p><code>from a.b.c import d</code> 并不是一步到位，而是按 <code>.</code> 一段段走，每段独立决定它是 regular / namespace package 还是普通 module：</p>
 <ol>
 <li>找 <code>a</code>：沿 <code>sys.path</code> 找叫 <code>a</code> 的目录 / 文件，写进 <code>sys.modules['a']</code>。</li>
 <li>找 <code>a.b</code>：在 <code>a.__path__</code> 里找 <code>b</code>，再走一遍 finder。如果 <code>a</code> 是 namespace package，<code>a.__path__</code> 可能是多个物理目录的合集，<code>b</code> 可能来自其中任何一个。</li>
 <li>找 <code>a.b.c</code>：在 <code>a.b.__path__</code> 里找 <code>c</code>。</li>
-<li>从 <code>a.b.c</code> 这个 module 对象上取属性 <code>d</code>。</li>
+<li>从 <code>a.b.c</code> 这个 module 对象上取属性 <code>d</code>；若属性不存在，import-from 还会尝试加载子模块 <code>a.b.c.d</code>，仍失败才抛出 <code>ImportError</code>。</li>
 </ol>
-<p>每一步加载的 module 都写进 <code>sys.modules</code>，下次重复 import 直接命中缓存、不再走 finder。所以中间任何一层只要被 import 过一次，后面再换 <code>sys.path</code> 也不会让它"重新解析"。</p>
-<h3 id="import">import 的两个隐藏副作用<a class="headerlink" href="#import" title="Permanent link">#</a></h3>
-<p>这两条副作用解释了大量"为什么空的 <code>__init__.py</code> 也能这样用"的困惑。</p>
-<p><strong>(a) <code>import a.b</code> 会把 <code>b</code> 设为 <code>a</code> 的属性。</strong> 这是 import 系统在加载子模块时主动做的赋值，<strong>不是</strong> <code>__init__.py</code> 里必须写 <code>from . import b</code> 才有的效果：</p>
+<p>每一步加载的 module 都写进 <code>sys.modules</code>。只要缓存项仍在，重复 import 会直接命中，不再走 finder；删除对应缓存项后，下一次 import 才会重新搜索。</p>
+<h3 id="zh-import">import 对 package 命名空间的写入<a class="headerlink" href="#zh-import" title="Permanent link">#</a></h3>
+<p>子模块加载完成后，import 系统还会更新父 package 的命名空间。这里有两项直接影响 <code>import a.b</code> 与 <code>from a import b</code> 行为的规则。</p>
+<p><strong>(a) <code>import a.b</code> 会把 <code>b</code> 设为 <code>a</code> 的属性。</strong> 该绑定由 import 系统在加载子模块时完成，因此空的 <code>__init__.py</code> 也具备这一行为：</p>
 <div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">a.b</span>           <span class="c1"># 哪怕 a/__init__.py 完全为空</span>
 <span class="n">a</span><span class="o">.</span><span class="n">b</span><span class="o">.</span><span class="n">foo</span><span class="p">()</span>            <span class="c1"># 也能 work：import 系统已经把 b 绑到 a 上了</span>
 </code></pre></div>
-<p><strong>(b) <code>from a import b</code> 在 <code>a</code> 上找不到属性 <code>b</code> 时，会兜底去加载子模块 <code>a.b</code>。</strong> 这就是为什么 <code>__init__.py</code> 里没写 <code>from . import b</code>，外面仍然能 <code>from a import b</code> 拿到子模块。<strong>注意</strong>这条兜底只对单层 attribute 生效——<code>from a import b.c</code> 是语法错误。</p>
-<h3 id="package_1">同名子模块 / 同名顶级 package 的歧义<a class="headerlink" href="#package_1" title="Permanent link">#</a></h3>
+<p><strong>(b) <code>from a import b</code> 在 <code>a</code> 上没有属性 <code>b</code> 时，会尝试加载子模块 <code>a.b</code>。</strong> 成功加载后，上一条规则又把 <code>b</code> 绑定到 <code>a</code>。这项回退只处理单层 attribute；<code>from a import b.c</code> 不符合该语句的语法。</p>
+<h3 id="zh-package_1">同名子模块 / 同名顶级 package 的歧义<a class="headerlink" href="#zh-package_1" title="Permanent link">#</a></h3>
 <p>import 系统<strong>只看名字</strong>，不区分"逻辑上是同一个包"。两种常见歧义：</p>
 <ul>
-<li><strong>同名顶级 package 撞车</strong>：<code>sys.path</code> 里有两条目录都包含 <code>foo/</code>，<code>import foo</code> 只会拿到 <code>sys.path</code> 中<strong>第一条</strong>命中的那个，另一个永远见不到。靠 <code>foo.__file__</code> 排查。</li>
-<li><strong>同名子模块不同含义</strong>：例如 <code>fbgemm_gpu.experimental.hstu.hstu_ops_gpu</code>（C++/CUDA 绑定）和 <code>fbgemm_gpu.experimental.hstu.hstu_blackwell.hstu_ops_gpu</code>（Triton 实现）是两个完全不同的 module，只是末尾文件名重合。靠绝对路径区分，常见做法是在调用方 <code>import ... as _sm90</code> / <code>as _sm100</code> 用别名 dispatch。</li>
+<li><strong>同名顶级 package 撞车</strong>：若某条路径提供 regular package 或普通 module，PathFinder 会返回该对象，不会再把其他同名目录并入其中；只有隐式 namespace portion 才会跨搜索位置合并。可用 <code>foo.__spec__.origin</code> 与 <code>foo.__spec__.submodule_search_locations</code> 排查实际来源。</li>
+<li><strong>同名子模块不同含义</strong>：例如 <code>acme.backends.cuda.ops</code> 与 <code>acme.backends.triton.ops</code> 是两个完全不同的 module，只是末尾名称相同。绝对模块名负责区分它们，调用方可再用 <code>import ... as cuda_ops</code> / <code>as triton_ops</code> 建立清晰别名。</li>
 </ul>
 <hr />
-<h2 id="3">3. 典型例子<a class="headerlink" href="#3" title="Permanent link">#</a></h2>
+<h2 id="zh-3">3. 典型例子<a class="headerlink" href="#zh-3" title="Permanent link">#</a></h2>
 <p>假设项目结构（<code>sys.path</code> 里有 <code>/proj</code>，所以 <code>app</code> 是顶级 package）：</p>
 <div class="highlight"><pre><span></span><code>/proj/
   app/                  &lt;- 顶级 package
@@ -213,7 +220,7 @@
         __init__.py
         f.py
 </code></pre></div>
-<h3 id="1-module">例 1：同目录导入兄弟 module<a class="headerlink" href="#1-module" title="Permanent link">#</a></h3>
+<h3 id="zh-1-module">例 1：同目录导入兄弟 module<a class="headerlink" href="#zh-1-module" title="Permanent link">#</a></h3>
 <p><code>app/pkg/a.py</code> 想用 <code>app/pkg/b.py</code> 里的 <code>foo</code>：</p>
 <div class="highlight"><pre><span></span><code><span class="c1"># 相对（推荐用于 package 内部）</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.</span><span class="w"> </span><span class="kn">import</span> <span class="n">b</span>
@@ -224,7 +231,7 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">app.pkg.b</span><span class="w"> </span><span class="kn">import</span> <span class="n">foo</span>
 </code></pre></div>
 <p><code>.</code> 表示"当前 package"，也就是 <code>__package__ == "app.pkg"</code>。</p>
-<h3 id="2-package">例 2：从兄弟 package 导入<a class="headerlink" href="#2-package" title="Permanent link">#</a></h3>
+<h3 id="zh-2-package">例 2：从兄弟 package 导入<a class="headerlink" href="#zh-2-package" title="Permanent link">#</a></h3>
 <p><code>app/pkg/a.py</code> 想用 <code>app/sib/e.py</code> 里的 <code>bar</code>：</p>
 <div class="highlight"><pre><span></span><code><span class="c1"># 相对：两个点退到 app，再进 sib</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..sib</span><span class="w"> </span><span class="kn">import</span> <span class="n">e</span>
@@ -235,7 +242,7 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">app.sib.e</span><span class="w"> </span><span class="kn">import</span> <span class="n">bar</span>
 </code></pre></div>
 <p>注意 <code>..</code> 不能越过顶级 package。这里 <code>pkg</code> 和 <code>sib</code> 都是 <code>app</code> 的子 package，<code>..</code> 退到 <code>app</code> 是合法的。<code>app</code> 可以是 regular package，也可以是 PEP 420 namespace package；关键不是磁盘上有没有 <code>app/__init__.py</code>，而是解释器能否把 <code>app.pkg.a</code> 作为 package module 加载，并正确设置 <code>__package__ == "app.pkg"</code>。</p>
-<h3 id="3-package">例 3：从兄弟 package 的下一级导入<a class="headerlink" href="#3-package" title="Permanent link">#</a></h3>
+<h3 id="zh-3-package">例 3：从兄弟 package 的下一级导入<a class="headerlink" href="#zh-3-package" title="Permanent link">#</a></h3>
 <p><code>app/pkg/a.py</code> 想用 <code>app/sib/sub2/f.py</code> 里的 <code>baz</code>：</p>
 <div class="highlight"><pre><span></span><code><span class="c1"># 相对</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..sib.sub2</span><span class="w"> </span><span class="kn">import</span> <span class="n">f</span>
@@ -245,41 +252,45 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">app.sib.sub2</span><span class="w"> </span><span class="kn">import</span> <span class="n">f</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">app.sib.sub2.f</span><span class="w"> </span><span class="kn">import</span> <span class="n">baz</span>
 </code></pre></div>
-<h3 id="4">例 4：脚本入口<a class="headerlink" href="#4" title="Permanent link">#</a></h3>
+<h3 id="zh-4">例 4：脚本入口<a class="headerlink" href="#zh-4" title="Permanent link">#</a></h3>
 <p><code>app/main.py</code> 作为入口，引用其它模块：</p>
 <div class="highlight"><pre><span></span><code><span class="c1"># main.py —— 推荐用 -m 启动：python -m app.main</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">app.pkg.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">something</span>    <span class="c1"># 绝对，最稳</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.pkg.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">something</span>       <span class="c1"># 相对，要求 __package__ == &quot;app&quot;，即用 -m 启动</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.pkg.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">something</span>       <span class="c1"># 相对，要求 __spec__.parent == &quot;app&quot;，即用 -m 启动</span>
 </code></pre></div>
 <hr />
-<h2 id="4_1">4. 反例（常见报错）<a class="headerlink" href="#4_1" title="Permanent link">#</a></h2>
-<h3 id="1importerror-attempted-relative-import-with-no-known-parent-package">反例 1：<code>ImportError: attempted relative import with no known parent package</code><a class="headerlink" href="#1importerror-attempted-relative-import-with-no-known-parent-package" title="Permanent link">#</a></h3>
-<p><div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/proj/app/pkg
+<h2 id="zh-4_1">4. 常见错误及其成因<a class="headerlink" href="#zh-4_1" title="Permanent link">#</a></h2>
+<h3 id="zh-1importerror-attempted-relative-import-with-no-known-parent-package">错误 1：<code>ImportError: attempted relative import with no known parent package</code><a class="headerlink" href="#zh-1importerror-attempted-relative-import-with-no-known-parent-package" title="Permanent link">#</a></h3>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/proj/app/pkg
 $<span class="w"> </span>python<span class="w"> </span>a.py
 </code></pre></div>
-<code>a.py</code> 里有 <code>from . import b</code>。直接跑文件，<code>a.py</code> 的 <code>__name__ == "__main__"</code>，<code>__package__</code> 是 <code>None</code>——它压根不知道自己属于 <code>app.pkg</code>，相对导入起点丢了。</p>
-<p><strong>修法</strong>：
-- 改用 <code>python -m app.pkg.a</code>（在 <code>/proj</code> 下跑），让解释器把它当 module 加载，<code>__package__</code> 会被设成 <code>"app.pkg"</code>。
-- 或者把 <code>a.py</code> 写成纯脚本，里面只用绝对导入 <code>from app.pkg import b</code>（前提是 <code>/proj</code> 在 <code>sys.path</code> 里）。</p>
-<h3 id="2modulenotfounderror-no-module-named-app">反例 2：<code>ModuleNotFoundError: No module named 'app'</code><a class="headerlink" href="#2modulenotfounderror-no-module-named-app" title="Permanent link">#</a></h3>
-<p><div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/home/me
+<p><code>a.py</code> 包含 <code>from . import b</code>。直接运行该文件时，<code>a.py</code> 的 <code>__name__ == "__main__"</code>，而 <code>__spec__</code> 与 <code>__package__</code> 没有提供 <code>app.pkg</code> 这一 package 上下文，因此解释器无法确定相对导入的起点。</p>
+<p><strong>修复方式：</strong></p>
+<ul>
+<li>在 <code>/proj</code> 下执行 <code>python -m app.pkg.a</code>，让解释器按 module 加载它并设置 <code>__package__ == "app.pkg"</code>。</li>
+<li>将 <code>a.py</code> 设计为独立脚本并使用绝对导入 <code>from app.pkg import b</code>，同时确保 <code>/proj</code> 位于 <code>sys.path</code>。</li>
+</ul>
+<h3 id="zh-2modulenotfounderror-no-module-named-app">错误 2：<code>ModuleNotFoundError: No module named 'app'</code><a class="headerlink" href="#zh-2modulenotfounderror-no-module-named-app" title="Permanent link">#</a></h3>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/home/me
 $<span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>app.main
 </code></pre></div>
-当前目录是 <code>/home/me</code>，<code>sys.path[0]</code> 是 <code>/home/me</code>，里面根本没有 <code>app/</code> 目录。解释器找不到顶级 package。</p>
-<p><strong>修法</strong>：
-- <code>cd /proj &amp;&amp; python -m app.main</code>，或者
-- <code>PYTHONPATH=/proj python -m app.main</code>，或者
-- 把项目装成可编辑包（<code>pip install -e .</code> + <code>pyproject.toml</code>），让 <code>app</code> 进 site-packages。</p>
-<p>变体：<code>from app.pgk.a import x</code>（拼错 <code>pkg</code> → <code>pgk</code>）也会报同样错——错误信息只告诉你"没这个名字"，不会告诉你拼错了。</p>
-<h3 id="3importerror-attempted-relative-import-beyond-top-level-package">反例 3：<code>ImportError: attempted relative import beyond top-level package</code><a class="headerlink" href="#3importerror-attempted-relative-import-beyond-top-level-package" title="Permanent link">#</a></h3>
-<p><div class="highlight"><pre><span></span><code><span class="c1"># app/__init__.py 里写：</span>
+<p>当前目录是 <code>/home/me</code>，因此 <code>sys.path[0]</code> 为 <code>/home/me</code>。该搜索位置没有名为 <code>app</code> 的直接子项，解释器无法解析顶级 package <code>app</code>。</p>
+<p><strong>修复方式：</strong></p>
+<ul>
+<li>执行 <code>cd /proj &amp;&amp; python -m app.main</code>。</li>
+<li>通过 <code>PYTHONPATH=/proj python -m app.main</code> 显式加入项目根目录。</li>
+<li>使用 <code>pyproject.toml</code> 与 <code>pip install -e .</code> 把项目安装为 editable package。</li>
+</ul>
+<p>名称拼写错误也可能产生相同异常。例如，<code>from app.pgk.a import x</code> 将 <code>pkg</code> 写成了 <code>pgk</code>；错误信息只表明该限定名称无法解析，不会区分搜索路径缺失与拼写错误。</p>
+<h3 id="zh-3importerror-attempted-relative-import-beyond-top-level-package">错误 3：<code>ImportError: attempted relative import beyond top-level package</code><a class="headerlink" href="#zh-3importerror-attempted-relative-import-beyond-top-level-package" title="Permanent link">#</a></h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># app/__init__.py 里写：</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..util</span><span class="w"> </span><span class="kn">import</span> <span class="n">helper</span>
 </code></pre></div>
-<code>app</code> 已经是顶级 package，<code>..</code> 想退到 <code>app</code> 的"父 package"——根本不存在。Python 不允许相对导入跨出顶级 package 的边界。</p>
-<p><strong>注意</strong>：错误信息里的 "top-level package" 指的是 <strong>相对导入起点所在的顶级 package</strong>（这里是 <code>app</code>），不是说"我已经在最外层目录了"。即使磁盘上 <code>app/</code> 外面还有别的目录，也无关——<code>sys.path</code> 决定的"顶"就是顶。</p>
-<p><strong>修法</strong>：用绝对导入 <code>from util import helper</code>（前提是 <code>util</code> 也是顶级 package），或者把 <code>util</code> 挪进 <code>app</code> 里变成 <code>app.util</code>。</p>
-<h3 id="4__init__py-import-importerror-cannot-import-name-x">反例 4：<code>__init__.py</code> 里循环 import → <code>ImportError: cannot import name 'X'</code><a class="headerlink" href="#4__init__py-import-importerror-cannot-import-name-x" title="Permanent link">#</a></h3>
-<p><div class="highlight"><pre><span></span><code><span class="c1"># app/pkg/__init__.py</span>
+<p><code>app</code> 已经是顶级 package，<code>..</code> 会尝试移动到其 package 边界之外。该层级不存在可供解析的父 package，因此 Python 抛出此错误。</p>
+<p>错误信息中的 "top-level package" 指相对导入起点所属的顶级 package，此处为 <code>app</code>。磁盘目录是否还有更外层的父目录不影响这一边界；顶级 package 由有效的 <code>sys.path</code> 搜索位置决定。</p>
+<p><strong>处理方式</strong>：使用绝对导入 <code>from util import helper</code>（前提是 <code>util</code> 也是顶级 package），或者把 <code>util</code> 移入 <code>app</code> 并作为 <code>app.util</code> 导入。</p>
+<h3 id="zh-4__init__py-import-importerror-cannot-import-name-x">错误 4：<code>__init__.py</code> 循环 import → <code>ImportError: cannot import name 'X'</code><a class="headerlink" href="#zh-4__init__py-import-importerror-cannot-import-name-x" title="Permanent link">#</a></h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># app/pkg/__init__.py</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">Foo</span>
 
 <span class="c1"># app/pkg/a.py</span>
@@ -288,51 +299,54 @@ $<span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span
 <span class="c1"># app/pkg/b.py</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">Foo</span>        <span class="c1"># 此时 a 还没执行完，Foo 尚未定义</span>
 </code></pre></div>
-报错形式是 <code>ImportError: cannot import name 'Foo' from partially initialized module 'app.pkg.a'</code>。</p>
-<p><strong>修法</strong>：把交叉依赖打散（按需 <code>import</code> 到函数体内，或拆出共享底层 module），不要在 <code>__init__.py</code> 顶层就 re-export 出会引发回环的符号。</p>
-<h3 id="5-syspath0">反例 5：被 <code>sys.path[0]</code> 偷换的"假顶级"<a class="headerlink" href="#5-syspath0" title="Permanent link">#</a></h3>
-<p><div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/proj/app
+<p>报错形式是 <code>ImportError: cannot import name 'Foo' from partially initialized module 'app.pkg.a'</code>。</p>
+<p><strong>处理方式</strong>：拆分交叉依赖，例如按需在函数体内 <code>import</code>，或把共享逻辑下沉到独立 module；<code>__init__.py</code> 顶层只 re-export 不会形成回环的符号。</p>
+<h3 id="zh-5-syspath0">错误 5：<code>sys.path[0]</code> 改变顶级 package 可见性<a class="headerlink" href="#zh-5-syspath0" title="Permanent link">#</a></h3>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/proj/app
 $<span class="w"> </span>python<span class="w"> </span>pkg/a.py
 </code></pre></div>
-<code>a.py</code> 里 <code>from app.pkg import b</code> 会报 <code>ModuleNotFoundError: No module named 'app'</code>。原因：<code>python pkg/a.py</code> 把 <code>/proj/app/pkg</code> 插到 <code>sys.path[0]</code>——这下 <code>pkg</code> 看起来像顶级了，但 <code>app</code> 反而不在 <code>sys.path</code> 任何一项的直接子项里。</p>
-<p><strong>修法</strong>：永远用 <code>python -m app.pkg.a</code> 在项目根目录跑，别直接 <code>python xxx.py</code> 跑包里的文件。</p>
-<h3 id="6-namespace-package-__init__py">反例 6：给 namespace package 补了 <code>__init__.py</code><a class="headerlink" href="#6-namespace-package-__init__py" title="Permanent link">#</a></h3>
-<p>某天有人觉得 <code>fbgemm_gpu/experimental/</code> 里没 <code>__init__.py</code> "看着不规范"，手贱补了一个。结果：</p>
+<p><code>a.py</code> 中的 <code>from app.pkg import b</code> 会抛出 <code>ModuleNotFoundError: No module named 'app'</code>。执行 <code>python pkg/a.py</code> 时，解释器把 <code>/proj/app/pkg</code> 放入 <code>sys.path[0]</code>，而项目根目录 <code>/proj</code> 不在有效搜索位置中；因此 <code>app</code> 不是任何 <code>sys.path</code> 条目的直接子项。</p>
+<p><strong>处理方式</strong>：包内模块通常从项目根目录用 <code>python -m app.pkg.a</code> 启动，使解释器建立完整的 package 身份。</p>
+<h3 id="zh-6-namespace-package-__init__py">错误 6：<code>__init__.py</code> 使 namespace composition 失效<a class="headerlink" href="#zh-6-namespace-package-__init__py" title="Permanent link">#</a></h3>
+<p>假设 <code>/env/a/acme/plugins/alpha</code> 与 <code>/env/b/acme/plugins/beta</code> 原本共同组成 <code>acme.plugins</code>。如果搜索顺序靠前的 <code>/env/a/acme/plugins/</code> 被补上 <code>__init__.py</code>，结果是：</p>
 <ul>
-<li><code>fbgemm_gpu.experimental</code> 从 namespace 退化成 regular package。</li>
-<li>它的 <code>__path__</code> 从可拼接的 <code>_NamespacePath</code> 变成单一目录的普通 list。</li>
-<li>别的 wheel（<code>fbgemm_gpu_experimental_gen_ai</code> 等）往别处的 <code>experimental/gen_ai/</code> 装的子目录<strong>不再被识别</strong>——只有这个被"占坑"了的 <code>__init__.py</code> 所在目录下的子目录算数。</li>
+<li>PathFinder 会把该位置的 <code>acme.plugins</code> 作为 regular package 返回。</li>
+<li><code>acme.plugins.__path__</code> 不再包含另一个 namespace portion。</li>
+<li><code>/env/b</code> 中的 <code>acme.plugins.beta</code> 因而不可见。</li>
 </ul>
-<p>报错形式：<code>ModuleNotFoundError: No module named 'fbgemm_gpu.experimental.gen_ai'</code>，但磁盘上 <code>gen_ai/</code> 明明存在。</p>
-<p><strong>修法</strong>：删掉那个不该存在的 <code>__init__.py</code>。判断一个目录"该不该有 <code>__init__.py</code>"的标准：<strong>这个目录是单个 wheel 拥有的，还是要给多个 wheel 拼接命名空间的？</strong> 前者必须有，后者绝对不能有。</p>
+<p>报错形式可能是 <code>ModuleNotFoundError: No module named 'acme.plugins.beta'</code>，即使对应目录确实存在。</p>
+<p><strong>处理方式</strong>：需要跨发行包合并时删除该 <code>__init__.py</code>；采用 regular package 时，则把所有子包安装到其有效搜索位置。选择取决于 package 的所有权边界。</p>
 <hr />
-<h2 id="5">5. 检查清单<a class="headerlink" href="#5" title="Permanent link">#</a></h2>
+<h2 id="zh-5">5. 检查清单<a class="headerlink" href="#zh-5" title="Permanent link">#</a></h2>
 <p>碰到 import 报错时，按顺序排查：</p>
 <ol>
 <li><code>python -c "import sys; print(sys.path)"</code> —— 顶级 package 的父目录在不在里面？</li>
-<li><code>python -c "import app; print(app.__file__)"</code> —— 找到的是不是你期望的那个 <code>app</code>？（小心同名 package 撞车）</li>
-<li>出错的文件里打 <code>print(__name__, __package__)</code> —— 相对导入的起点对不对？</li>
-<li>启动命令是 <code>python file.py</code> 还是 <code>python -m pkg.file</code>？前者几乎一定会让 <code>__package__</code> 丢失。</li>
+<li><code>python -c "import app; print(app.__spec__)"</code> —— origin 与 submodule search locations 是否符合预期？</li>
+<li>出错的文件里打印 <code>__name__</code>、<code>__spec__</code> 以及 <code>getattr(__spec__, "parent", None)</code> —— 相对导入的起点对不对？</li>
+<li>启动命令是 <code>python file.py</code> 还是 <code>python -m pkg.file</code>？前者通常不会为 <code>__main__</code> 建立 package spec。</li>
 <li><code>__init__.py</code> 是不是在导入时就触发了循环？</li>
 </ol>
-<h2 id="refs">参考资料<a class="headerlink" href="#refs" title="Permanent link">#</a></h2>
+<h2 id="zh-refs">参考资料<a class="headerlink" href="#zh-refs" title="Permanent link">#</a></h2>
 <ul>
-<li><a href="https://docs.python.org/3/reference/import.html">Python Language Reference: The import system</a></li>
+<li><a href="https://docs.python.org/3.14/reference/import.html">Python 3.14 Language Reference: The import system</a></li>
+<li><a href="https://docs.python.org/3.14/reference/datamodel.html#module.__package__">Python 3.14 Data model: module package metadata</a></li>
+<li><a href="https://docs.python.org/3.14/using/cmdline.html#cmdoption-m">Python 3.14 command line: <code>-m</code></a></li>
 <li><a href="https://peps.python.org/pep-0420/">PEP 420: Implicit Namespace Packages</a></li>
 <li><a href="https://peps.python.org/pep-0328/">PEP 328: Imports, multi-line imports, and absolute/relative imports</a></li>
 </ul>
     </div>
     <div class="lang-en">
-    <h1 id="en-python-import-vs">Python Import Mechanism: Absolute vs Relative<a class="headerlink" href="#en-python-import-vs" title="Permanent link">#</a></h1>
+    <h1 id="en-python-import-vs">Python Import Mechanism: Absolute vs Relative</h1>
+<p class="lead">Python's import system resolves module names and package context rather than file paths in isolation. It identifies the current module's runtime identity, then combines <code>sys.modules</code>, <code>sys.path</code>, and each package's <code>__path__</code> to locate the target. This model accounts for absolute imports, relative imports, namespace packages, and the behavioral difference between executing a file directly and using <code>python -m</code>.</p>
+<blockquote>
+<p><strong>Version scope:</strong> this article follows the Python 3.14 language reference. The compatibility fallback through <code>__package__</code> has an explicit version boundary described below.</p>
+</blockquote>
 <h2 id="en-1">1. Foundations<a class="headerlink" href="#en-1" title="Permanent link">#</a></h2>
 <h3 id="en-module">Module<a class="headerlink" href="#en-module" title="Permanent link">#</a></h3>
-<p>A single <code>.py</code> file <em>is</em> a module. Once <code>import</code>ed, it becomes a module object and is cached in <code>sys.modules</code> so it never executes twice.</p>
+<p>A <code>.py</code> file can normally be loaded as a source module; modules may also come from extension libraries, built-ins, or custom loaders. After the first <code>import</code>, the module object enters <code>sys.modules</code>. Ordinary repeat imports do not execute its code again while that cache entry remains.</p>
 <h3 id="en-package">Package<a class="headerlink" href="#en-package" title="Permanent link">#</a></h3>
-<p>A <strong>directory containing an <code>__init__.py</code></strong> is a package (a "regular package"). It is itself a module object, but additionally carries a <code>__path__</code> attribute that holds child modules and child packages.</p>
-<blockquote>
-<p>Since PEP 420 there is also the <strong>namespace package</strong>: a directory with <em>no</em> <code>__init__.py</code> that can be stitched together from multiple physical directories. It is a real production-grade footgun, so it gets its own section below ("Namespace package").</p>
-</blockquote>
-<h3 id="en-__init__py">What <code>__init__.py</code> does<a class="headerlink" href="#en-__init__py" title="Permanent link">#</a></h3>
+<p>A package is a module with a <code>__path__</code>, which gives the import system locations in which to search for submodules and subpackages. A directory containing <code>__init__.py</code> normally forms a regular package; finders assemble a PEP 420 namespace package dynamically from matching directories.</p>
+<h3 id="en-__init__py">The role of <code>__init__.py</code><a class="headerlink" href="#en-__init__py" title="Permanent link">#</a></h3>
 <ol>
 <li><strong>Marker</strong>: tells Python to treat the directory as a regular package.</li>
 <li><strong>Initialization code</strong>: runs once on the first <code>import pkg</code> (even <code>from pkg.a import x</code> first executes <code>pkg/__init__.py</code>).</li>
@@ -340,11 +354,11 @@ $<span class="w"> </span>python<span class="w"> </span>pkg/a.py
 <li><strong>Defining <code>__all__</code></strong>: controls which names <code>from pkg import *</code> exposes.</li>
 </ol>
 <h3 id="en-packagetop-level-package">Top-level package<a class="headerlink" href="#en-packagetop-level-package" title="Permanent link">#</a></h3>
-<p><strong>A direct child of some entry in <code>sys.path</code></strong>: if that child is a directory carrying an <code>__init__.py</code>, it is a top-level package.</p>
+<p>A top-level package is resolved directly from an entry in <code>sys.path</code>. It may be either a regular package or a namespace package.</p>
 <p>Example: <code>sys.path</code> contains <code>/home/me/proj</code>, and <code>/home/me/proj/app/__init__.py</code> exists, therefore <code>app</code> is a top-level package. <code>app.pkg</code> and <code>app.pkg.sub</code> are its sub-packages, but they are <strong>not</strong> top-level.</p>
-<p>Who counts as "top-level" is decided entirely by <code>sys.path</code>; it has <strong>no necessary relationship</strong> to how deeply directories nest on disk.</p>
+<p>Entries in <code>sys.path</code> determine the top-level boundary. The same directory tree can therefore acquire different top-level names under different launch locations or installation layouts.</p>
 <h3 id="en-namespace-packagepep-420">Namespace package (PEP 420)<a class="headerlink" href="#en-namespace-packagepep-420" title="Permanent link">#</a></h3>
-<p>A directory with <strong>no <code>__init__.py</code></strong> that Python nonetheless treats as a package. The core differences from a regular package:</p>
+<p>A namespace package is a package whose search locations are supplied by multiple namespace portions. PathFinder collects matching directories from the parent search path and exposes them through a dynamically updated <code>__path__</code>; the shared levels omit <code>__init__.py</code>. The differences from a regular package are:</p>
 <table>
 <thead>
 <tr>
@@ -362,12 +376,12 @@ $<span class="w"> </span>python<span class="w"> </span>pkg/a.py
 <tr>
 <td><code>__file__</code></td>
 <td>present</td>
-<td>absent</td>
+<td>no single path represents the whole package; an implementation may omit it or set it to <code>None</code></td>
 </tr>
 <tr>
 <td><code>__path__</code></td>
-<td>plain list</td>
-<td><code>_NamespacePath</code> (stitched from several physical directories)</td>
+<td>a sequence of submodule search locations</td>
+<td>a custom iterable that can combine portions dynamically; CPython commonly displays <code>_NamespacePath</code></td>
 </tr>
 <tr>
 <td>Purpose</td>
@@ -376,24 +390,27 @@ $<span class="w"> </span>python<span class="w"> </span>pkg/a.py
 </tr>
 </tbody>
 </table>
-<p>Canonical use case: a hub-style directory like <code>fbgemm_gpu/experimental/</code> deliberately omits <code>__init__.py</code> so that independent wheels (<code>fbgemm_gpu_experimental_hstu</code>, <code>fbgemm_gpu_experimental_gen_ai</code>, etc.) can each install their own sub-package into <code>site-packages/fbgemm_gpu/experimental/&lt;name&gt;/</code>, and at runtime Python merges them all into a single <code>fbgemm_gpu.experimental</code> namespace.</p>
-<p><strong>Critical constraint</strong>: the moment <em>any</em> wheel drops an <code>__init__.py</code> into that directory, it instantly degrades into a regular package and the sub-directories that other wheels install there are <strong>no longer discoverable</strong> (see Pitfall 6).</p>
+<p>A typical use case is two distributions contributing subpackages under <code>/env/a/acme/plugins/</code> and <code>/env/b/acme/plugins/</code>, while deliberately omitting <code>__init__.py</code> at the shared levels. When both parent locations are searchable, Python can combine those portions into one <code>acme.plugins</code> namespace.</p>
+<p>Cross-location composition requires every matching location to participate as a namespace portion. If PathFinder encounters a regular package with the same name, it returns that package and does not merge the other namespace portions into it. Failure 6 shows how this rule changes subpackage visibility.</p>
 <hr />
-<h2 id="en-2-import">2. How <code>import</code> actually works<a class="headerlink" href="#en-2-import" title="Permanent link">#</a></h2>
+<h2 id="en-2-import">2. The <code>import</code> resolution process<a class="headerlink" href="#en-2-import" title="Permanent link">#</a></h2>
 <h3 id="en-syspath"><code>sys.path</code> decides what can be found<a class="headerlink" href="#en-syspath" title="Permanent link">#</a></h3>
-<p>What <code>import X</code> really does: the interpreter takes the dotted name <code>X</code>, looks it up in <code>sys.modules</code>; on a miss, it asks the finders to walk <code>sys.path</code> for a top-level package, then descends through each sub-package's <code>__path__</code> one segment at a time.</p>
-<p>Where <code>sys.path</code> entries come from:
-- The directory of the startup script (<code>python a.py</code> → the directory containing <code>a.py</code> is inserted at <code>sys.path[0]</code>).
-- <code>python -m pkg.mod</code> → the <strong>current working directory</strong> is inserted at <code>sys.path[0]</code> (this is one of the biggest differences between <code>-m</code> and running a file directly).
-- The <code>PYTHONPATH</code> environment variable.
-- The installed site-packages.</p>
-<h3 id="en-__name__-__package__"><code>__name__</code> and <code>__package__</code><a class="headerlink" href="#en-__name__-__package__" title="Permanent link">#</a></h3>
-<p>Every module carries these two attributes, and they decide how relative imports resolve.</p>
+<p>To resolve <code>import X</code>, the interpreter first looks up the dotted name <code>X</code> in <code>sys.modules</code>. On a cache miss, finders search <code>sys.path</code> for the top-level name, then continue through each package's <code>__path__</code>.</p>
+<p>Common sources of <code>sys.path</code> entries include:</p>
+<ul>
+<li>The startup script's directory; <code>python a.py</code> places the directory containing <code>a.py</code> at <code>sys.path[0]</code>.</li>
+<li>The current working directory for <code>python -m pkg.mod</code>.</li>
+<li>The <code>PYTHONPATH</code> environment variable.</li>
+<li>Interpreter-configured site-packages directories.</li>
+</ul>
+<h3 id="en-__name__-__package__"><code>__name__</code>, <code>__spec__.parent</code>, and <code>__package__</code><a class="headerlink" href="#en-__name__-__package__" title="Permanent link">#</a></h3>
+<p><code>__name__</code> identifies the module. In Python 3.14, explicit relative imports primarily use <code>__spec__.parent</code> to identify its package.</p>
 <table>
 <thead>
 <tr>
 <th>How it was launched</th>
 <th><code>__name__</code></th>
+<th><code>__spec__.parent</code></th>
 <th><code>__package__</code></th>
 </tr>
 </thead>
@@ -401,49 +418,52 @@ $<span class="w"> </span>python<span class="w"> </span>pkg/a.py
 <tr>
 <td><code>python app/pkg/a.py</code> (run as a file)</td>
 <td><code>"__main__"</code></td>
+<td><code>__spec__ is None</code></td>
 <td><code>None</code> or <code>""</code></td>
 </tr>
 <tr>
 <td><code>python -m app.pkg.a</code> (run as a module)</td>
 <td><code>"__main__"</code></td>
 <td><code>"app.pkg"</code></td>
+<td><code>"app.pkg"</code></td>
 </tr>
 <tr>
 <td>Imported elsewhere as <code>import app.pkg.a</code></td>
 <td><code>"app.pkg.a"</code></td>
 <td><code>"app.pkg"</code></td>
+<td><code>"app.pkg"</code></td>
 </tr>
 </tbody>
 </table>
-<p><strong>Relative imports (<code>from . import x</code>) only consult <code>__package__</code></strong>: they take it as the starting point, and each extra dot strips off one level. If <code>__package__</code> is <code>None</code>/<code>""</code>, the relative import fails outright.</p>
-<p>That is exactly why running a file inside a package with <code>python a.py</code> immediately breaks on <code>from . import b</code>: the file has no idea which package it belongs to.</p>
+<p>In Python 3.14, explicit relative imports use <code>__spec__.parent</code> as the package anchor; <code>__package__</code> provides a compatibility fallback when that value is unavailable. The fallback has been deprecated since Python 3.13 and is scheduled for removal in Python 3.15. Each additional leading dot moves one level upward from the anchor.</p>
+<p>When a package file is run directly with <code>python a.py</code>, <code>__main__.__spec__</code> is normally <code>None</code> and there is no usable package fallback, so <code>from . import b</code> has no anchor.</p>
 <h3 id="en-vs">Absolute imports vs. relative imports<a class="headerlink" href="#en-vs" title="Permanent link">#</a></h3>
 <ul>
-<li><strong>Absolute import</strong>: <code>from app.pkg import b</code>. Looks up the full path starting at a <code>sys.path</code> root. Readable, and stays valid when files move between packages.</li>
-<li><strong>Relative import</strong>: <code>from . import b</code>, <code>from ..sib import e</code>. Computed from <code>__package__</code>. Survives renaming the top-level package, but <strong>cannot cross past the top level</strong>, and cannot be used at a script entry point.</li>
+<li><strong>Absolute import</strong>: <code>from app.pkg import b</code>. Resolves the full name from a <code>sys.path</code> root. The target is explicit, but callers still need updates when a package is renamed or moved.</li>
+<li><strong>Relative import</strong>: <code>from . import b</code>, <code>from ..sib import e</code>. Computed from the current module's package context. It <strong>cannot cross past the top level</strong>. A file launched directly normally lacks that context, while an entry module launched with <code>-m</code> may use relative imports.</li>
 </ul>
 <p>PEP 8 recommends absolute imports; relative imports are appropriate for <strong>intra-package</strong> sibling/close-relative references.</p>
-<h3 id="en-dotted-name">How a dotted name is resolved one segment at a time<a class="headerlink" href="#en-dotted-name" title="Permanent link">#</a></h3>
+<h3 id="en-dotted-name">Segment-by-segment resolution of a dotted name<a class="headerlink" href="#en-dotted-name" title="Permanent link">#</a></h3>
 <p><code>from a.b.c import d</code> is not resolved in one step. It walks the <code>.</code>s segment by segment, and each segment is independently decided to be a regular package, a namespace package, or a plain module:</p>
 <ol>
 <li>Find <code>a</code>: walk <code>sys.path</code> looking for a directory or file named <code>a</code>, write it into <code>sys.modules['a']</code>.</li>
 <li>Find <code>a.b</code>: look for <code>b</code> in <code>a.__path__</code>, running the finder once more. If <code>a</code> is a namespace package, <code>a.__path__</code> may be a union of several physical directories, and <code>b</code> may come from any of them.</li>
 <li>Find <code>a.b.c</code>: look for <code>c</code> in <code>a.b.__path__</code>.</li>
-<li>From the module object <code>a.b.c</code>, fetch the attribute <code>d</code>.</li>
+<li>Fetch attribute <code>d</code> from the module object <code>a.b.c</code>. If it is absent, import-from also attempts to load submodule <code>a.b.c.d</code>; if that fails, it raises <code>ImportError</code>.</li>
 </ol>
-<p>Every module loaded along the way is written into <code>sys.modules</code>, so a repeat import hits the cache directly and never runs the finder again. Once any intermediate layer has been imported, changing <code>sys.path</code> afterwards will <em>not</em> cause it to be "re-resolved".</p>
-<h3 id="en-import">Two hidden side effects of <code>import</code><a class="headerlink" href="#en-import" title="Permanent link">#</a></h3>
-<p>These two side effects explain a great deal of the confusion around "why does an empty <code>__init__.py</code> still let me do this?"</p>
-<p><strong>(a) <code>import a.b</code> sets <code>b</code> as an attribute on <code>a</code>.</strong> The import system makes this assignment proactively when it loads a submodule; it is <strong>not</strong> something that only happens if <code>__init__.py</code> contains <code>from . import b</code>:</p>
+<p>Every module loaded along the way is written into <code>sys.modules</code>. While the relevant cache entry remains, a repeat import returns it without running the finder. Deleting that entry causes the next import to search again.</p>
+<h3 id="en-import">How <code>import</code> updates a package namespace<a class="headerlink" href="#en-import" title="Permanent link">#</a></h3>
+<p>After loading a submodule, the import system also updates the parent package's namespace. Two rules determine the behavior of <code>import a.b</code> and <code>from a import b</code>.</p>
+<p><strong>(a) <code>import a.b</code> sets <code>b</code> as an attribute on <code>a</code>.</strong> The import system creates this binding as part of submodule loading, so an empty <code>__init__.py</code> has the same behavior:</p>
 <div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">a.b</span>           <span class="c1"># even if a/__init__.py is completely empty</span>
 <span class="n">a</span><span class="o">.</span><span class="n">b</span><span class="o">.</span><span class="n">foo</span><span class="p">()</span>            <span class="c1"># this still works: the import system already bound b onto a</span>
 </code></pre></div>
-<p><strong>(b) <code>from a import b</code>, when it cannot find an attribute <code>b</code> on <code>a</code>, falls back to loading the submodule <code>a.b</code>.</strong> This is why <code>from a import b</code> still pulls in the submodule even when <code>__init__.py</code> has no <code>from . import b</code>. <strong>Note</strong> that this fallback only applies to a single attribute hop: <code>from a import b.c</code> is a syntax error.</p>
+<p><strong>(b) If <code>from a import b</code> finds no attribute <code>b</code> on <code>a</code>, it attempts to load the submodule <code>a.b</code>.</strong> A successful load then binds <code>b</code> to <code>a</code> under the first rule. This fallback handles one attribute level; <code>from a import b.c</code> is outside the statement's grammar.</p>
 <h3 id="en-package_1">Ambiguity from same-named submodules / top-level packages<a class="headerlink" href="#en-package_1" title="Permanent link">#</a></h3>
 <p>The import system <strong>only looks at names</strong>; it does not understand "logically the same package". Two common ambiguities:</p>
 <ul>
-<li><strong>Two top-level packages with the same name collide</strong>: if <code>sys.path</code> contains two directories that both hold a <code>foo/</code>, <code>import foo</code> only gets the one in the <strong>first</strong> <code>sys.path</code> entry that matches; the other is invisible forever. Diagnose with <code>foo.__file__</code>.</li>
-<li><strong>Same-named submodules meaning different things</strong>: for example, <code>fbgemm_gpu.experimental.hstu.hstu_ops_gpu</code> (the C++/CUDA binding) and <code>fbgemm_gpu.experimental.hstu.hstu_blackwell.hstu_ops_gpu</code> (the Triton implementation) are two entirely different modules that happen to share the same file name at the end. They are distinguished by the absolute path, and the usual practice is to bring them in with aliases at the call site (<code>import ... as _sm90</code> / <code>as _sm100</code>) and dispatch through those aliases.</li>
+<li><strong>Two top-level packages with the same name collide</strong>: if one search location supplies a regular package or plain module, PathFinder returns that object rather than merging other same-named directories into it. Only implicit namespace portions compose across locations. Inspect <code>foo.__spec__.origin</code> and <code>foo.__spec__.submodule_search_locations</code> to diagnose the actual source.</li>
+<li><strong>Same-named submodules meaning different things</strong>: <code>acme.backends.cuda.ops</code> and <code>acme.backends.triton.ops</code> are distinct modules despite sharing the final component. Their absolute names distinguish them; callers can add explicit aliases such as <code>cuda_ops</code> and <code>triton_ops</code>.</li>
 </ul>
 <hr />
 <h2 id="en-3">3. Worked examples<a class="headerlink" href="#en-3" title="Permanent link">#</a></h2>
@@ -502,37 +522,41 @@ $<span class="w"> </span>python<span class="w"> </span>pkg/a.py
 <p><code>app/main.py</code> is the entry point and pulls in other modules:</p>
 <div class="highlight"><pre><span></span><code><span class="c1"># main.py — recommended launch: python -m app.main</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">app.pkg.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">something</span>    <span class="c1"># absolute, most robust</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.pkg.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">something</span>       <span class="c1"># relative, requires __package__ == &quot;app&quot;, i.e. launched with -m</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.pkg.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">something</span>       <span class="c1"># relative, requires __spec__.parent == &quot;app&quot;, i.e. launched with -m</span>
 </code></pre></div>
 <hr />
-<h2 id="en-4_1">4. Pitfalls (common error cases)<a class="headerlink" href="#en-4_1" title="Permanent link">#</a></h2>
-<h3 id="en-1importerror-attempted-relative-import-with-no-known-parent-package">Pitfall 1: <code>ImportError: attempted relative import with no known parent package</code><a class="headerlink" href="#en-1importerror-attempted-relative-import-with-no-known-parent-package" title="Permanent link">#</a></h3>
-<p><div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/proj/app/pkg
+<h2 id="en-4_1">4. Common Failures and Their Causes<a class="headerlink" href="#en-4_1" title="Permanent link">#</a></h2>
+<h3 id="en-1importerror-attempted-relative-import-with-no-known-parent-package">Failure 1: <code>ImportError: attempted relative import with no known parent package</code><a class="headerlink" href="#en-1importerror-attempted-relative-import-with-no-known-parent-package" title="Permanent link">#</a></h3>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/proj/app/pkg
 $<span class="w"> </span>python<span class="w"> </span>a.py
 </code></pre></div>
-<code>a.py</code> contains <code>from . import b</code>. When run as a file, <code>a.py</code>'s <code>__name__ == "__main__"</code> and <code>__package__</code> is <code>None</code>. It does not know it belongs to <code>app.pkg</code>, so the relative import has no starting point.</p>
-<p><strong>Fix</strong>:
-- Switch to <code>python -m app.pkg.a</code> (run from <code>/proj</code>), so the interpreter loads it as a module and <code>__package__</code> is set to <code>"app.pkg"</code>.
-- Or write <code>a.py</code> as a pure script that uses only absolute imports, e.g. <code>from app.pkg import b</code> (assuming <code>/proj</code> is on <code>sys.path</code>).</p>
-<h3 id="en-2modulenotfounderror-no-module-named-app">Pitfall 2: <code>ModuleNotFoundError: No module named 'app'</code><a class="headerlink" href="#en-2modulenotfounderror-no-module-named-app" title="Permanent link">#</a></h3>
-<p><div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/home/me
+<p><code>a.py</code> contains <code>from . import b</code>. When run as a file, <code>a.py</code>'s <code>__name__ == "__main__"</code>, while <code>__spec__</code> and <code>__package__</code> provide no <code>app.pkg</code> package context. The interpreter therefore has no anchor for the relative import.</p>
+<p><strong>Resolution paths:</strong></p>
+<ul>
+<li>Run <code>python -m app.pkg.a</code> from <code>/proj</code>, so the interpreter loads it as a module and sets <code>__package__ == "app.pkg"</code>.</li>
+<li>Design <code>a.py</code> as a standalone script and use the absolute import <code>from app.pkg import b</code>, with <code>/proj</code> present on <code>sys.path</code>.</li>
+</ul>
+<h3 id="en-2modulenotfounderror-no-module-named-app">Failure 2: <code>ModuleNotFoundError: No module named 'app'</code><a class="headerlink" href="#en-2modulenotfounderror-no-module-named-app" title="Permanent link">#</a></h3>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/home/me
 $<span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>app.main
 </code></pre></div>
-The current directory is <code>/home/me</code>, so <code>sys.path[0]</code> is <code>/home/me</code>, which contains no <code>app/</code> directory at all. The interpreter cannot locate the top-level package.</p>
-<p><strong>Fix</strong>:
-- <code>cd /proj &amp;&amp; python -m app.main</code>, or
-- <code>PYTHONPATH=/proj python -m app.main</code>, or
-- Install the project as an editable package (<code>pip install -e .</code> with <code>pyproject.toml</code>) so that <code>app</code> ends up in site-packages.</p>
-<p>Variant: <code>from app.pgk.a import x</code> (typo, <code>pkg</code> → <code>pgk</code>) raises the same error. The message only tells you "no such name", not that you misspelled it.</p>
-<h3 id="en-3importerror-attempted-relative-import-beyond-top-level-package">Pitfall 3: <code>ImportError: attempted relative import beyond top-level package</code><a class="headerlink" href="#en-3importerror-attempted-relative-import-beyond-top-level-package" title="Permanent link">#</a></h3>
-<p><div class="highlight"><pre><span></span><code><span class="c1"># Inside app/__init__.py:</span>
+<p>The current directory is <code>/home/me</code>, so <code>sys.path[0]</code> is <code>/home/me</code>. That search location has no direct child named <code>app</code>, so the interpreter cannot resolve the top-level package.</p>
+<p><strong>Resolution paths:</strong></p>
+<ul>
+<li>Run <code>cd /proj &amp;&amp; python -m app.main</code>.</li>
+<li>Add the project root explicitly with <code>PYTHONPATH=/proj python -m app.main</code>.</li>
+<li>Use <code>pyproject.toml</code> and <code>pip install -e .</code> to install the project as an editable package.</li>
+</ul>
+<p>A spelling error can produce the same exception. For example, <code>from app.pgk.a import x</code> writes <code>pgk</code> instead of <code>pkg</code>; the message reports an unresolved qualified name without distinguishing a missing search path from a misspelling.</p>
+<h3 id="en-3importerror-attempted-relative-import-beyond-top-level-package">Failure 3: <code>ImportError: attempted relative import beyond top-level package</code><a class="headerlink" href="#en-3importerror-attempted-relative-import-beyond-top-level-package" title="Permanent link">#</a></h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Inside app/__init__.py:</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..util</span><span class="w"> </span><span class="kn">import</span> <span class="n">helper</span>
 </code></pre></div>
-<code>app</code> is already the top-level package, and <code>..</code> tries to back out to <code>app</code>'s "parent package", which does not exist. Python forbids relative imports from crossing the boundary of the top-level package.</p>
-<p><strong>Note</strong>: "top-level package" in this error message means <strong>the top-level package that the relative import started from</strong> (here, <code>app</code>). It does <em>not</em> mean "I am already at the outermost directory". Even if there are other directories on disk outside <code>app/</code>, that is irrelevant: the "top" is whatever <code>sys.path</code> defines as the top.</p>
-<p><strong>Fix</strong>: use an absolute import, <code>from util import helper</code> (assuming <code>util</code> is also a top-level package), or relocate <code>util</code> under <code>app</code> so it becomes <code>app.util</code>.</p>
-<h3 id="en-4__init__py-import-importerror-cannot-import-name-x">Pitfall 4: a circular <code>import</code> in <code>__init__.py</code> → <code>ImportError: cannot import name 'X'</code><a class="headerlink" href="#en-4__init__py-import-importerror-cannot-import-name-x" title="Permanent link">#</a></h3>
-<p><div class="highlight"><pre><span></span><code><span class="c1"># app/pkg/__init__.py</span>
+<p><code>app</code> is already the top-level package, so <code>..</code> attempts to move beyond its package boundary. No parent package exists at that level, and Python raises this error.</p>
+<p>In this diagnostic, "top-level package" means the top-level package containing the relative-import anchor, here <code>app</code>. Parent directories outside <code>app/</code> on disk do not change that boundary; the effective <code>sys.path</code> entries determine which package is top-level.</p>
+<p><strong>Resolution</strong>: use the absolute import <code>from util import helper</code> when <code>util</code> is also a top-level package, or relocate it under <code>app</code> and import it as <code>app.util</code>.</p>
+<h3 id="en-4__init__py-import-importerror-cannot-import-name-x">Failure 4: a circular <code>import</code> in <code>__init__.py</code> → <code>ImportError: cannot import name 'X'</code><a class="headerlink" href="#en-4__init__py-import-importerror-cannot-import-name-x" title="Permanent link">#</a></h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># app/pkg/__init__.py</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">Foo</span>
 
 <span class="c1"># app/pkg/a.py</span>
@@ -541,36 +565,38 @@ The current directory is <code>/home/me</code>, so <code>sys.path[0]</code> is <
 <span class="c1"># app/pkg/b.py</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.a</span><span class="w"> </span><span class="kn">import</span> <span class="n">Foo</span>        <span class="c1"># at this point a has not finished executing, Foo is not yet defined</span>
 </code></pre></div>
-The error shows up as <code>ImportError: cannot import name 'Foo' from partially initialized module 'app.pkg.a'</code>.</p>
-<p><strong>Fix</strong>: break the cross-dependency apart (lazily <code>import</code> inside function bodies, or split the shared core into its own module). Do not re-export at the top of <code>__init__.py</code> any symbol whose construction will loop back through the package.</p>
-<h3 id="en-5-syspath0">Pitfall 5: the "fake top-level" caused by <code>sys.path[0]</code><a class="headerlink" href="#en-5-syspath0" title="Permanent link">#</a></h3>
-<p><div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/proj/app
+<p>The error shows up as <code>ImportError: cannot import name 'Foo' from partially initialized module 'app.pkg.a'</code>.</p>
+<p><strong>Resolution</strong>: break apart the cross-dependency by importing lazily inside a function or moving shared logic into a lower-level module. Top-level re-exports in <code>__init__.py</code> should preserve an acyclic import graph.</p>
+<h3 id="en-5-syspath0">Failure 5: <code>sys.path[0]</code> changes top-level package visibility<a class="headerlink" href="#en-5-syspath0" title="Permanent link">#</a></h3>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/proj/app
 $<span class="w"> </span>python<span class="w"> </span>pkg/a.py
 </code></pre></div>
-<code>a.py</code>'s <code>from app.pkg import b</code> raises <code>ModuleNotFoundError: No module named 'app'</code>. The reason: <code>python pkg/a.py</code> inserts <code>/proj/app/pkg</code> at <code>sys.path[0]</code>. Now <code>pkg</code> looks like a top-level package, but <code>app</code> is no longer a direct child of <em>any</em> <code>sys.path</code> entry.</p>
-<p><strong>Fix</strong>: always launch with <code>python -m app.pkg.a</code> from the project root; never run a file inside a package with <code>python xxx.py</code>.</p>
-<h3 id="en-6-namespace-package-__init__py">Pitfall 6: someone "helpfully" adds an <code>__init__.py</code> to a namespace package<a class="headerlink" href="#en-6-namespace-package-__init__py" title="Permanent link">#</a></h3>
-<p>Suppose someone decides that <code>fbgemm_gpu/experimental/</code> "looks irregular" without an <code>__init__.py</code> and drops one in. Consequences:</p>
+<p><code>a.py</code>'s <code>from app.pkg import b</code> raises <code>ModuleNotFoundError: No module named 'app'</code>. Running <code>python pkg/a.py</code> places <code>/proj/app/pkg</code> at <code>sys.path[0]</code>, while the project root <code>/proj</code> is absent from the effective search path. Consequently, <code>app</code> is not a direct child of any <code>sys.path</code> entry.</p>
+<p><strong>Resolution</strong>: launch package modules from the project root with <code>python -m app.pkg.a</code>, allowing the interpreter to establish the complete package identity.</p>
+<h3 id="en-6-namespace-package-__init__py">Failure 6: <code>__init__.py</code> disables namespace composition<a class="headerlink" href="#en-6-namespace-package-__init__py" title="Permanent link">#</a></h3>
+<p>Suppose <code>/env/a/acme/plugins/alpha</code> and <code>/env/b/acme/plugins/beta</code> originally compose the <code>acme.plugins</code> namespace. If an <code>__init__.py</code> is added to the earlier search location <code>/env/a/acme/plugins/</code>, then:</p>
 <ul>
-<li><code>fbgemm_gpu.experimental</code> degrades from a namespace package into a regular package.</li>
-<li>Its <code>__path__</code> changes from the splice-capable <code>_NamespacePath</code> into a plain single-directory list.</li>
-<li>Sub-directories that other wheels (<code>fbgemm_gpu_experimental_gen_ai</code>, etc.) installed into <code>experimental/gen_ai/</code> at <em>other</em> locations are <strong>no longer discoverable</strong>. Only the sub-directories under the one directory holding the squatted <code>__init__.py</code> count.</li>
+<li>PathFinder returns <code>acme.plugins</code> from that location as a regular package.</li>
+<li><code>acme.plugins.__path__</code> no longer includes the other namespace portion.</li>
+<li><code>acme.plugins.beta</code> under <code>/env/b</code> is consequently not discoverable.</li>
 </ul>
-<p>The error looks like <code>ModuleNotFoundError: No module named 'fbgemm_gpu.experimental.gen_ai'</code>, even though <code>gen_ai/</code> visibly exists on disk.</p>
-<p><strong>Fix</strong>: delete that rogue <code>__init__.py</code>. The rule for deciding whether a directory should have an <code>__init__.py</code>: <strong>is this directory owned by a single wheel, or is it a namespace meant to be stitched from multiple wheels?</strong> The former must have one; the latter absolutely must not.</p>
+<p>The resulting error may be <code>ModuleNotFoundError: No module named 'acme.plugins.beta'</code>, even though the directory exists.</p>
+<p><strong>Resolution</strong>: remove <code>__init__.py</code> when the level must compose across distributions. For a regular package, install every subpackage into its effective search locations. The choice follows package ownership.</p>
 <hr />
 <h2 id="en-5">5. Diagnostic checklist<a class="headerlink" href="#en-5" title="Permanent link">#</a></h2>
 <p>When you hit an import error, work through these in order:</p>
 <ol>
 <li><code>python -c "import sys; print(sys.path)"</code>: is the parent directory of the top-level package present?</li>
-<li><code>python -c "import app; print(app.__file__)"</code>: is the <code>app</code> that gets found the one you expected? (Watch out for same-name collisions.)</li>
-<li>In the failing file, <code>print(__name__, __package__)</code>: is the relative-import starting point what you thought?</li>
-<li>Is the launch command <code>python file.py</code> or <code>python -m pkg.file</code>? The former almost guarantees <code>__package__</code> is lost.</li>
+<li><code>python -c "import app; print(app.__spec__)"</code>: do the origin and submodule search locations match what you expected?</li>
+<li>In the failing file, print <code>__name__</code>, <code>__spec__</code>, and <code>getattr(__spec__, "parent", None)</code>: is the relative-import anchor correct?</li>
+<li>Is the launch command <code>python file.py</code> or <code>python -m pkg.file</code>? The former normally does not establish a package spec for <code>__main__</code>.</li>
 <li>Does <code>__init__.py</code> trigger a cycle at import time?</li>
 </ol>
 <h2 id="en-refs">References<a class="headerlink" href="#en-refs" title="Permanent link">#</a></h2>
 <ul>
-<li><a href="https://docs.python.org/3/reference/import.html">Python Language Reference: The import system</a></li>
+<li><a href="https://docs.python.org/3.14/reference/import.html">Python 3.14 Language Reference: The import system</a></li>
+<li><a href="https://docs.python.org/3.14/reference/datamodel.html#module.__package__">Python 3.14 Data model: module package metadata</a></li>
+<li><a href="https://docs.python.org/3.14/using/cmdline.html#cmdoption-m">Python 3.14 command line: <code>-m</code></a></li>
 <li><a href="https://peps.python.org/pep-0420/">PEP 420: Implicit Namespace Packages</a></li>
 <li><a href="https://peps.python.org/pep-0328/">PEP 328: Imports, multi-line imports, and absolute/relative imports</a></li>
 </ul>

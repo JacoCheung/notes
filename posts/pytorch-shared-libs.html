@@ -3,17 +3,17 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PyTorch 共享库结构: 源码目录 → .so → torch._C</title>
-<meta name="post:title"           content="PyTorch 共享库结构: 源码目录 → .so → torch._C">
-<meta name="post:title_en"        content="PyTorch Shared Library Structure: Source Trees, .so Files, and torch._C">
+<title>PyTorch Linux 共享库的构建与加载关系</title>
+<meta name="post:title"           content="PyTorch Linux 共享库的构建与加载关系">
+<meta name="post:title_en"        content="Build and Load Relationships of PyTorch Linux Shared Libraries">
 <meta name="post:slug"            content="pytorch-shared-libs">
 <meta name="post:date"            content="2026-06-03">
 <meta name="post:tags"            content="PyTorch, 系统设计, C++, 构建">
 <meta name="post:tags_en"         content="PyTorch, Systems Design, C++, Build">
 <meta name="post:reading"         content="25 分钟">
 <meta name="post:reading_en"      content="25 min">
-<meta name="post:summary"         content="PyTorch Linux CUDA wheel 里主要 .so 的源码目录映射与链接依赖,对照上游 CMake 考据 + 交互式 D3 图。 涉及 libtorch.so 为何是空 aggregator、libtorch_python.so 与 torch._C 的关系、libtorch_global_deps 的 RTLD_GLOBAL 预加载等机制。">
-<meta name="post:summary_en"      content="How the main .so files in a Linux CUDA PyTorch wheel map to source-tree directories and link to one another, grounded in upstream CMake, with an interactive D3 dependency graph. Covers why libtorch.so is empty, how libtorch_python.so relates to torch._C, and how libtorch_global_deps gets RTLD_GLOBAL-preloaded.">
+<meta name="post:summary"         content="Linux CUDA wheel 把核心类型、CPU/CUDA 算子和 Python binding 分置于多个共享库。v2.12.0 的 CMake target 给出 c10 至 torch_python 的构建层次；实际装载仍由 ELF DT_NEEDED 与 RTLD_GLOBAL 决定，须以安装产物核验。">
+<meta name="post:summary_en"      content="Linux CUDA wheels distribute PyTorch core types, CPU and CUDA operators, and Python bindings across several shared libraries, so import behavior depends on both build topology and ELF dependencies. PyTorch v2.12.0 CMake targets establish the link hierarchy from c10 through torch_python, while final DT_NEEDED entries and RTLD_GLOBAL preload behavior remain properties of the installed artifacts.">
 <meta name="post:series"          content="pytorch-internals">
 <meta name="post:series_title"    content="PyTorch 内部机制">
 <meta name="post:series_title_en" content="PyTorch Internals">
@@ -255,43 +255,43 @@
     <div class="toc-title">目录 · TOC</div>
     <div class="lang-zh">
     <ul>
-      <li><a href="#zh-1">1. 起点:`import torch` 加载了哪些 .so</a></li>
-      <li><a href="#zh-2">2. 依赖图(交互主体)</a></li>
-      <li><a href="#zh-3">3. 每个库的源码目录详解</a>
+      <li><a href="#zh-1">1. import torch 的加载起点</a></li>
+      <li><a href="#zh-2">2. 构建依赖图与 ELF 边界</a></li>
+      <li><a href="#zh-3">3. 共享库的源码归属</a>
         <ul>
           <li><a href="#zh-3-1">3.1 libc10</a></li>
           <li><a href="#zh-3-2">3.2 libc10_cuda</a></li>
           <li><a href="#zh-3-3">3.3 libtorch_cpu</a></li>
           <li><a href="#zh-3-4">3.4 libtorch_cuda</a></li>
-          <li><a href="#zh-3-5">3.5 libtorch(空 aggregator)</a></li>
+          <li><a href="#zh-3-5">3.5 libtorch wrapper target</a></li>
           <li><a href="#zh-3-6">3.6 libtorch_python</a></li>
           <li><a href="#zh-3-7">3.7 libtorch_global_deps</a></li>
-          <li><a href="#zh-3-8">3.8 libshm 等</a></li>
+          <li><a href="#zh-3-8">3.8 辅助与可选库</a></li>
         </ul>
       </li>
-      <li><a href="#zh-4">4. torch._C 是什么</a></li>
-      <li><a href="#zh-5">5. 几个反直觉的点</a></li>
+      <li><a href="#zh-4">4. torch._C 的加载职责</a></li>
+      <li><a href="#zh-5">5. 构建目标与安装产物的边界</a></li>
       <li><a href="#zh-refs">参考资料</a></li>
     </ul>
     </div>
     <div class="lang-en">
     <ul>
-      <li><a href="#en-1">1. Start: which .so files import torch loads</a></li>
-      <li><a href="#en-2">2. The interactive dependency graph</a></li>
-      <li><a href="#en-3">3. Source directories per library</a>
+      <li><a href="#en-1">1. The import torch loading entry</a></li>
+      <li><a href="#en-2">2. Build graph and ELF boundary</a></li>
+      <li><a href="#en-3">3. Source ownership by library</a>
         <ul>
           <li><a href="#en-3-1">3.1 libc10</a></li>
           <li><a href="#en-3-2">3.2 libc10_cuda</a></li>
           <li><a href="#en-3-3">3.3 libtorch_cpu</a></li>
           <li><a href="#en-3-4">3.4 libtorch_cuda</a></li>
-          <li><a href="#en-3-5">3.5 libtorch (empty aggregator)</a></li>
+          <li><a href="#en-3-5">3.5 libtorch (wrapper target)</a></li>
           <li><a href="#en-3-6">3.6 libtorch_python</a></li>
           <li><a href="#en-3-7">3.7 libtorch_global_deps</a></li>
-          <li><a href="#en-3-8">3.8 libshm and others</a></li>
+          <li><a href="#en-3-8">3.8 Auxiliary and optional libraries</a></li>
         </ul>
       </li>
-      <li><a href="#en-4">4. What torch._C actually is</a></li>
-      <li><a href="#en-5">A few counterintuitive points</a></li>
+      <li><a href="#en-4">4. Loading responsibilities of torch._C</a></li>
+      <li><a href="#en-5">5. Build targets and installed artifacts</a></li>
       <li><a href="#en-refs">References</a></li>
     </ul>
     </div>
@@ -302,13 +302,15 @@
 <!-- ============================= 中文版 ============================= -->
 <div class="lang-zh">
 
-<h1>PyTorch 共享库结构: 源码目录 → .so → torch._C</h1>
+<h1>PyTorch Linux 共享库的构建与加载关系</h1>
 
-<p><strong>范围说明</strong>:本文按 Linux CUDA wheel 与 PyTorch <code>v2.12.0</code> 源码来写。macOS、Windows、ROCm、CPU-only wheel 和本地源码编译的文件名、可选库、链接方式可能不同;遇到差异时,以你安装包里的 <code>torch/lib/</code> 和对应版本源码为准。</p>
+<p class="lead"><code>import torch</code> 是 PyTorch 在 Python 中的统一入口。Linux 动态加载器在这个入口背后装入一组分工明确的共享库：基础类型与 dispatcher、CPU 算子、CUDA 算子、Python binding 和全局依赖分别位于不同二进制中。它们的构建关系与实际 ELF 依赖共同决定符号解析和扩展加载行为，而 <code>torch._C</code> 只承担面向 CPython 的入口职责。</p>
 
-<h2 id="zh-1">1. 起点:<code>import torch</code> 到底加载了哪些 .so</h2>
+<p><strong>范围说明</strong>:本文以 Linux CUDA wheel 与 PyTorch <code>v2.12.0</code> 源码为边界。macOS、Windows、ROCm、CPU-only wheel 和本地源码构建可能采用不同的文件名、可选库与链接结构；具体环境应以已安装的 <code>torch/lib/</code> 和对应版本源码为准。</p>
 
-<p>装一份 CUDA 版 PyTorch wheel,看 <code>torch/lib/</code> 下面是这样:</p>
+<h2 id="zh-1">1. <code>import torch</code> 的共享库加载起点</h2>
+
+<p>CUDA 版 PyTorch wheel 通常在 <code>torch/lib/</code> 中携带下列共享库。构建选项会改变其中的可选项，因此这份清单用于建立分层结构，而非规定每个发行包必须包含的文件集合。</p>
 
 <pre class="code"><span class="cm">$ ls torch/lib/*.so</span>
 torch/lib/libc10.so
@@ -326,32 +328,29 @@ torch/lib/libtorch_cuda_linalg.so
 <span class="cm"># 可选(USE_NVSHMEM):</span>
 torch/lib/libtorch_nvshmem.so</pre>
 
-<p>这一篇要回答的问题就两个:</p>
+<p>阅读这组二进制需要同时追踪两条关系：源码目录如何汇入 CMake target，以及 target 的链接接口如何体现在安装后的 ELF 依赖中。两者相关，却不完全相同；链接器的 <code>--as-needed</code>、构建开关和 wheel 打包过程都可能改变最终的 <code>DT_NEEDED</code> 条目。</p>
 
-<ol>
-  <li>每个 <code>.so</code> 是从源码树<strong>哪个目录</strong>编出来的?</li>
-  <li>它们之间的<strong>链接依赖</strong>是怎样的?</li>
-</ol>
+<p><code>libtorch.so</code> 正好说明了这一区别。它对应一个以占位翻译单元创建的 wrapper target，自身实现很少，主要通过 <code>PUBLIC</code> 链接接口关联 <code>torch_cpu</code> 与当前启用的设备库。这个 CMake 角色不能直接推出某个 wheel 中 <code>libtorch.so</code> 的完整动态依赖。</p>
 
-<p>顺手把一个反直觉的事实先放在这儿:<strong><code>libtorch.so</code> 是一个空文件</strong>。它只是个 aggregator,把 <code>libtorch_cpu.so</code> 和 <code>libtorch_cuda.so</code> 打成一个对外引用,使得"链 libtorch 就同时有 CPU 和 CUDA"。 下面的依赖图直接给出全貌,§3 再展开每个库的细节。</p>
+<h2 id="zh-2">2. 构建依赖图与 ELF 边界</h2>
 
-<h2 id="zh-2">2. 依赖图(交互主体)</h2>
+<p>下面的交互图以共享库为主节点，连接其 CMake target、源码目录和 target 级链接关系。选择任意 <code>lib*.so</code> 节点后，右侧面板会列出对应信息；节点可拖动，悬停时显示简要职责。</p>
 
-<p>下面这张图把每个 .so 与它的源码目录和链接关系全展开。<strong>点击任意 <code>lib*.so</code> 节点</strong>,右侧面板会显示它的 CMake target、源码目录清单、链接依赖。 节点也可<strong>拖动</strong>(d3-force 自动重新布局),hover 出一句话定义。</p>
-
-<p>两类边:<strong>蓝色</strong>是 link-time 依赖("A → B" 意为 A 链 B),<strong>橙色虚点</strong>是 <code>libtorch_global_deps</code> 那条"不被链、被 dlopen"的特殊路径。 每个库具体由哪些源码目录编出来的,点节点看右侧 panel。</p>
+<p><strong>蓝色</strong>边表示 PyTorch <code>v2.12.0</code> CMake target 的链接关系，其中“A → B”表示 A 的构建配置链接 B；<strong>橙色虚点</strong>表示 <code>libtorch_global_deps</code> 的显式预加载路径。图的证据范围止于构建关系。具体 wheel 的 ELF <code>DT_NEEDED</code> 图应使用 <code>readelf -d</code> 或 <code>ldd</code> 核对。</p>
 
 </div>
 
 <div class="lang-en">
 
-<h1>PyTorch Shared Library Structure: Source Trees, .so Files, and torch._C</h1>
+<h1>Build and Load Relationships of PyTorch Linux Shared Libraries</h1>
 
-<p><strong>Scope</strong>: this article describes the Linux CUDA wheel and PyTorch <code>v2.12.0</code> source. macOS, Windows, ROCm, CPU-only wheels, and local source builds can differ in file names, optional libraries, and link structure. If your install disagrees with this post, trust your own <code>torch/lib/</code> directory and the matching source tag.</p>
+<p class="lead"><code>import torch</code> is PyTorch's unified Python entry point. Behind it, the Linux dynamic loader brings in shared libraries with distinct responsibilities: core types and the dispatcher, CPU operators, CUDA operators, Python bindings, and global dependencies live in separate binaries. Their build relations and concrete ELF dependencies determine symbol resolution and extension loading, while <code>torch._C</code> serves as the CPython-facing entry.</p>
+
+<p><strong>Scope</strong>: this article describes the Linux CUDA wheel and PyTorch <code>v2.12.0</code> source. macOS, Windows, ROCm, CPU-only wheels, and local source builds can differ in file names, optional libraries, and link structure. Concrete environments should be checked against the installed <code>torch/lib/</code> directory and the matching source tag.</p>
 
 <h2 id="en-1">1. Start: which .so files <code>import torch</code> loads</h2>
 
-<p>Install a CUDA-enabled PyTorch wheel and <code>torch/lib/</code> looks like this:</p>
+<p>A CUDA-enabled PyTorch wheel commonly contains the following shared libraries under <code>torch/lib/</code>. Build options change the optional entries, so the list establishes the binary layers rather than prescribing every distribution.</p>
 
 <pre class="code"><span class="cm">$ ls torch/lib/*.so</span>
 torch/lib/libc10.so
@@ -369,20 +368,15 @@ torch/lib/libtorch_cuda_linalg.so
 <span class="cm"># optional (USE_NVSHMEM):</span>
 torch/lib/libtorch_nvshmem.so</pre>
 
-<p>This article answers two questions:</p>
+<p>Understanding these binaries requires two related views: how source directories feed CMake targets, and how target link interfaces survive in installed ELF artifacts. Linker <code>--as-needed</code>, build flags, and wheel packaging can all change the final <code>DT_NEEDED</code> entries.</p>
 
-<ol>
-  <li>Which <strong>source-tree directory</strong> does each <code>.so</code> compile from?</li>
-  <li>How do they <strong>link</strong> to each other?</li>
-</ol>
+<p><code>libtorch.so</code> illustrates the distinction. CMake creates it as a wrapper target from a placeholder translation unit, with little implementation of its own, and uses its <code>PUBLIC</code> link interface to associate <code>torch_cpu</code> with the enabled device libraries. That CMake role alone does not determine the complete dynamic dependency list of a particular wheel.</p>
 
-<p>One counterintuitive fact up front: <strong><code>libtorch.so</code> is an empty file</strong>. It is an aggregator that bundles <code>libtorch_cpu.so</code> and <code>libtorch_cuda.so</code> behind one name, so that "link libtorch and you get both CPU and CUDA" stays a stable API. The graph below shows the full picture; §3 expands each library individually.</p>
+<h2 id="en-2">2. Build graph and ELF boundary</h2>
 
-<h2 id="en-2">2. The interactive dependency graph</h2>
+<p>The interactive graph uses shared libraries as its primary nodes and connects each one to its CMake target, source directories, and target-level link relations. Selecting a <code>lib*.so</code> node opens those details in the side panel; nodes can be dragged, and hover text gives a short responsibility summary.</p>
 
-<p>The graph below lays out every <code>.so</code> with its source directories and link relationships. <strong>Click any <code>lib*.so</code> node</strong> and the side panel shows that library's CMake target, the source directories it is compiled from, and its link dependencies. Nodes are <strong>draggable</strong> (d3-force re-lays out automatically); hover for a one-line definition.</p>
-
-<p>Two kinds of edges: <strong>blue</strong> = link-time dependency ("A → B" means A links B); <strong>orange dotted</strong> = the special "not linked, dlopened by Python" path for <code>libtorch_global_deps</code>. For the per-library source-directory breakdown, click a node and read the side panel.</p>
+<p><strong>Blue</strong> edges represent link relations between PyTorch <code>v2.12.0</code> CMake targets; <strong>orange dotted</strong> edges represent the explicit preload path for <code>libtorch_global_deps</code>. The graph's evidence boundary is the build relationship. Inspect a concrete wheel with <code>readelf -d</code> or <code>ldd</code> to obtain its ELF <code>DT_NEEDED</code> graph.</p>
 
 </div>
 
@@ -419,13 +413,13 @@ torch/lib/libtorch_nvshmem.so</pre>
 <!-- ===== §3 detail (relocated to follow the graph) ===== -->
 <div class="lang-zh">
 
-<h2 id="zh-3">3. 每个库的源码目录详解</h2>
+<h2 id="zh-3">3. 共享库的源码归属</h2>
 
-<p>下面这一节是侧栏 detail 面板的展开版本 —— 同样的信息加上 prose 和表格上下文,适合通读。</p>
+<p>交互图给出整体拓扑，下面按依赖层次展开各库的源码归属与职责。先从不依赖 ATen 和 Python 的 <code>c10</code> 开始，再进入设备基础设施、算子实现和 Python binding。</p>
 
 <h3 id="zh-3-1">3.1 <code>libc10</code>: Core Tensor 抽象</h3>
 
-<p><strong>源码</strong>: <code>c10/CMakeLists.txt</code> 用 GLOB 收:</p>
+<p><code>c10/CMakeLists.txt</code> 通过 GLOB 收集这一 target 的源码：</p>
 
 <pre class="code">file(GLOB C10_SRCS
   *.cpp
@@ -436,13 +430,13 @@ torch/lib/libtorch_nvshmem.so</pre>
   util/*.cpp)
 <span class="cm"># 显式排除 c10/cuda/、c10/hip/</span></pre>
 
-<p>包含:<code>TensorImpl</code>、<code>Storage</code>、<code>Device</code>、<code>DispatchKey</code>、<code>Allocator</code>、<code>intrusive_ptr</code>、<code>TypeMeta</code>、所有 <code>c10::util</code> 工具(<code>Optional</code>、<code>SmallVector</code>、<code>ArrayRef</code>、错误处理宏)。 是整个 PyTorch C++ API 最底层、没有任何 CUDA / Python / ATen 依赖的一层。</p>
+<p>这一层提供 <code>TensorImpl</code>、<code>Storage</code>、<code>Device</code>、<code>DispatchKey</code>、<code>Allocator</code>、<code>intrusive_ptr</code>、<code>TypeMeta</code>，以及 <code>c10::util</code> 下的通用工具，如 <code>Optional</code>、<code>SmallVector</code>、<code>ArrayRef</code> 和错误处理宏。它构成 PyTorch C++ API 的基础类型层；标准构建中的 <code>c10</code> target 位于 CUDA、Python 与 ATen target 之下。</p>
 
-<p><strong>链接</strong>:fmt、nlohmann_json、moodycamel(concurrent queue),可选 gflags / glog / cpuinfo。</p>
+<p><code>c10</code> target 链接 fmt、nlohmann_json 和 moodycamel（concurrent queue），并按构建选项链接 gflags、glog 或 cpuinfo。后续 target 通过对 <code>c10</code> 的 <code>PUBLIC</code> 依赖继承这组基础类型与必要的传递链接关系。</p>
 
 <h3 id="zh-3-2">3.2 <code>libc10_cuda</code>: CUDA 基础设施</h3>
 
-<p><strong>源码</strong>: <code>c10/cuda/CMakeLists.txt</code> 显式列出(不用 glob):</p>
+<p><code>c10/cuda/CMakeLists.txt</code> 显式列出 <code>c10_cuda</code> target 的源码，而没有使用 glob：</p>
 
 <pre class="code">add_library(c10_cuda
   CUDAAllocatorConfig.cpp
@@ -453,19 +447,21 @@ torch/lib/libtorch_nvshmem.so</pre>
   impl/CUDAGuardImpl.cpp
   ...)</pre>
 
-<p>包含:CUDA 流(<code>CUDAStream</code>)、CUDA caching allocator(<strong>这就是 <code>torch.cuda.empty_cache()</code> 操作的对象</strong>)、<code>CUDAGuard</code>、CUDA device assertion、driver API 包装。 这是 PyTorch CUDA 路径的"底座"。</p>
+<p>该库实现 CUDA 流（<code>CUDAStream</code>）、CUDA caching allocator（<code>torch.cuda.empty_cache()</code> 操作的对象）、<code>CUDAGuard</code>、CUDA device assertion 和 driver API 包装。这些组件为上层 CUDA 算子提供设备、stream、内存与运行时状态管理。</p>
 
-<p><strong>链接</strong>:<code>c10</code> PUBLIC + <code>torch::cudart</code> PUBLIC。</p>
+<p><code>c10_cuda</code> 以 <code>PUBLIC</code> 方式链接 <code>c10</code> 与 <code>torch::cudart</code>。因此，依赖 <code>c10_cuda</code> 的设备库可以沿 target 链获得核心类型和 CUDA runtime 的链接要求。</p>
+
+<p>设备基础设施本身不承载 ATen 算子。算子层在此之上分成两部分：<code>libtorch_cpu</code> 提供 dispatcher、CPU 实现和框架运行时，<code>libtorch_cuda</code> 则复用这些机制并注册 CUDA 实现。</p>
 
 <h3 id="zh-3-3">3.3 <code>libtorch_cpu</code>: 主 CPU 库(算子 + autograd + JIT)</h3>
 
-<p><strong>这是体积最大的一个 .so</strong>(GB 量级)。源码由 <code>caffe2/CMakeLists.txt</code> 里 <code>${Caffe2_CPU_SRCS}</code> 这个大变量收集,主要包含:</p>
+<p><code>libtorch_cpu.so</code> 通常是 wheel 中体积较大的共享库之一。<code>caffe2/CMakeLists.txt</code> 通过 <code>${Caffe2_CPU_SRCS}</code> 汇集其源码，主要覆盖下列模块：</p>
 
 <table>
   <thead><tr><th>来源</th><th>具体路径</th><th>负责什么</th></tr></thead>
   <tbody>
     <tr><td><code>${ATen_CPU_SRCS}</code></td><td><code>aten/src/ATen/</code>(非 CUDA 子目录)</td><td>ATen 核心:Tensor、dispatcher、native_functions.yaml 生成的入口函数</td></tr>
-    <tr><td></td><td><code>aten/src/ATen/native/</code></td><td>所有 CPU 算子的 host 端实现</td></tr>
+    <tr><td></td><td><code>aten/src/ATen/native/</code></td><td>CPU native operator 的主要 host 端实现</td></tr>
     <tr><td></td><td><code>aten/src/ATen/native/mkl/</code> + <code>mkldnn/</code></td><td>Intel MKL / MKLDNN 后端</td></tr>
     <tr><td></td><td><code>aten/src/ATen/native/quantized/</code></td><td>量化算子</td></tr>
     <tr><td></td><td><code>aten/src/ATen/native/sparse/</code></td><td>稀疏算子(CPU 部分)</td></tr>
@@ -482,19 +478,19 @@ torch/lib/libtorch_nvshmem.so</pre>
   </tbody>
 </table>
 
-<p>具体的源文件列表用 Bazel 风格的 <code>append_filelist()</code> 从 <code>build_variables.bzl</code> 读出 —— 这个 <code>.bzl</code> 是 PyTorch 的"源码列表事实唯一来源",Bazel 和 CMake 共用。</p>
+<p>不少整理过的源文件列表由 <code>append_filelist()</code> 从 <code>build_variables.bzl</code> 读入,供 CMake 与 Bazel 复用;但 CMake 中仍有 glob、条件追加和直接列出的源文件,因此它不是整个项目唯一的源码清单。</p>
 
-<p><strong>链接</strong>:<code>c10</code> PUBLIC + MKL / MKLDNN / Sleef / protobuf / flatbuffers / OpenMP 等。</p>
+<p><code>torch_cpu</code> 以 <code>PUBLIC</code> 方式链接 <code>c10</code>，并根据构建配置链接 MKL、MKLDNN、Sleef、protobuf、flatbuffers 和 OpenMP 等依赖。它由此成为设备算子库和 C++ wrapper target 共同依赖的 ATen 与框架运行时层。</p>
 
 <h3 id="zh-3-4">3.4 <code>libtorch_cuda</code>: CUDA 算子库</h3>
 
-<p>源码 <code>${Caffe2_GPU_SRCS} + ${Caffe2_GPU_CU_SRCS}</code>:</p>
+<p><code>caffe2/CMakeLists.txt</code> 通过 <code>${Caffe2_GPU_SRCS}</code> 与 <code>${Caffe2_GPU_CU_SRCS}</code> 汇集 CUDA host 代码和 device code：</p>
 
 <table>
   <thead><tr><th>路径</th><th>负责什么</th></tr></thead>
   <tbody>
     <tr><td><code>aten/src/ATen/cuda/</code></td><td>CUDA 上下文、context 管理、CUDAEvent</td></tr>
-    <tr><td><code>aten/src/ATen/native/cuda/</code></td><td><strong>所有 CUDA 算子内核(.cu 文件)</strong></td></tr>
+    <tr><td><code>aten/src/ATen/native/cuda/</code></td><td><strong>CUDA native operator 的主要实现与 kernel</strong></td></tr>
     <tr><td><code>aten/src/ATen/native/sparse/cuda/</code></td><td>稀疏 CUDA</td></tr>
     <tr><td><code>aten/src/ATen/native/quantized/cuda/</code></td><td>量化 CUDA</td></tr>
     <tr><td><code>aten/src/ATen/native/transformers/cuda/</code></td><td>SDPA / FlashAttention 的 CUDA 实现</td></tr>
@@ -505,11 +501,11 @@ torch/lib/libtorch_nvshmem.so</pre>
   </tbody>
 </table>
 
-<p><strong>链接</strong>:<code>c10_cuda</code> PUBLIC <strong>+ <code>torch_cpu</code> PUBLIC</strong>(CUDA 算子需要 ATen 的 dispatcher 和 native 函数注册机制),plus <code>torch::cudart</code>、可选 NCCL / cuFile / cuSPARSELt / cuDSS / NVTX / NVSHMEM。</p>
+<p><code>torch_cuda</code> 以 <code>PUBLIC</code> 方式链接 <code>c10_cuda</code> 和 <code>torch_cpu</code>：前者提供设备基础设施，后者提供 ATen dispatcher 与 native 函数注册机制。该 target 还链接 <code>torch::cudart</code>，并按功能开关加入 NCCL、cuFile、cuSPARSELt、cuDSS、NVTX 或 NVSHMEM。这个 target 关系使 CUDA 算子库在链接时接入同一套 dispatcher 与核心类型，而最终进程实际装入哪些 ELF 依赖仍由构建产物的 <code>DT_NEEDED</code> 决定。</p>
 
-<h3 id="zh-3-5">3.5 <code>libtorch</code>: 空的 aggregator</h3>
+<h3 id="zh-3-5">3.5 <code>libtorch</code>: wrapper target</h3>
 
-<p>这是最魔幻的一个:</p>
+<p><code>libtorch</code> target 用链接接口聚合 CPU 与设备库，CMake 定义本身很短：</p>
 
 <pre class="code"><span class="cm"># caffe2/CMakeLists.txt:923</span>
 <span class="cm"># Wrapper library for people who link against torch and expect</span>
@@ -520,18 +516,18 @@ target_link_libraries(torch PUBLIC torch_cpu_library)
   target_link_libraries(torch PUBLIC torch_cuda_library)
 <span class="kw">endif</span>()</pre>
 
-<p>它编出的 <code>libtorch.so</code> 几乎没有自己的代码 —— 只有一个空 <code>.cpp</code> 占位符。它存在的全部理由是:让用户写 <code>target_link_libraries(my_app torch)</code> 就同时能拿到 CPU 和 CUDA。 它是 PyTorch 工程对"链 libtorch 就够了"这个 API 承诺的实现机制。</p>
+<p>非 MSVC 构建使用空的 <code>empty.cpp</code> 创建 <code>libtorch.so</code>,其主要职责是提供 wrapper target 的链接接口。<code>torch</code> target 的 <code>PUBLIC</code> 关系让 CMake consumer 同时获得 CPU 与当前启用的设备库；安装后 <code>libtorch.so</code> 保留哪些动态依赖,仍取决于具体构建产物。</p>
 
 <p>在 <code>BUILD_LIBTORCHLESS</code> split-build 模式下,<code>torch</code> 会被 <code>find_library()</code> 找到一个已安装的外部 <code>libtorch.so</code>,但概念不变。</p>
 
 <h3 id="zh-3-6">3.6 <code>libtorch_python</code>: Python 绑定</h3>
 
-<p>源码在 <code>torch/CMakeLists.txt</code>,源文件列表来自 <code>build_variables.bzl</code> 里的 <code>libtorch_python_core_sources</code>:</p>
+<p><code>torch/CMakeLists.txt</code> 定义 <code>torch_python</code> target，其源码列表来自 <code>build_variables.bzl</code> 中的 <code>libtorch_python_core_sources</code>：</p>
 
 <table>
   <thead><tr><th>路径</th><th>内容</th></tr></thead>
   <tbody>
-    <tr><td><code>torch/csrc/Module.cpp</code></td><td><strong>Python 模块入口,定义 <code>PyInit__C</code></strong></td></tr>
+    <tr><td><code>torch/csrc/Module.cpp</code></td><td>实现 <code>initModule()</code>,由薄扩展 <code>torch._C</code> 的 <code>PyInit__C</code> 调用</td></tr>
     <tr><td><code>torch/csrc/autograd/python_*.cpp</code></td><td>Autograd 的 Python binding(<code>python_function.cpp</code>、<code>python_variable.cpp</code>、<code>python_engine.cpp</code> 等)</td></tr>
     <tr><td><code>torch/csrc/jit/python/*.cpp</code></td><td>TorchScript 的 Python 接口</td></tr>
     <tr><td><code>torch/csrc/api/python/</code></td><td>C++ Frontend 的 pybind 包装</td></tr>
@@ -540,15 +536,15 @@ target_link_libraries(torch PUBLIC torch_cpu_library)
     <tr><td><code>torch/csrc/inductor/*python*</code></td><td>Inductor 的 Python 桥</td></tr>
     <tr><td><code>torch/csrc/distributed/*/init.cpp</code></td><td>distributed 的 Python init</td></tr>
     <tr><td><code>libtorch_python_cuda_core_sources</code></td><td>CUDA 专属:<code>torch/csrc/cuda/Module.cpp</code>、<code>Stream.cpp</code>、<code>Event.cpp</code>、<code>python_comm.cpp</code>、<code>shared/cudart.cpp</code>、<code>shared/nvtx.cpp</code></td></tr>
-    <tr><td>生成的</td><td><code>${GENERATED_CXX_PYTHON}</code> —— 由 <code>tools/autograd/</code> codegen 出来的 Python 绑定</td></tr>
+    <tr><td>生成的</td><td><code>${GENERATED_CXX_PYTHON}</code>: 由 <code>tools/autograd/</code> codegen 出来的 Python 绑定</td></tr>
   </tbody>
 </table>
 
-<p><strong>链接</strong>:<code>${TORCH_LIB}</code> PRIVATE,这个变量在标准 build 里就是空 aggregator <code>torch</code> —— <strong>所以 <code>libtorch_python</code> 链接的是空壳 <code>libtorch.so</code>,通过它间接拿到 CPU 和 CUDA</strong>。 另外链 <code>Python::Module</code>、pybind11、<code>shm</code>、cuDNN / cuSPARSELt / cuFile / NVTX(可选)、UCC / NumPy。</p>
+<p>算子库形成 C++ 执行层之后，<code>torch_python</code> 再把这一层暴露给 CPython。CMake 以 <code>PRIVATE</code> 方式将 <code>torch_python</code> 链接到 <code>${TORCH_LIB}</code>；标准构建中的该变量指向 wrapper target <code>torch</code>，后者聚合 <code>torch_cpu</code> 与已启用的设备库。target 的传递链接接口与最终 ELF 的 <code>DT_NEEDED</code> 列表属于不同层次，因此仅凭这行 CMake 不能断言 wheel 必然经由 <code>libtorch.so</code> 间接加载 CPU/CUDA。其它链接项包括 <code>Python::Module</code>、pybind11、<code>shm</code> 及若干可选库。</p>
 
 <h3 id="zh-3-7">3.7 <code>libtorch_global_deps</code>: RTLD_GLOBAL 预加载技巧</h3>
 
-<p>这是另一个反直觉的库:</p>
+<p><code>libtorch_global_deps</code> 用占位源码承载一组需要提前进入全局符号空间的依赖：</p>
 
 <pre class="code">add_library(torch_global_deps SHARED <span class="cm">torch/csrc/empty.c</span>)
 target_link_libraries(torch_global_deps PRIVATE
@@ -558,7 +554,7 @@ target_link_libraries(torch_global_deps PRIVATE
   CUDA::nvToolsExt
   ...)</pre>
 
-<p>它的 C 代码本身是空的(只有一个 <code>empty.c</code> 占位符),但它<strong>链接了 MPI / MKL / cudart / nvToolsExt 这些"想要进全局符号空间"的库</strong>。 关键事实:<strong>没有任何其它 PyTorch 库链接它</strong>。 它的存在目的不是被链,而是被 Python 启动时手动 <code>dlopen</code> 进 <code>RTLD_GLOBAL</code>:</p>
+<p>它的 C 代码本身只有一个 <code>empty.c</code> 占位符,构建配置按功能开关链接 MPI、MKL 与部分 CUDA 依赖。<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/__init__.py"><code>torch/__init__.py</code></a> 在常规 Linux 启动路径中用 <code>RTLD_GLOBAL</code> 显式加载它:</p>
 
 <pre class="code"><span class="cm"># torch/__init__.py (节选)</span>
 <span class="kw">def</span> _load_global_deps():
@@ -568,15 +564,15 @@ target_link_libraries(torch_global_deps PRIVATE
 <span class="cm"># ... 然后:</span>
 <span class="kw">from</span> torch._C <span class="kw">import</span> *</pre>
 
-<p>为什么要这么搞:MKL、MPI、cudart 等依赖里有"必须被多个 .so 共享同一个 OpenMP / CUDA runtime 实例"的痛点。 如果 Python 用默认 <code>RTLD_LOCAL</code> 加载 <code>libtorch_python.so</code>,这些 runtime 符号会被局部隔离,可能跟用户 numpy / scipy 里加载的 MKL 撞符号或拿到不同实例。 把它们的符号通过 <code>libtorch_global_deps</code> 提前 <code>RTLD_GLOBAL</code> 进进程,后续所有 .so 都共享同一份。</p>
+<p><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/caffe2/CMakeLists.txt">CMake 的公开注释</a>给出两类动机:OpenMPI 等库会在初始化后 <code>dlopen</code> 插件,并假设所需符号位于全局命名空间;某些 CUDA 库又可能安装在非标准路径,局部加载后无法被后续的普通搜索找到。这里不把它概括成“所有 runtime 必须共享同一实例”,因为公开源码没有给出这样的统一保证。</p>
 
-<h3 id="zh-3-8">3.8 其它的</h3>
+<h3 id="zh-3-8">3.8 辅助与可选库</h3>
 
 <ul>
   <li><strong><code>libshm.so</code></strong>:<code>torch/lib/libshm/</code>,跨进程共享内存 Tensor 的 manager。 link <code>torch_cpu</code> PRIVATE。 配套还有 <code>torch_shm_manager</code> 可执行文件。</li>
-  <li><strong><code>libcaffe2_nvrtc.so</code></strong>:<code>aten/src/ATen/cuda/nvrtc_stub/ATenNVRTC.cpp</code>,这是个<strong>延迟绑定 stub</strong> —— libtorch 不直接链 NVRTC,而是用 dlopen 这个 stub 间接调,这样没装 NVRTC 的环境也不会一加载就崩。</li>
+  <li><strong><code>libcaffe2_nvrtc.so</code></strong>:位于 <code>aten/src/ATen/cuda/nvrtc_stub/ATenNVRTC.cpp</code> 的<strong>延迟绑定 stub</strong>。相关路径通过运行时加载取得 NVRTC 入口,从而避免在主库加载阶段建立同样的直接依赖。</li>
   <li><strong><code>libtorch_cuda_linalg.so</code></strong>:可选(<code>BUILD_LAZY_CUDA_LINALG=ON</code>),把 MAGMA / cusolver 相关的 linalg 算子从 <code>libtorch_cuda.so</code> 里拆出来 lazy load,主库不必硬链 MAGMA。</li>
-  <li><strong><code>libnnapi_backend.so</code></strong>:<code>torch/csrc/jit/backends/nnapi/</code>,Android NNAPI 的 TorchScript backend。 Linux 上居然也无条件 ship —— 历史遗留。</li>
+  <li><strong><code>libnnapi_backend.so</code></strong>:<code>torch/csrc/jit/backends/nnapi/</code> 下的 Android NNAPI TorchScript backend。固定版本的 CMake 在启用 Python 且目标不是 Darwin 时构建该 target；是否进入具体发行包仍由打包配置决定。</li>
   <li><strong><code>libtorch_nvshmem.so</code></strong>:可选(<code>USE_NVSHMEM</code>),用 NVSHMEM 做集体通信。</li>
 </ul>
 
@@ -584,13 +580,13 @@ target_link_libraries(torch_global_deps PRIVATE
 
 <div class="lang-en">
 
-<h2 id="en-3">3. Source directories per library</h2>
+<h2 id="en-3">3. Source ownership by library</h2>
 
-<p>This section is the long-form version of the side-panel summary, with prose context and full tables.</p>
+<p>The graph establishes the overall topology. The sections below follow the dependency layers from <code>c10</code>, which is independent of ATen and Python, through device infrastructure and operator implementations to the Python bindings.</p>
 
 <h3 id="en-3-1">3.1 <code>libc10</code>: the core tensor abstraction</h3>
 
-<p><strong>Sources</strong>: <code>c10/CMakeLists.txt</code> collects with a GLOB:</p>
+<p><code>c10/CMakeLists.txt</code> collects the target's sources with a GLOB:</p>
 
 <pre class="code">file(GLOB C10_SRCS
   *.cpp
@@ -601,13 +597,13 @@ target_link_libraries(torch_global_deps PRIVATE
   util/*.cpp)
 <span class="cm"># explicitly excludes c10/cuda/ and c10/hip/</span></pre>
 
-<p>Contains: <code>TensorImpl</code>, <code>Storage</code>, <code>Device</code>, <code>DispatchKey</code>, <code>Allocator</code>, <code>intrusive_ptr</code>, <code>TypeMeta</code>, the entire <code>c10::util</code> toolkit (<code>Optional</code>, <code>SmallVector</code>, <code>ArrayRef</code>, error-handling macros). The lowest layer of the PyTorch C++ API, with no CUDA, Python, or ATen dependencies.</p>
+<p>This layer provides <code>TensorImpl</code>, <code>Storage</code>, <code>Device</code>, <code>DispatchKey</code>, <code>Allocator</code>, <code>intrusive_ptr</code>, <code>TypeMeta</code>, and general utilities under <code>c10::util</code>, including <code>Optional</code>, <code>SmallVector</code>, <code>ArrayRef</code>, and error-handling macros. It forms the foundation of the PyTorch C++ API; in a standard build, the <code>c10</code> target sits below the CUDA, Python, and ATen targets.</p>
 
-<p><strong>Links</strong>: fmt, nlohmann_json, moodycamel (concurrent queue), optionally gflags / glog / cpuinfo.</p>
+<p>The <code>c10</code> target links fmt, nlohmann_json, and moodycamel (concurrent queue), with optional links to gflags, glog, and cpuinfo. Downstream targets that depend on <code>c10</code> through a <code>PUBLIC</code> relation inherit its core types and required transitive link interface.</p>
 
 <h3 id="en-3-2">3.2 <code>libc10_cuda</code>: CUDA infrastructure</h3>
 
-<p><strong>Sources</strong>: <code>c10/cuda/CMakeLists.txt</code> lists files explicitly (no GLOB):</p>
+<p><code>c10/cuda/CMakeLists.txt</code> lists the <code>c10_cuda</code> sources explicitly rather than using a GLOB:</p>
 
 <pre class="code">add_library(c10_cuda
   CUDAAllocatorConfig.cpp
@@ -618,19 +614,21 @@ target_link_libraries(torch_global_deps PRIVATE
   impl/CUDAGuardImpl.cpp
   ...)</pre>
 
-<p>Contains: CUDA streams (<code>CUDAStream</code>), the CUDA caching allocator (<strong>this is what <code>torch.cuda.empty_cache()</code> operates on</strong>), <code>CUDAGuard</code>, CUDA device assertions, driver-API wrappers. The CUDA foundation for the rest of PyTorch.</p>
+<p>The library implements CUDA streams (<code>CUDAStream</code>), the CUDA caching allocator operated on by <code>torch.cuda.empty_cache()</code>, <code>CUDAGuard</code>, CUDA device assertions, and driver-API wrappers. These components provide device, stream, memory, and runtime-state management for higher-level CUDA operators.</p>
 
-<p><strong>Links</strong>: <code>c10</code> PUBLIC + <code>torch::cudart</code> PUBLIC.</p>
+<p><code>c10_cuda</code> links both <code>c10</code> and <code>torch::cudart</code> as <code>PUBLIC</code> dependencies. Device libraries that depend on <code>c10_cuda</code> can therefore inherit the link requirements for the core types and the CUDA runtime along the target chain.</p>
+
+<p>Device infrastructure does not itself contain ATen operators. The operator layer above it is split between <code>libtorch_cpu</code>, which provides the dispatcher, CPU implementations, and framework runtime, and <code>libtorch_cuda</code>, which reuses those mechanisms while registering CUDA implementations.</p>
 
 <h3 id="en-3-3">3.3 <code>libtorch_cpu</code>: the main CPU library (ops, autograd, JIT)</h3>
 
-<p><strong>The largest single <code>.so</code> in the wheel</strong> (GB-scale). Sources come from <code>${Caffe2_CPU_SRCS}</code> in <code>caffe2/CMakeLists.txt</code>:</p>
+<p><code>libtorch_cpu.so</code> is commonly one of the larger shared libraries in a wheel. <code>caffe2/CMakeLists.txt</code> collects its sources through <code>${Caffe2_CPU_SRCS}</code>, covering the following modules:</p>
 
 <table>
   <thead><tr><th>Source variable</th><th>Path</th><th>Responsibility</th></tr></thead>
   <tbody>
     <tr><td><code>${ATen_CPU_SRCS}</code></td><td><code>aten/src/ATen/</code> (non-CUDA subdirs)</td><td>ATen core: Tensor, dispatcher, generated entry points from <code>native_functions.yaml</code></td></tr>
-    <tr><td></td><td><code>aten/src/ATen/native/</code></td><td>host-side implementations of every CPU op</td></tr>
+    <tr><td></td><td><code>aten/src/ATen/native/</code></td><td>main host-side implementations of CPU native operators</td></tr>
     <tr><td></td><td><code>aten/src/ATen/native/mkl/</code> + <code>mkldnn/</code></td><td>Intel MKL / MKLDNN backends</td></tr>
     <tr><td></td><td><code>aten/src/ATen/native/quantized/</code></td><td>quantised ops</td></tr>
     <tr><td></td><td><code>aten/src/ATen/native/sparse/</code></td><td>sparse ops (CPU)</td></tr>
@@ -647,19 +645,19 @@ target_link_libraries(torch_global_deps PRIVATE
   </tbody>
 </table>
 
-<p>The concrete source-file lists live in <code>build_variables.bzl</code> and are pulled in by <code>append_filelist()</code>. This <code>.bzl</code> file is the single source of truth for source lists, shared by Bazel and CMake.</p>
+<p>Many curated source lists are pulled from <code>build_variables.bzl</code> through <code>append_filelist()</code> and reused by CMake and Bazel. CMake also contains globs, conditional additions, and directly listed sources, so this file is not the sole source manifest for the entire project.</p>
 
-<p><strong>Links</strong>: <code>c10</code> PUBLIC plus MKL / MKLDNN / Sleef / protobuf / flatbuffers / OpenMP.</p>
+<p><code>torch_cpu</code> links <code>c10</code> as a <code>PUBLIC</code> dependency and, according to the build configuration, links MKL, MKLDNN, Sleef, protobuf, flatbuffers, and OpenMP. It consequently serves as the ATen and framework-runtime layer shared by device operator libraries and the C++ wrapper target.</p>
 
 <h3 id="en-3-4">3.4 <code>libtorch_cuda</code>: the CUDA op library</h3>
 
-<p>Sources: <code>${Caffe2_GPU_SRCS} + ${Caffe2_GPU_CU_SRCS}</code>:</p>
+<p><code>caffe2/CMakeLists.txt</code> collects CUDA host and device code through <code>${Caffe2_GPU_SRCS}</code> and <code>${Caffe2_GPU_CU_SRCS}</code>:</p>
 
 <table>
   <thead><tr><th>Path</th><th>Responsibility</th></tr></thead>
   <tbody>
     <tr><td><code>aten/src/ATen/cuda/</code></td><td>CUDA context management, CUDAEvent</td></tr>
-    <tr><td><code>aten/src/ATen/native/cuda/</code></td><td><strong>every CUDA op kernel (<code>.cu</code> files)</strong></td></tr>
+    <tr><td><code>aten/src/ATen/native/cuda/</code></td><td><strong>main implementations and kernels for CUDA native operators</strong></td></tr>
     <tr><td><code>aten/src/ATen/native/sparse/cuda/</code></td><td>sparse CUDA</td></tr>
     <tr><td><code>aten/src/ATen/native/quantized/cuda/</code></td><td>quantised CUDA</td></tr>
     <tr><td><code>aten/src/ATen/native/transformers/cuda/</code></td><td>CUDA implementations of SDPA / FlashAttention</td></tr>
@@ -670,11 +668,11 @@ target_link_libraries(torch_global_deps PRIVATE
   </tbody>
 </table>
 
-<p><strong>Links</strong>: <code>c10_cuda</code> PUBLIC <strong>and <code>torch_cpu</code> PUBLIC</strong> (CUDA ops need ATen's dispatcher and native-function registration), plus <code>torch::cudart</code>, optional NCCL / cuFile / cuSPARSELt / cuDSS / NVTX / NVSHMEM.</p>
+<p><code>torch_cuda</code> links <code>c10_cuda</code> and <code>torch_cpu</code> as <code>PUBLIC</code> dependencies: the former supplies device infrastructure, while the latter supplies the ATen dispatcher and native-function registration. The target also links <code>torch::cudart</code> and optionally NCCL, cuFile, cuSPARSELt, cuDSS, NVTX, or NVSHMEM. This target relation connects CUDA operators to the shared dispatcher and core types at link time; the final process load set still follows the built artifacts' <code>DT_NEEDED</code> entries.</p>
 
-<h3 id="en-3-5">3.5 <code>libtorch</code>: the empty aggregator</h3>
+<h3 id="en-3-5">3.5 <code>libtorch</code>: the wrapper target</h3>
 
-<p>The most surprising entry:</p>
+<p>The <code>libtorch</code> target aggregates CPU and device libraries through its link interface. Its CMake definition is short:</p>
 
 <pre class="code"><span class="cm"># caffe2/CMakeLists.txt:923</span>
 <span class="cm"># Wrapper library for people who link against torch and expect</span>
@@ -685,18 +683,18 @@ target_link_libraries(torch PUBLIC torch_cpu_library)
   target_link_libraries(torch PUBLIC torch_cuda_library)
 <span class="kw">endif</span>()</pre>
 
-<p>The resulting <code>libtorch.so</code> contains almost no code of its own: just one empty <code>.cpp</code>. Its entire purpose is to give users a single name to link against: <code>target_link_libraries(my_app torch)</code> transitively pulls both CPU and CUDA. It is the implementation of PyTorch's "link libtorch and that is all you need" API contract.</p>
+<p>The resulting <code>libtorch.so</code> contains almost no implementation of its own: non-MSVC builds use an empty <code>empty.cpp</code> placeholder. The <code>torch</code> target's <code>PUBLIC</code> link interface gives CMake consumers the CPU library and the enabled device library. Which dynamic dependencies remain on the installed <code>libtorch.so</code> is artifact-dependent.</p>
 
 <p>In <code>BUILD_LIBTORCHLESS</code> split-build mode, <code>torch</code> is resolved by <code>find_library()</code> against an externally installed <code>libtorch.so</code>, but the concept is identical.</p>
 
 <h3 id="en-3-6">3.6 <code>libtorch_python</code>: the Python bindings</h3>
 
-<p>Defined in <code>torch/CMakeLists.txt</code>; its source list comes from <code>libtorch_python_core_sources</code> in <code>build_variables.bzl</code>:</p>
+<p><code>torch/CMakeLists.txt</code> defines the <code>torch_python</code> target, whose source list comes from <code>libtorch_python_core_sources</code> in <code>build_variables.bzl</code>:</p>
 
 <table>
   <thead><tr><th>Path</th><th>Content</th></tr></thead>
   <tbody>
-    <tr><td><code>torch/csrc/Module.cpp</code></td><td><strong>Python module entry, defines <code>PyInit__C</code></strong></td></tr>
+    <tr><td><code>torch/csrc/Module.cpp</code></td><td>Implements <code>initModule()</code>, called by the thin <code>torch._C</code> extension's <code>PyInit__C</code></td></tr>
     <tr><td><code>torch/csrc/autograd/python_*.cpp</code></td><td>Autograd Python bindings (<code>python_function.cpp</code>, <code>python_variable.cpp</code>, <code>python_engine.cpp</code>)</td></tr>
     <tr><td><code>torch/csrc/jit/python/*.cpp</code></td><td>TorchScript Python interface</td></tr>
     <tr><td><code>torch/csrc/api/python/</code></td><td>pybind wrappers for the C++ Frontend</td></tr>
@@ -709,11 +707,11 @@ target_link_libraries(torch PUBLIC torch_cpu_library)
   </tbody>
 </table>
 
-<p><strong>Links</strong>: <code>${TORCH_LIB}</code> PRIVATE, which in the standard build is the empty aggregator <code>torch</code>. <strong>So <code>libtorch_python</code> links the hollow <code>libtorch.so</code> and acquires CPU and CUDA only transitively.</strong> Other links: <code>Python::Module</code>, pybind11, <code>shm</code>, cuDNN / cuSPARSELt / cuFile / NVTX (optional), UCC / NumPy.</p>
+<p>Once the operator libraries form the C++ execution layer, <code>torch_python</code> exposes that layer to CPython. CMake links <code>torch_python</code> privately to <code>${TORCH_LIB}</code>, which points to the <code>torch</code> wrapper target in a standard build; that wrapper aggregates <code>torch_cpu</code> and the enabled device libraries. A target's transitive link interface is distinct from the final ELF <code>DT_NEEDED</code> list, so this line alone does not prove that a wheel always loads CPU/CUDA indirectly through <code>libtorch.so</code>. Other links include <code>Python::Module</code>, pybind11, <code>shm</code>, and optional libraries.</p>
 
 <h3 id="en-3-7">3.7 <code>libtorch_global_deps</code>: the RTLD_GLOBAL preload trick</h3>
 
-<p>Another counterintuitive library:</p>
+<p><code>libtorch_global_deps</code> uses placeholder source to carry dependencies that must enter the global symbol namespace early:</p>
 
 <pre class="code">add_library(torch_global_deps SHARED <span class="cm">torch/csrc/empty.c</span>)
 target_link_libraries(torch_global_deps PRIVATE
@@ -723,7 +721,7 @@ target_link_libraries(torch_global_deps PRIVATE
   CUDA::nvToolsExt
   ...)</pre>
 
-<p>The C code is empty (one placeholder <code>empty.c</code>), but the library links <strong>MPI, MKL, cudart, nvToolsExt, all the runtimes that want a single global instance</strong>. The key fact: <strong>no other PyTorch library links it.</strong> Its purpose is not to be linked but to be manually <code>dlopen</code>ed with <code>RTLD_GLOBAL</code> at Python startup:</p>
+<p>The C code is a placeholder <code>empty.c</code>; the target links MPI, MKL, and selected CUDA dependencies according to build options. In the normal Linux startup path, <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/__init__.py"><code>torch/__init__.py</code></a> explicitly loads it with <code>RTLD_GLOBAL</code>:</p>
 
 <pre class="code"><span class="cm"># torch/__init__.py (abridged)</span>
 <span class="kw">def</span> _load_global_deps():
@@ -733,15 +731,15 @@ target_link_libraries(torch_global_deps PRIVATE
 <span class="cm"># ... then:</span>
 <span class="kw">from</span> torch._C <span class="kw">import</span> *</pre>
 
-<p>Why: MKL, MPI, cudart, and similar runtimes require "all shared libraries see the same instance" semantics. If Python loads <code>libtorch_python.so</code> with the default <code>RTLD_LOCAL</code>, those runtime symbols become locally scoped and may collide with, or be a different instance from, the MKL already loaded by the user's numpy or scipy. Pre-dlopen-ing them with <code>RTLD_GLOBAL</code> through <code>libtorch_global_deps</code> ensures every later <code>.so</code> shares one instance.</p>
+<p>The public <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/caffe2/CMakeLists.txt">CMake note</a> gives two concrete motivations: libraries such as OpenMPI may <code>dlopen</code> plugins after initialization and expect required symbols in the global namespace; some CUDA libraries may live in non-standard locations and cannot be found by a later normal search after a local load. The source does not state a universal “single runtime instance” guarantee.</p>
 
-<h3 id="en-3-8">3.8 The smaller libraries</h3>
+<h3 id="en-3-8">3.8 Auxiliary and optional libraries</h3>
 
 <ul>
   <li><strong><code>libshm.so</code></strong>: under <code>torch/lib/libshm/</code>, the shared-memory manager for cross-process tensors; links <code>torch_cpu</code> PRIVATE. Ships alongside the <code>torch_shm_manager</code> executable.</li>
-  <li><strong><code>libcaffe2_nvrtc.so</code></strong>: <code>aten/src/ATen/cuda/nvrtc_stub/ATenNVRTC.cpp</code>. A <strong>lazy-binding stub</strong>: libtorch never links NVRTC directly; it dlopens this stub at runtime, so environments without NVRTC do not crash on import.</li>
+  <li><strong><code>libcaffe2_nvrtc.so</code></strong>: a <strong>lazy-binding stub</strong> implemented in <code>aten/src/ATen/cuda/nvrtc_stub/ATenNVRTC.cpp</code>. The relevant path obtains NVRTC entry points through runtime loading instead of imposing the same direct dependency at main-library load time.</li>
   <li><strong><code>libtorch_cuda_linalg.so</code></strong>: optional (<code>BUILD_LAZY_CUDA_LINALG=ON</code>); splits MAGMA / cusolver linalg kernels out of <code>libtorch_cuda.so</code> so the main library does not have to hard-link MAGMA.</li>
-  <li><strong><code>libnnapi_backend.so</code></strong>: <code>torch/csrc/jit/backends/nnapi/</code>, the Android NNAPI TorchScript backend. Surprisingly ships unconditionally on Linux.</li>
+  <li><strong><code>libnnapi_backend.so</code></strong>: the Android NNAPI TorchScript backend under <code>torch/csrc/jit/backends/nnapi/</code>. In the pinned CMake, the target is built when Python is enabled and the platform is not Darwin; inclusion in a distribution still depends on packaging.</li>
   <li><strong><code>libtorch_nvshmem.so</code></strong>: optional (<code>USE_NVSHMEM</code>), NVSHMEM-based collective communication.</li>
 </ul>
 
@@ -749,57 +747,60 @@ target_link_libraries(torch_global_deps PRIVATE
 
 <div class="lang-zh">
 
-<h2 id="zh-4">4. <code>torch._C</code> 到底是什么</h2>
+<h2 id="zh-4">4. <code>torch._C</code> 的加载职责</h2>
 
-<p>把它拆开:</p>
+<p><code>torch._C</code> 是面向 CPython 的薄扩展入口。它与 <code>libtorch_python.so</code> 的职责可以沿构建和初始化路径拆成三步：</p>
 
 <ol>
-  <li><code>torch._C</code> 是个 Python 扩展模块;在本文这个 Linux CUDA wheel 布局里,它由 <code>libtorch_python.so</code> 提供。</li>
-  <li><code>libtorch_python.so</code> 是按 CPython 扩展模块的接口编出来的(链 <code>Python::Module</code>),在这个 wheel 里落在 <code>torch/lib/libtorch_python.so</code>。其它平台或构建方式可能换文件名或安装位置。</li>
-  <li>它的 Python 入口符号是 <code>PyInit__C</code>,定义在 <code>torch/csrc/Module.cpp</code> —— 这个名字告诉 CPython 它是 <code>_C</code> 这个名字的扩展模块,而 setuptools 把它注册到 <code>torch._C</code> 这个完整路径下。</li>
-  <li>Python 端 <code>from torch._C import *</code> 触发动态链接器加载 <code>libtorch_python.so</code> → 它的 NEEDED 项把 <code>libtorch.so</code> 拖进来 → 再把 <code>libtorch_cpu.so</code> 和 <code>libtorch_cuda.so</code> 拖进来 → 再底下是 <code>libc10.so</code> 和 <code>libc10_cuda.so</code>。</li>
+  <li><code>torch._C</code> 是 Python 扩展模块。PyTorch <code>v2.12.0</code> 的 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/setup.py"><code>setup.py</code></a> 用 <code>torch/csrc/stub.c</code> 构建这个薄扩展,并链接 <code>torch_python</code>。</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/stub.c"><code>stub.c</code></a> 定义 <code>PyInit__C</code>,其函数体调用 <code>initModule()</code>;<code>initModule()</code> 才实现在 <code>torch/csrc/Module.cpp</code> 并由 <code>libtorch_python.so</code> 提供。</li>
+  <li><code>from torch._C import *</code> 先让动态加载器装入薄扩展及其链接依赖。CMake target 图可以说明构建关系,但不能替代具体 wheel 的 <code>DT_NEEDED</code> 检查。</li>
 </ol>
 
-<p>所以在这个 Linux wheel 语境下,Python 角度看的 <code>torch._C</code>,从 C++ / 动态链接器角度看主要落到 <code>libtorch_python.so</code> 这个扩展模块;再底下一连串 .so 是动态链接器的工作。</p>
+<p>在这个 Linux wheel 语境下，<code>torch._C</code> 提供 CPython 初始化入口，<code>libtorch_python.so</code> 承载大部分 Python binding 实现。安装产物实际加载的下游库可用 <code>readelf -d torch/_C*.so</code>、<code>readelf -d torch/lib/libtorch_python.so</code> 或 <code>ldd</code> 核对。</p>
 
 <p><code>torch/__init__.py</code> 的实际启动流程:</p>
 
 <pre class="code"><span class="cm"># 1. 先用 RTLD_GLOBAL dlopen libtorch_global_deps,把 MKL/cudart 等全局化</span>
 _load_global_deps()
 
-<span class="cm"># 2. 加载 _C(即 libtorch_python),触发整条 .so 加载链</span>
+<span class="cm"># 2. 加载 _C 薄扩展及该构建产物记录的动态依赖</span>
 <span class="kw">from</span> torch._C <span class="kw">import</span> *
 
 <span class="cm"># 3. 显式 init ATen / c10 的全局状态</span>
 _C._initExtension(_manager_path())</pre>
 
-<h2 id="zh-5">5. 几个反直觉的点</h2>
+<h2 id="zh-5">5. 构建目标与安装产物的边界</h2>
+
+<p>CMake target 描述构建期的源码归属与传递链接接口,安装后的 <code>.so</code> 则由链接器和打包流程形成具体 ELF。下面汇总两类对象之间最容易混淆的对应关系。</p>
 
 <ol>
-  <li><strong><code>libtorch.so</code> 是空的</strong>。 你 <code>nm libtorch.so</code> 看不到几个符号,它只是个链接 manifest。</li>
-  <li><strong>定义 <code>torch_cpu</code> 和 <code>torch_cuda</code> 的 CMake 在 <code>caffe2/CMakeLists.txt</code> 里</strong>。 看见 caffe2 别犯怵,这不是给 Caffe2 框架用的,是真 libtorch 的家。</li>
-  <li><strong><code>libtorch_python</code> 不直接链 <code>libtorch_cpu</code> 或 <code>libtorch_cuda</code></strong>。 它链空壳 <code>libtorch</code>,通过 aggregator 间接拿到。 在 split-build 模式下这一抽象层让 build 还能切换到外部安装的 libtorch。</li>
-  <li><strong><code>libtorch_global_deps</code> 没有任何库链它</strong>。 它的存在是为了被 <code>ctypes.CDLL(..., RTLD_GLOBAL)</code> 单独 dlopen,做 MKL / cudart 等的全局符号预加载。</li>
-  <li><strong><code>libcaffe2_nvrtc</code> 也是个 stub</strong>。 它的意义在于 lazy bind NVRTC,这样运行时不带 NVRTC 的环境也能 <code>import torch</code> 而不是直接挂掉。 想真用 NVRTC 时 PyTorch 会再 dlopen 进来。</li>
-  <li><strong><code>libnnapi_backend.so</code> 在 Linux 上也无条件 ship</strong>。 这是 Android NNAPI 的 TorchScript backend,Linux 上其实没人用,纯历史遗留。</li>
-  <li><strong>源文件列表的"事实唯一来源"是 <code>build_variables.bzl</code></strong>。 CMake 和 Bazel 都从这个 <code>.bzl</code> 读 <code>libtorch_python_core_sources</code> / <code>libtorch_python_cuda_core_sources</code> / <code>libtorch_cuda_distributed_*_sources</code> 等列表。 想加 / 移源文件,改这里就行。</li>
+  <li><strong><code>libtorch.so</code> 由占位翻译单元创建</strong>。生成的共享对象承载 wrapper target,主要价值在 CMake target 的 <code>PUBLIC</code> 链接接口。</li>
+  <li><strong><code>caffe2/CMakeLists.txt</code> 定义 <code>torch_cpu</code> 和 <code>torch_cuda</code> target</strong>。目录名来自项目历史，当前文件仍承担 libtorch 主要 target 的构建职责。</li>
+  <li><strong><code>torch_python</code> 的 CMake target 链接 <code>${TORCH_LIB}</code></strong>。标准构建中它指向 wrapper target <code>torch</code>;最终 wheel 是否保留相同的间接 ELF 依赖链,需要检查产物。</li>
+  <li><strong><code>libtorch_global_deps</code> 走显式预加载路径</strong>。<code>torch/__init__.py</code> 在常规 Linux 路径中用 <code>ctypes.CDLL(..., RTLD_GLOBAL)</code> 加载它。</li>
+  <li><strong><code>libcaffe2_nvrtc</code> 是延迟绑定 stub</strong>。它把 NVRTC 的装载推迟到相关功能实际使用时，使基础导入路径不依赖 NVRTC 已经可用。</li>
+  <li><strong><code>libnnapi_backend.so</code></strong> 对应 <code>torch/csrc/jit/backends/nnapi/</code> 的 NNAPI backend;是否随特定 Linux 包发布取决于构建与打包配置。</li>
+  <li><strong><code>build_variables.bzl</code> 保存多组共享源文件列表</strong>,但不是整个源码树的唯一清单;仍需结合各级 CMake 条件阅读。</li>
 </ol>
 
 <h2 id="zh-refs">参考资料</h2>
 
-<p>本文的源码事实按 <a href="https://github.com/pytorch/pytorch" target="_blank" rel="noopener">pytorch/pytorch</a> 的 <code>v2.12.0</code> tag 核对。关键 CMake 文件:</p>
+<p>本文的源码事实按 <a href="https://github.com/pytorch/pytorch/tree/v2.12.0" target="_blank" rel="noopener">pytorch/pytorch <code>v2.12.0</code></a> 核对。关键 CMake 文件:</p>
 
 <ul>
   <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/CMakeLists.txt" target="_blank" rel="noopener">CMakeLists.txt</a>(顶层,USE_OBSERVERS / USE_CUDA / BUILD_LAZY_CUDA_LINALG 等开关)</li>
   <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/c10/CMakeLists.txt" target="_blank" rel="noopener">c10/CMakeLists.txt</a></li>
   <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/c10/cuda/CMakeLists.txt" target="_blank" rel="noopener">c10/cuda/CMakeLists.txt</a></li>
   <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/CMakeLists.txt" target="_blank" rel="noopener">aten/src/ATen/CMakeLists.txt</a>(<code>ATen_CPU_SRCS</code> / <code>ATen_CUDA_CPP_SRCS</code> / <code>ATen_CUDA_CU_SRCS</code> 的拼装)</li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/caffe2/CMakeLists.txt" target="_blank" rel="noopener">caffe2/CMakeLists.txt</a>(<code>torch_cpu</code> / <code>torch_cuda</code> / <code>torch</code> / <code>torch_global_deps</code> / <code>caffe2_nvrtc</code> 的真正定义所在)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/caffe2/CMakeLists.txt" target="_blank" rel="noopener">caffe2/CMakeLists.txt</a>(<code>torch_cpu</code> / <code>torch_cuda</code> / <code>torch</code> / <code>torch_global_deps</code> / <code>caffe2_nvrtc</code> 的定义位置)</li>
   <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/CMakeLists.txt" target="_blank" rel="noopener">torch/CMakeLists.txt</a>(<code>torch_python</code> 与 <code>nnapi_backend</code>)</li>
   <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/lib/libshm/CMakeLists.txt" target="_blank" rel="noopener">torch/lib/libshm/CMakeLists.txt</a></li>
   <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/build_variables.bzl" target="_blank" rel="noopener">build_variables.bzl</a>(<code>libtorch_python_core_sources</code> 等源文件清单)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/setup.py" target="_blank" rel="noopener">setup.py</a>(<code>torch._C</code> 扩展定义)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/stub.c" target="_blank" rel="noopener">torch/csrc/stub.c</a>(<code>PyInit__C</code>)</li>
   <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/__init__.py" target="_blank" rel="noopener">torch/__init__.py</a>(<code>_load_global_deps</code> 与 <code>from torch._C import *</code>)</li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/Module.cpp" target="_blank" rel="noopener">torch/csrc/Module.cpp</a>(<code>PyInit__C</code>)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/Module.cpp" target="_blank" rel="noopener">torch/csrc/Module.cpp</a>(<code>initModule()</code>)</li>
 </ul>
 
 <hr>
@@ -808,45 +809,46 @@ _C._initExtension(_manager_path())</pre>
 
 <div class="lang-en">
 
-<h2 id="en-4">4. What <code>torch._C</code> actually is</h2>
+<h2 id="en-4">4. Loading responsibilities of <code>torch._C</code></h2>
 
-<p>Breaking it down:</p>
+<p><code>torch._C</code> is the thin extension entry for CPython. Its relationship with <code>libtorch_python.so</code> follows three build and initialization steps:</p>
 
 <ol>
-  <li><code>torch._C</code> is a Python extension module; in the Linux CUDA wheel layout discussed here, it is provided by <code>libtorch_python.so</code>.</li>
-  <li><code>libtorch_python.so</code> is built as a CPython extension (links <code>Python::Module</code>) and installed to <code>torch/lib/libtorch_python.so</code> in this wheel. Other platforms or build modes may use different file names or install locations.</li>
-  <li>Its Python entry symbol is <code>PyInit__C</code>, defined in <code>torch/csrc/Module.cpp</code>. The name tells CPython this is the <code>_C</code> extension; setuptools registers it under the full path <code>torch._C</code>.</li>
-  <li>On the Python side, <code>from torch._C import *</code> triggers the dynamic linker to load <code>libtorch_python.so</code>; its NEEDED entries drag in <code>libtorch.so</code>; the aggregator drags in <code>libtorch_cpu.so</code> and <code>libtorch_cuda.so</code>; and those drag in <code>libc10.so</code> and <code>libc10_cuda.so</code>.</li>
+  <li><code>torch._C</code> is a Python extension. In PyTorch <code>v2.12.0</code>, <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/setup.py"><code>setup.py</code></a> builds the thin extension from <code>torch/csrc/stub.c</code> and links it to <code>torch_python</code>.</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/stub.c"><code>stub.c</code></a> defines <code>PyInit__C</code>, whose body calls <code>initModule()</code>; <code>initModule()</code> is implemented in <code>torch/csrc/Module.cpp</code> and provided by <code>libtorch_python.so</code>.</li>
+  <li><code>from torch._C import *</code> asks the dynamic loader to load the thin extension and the dependencies recorded in that artifact. The CMake target graph describes build relations, not a universal wheel <code>DT_NEEDED</code> chain.</li>
 </ol>
 
-<p>So, in this Linux wheel context, <code>torch._C</code> from Python's perspective mostly lands on the <code>libtorch_python.so</code> extension module from the C++ / dynamic-linker perspective; the rest of the chain is the dynamic linker doing its job.</p>
+<p>In this Linux wheel context, <code>torch._C</code> is the thin CPython-facing entry and <code>libtorch_python.so</code> carries most Python-binding implementation. Inspect the installed artifacts with <code>readelf -d torch/_C*.so</code>, <code>readelf -d torch/lib/libtorch_python.so</code>, or <code>ldd</code> to determine the actual downstream libraries.</p>
 
 <p>The startup sequence in <code>torch/__init__.py</code>:</p>
 
 <pre class="code"><span class="cm"># 1. dlopen libtorch_global_deps with RTLD_GLOBAL so MKL/cudart symbols are global</span>
 _load_global_deps()
 
-<span class="cm"># 2. load _C (i.e. libtorch_python), which triggers the full .so chain</span>
+<span class="cm"># 2. load the thin _C extension and the dependencies recorded by this build</span>
 <span class="kw">from</span> torch._C <span class="kw">import</span> *
 
 <span class="cm"># 3. explicitly init ATen / c10 global state</span>
 _C._initExtension(_manager_path())</pre>
 
-<h2 id="en-5">5. A few counterintuitive points</h2>
+<h2 id="en-5">5. Build targets and installed artifacts</h2>
+
+<p>A CMake target describes source ownership and transitive link interfaces during the build. An installed <code>.so</code> is the concrete ELF artifact produced by the linker and packaging process. The following points consolidate the correspondences that are easiest to conflate.</p>
 
 <ol>
-  <li><strong><code>libtorch.so</code> is empty.</strong> <code>nm libtorch.so</code> finds almost nothing; it is a linker manifest.</li>
-  <li><strong>The CMake that defines <code>torch_cpu</code> and <code>torch_cuda</code> lives in <code>caffe2/CMakeLists.txt</code>.</strong> Do not be confused by the directory name; it is the actual home of libtorch, not anything to do with the historical Caffe2 framework.</li>
-  <li><strong><code>libtorch_python</code> does not link <code>libtorch_cpu</code> or <code>libtorch_cuda</code> directly.</strong> It links the empty <code>libtorch</code> aggregator and gets both halves transitively. This indirection is what lets split-build mode swap in an externally installed libtorch.</li>
-  <li><strong>Nothing links <code>libtorch_global_deps</code>.</strong> It exists solely to be loaded by <code>ctypes.CDLL(..., RTLD_GLOBAL)</code> for MKL / cudart symbol preloading.</li>
-  <li><strong><code>libcaffe2_nvrtc</code> is a stub.</strong> Its purpose is to defer NVRTC binding, so environments without NVRTC can still <code>import torch</code> without crashing. PyTorch dlopens NVRTC through this stub only when the user actually needs it.</li>
-  <li><strong><code>libnnapi_backend.so</code> ships unconditionally on Linux.</strong> It is the Android NNAPI TorchScript backend; no one uses it on Linux. Historical artefact.</li>
-  <li><strong>The single source of truth for source-file lists is <code>build_variables.bzl</code>.</strong> Both CMake and Bazel read <code>libtorch_python_core_sources</code>, <code>libtorch_python_cuda_core_sources</code>, <code>libtorch_cuda_distributed_*_sources</code>, and friends from this <code>.bzl</code>. Adding or removing source files happens here.</li>
+  <li><strong><code>libtorch.so</code> is built from a placeholder translation unit.</strong> The resulting shared object carries the wrapper target, whose main role is its CMake <code>PUBLIC</code> link interface.</li>
+  <li><strong><code>caffe2/CMakeLists.txt</code> defines the <code>torch_cpu</code> and <code>torch_cuda</code> targets.</strong> The directory name reflects project history, while the file still owns the main libtorch target definitions.</li>
+  <li><strong>The <code>torch_python</code> CMake target links <code>${TORCH_LIB}</code>.</strong> In a standard build this points to the <code>torch</code> wrapper target; inspect the wheel to see whether the same indirect ELF dependency chain remains.</li>
+  <li><strong><code>libtorch_global_deps</code> follows an explicit preload path.</strong> In the normal Linux path, <code>torch/__init__.py</code> loads it with <code>ctypes.CDLL(..., RTLD_GLOBAL)</code>.</li>
+  <li><strong><code>libcaffe2_nvrtc</code> is a lazy-binding stub.</strong> It defers NVRTC loading until the corresponding functionality is used, keeping the base import path independent of NVRTC availability.</li>
+  <li><strong><code>libnnapi_backend.so</code></strong> corresponds to the NNAPI backend under <code>torch/csrc/jit/backends/nnapi/</code>; whether it ships in a Linux package depends on build and packaging configuration.</li>
+  <li><strong><code>build_variables.bzl</code> stores many shared source lists</strong>, but it is not the sole manifest for the whole source tree; CMake conditions must also be read.</li>
 </ol>
 
 <h2 id="en-refs">References</h2>
 
-<p>All source-tree facts in this article are checked against the <code>v2.12.0</code> tag of <a href="https://github.com/pytorch/pytorch" target="_blank" rel="noopener">pytorch/pytorch</a>. Key CMake files:</p>
+<p>All source-tree facts in this article are checked against <a href="https://github.com/pytorch/pytorch/tree/v2.12.0" target="_blank" rel="noopener"><code>pytorch/pytorch@v2.12.0</code></a>. Key CMake files:</p>
 
 <ul>
   <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/CMakeLists.txt" target="_blank" rel="noopener">CMakeLists.txt</a> (top-level; <code>USE_OBSERVERS</code>, <code>USE_CUDA</code>, <code>BUILD_LAZY_CUDA_LINALG</code>, etc.)</li>
@@ -857,8 +859,10 @@ _C._initExtension(_manager_path())</pre>
   <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/CMakeLists.txt" target="_blank" rel="noopener">torch/CMakeLists.txt</a> (<code>torch_python</code> and <code>nnapi_backend</code>)</li>
   <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/lib/libshm/CMakeLists.txt" target="_blank" rel="noopener">torch/lib/libshm/CMakeLists.txt</a></li>
   <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/build_variables.bzl" target="_blank" rel="noopener">build_variables.bzl</a> (canonical source-file lists)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/setup.py" target="_blank" rel="noopener">setup.py</a> (<code>torch._C</code> extension definition)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/stub.c" target="_blank" rel="noopener">torch/csrc/stub.c</a> (<code>PyInit__C</code>)</li>
   <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/__init__.py" target="_blank" rel="noopener">torch/__init__.py</a> (<code>_load_global_deps</code> and <code>from torch._C import *</code>)</li>
-  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/Module.cpp" target="_blank" rel="noopener">torch/csrc/Module.cpp</a> (<code>PyInit__C</code>)</li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/Module.cpp" target="_blank" rel="noopener">torch/csrc/Module.cpp</a> (<code>initModule()</code>)</li>
 </ul>
 
 <hr>
@@ -887,8 +891,8 @@ const NODES = [
       cmake: 'c10/CMakeLists.txt',
       sources: ['c10/*.cpp', 'c10/core/*.cpp', 'c10/core/impl/*.cpp', 'c10/mobile/*.cpp', 'c10/macros/*.cpp', 'c10/util/*.cpp', '(excludes c10/cuda/, c10/hip/)'],
       links: ['fmt', 'nlohmann_json', 'moodycamel', '(optional) gflags / glog / cpuinfo'],
-      note: { zh: 'TensorImpl / Storage / DispatchKey / Allocator / intrusive_ptr / TypeMeta / 全套 c10::util 工具。 整个 PyTorch C++ API 最底层。',
-              en: 'TensorImpl / Storage / DispatchKey / Allocator / intrusive_ptr / TypeMeta / all of c10::util. The lowest layer of the PyTorch C++ API.' },
+      note: { zh: 'TensorImpl / Storage / DispatchKey / Allocator / intrusive_ptr / TypeMeta 与 c10::util 通用工具。PyTorch C++ API 的基础类型层。',
+              en: 'TensorImpl / Storage / DispatchKey / Allocator / intrusive_ptr / TypeMeta and general c10::util helpers. The foundational type layer of the PyTorch C++ API.' },
     } },
   { id: 'libc10_cuda', kind: 'lib', label: 'libc10_cuda.so',
     desc: { zh: 'CUDA 基础设施;CUDAStream, CUDA caching allocator, CUDAGuard',
@@ -916,31 +920,31 @@ const NODES = [
               en: 'Source list comes from libtorch_python_core_sources etc. in build_variables.bzl (append_filelist).' },
     } },
   { id: 'libtorch_cuda', kind: 'lib', label: 'libtorch_cuda.so',
-    desc: { zh: '所有 CUDA 算子内核(.cu),链 torch_cpu 拿 dispatcher',
-            en: 'All CUDA op kernels (.cu); links torch_cpu for the dispatcher' },
+    desc: { zh: 'CUDA native operator 实现;链接 torch_cpu 取得 dispatcher 与 ATen 基础设施',
+            en: 'CUDA native-operator implementations; links torch_cpu for the dispatcher and ATen infrastructure' },
     detail: {
       target: 'torch_cuda',
       cmake: 'caffe2/CMakeLists.txt:974/984',
       sources: [
-        '— ATen CUDA / cuDNN —',
+        ': ATen CUDA / cuDNN: ',
         'aten/src/ATen/{cuda, cudnn}/**',
         'aten/src/ATen/native/{cuda, cudnn}/**',
         'aten/src/ATen/native/{sparse, quantized, nested, transformers}/cuda/**',
         'aten/src/ATen/native/quantized/cudnn/**',
         'aten/src/ATen/native/cuda/linalg/** (除非 BUILD_LAZY_CUDA_LINALG)',
         'aten/src/ATen/native/miopen/** (源在列表,内容 #ifdef USE_ROCM 保护)',
-        '— torch/csrc CUDA host —',
+        ': torch/csrc CUDA host: ',
         'torch/csrc/cuda/*.cpp (host 侧,non-Python)',
         'torch/csrc/CudaIPCTypes.cpp',
         'torch/csrc/inductor/aoti_*/** (CUDA shim / runner / inductor_ops_gpu)',
         'torch/csrc/jit/{codegen/fuser/cuda, runtime, tensorexpr, passes}/*cuda*.cpp',
         'torch/csrc/autograd/functions/comm.cpp',
         'torch/csrc/profiler/stubs/cuda.cpp',
-        '— torch/csrc distributed CUDA —',
+        ': torch/csrc distributed CUDA: ',
         'torch/csrc/distributed/c10d/*{cuda,NCCL,UCC,Cuda}*.cpp',
         'torch/csrc/distributed/c10d/{cuda, symm_mem, quantization}/**',
         'torch/csrc/distributed/rpc/tensorpipe_cuda.cpp',
-        '— generated —',
+        ': generated: ',
         'torch/csrc/inductor/aoti_torch/generated/c_shim_cuda.cpp',
       ],
       links: ['c10_cuda (PUBLIC)', 'torch_cpu (PUBLIC)', 'torch::cudart', '(optional) NCCL / cuFile / cuSPARSELt / cuDSS / NVTX / NVSHMEM / UCC'],
@@ -955,18 +959,18 @@ const NODES = [
       cmake: 'caffe2/CMakeLists.txt:923',
       sources: ['(一个空 .cpp 占位符)', '(no real code)'],
       links: ['torch_cpu_library (PUBLIC)', 'torch_cuda_library (PUBLIC, if USE_CUDA)'],
-      note: { zh: '存在的全部理由:让用户写 target_link_libraries(my_app torch) 就同时拿到 CPU 和 CUDA。 split-build 模式下会被 find_library 找到外部 libtorch.so,概念不变。',
-              en: 'Sole purpose: let users write target_link_libraries(my_app torch) and transitively get both CPU and CUDA. In split-build mode, find_library locates an external libtorch.so; same concept.' },
+      note: { zh: '作为 wrapper target,它让 CMake consumer 通过 target_link_libraries(my_app torch) 传递获得 CPU 与 CUDA 依赖。split-build 模式下会由 find_library 定位外部 libtorch.so,对应关系不变。',
+              en: 'As a wrapper target, it lets a CMake consumer acquire CPU and CUDA dependencies transitively through target_link_libraries(my_app torch). In split-build mode, find_library locates the external libtorch.so while preserving that relationship.' },
     } },
   { id: 'libtorch_python', kind: 'lib', label: 'libtorch_python.so',
-    desc: { zh: 'Python 扩展模块,PyInit__C 入口;在本文 wheel 布局里提供 torch._C',
-            en: 'CPython extension; PyInit__C; provides torch._C in this wheel layout' },
+    desc: { zh: 'torch._C 的主要 Python 绑定实现;薄扩展本身由 stub.c 构建',
+            en: 'Main Python-binding implementation behind torch._C; the thin extension is built from stub.c' },
     detail: {
       target: 'torch_python',
       cmake: 'torch/CMakeLists.txt',
       sources: [
-        '— libtorch_python_core_sources (build_variables.bzl:913+) —',
-        'torch/csrc/Module.cpp (PyInit__C)',
+        ': libtorch_python_core_sources (build_variables.bzl:913+): ',
+        'torch/csrc/Module.cpp (initModule)',
         'torch/csrc/autograd/python_*.cpp',
         'torch/csrc/jit/python/**',
         'torch/csrc/jit/passes/onnx*.cpp',
@@ -977,18 +981,18 @@ const NODES = [
         'torch/csrc/utils/**',
         'torch/csrc/{Device,Dtype,Layout,MemoryFormat,Storage,Stream,Event,Generator}.cpp',
         'torch/csrc/{mps,mtia,functorch,functionalization,monitor,onnx,multiprocessing,fx,nativert/python}/**',
-        '— libtorch_python_cuda_core_sources —',
+        ': libtorch_python_cuda_core_sources: ',
         'torch/csrc/cuda/*.cpp (Python 桥:Module / Stream / Event / Graph / MemPool / GreenContext / GdsFile / ...)',
         'torch/csrc/cuda/shared/{cudart,nvtx}.cpp',
-        '— libtorch_python_distributed_sources —',
+        ': libtorch_python_distributed_sources: ',
         'torch/csrc/distributed/c10d/{init, python_comm_hook, python_callback_work}.cpp',
         'torch/csrc/distributed/{autograd,rpc}/**',
-        '— generated —',
+        ': generated: ',
         '${GENERATED_CXX_PYTHON}: python_torch_functions_* / python_variable_methods / python_nn_functions / ...',
       ],
       links: ['${TORCH_LIB} (PRIVATE) = aggregator torch', 'Python::Module', 'pybind11', 'shm', '(optional) cuDNN / cuSPARSELt / cuFile / NVTX / UCC / NumPy'],
-      note: { zh: '关键:链的是空壳 libtorch.so(aggregator),而不是直接 libtorch_cpu / libtorch_cuda。 split-build 模式下这一抽象层不变。',
-              en: 'Key: it links the empty aggregator libtorch.so, not torch_cpu / torch_cuda directly. The indirection is preserved in split-build mode.' },
+      note: { zh: 'CMake target 链接 ${TORCH_LIB};标准构建中它指向 wrapper target torch。最终 ELF 依赖应检查具体 wheel。',
+              en: 'The CMake target links ${TORCH_LIB}, which points to the torch wrapper target in a standard build. Inspect the wheel for final ELF dependencies.' },
     } },
   { id: 'libtorch_global_deps', kind: 'lib-dummy', label: 'libtorch_global_deps.so',
     desc: { zh: '没人链它;Python 启动时 ctypes.CDLL(RTLD_GLOBAL) 单独 dlopen,预加载 MKL / cudart 等',
@@ -998,8 +1002,8 @@ const NODES = [
       cmake: 'caffe2/CMakeLists.txt:1806',
       sources: ['torch/csrc/empty.c (一个空 C 文件)'],
       links: ['MPI_LIBRARIES (PRIVATE)', 'MKL_LIBRARIES (PRIVATE)', 'CUDA::cudart (PRIVATE)', 'CUDA::nvToolsExt (PRIVATE)'],
-      note: { zh: '没有任何 PyTorch 库链接它。 Python 启动时 torch/__init__.py 用 ctypes.CDLL(..., RTLD_GLOBAL) 显式预加载,目的是把 MKL / cudart 等的符号提前进全局符号空间,避免与用户其它依赖(numpy/scipy 自带的 MKL)撞符号或拿到不同实例。',
-              en: 'No PyTorch library links it. At Python startup, torch/__init__.py preloads it via ctypes.CDLL(..., RTLD_GLOBAL) to push MKL / cudart symbols into the global symbol space and avoid clashes (or instance mismatch) with the user\'s other dependencies (e.g. the MKL inside numpy / scipy).' },
+      note: { zh: 'torch/__init__.py 用 ctypes.CDLL(..., RTLD_GLOBAL) 显式预加载。公开 CMake 注释给出的动机是 dlopen 插件的全局符号需求与非标准 CUDA 库路径。',
+              en: 'torch/__init__.py explicitly preloads it with ctypes.CDLL(..., RTLD_GLOBAL). Public CMake comments cite dlopened plugins and non-standard CUDA library paths.' },
     } },
   { id: 'libshm', kind: 'lib', label: 'libshm.so',
     desc: { zh: '跨进程共享内存 Tensor 的 manager;链 torch_cpu',
@@ -1024,8 +1028,8 @@ const NODES = [
               en: 'Deliberately not linked into libtorch directly; PyTorch dlopens it at runtime so environments without NVRTC can still import torch without crashing.' },
     } },
   { id: 'libnnapi_backend', kind: 'lib', label: 'libnnapi_backend.so',
-    desc: { zh: 'Android NNAPI 的 TorchScript backend;Linux 上也无条件 ship,历史遗留',
-            en: 'Android NNAPI TorchScript backend; ships unconditionally on Linux, a historical artefact' },
+    desc: { zh: 'Android NNAPI 的 TorchScript backend;非 Darwin 的 Python 构建会创建该 target',
+            en: 'Android NNAPI TorchScript backend; built for non-Darwin Python configurations' },
     detail: {
       target: 'nnapi_backend',
       cmake: 'torch/CMakeLists.txt:462',
@@ -1034,8 +1038,8 @@ const NODES = [
         'torch/csrc/jit/backends/nnapi/nnapi_backend_preprocess.cpp',
       ],
       links: ['torch (aggregator)', 'torch_python'],
-      note: { zh: '只在 NOT Darwin 时 build,Linux 上无条件 ship。 实际只在 Android NNAPI 设备上有意义,桌面环境基本没人调。',
-              en: 'Built whenever not on Darwin; ships unconditionally on Linux. Only meaningful on Android NNAPI devices; effectively unused in desktop deployments.' },
+      note: { zh: '固定版本的 CMake 在启用 Python 且目标不是 Darwin 时创建该 target。是否进入 wheel 还取决于打包配置。',
+              en: 'The pinned CMake creates this target when Python is enabled and the platform is not Darwin. Wheel inclusion remains packaging-dependent.' },
     } },
   { id: 'libtorch_cuda_linalg', kind: 'lib', label: 'libtorch_cuda_linalg.so',
     desc: { zh: '可选;把 MAGMA / cusolver 的 linalg 内核拆出来 lazy load,主库不必硬链 MAGMA',

@@ -3,17 +3,17 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>oneTrans+YaMBDA study</title>
-<meta name="post:title"      content="oneTrans+YaMBDA study">
-<meta name="post:title_en"   content="oneTrans + YaMBDA study">
+<title>OneTrans 与 YaMBDA 的数据处理流程与特征组织</title>
+<meta name="post:title"      content="OneTrans 与 YaMBDA 的数据处理流程与特征组织">
+<meta name="post:title_en"   content="OneTrans and YaMBDA: Data Processing Flow and Feature Organization">
 <meta name="post:slug"       content="onetrans-yambda-study">
 <meta name="post:date"       content="2026-05-18">
 <meta name="post:tags"       content="推荐系统, MLperf, TorchRec">
 <meta name="post:tags_en"    content="Recommender Systems, MLPerf, TorchRec">
 <meta name="post:reading"    content="20 分钟">
 <meta name="post:reading_en" content="20 min">
-<meta name="post:summary"    content="Yambda 数据集与 OneTrans 数据流梳理：原始 parquet schema、sparse/sequential/dense/cross-product 训练特征清单、embedding 表总览、ScoringPair 字段索引、DataLoader 运行时派生与 candidate 生成,并配 B=2 batch 张量流示例。">
-<meta name="post:summary_en" content="A study of the Yambda dataset and OneTrans data pipeline: parquet schema, sparse / sequential / dense / cross-product feature inventory, embedding-table summary, ScoringPair indexing, DataLoader runtime derivations, candidate generation, and a B=2 batch tensor flow.">
+<meta name="post:summary"    content="OneTrans 将 YaMBDA 事件变为 ScoringPair：行为历史经 KJT 和 embedding lookup 生成 S-token，非序列特征组成 NS-token。Shape 推导表明序列长度主导三张 native 表查询，NS-token 在金字塔裁剪中始终保留。">
+<meta name="post:summary_en" content="OneTrans converts YaMBDA events into target-event ScoringPairs. Behavior histories pass through KJT assembly and embedding lookup to form S-tokens, while scalar embeddings and dense features form NS-tokens. Shape derivations at the pinned commit show that sequence length dominates lookups to the three native embedding tables and that NS-tokens survive every pyramid-trimming stage.">
 <meta name="post:series"          content="recsys">
 <meta name="post:series_title"    content="推荐系统">
 <meta name="post:series_title_en" content="Recommender Systems">
@@ -29,43 +29,43 @@
 <div class="lang-zh">
 <strong>目录</strong>
 <ul>
-  <li><a href="#sec1">1. 原始数据集</a>
+  <li><a href="#zh-sec1">1. 原始数据集</a>
     <ul>
-      <li><a href="#sec1-1">1.1 来源与规模</a></li>
-      <li><a href="#sec1-2">1.2 文件清单</a></li>
-      <li><a href="#sec1-3">1.3 <code>multi_event.parquet</code> Schema</a></li>
+      <li><a href="#zh-sec1-1">1.1 来源与规模</a></li>
+      <li><a href="#zh-sec1-2">1.2 文件清单</a></li>
+      <li><a href="#zh-sec1-3">1.3 <code>multi_event.parquet</code> Schema</a></li>
     </ul>
   </li>
-  <li><a href="#sec2">2. 训练特征清单</a>
+  <li><a href="#zh-sec2">2. 训练特征清单</a>
     <ul>
-      <li><a href="#sec2-1">2.1 Sparse Non-Sequential 特征</a></li>
-      <li><a href="#sec2-2">2.2 Sparse Sequential 特征</a></li>
-      <li><a href="#sec2-3">2.3 Dense 特征</a></li>
-      <li><a href="#sec2-4">2.4 Cross-Product Sparse 特征</a></li>
-      <li><a href="#sec2-5">2.5 Embedding 表总览</a></li>
-      <li><a href="#sec2-6">2.6 <code>ScoringPair</code> 字段索引</a></li>
-      <li><a href="#sec2-7">2.7 多任务标签</a></li>
+      <li><a href="#zh-sec2-1">2.1 Sparse Non-Sequential 特征</a></li>
+      <li><a href="#zh-sec2-2">2.2 Sparse Sequential 特征</a></li>
+      <li><a href="#zh-sec2-3">2.3 Dense 特征</a></li>
+      <li><a href="#zh-sec2-4">2.4 Cross-Product Sparse 特征</a></li>
+      <li><a href="#zh-sec2-5">2.5 Embedding 表总览</a></li>
+      <li><a href="#zh-sec2-6">2.6 <code>ScoringPair</code> 字段索引</a></li>
+      <li><a href="#zh-sec2-7">2.7 多任务标签</a></li>
     </ul>
   </li>
-  <li><a href="#sec3">3. 预处理与数据加载</a>
+  <li><a href="#zh-sec3">3. 预处理与数据加载</a>
     <ul>
-      <li><a href="#sec3-1">3.1 DataLoader 运行时派生</a></li>
-      <li><a href="#sec3-2">3.2 Candidate 生成</a></li>
-      <li><a href="#sec3-3">3.3 多事件拼接为长历史序列</a></li>
+      <li><a href="#zh-sec3-1">3.1 DataLoader 运行时派生</a></li>
+      <li><a href="#zh-sec3-2">3.2 Candidate 生成</a></li>
+      <li><a href="#zh-sec3-3">3.3 多事件拼接为长历史序列</a></li>
     </ul>
   </li>
-  <li><a href="#sec4">4. 总结</a></li>
-  <li><a href="#sec5">5. Batch 张量流(B=2 示例)</a>
+  <li><a href="#zh-sec4">4. 从数据字段到训练样本</a></li>
+  <li><a href="#zh-sec5">5. Batch 张量流与 Token 布局</a>
     <ul>
 
-      <li><a href="#sec5-1">5.1 输入示例(B=2, L=4)</a></li>
-      <li><a href="#sec5-2">5.2 Collate 后的张量</a></li>
-      <li><a href="#sec5-3">5.3 每表 Lookup 次数</a></li>
-      <li><a href="#sec5-4">5.4 Lookup 到 Token 的转换</a></li>
-      <li><a href="#sec5-5">5.5 Lookup 后的张量形状</a></li>
-      <li><a href="#sec5-6">5.6 Dense 特征处理路径</a></li>
-      <li><a href="#sec5-7">5.7 Attention 输入的 token 排列(按 feature name)</a></li>
-      <li><a href="#sec5-8">5.8 全流程可视化(Raw → Attention)</a></li>
+      <li><a href="#zh-sec5-1">5.1 输入示例(B=2, L=4)</a></li>
+      <li><a href="#zh-sec5-2">5.2 Collate 后的张量</a></li>
+      <li><a href="#zh-sec5-3">5.3 每表 Lookup 次数</a></li>
+      <li><a href="#zh-sec5-4">5.4 Lookup 到 Token 的转换</a></li>
+      <li><a href="#zh-sec5-5">5.5 Lookup 后的张量形状</a></li>
+      <li><a href="#zh-sec5-6">5.6 Dense 特征处理路径</a></li>
+      <li><a href="#zh-sec5-7">5.7 Attention 输入的 token 排列(按 feature name)</a></li>
+      <li><a href="#zh-sec5-8">5.8 全流程可视化(Raw → Attention)</a></li>
     </ul>
   </li>
 </ul>
@@ -98,8 +98,8 @@
       <li><a href="#en-sec3-3">3.3 Multi-event concatenation into long history sequences</a></li>
     </ul>
   </li>
-  <li><a href="#en-sec4">4. Summary</a></li>
-  <li><a href="#en-sec5">5. Batch tensor flow (B=2 example)</a>
+  <li><a href="#en-sec4">4. From Dataset Fields to Training Samples</a></li>
+  <li><a href="#en-sec5">5. Batch Tensor Flow and Token Layout</a>
     <ul>
 
       <li><a href="#en-sec5-1">5.1 Input example (B=2, L=4)</a></li>
@@ -120,24 +120,24 @@
 
 <div class="lang-zh">
 
-<h1>oneTrans+YaMBDA study</h1>
+<h1>OneTrans 与 YaMBDA 的数据处理流程与特征组织</h1>
 
-<p><strong>仓库</strong>:<a href="https://github.com/AMD-AGI/Primus-DLRM">github.com/AMD-AGI/Primus-DLRM</a> &mdash; AMD-AGI 开源的 DLRM/OneTrans benchmark 实现。本文按写作时的 <code>main</code> 分支核对代码路径、行号和 config;如果上游后续改动导致行号漂移,以文件路径和附近符号名为准。</p>
+<p class="lead">OneTrans 从音乐行为日志中同时构造候选特征、用户历史与多任务标签。原始事件先经过时间切分和会话整理，再由 DataLoader 派生 categorical ID、计数器与定长历史；这些字段经 KJT 组装和 embedding lookup 后，分别进入 S-token 与 NS-token。本文沿着这条数据路径，把 YaMBDA 的静态 schema、<code>ScoringPair</code> 样本结构和 attention 输入的运行时 shape 对齐起来。</p>
 
-<p>本文档说明 Yambda 数据集在 Primus-DLRM 仓库里被预处理、特征化、最终喂入 OneTrans 模型的完整数据流 &mdash; 从 raw input 一路到 attention 输入、再到 loss。</p>
+<p><strong>仓库快照</strong>:<a href="https://github.com/AMD-AGI/Primus-DLRM/tree/52733ce83e20fb64137c79bb3508768de4975de5"><code>AMD-AGI/Primus-DLRM@52733ce</code></a>。本文中的源码行为、配置值和行号均以该公开提交为准。</p>
 
 <div class="callout note">
-阅读建议:§1-§2 是<strong>静态特征清单</strong>(数据集字段、训练特征、embedding 表),§3 是<strong>预处理逻辑</strong>,§5 是<strong>动态数据流</strong>(逐张量 shape + 模型每层的 seqlen 变化)。详细结论在文末 §4。
+涉及 7 张 cross 表和 20 个 KJT key 的推导特指 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/configs/bench_onetrans_large_5b_cross_feat_shampoo.yaml"><code>bench_onetrans_large_5b_cross_feat_shampoo.yaml</code></a>;基础 5B 配置只有 4 张 native 表。
 </div>
 
 <hr>
 
-<h2 id="sec1">1. 原始数据集</h2>
+<h2 id="zh-sec1">1. 原始数据集</h2>
 
-<h3 id="sec1-1">1.1 来源与规模</h3>
+<h3 id="zh-sec1-1">1.1 来源与规模</h3>
 <ul>
-  <li><strong>Yambda</strong>(YaMBDA / Yandex Music Behavior Dataset),Yandex Music 于 <strong>2024 年</strong>通过 HuggingFace <code>yandex/yambda</code> 公开发布(Apache 2.0)</li>
-  <li>三档:<strong>50M / 500M / 5B</strong> 事件 &mdash; Primus-DLRM 默认使用 <strong>Yambda-5B</strong>(4.79B 真实事件)</li>
+  <li><strong>Yambda</strong>(YaMBDA / Yandex Music Behavior Dataset),Yandex Music 于 <strong>2025 年</strong>通过 <a href="https://huggingface.co/datasets/yandex/yambda/blob/241f44fbc77206c8c414fb665de5046b36a0a3fb/README.md">Hugging Face 数据集卡</a>公开(Apache 2.0)</li>
+  <li>三档:<strong>50M / 500M / 5B</strong> 事件;本文聚焦 Primus-DLRM 的 <strong>Yambda-5B</strong> 配置(4.79B 真实事件)</li>
   <li>5B 档全局统计:
     <ul>
       <li>Users: <strong>1M</strong></li>
@@ -148,23 +148,23 @@
   </li>
 </ul>
 
-<h3 id="sec1-2">1.2 文件清单</h3>
-<p>HuggingFace 下载,见 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/download.py#L11-L26">download.py:11-26</a>。</p>
+<h3 id="zh-sec1-2">1.2 文件清单</h3>
+<p>HuggingFace 下载,见 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/download.py#L11-L26">download.py:11-26</a>。</p>
 
 <table>
 <thead>
 <tr><th>文件</th><th>类型</th><th>内容</th></tr>
 </thead>
 <tbody>
-<tr><td><code>flat/&lt;size&gt;/multi_event.parquet</code></td><td><strong>事件流</strong></td><td>真正的训练数据,行级用户-曲目交互</td></tr>
+<tr><td><code>flat/&lt;size&gt;/multi_event.parquet</code></td><td><strong>事件流</strong></td><td>用于训练的行级用户-曲目交互</td></tr>
 <tr><td><code>embeddings.parquet</code></td><td><strong>物品目录元数据</strong></td><td>每首曲目的预训练音频嵌入,128 维(~14 GB,3 档共享)</td></tr>
 <tr><td><code>artist_item_mapping.parquet</code></td><td>物品目录元数据</td><td>item_id → artist_id</td></tr>
 <tr><td><code>album_item_mapping.parquet</code></td><td>物品目录元数据</td><td>item_id → album_id</td></tr>
 </tbody>
 </table>
 
-<h3 id="sec1-3">1.3 <code>multi_event.parquet</code> Schema</h3>
-<p>来自 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py#L166-L172">preprocessing.py:166-172</a>。</p>
+<h3 id="zh-sec1-3">1.3 <code>multi_event.parquet</code> Schema</h3>
+<p>来自 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/preprocessing.py#L166-L172">preprocessing.py:166-172</a>。</p>
 
 <table>
 <thead>
@@ -182,16 +182,16 @@
 </table>
 
 <div class="callout note">
-⚠️ 注意:<code>artist_id / album_id</code> <strong>不在事件表里</strong>,要通过 <code>artist_item_mapping / album_item_mapping</code> 用 <code>item_id</code> 现场 join。
+<code>artist_id / album_id</code> 属于物品目录属性。DataLoader 以事件表中的 <code>item_id</code> 为键，通过 <code>artist_item_mapping / album_item_mapping</code> 现场 join 得到这两个字段。
 </div>
 
 <hr>
 
-<h2 id="sec2">2. 训练特征清单</h2>
+<h2 id="zh-sec2">2. 训练特征清单</h2>
 
-<p>仓库 schema 定义在 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/schemas/yambda.yaml">configs/schemas/yambda.yaml</a>,embedding 表与 dense 特征定义在每个 config 文件里。下面按 <em>是否序列化</em> 切开。</p>
+<p>仓库 schema 定义在 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/configs/schemas/yambda.yaml">configs/schemas/yambda.yaml</a>,embedding 表与 dense 特征则由具体 config 补充。训练特征可按每个样本贡献一个值的 scalar 特征与贡献一段历史的 sequential 特征划分;cross 与 dense 特征在此基础上补充上下文。</p>
 
-<h3 id="sec2-1">2.1 Sparse Non-Sequential 特征</h3>
+<h3 id="zh-sec2-1">2.1 Sparse Non-Sequential 特征</h3>
 <p>来源:用户上下文 + 候选曲目本身。共 4 个 scalar feature,对应 <strong>4 张 native sparse 表</strong>。</p>
 
 <table>
@@ -206,15 +206,15 @@
 </tbody>
 </table>
 
-<p class="small">(见 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/bench_onetrans_large_5b.yaml#L46-L50">bench_onetrans_large_5b.yaml:46-50</a>)</p>
+<p class="small">(见 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/configs/bench_onetrans_large_5b.yaml#L46-L50">bench_onetrans_large_5b.yaml:46-50</a>)</p>
 
-<h3 id="sec2-2">2.2 Sparse Sequential 特征</h3>
+<h3 id="zh-sec2-2">2.2 Sparse Sequential 特征</h3>
 
-<p>OneTrans 的灵魂:用户历史按行为切成 <strong>3 个池子</strong>,每个池子记 3 种实体 ID,因此每样本 <strong>9 条 sequence</strong>。<code>L = history_length</code>(5B 配置 L=500 → S-token 序列长度 <code>L_S = 1500</code>)。</p>
+<p>OneTrans 按行为把用户历史分成 <strong>3 个池子</strong>，每个池子记录 3 种实体 ID，因此每个样本包含 <strong>9 条 sequence</strong>。<code>L = history_length</code>；5B 配置中 <code>L=500</code>，对应 S-token 序列长度 <code>L_S=1500</code>。</p>
 
 <table>
 <thead>
-<tr><th>Pool(行为池)</th><th>定义 (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L189-L191">dataset.py:189-191</a>)</th><th>3 条 sequence 名</th></tr>
+<tr><th>Pool(行为池)</th><th>定义 (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L189-L191">dataset.py:189-191</a>)</th><th>3 条 sequence 名</th></tr>
 </thead>
 <tbody>
 <tr>
@@ -236,13 +236,13 @@
 </table>
 
 <div class="callout note">
-注意:这 9 条序列<strong>没有独立的嵌入表</strong> &mdash; 它们和对应的 non-sequential scalar 共用同一张表(item/artist/album 各一张):
+这 9 条序列与对应的 non-sequential scalar 共享实体 embedding 表:item、artist 和 album 各使用一张表:
 <pre><code>- { name: item, features: [item, hist_lp_item, hist_like_item, hist_skip_item], ... }</code></pre>
-即候选曲目和历史曲目共享同一个 9.39M 行的 item 表 &mdash; 4 个 native sparse features 各对应一张表。
+因此,候选曲目与历史曲目都查询同一个 9.39M 行的 item 表;4 类 native sparse entity 分别对应一张表。
 </div>
 
-<h3 id="sec2-3">2.3 Dense 特征</h3>
-<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/bench_onetrans_large_5b.yaml#L58-L62">bench_onetrans_large_5b.yaml:58-62</a>:</p>
+<h3 id="zh-sec2-3">2.3 Dense 特征</h3>
+<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/configs/bench_onetrans_large_5b.yaml#L58-L62">bench_onetrans_large_5b.yaml:58-62</a>:</p>
 
 <table>
 <thead>
@@ -256,14 +256,14 @@
 </tbody>
 </table>
 
-<p>计数器特征由 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/counters.py">primus_dlrm/data/counters.py</a> 在预处理时用 Numba 滑动窗口算出。</p>
+<p>计数器特征由 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/counters.py">primus_dlrm/data/counters.py</a> 在预处理时用 Numba 滑动窗口算出。</p>
 
-<h3 id="sec2-4">2.4 Cross-Product Sparse 特征</h3>
-<p>只有 <code>bench_onetrans_large_5b_cross_feat_shampoo.yaml</code> 开启。这 7 张 cross 表(<code>user_x_artist</code> / <code>user_x_album</code> / <code>user_x_hour</code> / <code>item_x_hour</code> / <code>artist_x_hour</code> / <code>user_x_is_organic</code> / <code>user_x_artist_x_hour</code>)是把 embedding footprint 显著放大的关键设计。</p>
+<h3 id="zh-sec2-4">2.4 Cross-Product Sparse 特征</h3>
+<p>只有 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/configs/bench_onetrans_large_5b_cross_feat_shampoo.yaml#L32-L47"><code>bench_onetrans_large_5b_cross_feat_shampoo.yaml:32-47</code></a> 开启。这 7 张 cross 表分别是 <code>user_x_artist</code> / <code>user_x_album</code> / <code>user_x_hour</code> / <code>item_x_hour</code> / <code>artist_x_hour</code> / <code>user_x_is_organic</code> / <code>user_x_artist_x_hour</code>。</p>
 
-<h3 id="sec2-5">2.5 Embedding 表总览</h3>
+<h3 id="zh-sec2-5">2.5 Embedding 表总览</h3>
 
-<p>所有 sparse 特征最终都要打到下面 11 张表里的某一张:</p>
+<p>在上述 cross-feature 配置中,每个 sparse feature 都通过 KJT key 解析到以下 11 张表之一:</p>
 
 <table>
 <thead>
@@ -285,30 +285,30 @@
 </table>
 
 <div class="callout note">
-<strong>关键映射规则</strong>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/pipeline_batch.py">pipeline_batch.py</a>):每个 batch 里的每个 sparse 张量,通过 <code>schema.batch_to_feature</code> 把"batch 里的字段名"映射到"KJT feature 名",再通过 <code>embedding_tables[*].features</code> 找到对应的表。<strong>4 张 native 表被 13 个 KJT feature 共享</strong>(候选 + 9 条历史序列,共享 item/artist/album/uid),<strong>7 张 cross 表各占 1 个 KJT feature</strong>。
+<strong>字段到表的映射</strong>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/pipeline_batch.py">pipeline_batch.py</a>):<code>schema.batch_to_feature</code> 先把 batch 字段名转换为 KJT feature 名,<code>embedding_tables[*].features</code> 再把 feature 解析到 embedding 表。<strong>4 张 native 表由 13 个 KJT feature 共享</strong>(候选 + 9 条历史序列,共享 item/artist/album/uid),<strong>7 张 cross 表各对应 1 个 KJT feature</strong>。
 </div>
 
-<h3 id="sec2-6">2.6 <code>ScoringPair</code> 字段索引</h3>
+<h3 id="zh-sec2-6">2.6 <code>ScoringPair</code> 字段索引</h3>
 
-<p>每条训练样本(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L110-L143">dataset.py:110-143</a> 定义)对应一次 <code>(user, candidate_item, target_event)</code> 评分,按字段族分组:</p>
+<p>每条训练样本(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L110-L143">dataset.py:110-143</a> 定义)对应一次 <code>(user, candidate_item, target_event)</code> 评分,按字段族分组:</p>
 
 <table>
 <thead>
 <tr><th>字段族</th><th>个数</th><th>形状</th><th>关联小节</th></tr>
 </thead>
 <tbody>
-<tr><td>sparse non-sequential scalar</td><td>4</td><td><code>[B]</code> 各</td><td><a href="#sec2-1">§2.1</a></td></tr>
-<tr><td>sparse sequential</td><td>9(3 pool × 3 entity)</td><td><code>[B, L]</code> 各</td><td><a href="#sec2-2">§2.2</a></td></tr>
-<tr><td>sparse cross-product(可选)</td><td>7</td><td><code>[B]</code> 各</td><td><a href="#sec2-4">§2.4</a></td></tr>
-<tr><td>dense</td><td>4</td><td><code>[B, 128] / [B, 6] × 2 / [B, 18]</code></td><td><a href="#sec2-3">§2.3</a></td></tr>
-<tr><td>labels</td><td>4(多任务)</td><td><code>[B]</code> 各</td><td><a href="#sec2-7">§2.7</a></td></tr>
+<tr><td>sparse non-sequential scalar</td><td>4</td><td><code>[B]</code> 各</td><td><a href="#zh-sec2-1">§2.1</a></td></tr>
+<tr><td>sparse sequential</td><td>9(3 pool × 3 entity)</td><td><code>[B, L]</code> 各</td><td><a href="#zh-sec2-2">§2.2</a></td></tr>
+<tr><td>sparse cross-product(可选)</td><td>7</td><td><code>[B]</code> 各</td><td><a href="#zh-sec2-4">§2.4</a></td></tr>
+<tr><td>dense</td><td>4</td><td><code>[B, 128] / [B, 6] × 2 / [B, 18]</code></td><td><a href="#zh-sec2-3">§2.3</a></td></tr>
+<tr><td>labels</td><td>4(多任务)</td><td><code>[B]</code> 各</td><td><a href="#zh-sec2-7">§2.7</a></td></tr>
 </tbody>
 </table>
 
-<p>具体字段名称、含义、padding 行为见上面各小节;一个 <code>B=2</code> 实际样本(含每个字段的具体 ID/值)展开见 <a href="#sec5-1">§5.1</a>。</p>
+<p>具体字段名称、含义、padding 行为见上面各小节;一个 <code>B=2</code> 实际样本(含每个字段的具体 ID/值)展开见 <a href="#zh-sec5-1">§5.1</a>。</p>
 
-<h3 id="sec2-7">2.7 多任务标签</h3>
-<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L558-L561">dataset.py:558-561</a>:</p>
+<h3 id="zh-sec2-7">2.7 多任务标签</h3>
+<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L558-L561">dataset.py:558-561</a>:</p>
 
 <table>
 <thead>
@@ -326,9 +326,9 @@
 
 <hr>
 
-<h2 id="sec3">3. 预处理与数据加载</h2>
+<h2 id="zh-sec3">3. 预处理与数据加载</h2>
 
-<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py">primus_dlrm/data/preprocessing.py</a> 的 <code>preprocess()</code> 一站式做完:</p>
+<p>离线预处理负责建立可复用的数据资产,DataLoader 则以目标事件为中心组装训练样本。<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/preprocessing.py">primus_dlrm/data/preprocessing.py</a> 中的 <code>preprocess()</code> 依次执行:</p>
 
 <pre><code>Raw parquet (4.79B 行, ~195 GB)
    ↓ ① 流式加载                                          _load_chunked
@@ -343,24 +343,24 @@
    └──→ data/shared_metadata/          ⑥ embeddings/artist/album mapping 三档共享
 </code></pre>
 
-<p class="small">关键代码:<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py#L123-L132">_compute_split_boundaries</a> · <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py#L150-L176">_build_sessions</a> · <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py#L218-L287">_load_and_save_metadata</a>。<code>event_type</code> 编码:<code>listen=0, like=1, dislike=2, unlike=3, undislike=4</code>。test 用户必须在 train 出现过,否则丢弃。</p>
+<p class="small">对应代码:<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/preprocessing.py#L123-L132">_compute_split_boundaries</a> · <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/preprocessing.py#L150-L176">_build_sessions</a> · <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/preprocessing.py#L218-L287">_load_and_save_metadata</a>。<code>event_type</code> 编码为 <code>listen=0, like=1, dislike=2, unlike=3, undislike=4</code>;test 集保留曾在 train 集出现的用户。</p>
 
-<h3 id="sec3-1">3.1 DataLoader 运行时派生</h3>
-<p>见 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py">primus_dlrm/data/dataset.py</a>:</p>
+<h3 id="zh-sec3-1">3.1 DataLoader 运行时派生</h3>
+<p>见 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py">primus_dlrm/data/dataset.py</a>:</p>
 
 <ol>
-  <li>把会话事件 flatten 成 <code>(uid, item, ts, event_type, played_ratio_pct, is_organic, ...)</code> 的 NumPy 数组,以 <strong>MAP_SHARED + PROT_READ</strong> 的 mmap 方式加载,零虚拟内存承诺(关键 &mdash; 5B 档下 8 ranks × 700 GB cache 不会撑爆 overcommit)</li>
+  <li>把会话事件 flatten 成 NumPy 数组。<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L21-L48"><code>_load_npy_readonly</code></a> 使用只读共享 mmap;源码注释说明这是为了避免每个进程重复计入 copy-on-write 的 overcommit。具体记账行为仍取决于操作系统。</li>
   <li>派生掩码:<code>flat_is_listen_plus / flat_is_like / flat_is_skip</code>(三个布尔数组)</li>
   <li>抽样 <code>(user, target_event)</code> 后,<strong>回扫该用户在 target 时刻之前的事件</strong>,按三个掩码切片得到 9 条历史序列(裁剪到 <code>history_length</code>)</li>
-  <li>现场算 <code>hour_of_day = (ts // 3600) % 24</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L588">dataset.py:588</a>)、读 <code>is_organic</code>,用于 cross-feature 哈希</li>
-  <li><strong>xxhash64 现算 cross-feature ID</strong>(不落盘,见 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/hashing.py">hashing.py</a>)→ 喂给 KeyedJaggedTensor</li>
+  <li>现场算 <code>hour_of_day = (ts // 3600) % 24</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L588">dataset.py:588</a>)、读 <code>is_organic</code>,用于 cross-feature 哈希</li>
+  <li><strong>xxhash64 现算 cross-feature ID</strong>(不落盘,见 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/hashing.py">hashing.py</a>)→ 喂给 KeyedJaggedTensor</li>
 </ol>
 
-<h3 id="sec3-2">3.2 Candidate 生成</h3>
+<h3 id="zh-sec3-2">3.2 Candidate 生成</h3>
 
-<p>仓库<strong>没有显式负采样</strong> &mdash; 每条训练样本的 candidate 直接就是用户 timeline 上某个真实事件的 item,label 来自那个事件的 <code>event_type</code> 和 <code>played_ratio</code>。</p>
+<p>这里的 <strong>candidate</strong> 是用户 timeline 上被选作监督目标的真实事件 item。其 <code>event_type</code> 与 <code>played_ratio</code> 同时生成多任务标签,默认训练由真实行为分布提供正负反馈。</p>
 
-<h4>(a) 样本位置的枚举(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L458-L500"><code>_build_sample_positions</code></a>)</h4>
+<h4>(a) 样本位置的枚举(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L458-L500"><code>_build_sample_positions</code></a>)</h4>
 
 <pre><code>for uid in users:
     user_event_count = user_end[uid] - user_start[uid]
@@ -370,7 +370,7 @@
 
 <p>用户 timeline 上<strong>第 (L+1) 个事件起的每一个事件位置都是一个训练样本</strong>。1M 用户 × 平均数千事件 → 数十亿个训练样本。</p>
 
-<h4>(b) 取样本时的 candidate 派生(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L505-L564"><code>YambdaTrainDataset.__getitem__</code></a>)</h4>
+<h4>(b) 取样本时的 candidate 派生(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L505-L564"><code>YambdaTrainDataset.__getitem__</code></a>)</h4>
 
 <pre><code>flat_pos      = self._positions[idx]                          # 选一个事件位置
 uid           = self.store.flat_uid[flat_pos]
@@ -397,13 +397,13 @@ audio         = self.audio_embeddings[target_item]            # 预训练音频 
 </tbody>
 </table>
 
-<p>每个事件最多只有一个 label 为 1。这是典型的 <strong>implicit-feedback multi-task ranking</strong>:listen+ 的负样本来自"听了但没听完"的真实事件,like / dislike 的负样本来自"做了别的动作"的真实事件,完全靠真实行为分布提供训练信号 &mdash; <strong>不需要从全体 9.39M item 里采样负例</strong>。</p>
+<p>每个事件最多只有一个 label 为 1,由此形成 <strong>implicit-feedback multi-task ranking</strong>:listen+ 的负反馈来自"听了但没听完"的真实事件,like / dislike 的负反馈来自执行其他动作的真实事件。默认路径直接使用这些行为信号,不从全体 9.39M item 额外抽取负例。</p>
 
-<p class="small">注:仓库的 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/negatives.py">data/negatives.py</a> 提供 in-batch BPR 负采样,但默认 <code>contrastive_weight=0</code>,这条路径不参与默认训练。</p>
+<p class="small">仓库的 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/negatives.py">data/negatives.py</a> 另行提供 in-batch BPR 负采样;默认 <code>contrastive_weight=0</code> 时该路径关闭。</p>
 
-<h3 id="sec3-3">3.3 多事件拼接为长历史序列</h3>
+<h3 id="zh-sec3-3">3.3 多事件拼接为长历史序列</h3>
 
-<p>关键认识:<strong>"把同一用户的多个 interaction 拼成一条按时间排序的长序列"这件事不是 DataLoader 在 <code>__getitem__</code> 里现做的,而是在 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L146-L206"><code>FlatEventStore.__init__</code></a> 一次性做完</strong>。每个 <code>__getitem__</code> 只是在已经拼好的长数组里切一段窗口。</p>
+<p><strong><code>FlatEventStore</code></strong> 是按用户和时间组织事件的连续数组存储。<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L146-L206"><code>FlatEventStore.__init__</code></a> 在加载阶段一次性完成 session 排序、展开和数组拼接;随后每次 <code>__getitem__</code> 只需按用户范围与目标位置切出历史窗口。</p>
 
 <h4>(a) 一次性的 flatten(预处理 + Store 构建阶段)</h4>
 
@@ -440,13 +440,14 @@ self.user_start[uid_vals] = starts
 self.user_end[uid_vals]   = ends
 </code></pre>
 
-<p>对任意 <code>uid</code>,该用户的完整按时间排序的 event 历史 = <code>flat_*[user_start[uid] : user_end[uid]]</code> 这一连续切片 &mdash; <strong>session 之间是无缝拼接的</strong>,序列里不保留 session 边界。</p>
+<p>对任意 <code>uid</code>,该用户的完整按时间排序的 event 历史 = <code>flat_*[user_start[uid] : user_end[uid]]</code> 这一连续切片；<strong>session 之间是无缝拼接的</strong>,序列里不保留 session 边界。</p>
 
-<h4>(c) 取样本时的"窗口扫描"(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L604-L636"><code>_get_split_history</code></a>)</h4>
+<h4>(c) 取样本时的"窗口扫描"(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L604-L636"><code>_get_split_history</code></a>)</h4>
 
 <pre><code>L          = config.data.history_length                       # 5B 配置 = 500
 scan_end   = flat_pos                                           # 当前事件位置(不含)
-scan_start = max(user_start[uid], flat_pos - 500)              # 回扫窗口,封顶 500 个 event
+scan_window = config.data.scan_window                           # 默认 500，可配置
+scan_start  = max(user_start[uid], flat_pos - scan_window)      # 原始事件回扫窗口
 
 item_ids = self.store.flat_item_ids[scan_start:scan_end]
 is_lp    = self.store.flat_is_listen_plus[scan_start:scan_end]   # 预先算好的布尔掩码
@@ -462,7 +463,7 @@ padded = np.zeros(L, dtype=np.int64)
 padded[L - n:] = items
 </code></pre>
 
-<h4>(d) 一图总结</h4>
+<h4>(d) 存储布局与取样路径</h4>
 
 <pre><code>FlatEventStore (一次性,所有 user 共享):
 
@@ -485,39 +486,41 @@ padded[L - n:] = items
   └─ ScoringPair(9 条 [L] 历史序列 + candidate scalar + dense + cross + labels)
 </code></pre>
 
-<h4>关键设计取舍</h4>
+<h4>存储与序列语义</h4>
 
 <ul>
-  <li><strong>预处理时 flatten 一次,训练时 zero-copy 扫窗口</strong> &mdash; 避免 DataLoader worker 反复做"分组 / 排序 / explode"。
+  <li><strong>预处理时 flatten 一次,训练时 zero-copy 扫窗口</strong>：避免 DataLoader worker 反复做"分组 / 排序 / explode"。
   </li>
-  <li><strong>右对齐 padding + 位置嵌入 0..L-1</strong> &mdash; 最近事件总在 index <code>L-1</code> 的位置,模型看到的"最近时间"在跨用户间稳定;但 padding 占了序列前段的位置嵌入,模型需要自己学会从向量 0 区分 padding。
+  <li><strong>右对齐 padding + 位置嵌入 0..L-1</strong>：最近事件总在 index <code>L-1</code> 的位置,模型看到的"最近时间"在跨用户间稳定;但 padding 占了序列前段的位置嵌入,模型需要自己学会从向量 0 区分 padding。
   </li>
-  <li><strong>session 边界丢弃</strong> &mdash; flat 序列里两个 session 之间没有 "[SEP]" 之类的标记,模型只能从 <code>timestamps</code>(并未作为 token 输入)的间隔推断,实际上不做显式 session-aware 建模。
+  <li><strong>跨 session 的连续历史</strong>：flat 序列将同一用户的 session 首尾相接,不插入 "[SEP]" 标记。<code>timestamps</code> 也未作为 token 输入,因此模型使用的是连续行为历史语义。
   </li>
-  <li><strong>回扫窗口硬编码 500</strong> &mdash; 不论 <code>history_length</code> 设置成多少,真实有效 token 数封顶 500(三池总和)。把 L 调到 &gt; 500 会得到更多 padding 而非更多信号。
+  <li><strong>训练回扫窗口与每池长度是两个配置</strong>：<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/config.py#L84-L99"><code>scan_window</code></a> 控制先读取多少个原始事件，<code>history_length</code> 再从每个 pool 保留最近 L 个。两者默认分别为 500 和 20；本文使用的 5B 配置把 L 设为 500，但没有覆盖 <code>scan_window</code>，因此训练样本仍只扫描最近 500 个原始事件。固定提交的 eval <code>get_user_history()</code> 仍直接写死 500，和训练路径并不完全一致。
   </li>
 </ul>
 
 <hr>
 
-<h2 id="sec4">4. 总结</h2>
+<h2 id="zh-sec4">4. 从数据字段到训练样本</h2>
+
+<p>静态 schema 与运行时数据流在 <code>ScoringPair</code> 汇合。每个目标事件提供候选及标签,目标之前的用户事件提供序列上下文,目录与统计资产补齐实体属性和 dense 特征。由此形成四条来源明确的字段路径:</p>
 
 <ul>
-  <li><strong>原始数据</strong>:Yambda 是 Yandex Music 公开的 4.79B 真实交互事件,每行 7 个字段(<code>uid, item_id, timestamp, event_type, is_organic, played_ratio_pct, track_length_seconds</code>)+ 三个共享目录文件(audio 嵌入、item→artist、item→album)。</li>
-  <li><strong>训练时</strong>:4 个 non-sequential sparse(uid/item/artist/album)+ 9 个 sequential sparse(3 pool × 3 entity,共享 4 张原生表)+ 4 类 dense(audio_embed/user_counters/item_counters/cross_counters),外加 4 个标签(listen+/like/dislike/played_ratio)。</li>
-  <li><strong>预处理</strong>:GTS 时间切分(300d train + 30min gap + 1d test)→ 30 分钟会话切分 → listen+/like/skip 三池切分 → 多窗口计数器。</li>
-  <li><strong>Cross-product 实现</strong>:仓库实现了 7 张 cross 表(名字、cardinality、hash 行为齐备),xxhash64 跨架构可复现;当前 <code>embedding_dim=64</code>,把 embedding footprint 控制在 ~75 GB。</li>
+  <li><strong>目标事件</strong>提供 <code>uid/item</code>、事件上下文与四个多任务标签;artist、album 和 audio embedding 通过目录映射补齐。</li>
+  <li><strong>目标之前的用户窗口</strong>按 listen+/like/skip 三个行为池过滤,形成 9 条右对齐的 entity 历史序列。</li>
+  <li><strong>离线统计资产</strong>提供 user、item 与 user-item counter;运行时字段提供 hour 与 <code>is_organic</code>。</li>
+  <li><strong>运行时组装</strong>用 xxhash64 生成 7 个 cross ID,再把 4 个 native scalar、9 条 sequence 和 7 个 cross scalar 写入单一 KJT。</li>
 </ul>
 
 <hr>
 
-<h2 id="sec5">5. Batch 张量流(B=2 示例)</h2>
+<h2 id="zh-sec5">5. Batch 张量流与 Token 布局</h2>
 
-<h3 id="sec5-1">5.1 输入示例(B=2, L=4)</h3>
+<h3 id="zh-sec5-1">5.1 输入示例(B=2, L=4)</h3>
 
-<p>(实际 5B 配置是 <code>B_per_gpu=2048, L=500</code>,这里把 L 缩到 4 是为了可读。)</p>
+<p>本节先用 <code>B=2, L=4</code> 展开每个 ID 的排列,再把形状公式代入真实配置。在固定提交中,cross-feature 配置写入全局 <code>batch_size=8192</code> 和 8 张 GPU(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/configs/bench_onetrans_large_5b_cross_feat_shampoo.yaml#L69-L91">配置</a>),启动代码按 world size 相除(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/scripts/run_distributed.py#L239">runner</a>),因此生产 shape 使用 <code>B_per_gpu=1024, L=500</code>。基础配置文件头部的“per-GPU batch=2048”注释与可执行配置不一致。</p>
 
-<h4>样本 #0 &mdash; user 42 在评分曲目 #999</h4>
+<h4>样本 #0：user 42 在评分曲目 #999</h4>
 <pre><code>uid              = 42
 item_id          = 999          # 候选
 artist_id        = 88           # 候选曲目的艺术家(从 mapping join 而来)
@@ -528,9 +531,9 @@ hist_lp_item_ids   = [101, 102, 103, 104]
 hist_lp_artist_ids = [ 11,  12,  11,  13]
 hist_lp_album_ids  = [201, 202, 201, 203]
 
-hist_like_item_ids   = [102, 105,   0,   0]   # 只有 2 个 like,后面 0 padding
-hist_like_artist_ids = [ 12,  14,   0,   0]
-hist_like_album_ids  = [202, 204,   0,   0]
+hist_like_item_ids   = [  0,   0, 102, 105]   # 只有 2 个 like，左侧补 0
+hist_like_artist_ids = [  0,   0,  12,  14]
+hist_like_album_ids  = [  0,   0, 202, 204]
 
 hist_skip_item_ids   = [301, 302, 303, 304]
 hist_skip_artist_ids = [ 21,  22,  21,  23]
@@ -538,13 +541,13 @@ hist_skip_album_ids  = [401, 402, 401, 403]
 
 # Cross-product 现算 ID(假设当前事件 timestamp 对应的 hour=14, is_organic=1)
 cross_ids = {
-  "user_x_artist":         xxhash64(42, 88)        % 100_000_000 = 42_103_771,
-  "user_x_album":          xxhash64(42, 333)       %  40_000_000 = 18_204_009,
-  "user_x_hour":           xxhash64(42, 14)        %  24_000_000 =  1_008_544,
-  "item_x_hour":           xxhash64(999, 14)       %  40_000_000 = 27_113_002,
-  "artist_x_hour":         xxhash64(88, 14)        %  32_000_000 = 14_750_388,
-  "user_x_is_organic":     xxhash64(42, 1)         %   2_000_000 =     31_557,
-  "user_x_artist_x_hour":  xxhash64(42, 88, 14)    %  40_000_000 = 33_902_115,
+  "user_x_artist":         xxhash64(42, 88)        % 100_000_000,
+  "user_x_album":          xxhash64(42, 333)       %  40_000_000,
+  "user_x_hour":           xxhash64(42, 14)        %  24_000_000,
+  "item_x_hour":           xxhash64(999, 14)       %  40_000_000,
+  "artist_x_hour":         xxhash64(88, 14)        %  32_000_000,
+  "user_x_is_organic":     xxhash64(42, 1)         %   2_000_000,
+  "user_x_artist_x_hour":  xxhash64(42, 88, 14)    %  40_000_000,
 }
 
 # Dense
@@ -560,13 +563,13 @@ dislike     = 0.0
 listen_pct  = 0.85
 </code></pre>
 
-<h4>样本 #1 &mdash; user 7 在评分曲目 #2024(只列与样本 #0 不同的字段)</h4>
+<h4>样本 #1：user 7 在评分曲目 #2024(只列与样本 #0 不同的字段)</h4>
 <pre><code>uid=7 · item_id=2024 · artist_id=501 · album_id=1700
 
 # 同一 user 在不同 pool 的真实历史长度不同:lp=2 / like=4 / skip=2,padding 落在前面
-hist_lp_item_ids   = [555, 556,   0,   0]      # 注意 0 padding 在前(右对齐)
+hist_lp_item_ids   = [  0,   0, 555, 556]      # 左侧补 0，真实事件右对齐
 hist_like_item_ids = [556, 600, 700, 800]
-hist_skip_item_ids = [901, 902,   0,   0]
+hist_skip_item_ids = [  0,   0, 901, 902]
 # (artist / album 同样 right-aligned padding,值略)
 
 # Cross ID 走相同的 xxhash64 流程,假设此处 hour=3, is_organic=0
@@ -576,9 +579,9 @@ cross_ids = { "user_x_artist": xxhash64(7, 501) % 100M, ... }   # 7 个,值随�
 listen_plus = 0.0   ·   like = 1.0   ·   dislike = 0.0   ·   listen_pct = 0.0
 </code></pre>
 
-<h3 id="sec5-2">5.2 Collate 后的张量</h3>
+<h3 id="zh-sec5-2">5.2 Collate 后的张量</h3>
 
-<p>由 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/pipeline_batch.py#L103-L131"><code>collate_pipeline_batch</code></a> 把 list of samples 拼成 <code>PipelineBatch</code>:</p>
+<p>由 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/pipeline_batch.py#L103-L131"><code>collate_pipeline_batch</code></a> 把 list of samples 拼成 <code>PipelineBatch</code>:</p>
 
 <h4>(a) Dense 张量字典(<code>PipelineBatch.tensors</code>)</h4>
 <pre><code>tensors = {
@@ -593,7 +596,7 @@ listen_plus = 0.0   ·   like = 1.0   ·   dislike = 0.0   ·   listen_pct = 0.0
 }
 </code></pre>
 
-<h4>(b) 单一 KJT(<code>PipelineBatch.unpooled_kjt</code>)— 包含全部稀疏 ID</h4>
+<h4>(b) 单一 KJT(<code>PipelineBatch.unpooled_kjt</code>)：包含全部稀疏 ID</h4>
 
 <p>按 schema <code>kjt_feature_order</code> 串接:</p>
 
@@ -635,15 +638,15 @@ values = torch.cat([
   [ 88,  501],                                        # "artist"   scalar × B
   [333, 1700],                                        # "album"    scalar × B
   [ 42,    7],                                        # "uid"      scalar × B
-  [101,102,103,104,  555,556,  0,  0],                # "hist_lp_item"      B×L
-  [102,105,  0,  0,  556,600,700,800],                # "hist_like_item"    B×L
-  [301,302,303,304,  901,902,  0,  0],                # "hist_skip_item"    B×L
-  [ 11, 12, 11, 13,   70, 71,  0,  0],                # "hist_lp_artist"    B×L
+  [101,102,103,104,    0,  0,555,556],                # "hist_lp_item"      B×L
+  [  0,  0,102,105,  556,600,700,800],                # "hist_like_item"    B×L
+  [301,302,303,304,    0,  0,901,902],                # "hist_skip_item"    B×L
+  [ 11, 12, 11, 13,    0,  0, 70, 71],                # "hist_lp_artist"    B×L
   ...                                                  # 同样模式继续 (hist_like_artist, hist_skip_artist,
                                                        #             hist_lp_album, hist_like_album, hist_skip_album)
   # 7 张 cross 表的 scalar id(每张 B=2 个)
-  [42_103_771, ...],                                  # "user_x_artist"
-  [18_204_009, ...],                                  # "user_x_album"
+  [hash_ua_0, hash_ua_1],                             # "user_x_artist"
+  [hash_ualbum_0, hash_ualbum_1],                     # "user_x_album"
   ...
 ])
 # values 总长度 = 4×B (scalar native) + 9×B×L (sequence native) + 7×B (cross)
@@ -651,34 +654,34 @@ values = torch.cat([
 #               = 8 + 72 + 14 = 94 个 int64 ID
 </code></pre>
 
-<h3 id="sec5-3">5.3 每表 Lookup 次数</h3>
+<h3 id="zh-sec5-3">5.3 每表 Lookup 次数</h3>
 
-<p>11 张表的列表见 <a href="#sec2-5">§2.5</a>;这里看一个 batch 实际对每张表的 GPU TBE 查询规模:</p>
+<p>11 张表的列表见 <a href="#zh-sec2-5">§2.5</a>;这里看一个 batch 实际对每张表的 GPU TBE 查询规模:</p>
 
 <table>
 <thead>
-<tr><th>表</th><th>每用户 lookup 次数</th><th>该 batch lookup 次数公式</th><th>B=2, L=4 例子</th><th>真实 5B 配置(B=2048, L=500)</th></tr>
+<tr><th>表</th><th>每用户 lookup 次数</th><th>该 batch lookup 次数公式</th><th>B=2, L=4 例子</th><th>真实 5B 配置(B=1024, L=500)</th></tr>
 </thead>
 <tbody>
-<tr><td><code>item</code> (9.39M)</td><td>1 + 3L</td><td>B × (1 + 3L)</td><td>2 × 13 = <strong>26</strong></td><td>2048 × 1501 = <strong>3,074,048</strong></td></tr>
-<tr><td><code>artist</code> (1.29M)</td><td>1 + 3L</td><td>B × (1 + 3L)</td><td>26</td><td>3,074,048</td></tr>
-<tr><td><code>album</code> (3.37M)</td><td>1 + 3L</td><td>B × (1 + 3L)</td><td>26</td><td>3,074,048</td></tr>
-<tr><td><code>uid</code> (1M)</td><td>1</td><td>B</td><td>2</td><td>2,048</td></tr>
-<tr><td>每张 cross 表(共 7 张)</td><td>1(各)→ 共 7</td><td>B(各)</td><td>2(各) → 共 14</td><td>2,048(各) → 共 14,336</td></tr>
-<tr><td><strong>合计</strong></td><td><strong>3·(1+3L) + 1 + 7 = 9L + 11</strong></td><td><strong>B·(9L + 11)</strong></td><td><strong>47/用户 → 94</strong></td><td><strong>4,511/用户 → 9,238,528</strong></td></tr>
+<tr><td><code>item</code> (9.39M)</td><td>1 + 3L</td><td>B × (1 + 3L)</td><td>2 × 13 = <strong>26</strong></td><td>1024 × 1501 = <strong>1,537,024</strong></td></tr>
+<tr><td><code>artist</code> (1.29M)</td><td>1 + 3L</td><td>B × (1 + 3L)</td><td>26</td><td>1,537,024</td></tr>
+<tr><td><code>album</code> (3.37M)</td><td>1 + 3L</td><td>B × (1 + 3L)</td><td>26</td><td>1,537,024</td></tr>
+<tr><td><code>uid</code> (1M)</td><td>1</td><td>B</td><td>2</td><td>1,024</td></tr>
+<tr><td>每张 cross 表(共 7 张)</td><td>1(各)→ 共 7</td><td>B(各)</td><td>2(各) → 共 14</td><td>1,024(各) → 共 7,168</td></tr>
+<tr><td><strong>合计</strong></td><td><strong>3·(1+3L) + 1 + 7 = 9L + 11</strong></td><td><strong>B·(9L + 11)</strong></td><td><strong>47/用户 → 94</strong></td><td><strong>4,511/用户 → 4,619,264</strong></td></tr>
 </tbody>
 </table>
 
 <div class="callout">
-<strong>观察:</strong>
+<p>查询分布带来三项直接影响:</p>
 <ul>
-  <li>~<strong>99.9% 的稀疏查询</strong>集中在 3 张 native 序列表(item / artist / album)— 这就是为什么 sequence length L 直接决定 TBE 吞吐压力。</li>
-  <li>cross 表数量虽多(7 张),但每张 batch 只查 B 次,总量很少,关键瓶颈是 <strong>表本身大</strong>(<code>user_x_artist</code> 单表 100M 行 × dim=512 = 204.8 GB)和 <strong>all-to-all</strong> 通信形状。</li>
+  <li>~<strong>99.8% 的稀疏查询</strong>集中在 3 张 native 序列表(item / artist / album),所以 sequence length L 直接决定 TBE 查询规模。</li>
+  <li>cross 表数量虽多(7 张),但每张每 batch 只查 B 次。按配置中的 <code>embedding_dim=64</code> 计算,<code>user_x_artist</code> 的 100M 行权重若以 FP32 存储约为 25.6 GB;实际存储和通信量还取决于 dtype、分片与运行时布局。</li>
   <li>序列 padding 用 0 也会查表行 0(占位 embedding);需要的话可以在模型侧 mask 掉。</li>
 </ul>
 </div>
 
-<h3 id="sec5-4">5.4 Lookup 到 Token 的转换</h3>
+<h3 id="zh-sec5-4">5.4 Lookup 到 Token 的转换</h3>
 
 <pre><code>9 条 sequence (B, L, D) → 按 pool 聚合(per-event 共享 MLP tokenizer)→ 3 × (B, L, d_model)
                         → concat → S-tokens [B, 3L, d_model]  (5B 配置 = [B, 1500, 384])
@@ -693,9 +696,9 @@ OneTrans Stack: 前向时 S-tokens 沿层金字塔裁剪 (1500 → 16),NS-tokens
     5B 默认: 1 个 Linear(384 → 1) 输出 listen+ logit (可配置最多 4 个 task,见 §2.7)
 </code></pre>
 
-<h3 id="sec5-5">5.5 Lookup 后的张量形状</h3>
+<h3 id="zh-sec5-5">5.5 Lookup 后的张量形状</h3>
 
-<p>仓库默认 <code>pooling="none"</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/config.py#L108">config.py:108</a>)→ 走 <strong>unpooled <code>EmbeddingCollection</code> (EC)</strong> 而不是 EBC,序列维度被保留。<code>TorchRecEmbeddings.forward</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/embedding.py#L126-L174">embedding.py:126-174</a>)的输出规则:</p>
+<p>仓库默认 <code>pooling="none"</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/config.py#L108">config.py:108</a>)→ 走 <strong>unpooled <code>EmbeddingCollection</code> (EC)</strong> 而不是 EBC,序列维度被保留。<code>TorchRecEmbeddings.forward</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/embedding.py#L126-L174">embedding.py:126-174</a>)的输出规则:</p>
 
 <table>
 <thead>
@@ -707,59 +710,59 @@ OneTrans Stack: 前向时 S-tokens 沿层金字塔裁剪 (1500 → 16),NS-tokens
 </tbody>
 </table>
 
-<p>代入 5B 配置(<code>B=2048, L=500, D=embedding_dim=64</code>),lookup 完之后 20 条张量(13 个 native KJT key + 7 个 cross)的具体形状:</p>
+<p>代入 5B 配置(<code>B=1024, L=500, D=embedding_dim=64</code>),lookup 完之后 20 条张量(13 个 native KJT key + 7 个 cross)的具体形状:</p>
 
 <table>
 <thead>
-<tr><th>KJT feature</th><th>来源表</th><th>类型</th><th>Lookup 后形状(B=2048, L=500, D=64)</th></tr>
+<tr><th>KJT feature</th><th>来源表</th><th>类型</th><th>Lookup 后形状(B=1024, L=500, D=64)</th></tr>
 </thead>
 <tbody>
 <tr><td colspan="4"><strong>4 个 native scalar(non-sequential)</strong></td></tr>
-<tr><td><code>item</code></td><td><code>item</code> 表 (9.39M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>artist</code></td><td><code>artist</code> 表 (1.29M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>album</code></td><td><code>album</code> 表 (3.37M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>uid</code></td><td><code>uid</code> 表 (1M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>item</code></td><td><code>item</code> 表 (9.39M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>artist</code></td><td><code>artist</code> 表 (1.29M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>album</code></td><td><code>album</code> 表 (3.37M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>uid</code></td><td><code>uid</code> 表 (1M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
 <tr><td colspan="4"><strong>9 个 sequential(序列保留 L 轴)</strong></td></tr>
-<tr><td><code>hist_lp_item / hist_like_item / hist_skip_item</code></td><td><code>item</code> 表 (9.39M)</td><td>sequence</td><td>各 <code>[2048, 500, 64]</code></td></tr>
-<tr><td><code>hist_lp_artist / hist_like_artist / hist_skip_artist</code></td><td><code>artist</code> 表</td><td>sequence</td><td>各 <code>[2048, 500, 64]</code></td></tr>
-<tr><td><code>hist_lp_album / hist_like_album / hist_skip_album</code></td><td><code>album</code> 表</td><td>sequence</td><td>各 <code>[2048, 500, 64]</code></td></tr>
+<tr><td><code>hist_lp_item / hist_like_item / hist_skip_item</code></td><td><code>item</code> 表 (9.39M)</td><td>sequence</td><td>各 <code>[1024, 500, 64]</code></td></tr>
+<tr><td><code>hist_lp_artist / hist_like_artist / hist_skip_artist</code></td><td><code>artist</code> 表</td><td>sequence</td><td>各 <code>[1024, 500, 64]</code></td></tr>
+<tr><td><code>hist_lp_album / hist_like_album / hist_skip_album</code></td><td><code>album</code> 表</td><td>sequence</td><td>各 <code>[1024, 500, 64]</code></td></tr>
 <tr><td colspan="4"><strong>7 个 cross scalar(non-sequential)</strong></td></tr>
-<tr><td><code>user_x_artist</code></td><td><code>user_x_artist</code> 表 (100M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>user_x_album</code></td><td><code>user_x_album</code> (40M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>user_x_hour</code></td><td><code>user_x_hour</code> (24M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>item_x_hour</code></td><td><code>item_x_hour</code> (40M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>artist_x_hour</code></td><td><code>artist_x_hour</code> (32M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>user_x_is_organic</code></td><td><code>user_x_is_organic</code> (2M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>user_x_artist_x_hour</code></td><td><code>user_x_artist_x_hour</code> (40M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>user_x_artist</code></td><td><code>user_x_artist</code> 表 (100M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>user_x_album</code></td><td><code>user_x_album</code> (40M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>user_x_hour</code></td><td><code>user_x_hour</code> (24M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>item_x_hour</code></td><td><code>item_x_hour</code> (40M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>artist_x_hour</code></td><td><code>artist_x_hour</code> (32M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>user_x_is_organic</code></td><td><code>user_x_is_organic</code> (2M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>user_x_artist_x_hour</code></td><td><code>user_x_artist_x_hour</code> (40M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
 </tbody>
 </table>
 
 <div class="callout">
-<strong>稀疏侧总激活体积</strong>:9 × (2048×500×64) + (4+7) × (2048×64) = <strong>≈ 590M floats ≈ 2.36 GB / batch</strong>(BF16 下减半 ≈ 1.18 GB)。<br>
-<strong>9 条历史序列吃掉 99.6%</strong> — 这是为什么 OneTrans 的 S-token 序列是稀疏后端 all-to-all 通信的主要负载源。
+<strong>稀疏侧总激活体积</strong>:9 × (1024×500×64) + (4+7) × (1024×64) = <strong>≈ 295.6M floats ≈ 1.18 GB / batch</strong>(BF16 下减半 ≈ 0.59 GB)。<br>
+<strong>按元素数计算,9 条历史序列占 99.8%</strong>。这说明 S-token 序列主导 lookup 输出体积;实际 all-to-all 字节数还会受 TorchRec 分片、padding 和 dtype 影响。
 </div>
 
-<p class="small">小提示:<code>scalar_feature_names</code> 集合(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/embedding.py#L169-L172">embedding.py:169-172</a>)决定 reshape 走 <code>[B,D]</code> 还是 <code>[B,-1,D]</code>。这个集合由 config 的 <code>feature.scalar_features</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/bench_onetrans_large_5b.yaml#L57">bench_onetrans_large_5b.yaml:57</a>)+ 7 个 cross scalar 自动注册组成。</p>
+<p class="small"><code>scalar_feature_names</code> 集合(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/embedding.py#L169-L172">embedding.py:169-172</a>)控制 reshape 选择 <code>[B,D]</code> 或 <code>[B,-1,D]</code>。该集合由 config 的 <code>feature.scalar_features</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/configs/bench_onetrans_large_5b.yaml#L57">bench_onetrans_large_5b.yaml:57</a>)与 7 个 cross scalar 自动注册组成。</p>
 
-<h3 id="sec5-6">5.6 Dense 特征处理路径</h3>
+<h3 id="zh-sec5-6">5.6 Dense 特征处理路径</h3>
 
-<p><strong>结论:用了,且是 OneTrans 的 NS-token 必不可少的输入</strong>。Dense 特征不经过 embedding lookup(已经是 float 向量),走单独通路。各 dense 的来源/语义见 <a href="#sec2-3">§2.3</a>;本节只看<strong>处理逻辑和形状变化</strong>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/bench_onetrans_large_5b.yaml#L58-L62">config 字段</a>):</p>
+<p>Dense 特征会进入 OneTrans 的 NS-token 输入。它们已经是浮点向量，不经过 embedding lookup，而是沿独立通路处理。各 dense 特征的来源和语义见 <a href="#zh-sec2-3">§2.3</a>；本节只讨论<strong>处理逻辑和形状变化</strong>（<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/configs/bench_onetrans_large_5b.yaml#L58-L62">config 字段</a>）：</p>
 
 <table>
 <thead>
-<tr><th>Dense 特征</th><th>输入(B=2048)</th><th>处理</th><th>投影后</th></tr>
+<tr><th>Dense 特征</th><th>输入(B=1024)</th><th>处理</th><th>投影后</th></tr>
 </thead>
 <tbody>
-<tr><td><code>audio_embed</code></td><td><code>[2048, 128]</code></td><td><code>project=true</code> · Linear(128→D) + GeLU</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>user_counters</code></td><td><code>[2048, 6]</code></td><td><code>project=false</code> · 原样 concat</td><td><code>[2048, 6]</code></td></tr>
-<tr><td><code>item_counters</code></td><td><code>[2048, 6]</code></td><td><code>project=false</code> · 原样 concat</td><td><code>[2048, 6]</code></td></tr>
-<tr><td><code>cross_counters</code></td><td><code>[2048, 18]</code></td><td><code>project=true</code> · Linear(18→D) + ReLU</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>audio_embed</code></td><td><code>[1024, 128]</code></td><td><code>project=true</code> · Linear(128→D) + GeLU</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>user_counters</code></td><td><code>[1024, 6]</code></td><td><code>project=false</code> · 原样 concat</td><td><code>[1024, 6]</code></td></tr>
+<tr><td><code>item_counters</code></td><td><code>[1024, 6]</code></td><td><code>project=false</code> · 原样 concat</td><td><code>[1024, 6]</code></td></tr>
+<tr><td><code>cross_counters</code></td><td><code>[1024, 18]</code></td><td><code>project=true</code> · Linear(18→D) + ReLU</td><td><code>[1024, 64]</code></td></tr>
 </tbody>
 </table>
 
-<p class="small">注:投影目标维度是 <code>embedding_dim = D = 64</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L341">onetrans.py:341</a>),不是 <code>d_model = 384</code> — 这样 dense 投影后和 sparse scalar embedding 同量级,方便直接 concat。</p>
+<p class="small">投影目标维度采用 <code>embedding_dim = D = 64</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/onetrans.py#L341">onetrans.py:341</a>),使 dense 投影与 sparse scalar embedding 具有相同宽度并可直接 concat;后续 AutoSplitTokenizer 再映射到 <code>d_model = 384</code>。</p>
 
-<h4>在 OneTrans 里的去向(代码:<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L522-L532"><code>OneTransModel._build_ns_raw</code></a>)</h4>
+<h4>在 OneTrans 里的去向(代码:<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/onetrans.py#L522-L532"><code>OneTransModel._build_ns_raw</code></a>)</h4>
 
 <pre><code>NS raw vector = concat([
   # 11 个 sparse scalar embedding(已 lookup,§5.5 上半部分)
@@ -779,18 +782,18 @@ OneTrans Stack: 前向时 S-tokens 沿层金字塔裁剪 (1500 → 16),NS-tokens
 # ns_raw_dim = 11 × D + 2 × D + 2 × 6
 #           = 11 × 64 + 2 × 64 + 12
 #           = 704 + 128 + 12 = 844
-# 形状: [B, 844] = [2048, 844]
+# 形状: [B, 844] = [1024, 844]
 
 ↓ AutoSplitTokenizer (onetrans.py:260-276):
     proj = Linear(844, 16 × 384) → GeLU → Linear(16 × 384, 16 × 384)
     .view(B, 16, 384)
 
-NS-tokens = [B, n_ns_tokens, d_model] = [2048, 16, 384]
+NS-tokens = [B, n_ns_tokens, d_model] = [1024, 16, 384]
 </code></pre>
 
-<h4>会喂给 attention 吗?— <span class="ok">会,通过 NS-tokens 这条通道</span></h4>
+<h4>Dense feature 通过 NS-tokens 进入 attention</h4>
 
-<p>NS-tokens 直接和 S-tokens 拼在一起进 Transformer 块(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L565-L582"><code>_backbone</code></a>):</p>
+<p>NS-tokens 直接和 S-tokens 拼在一起进 Transformer 块(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/onetrans.py#L565-L582"><code>_backbone</code></a>):</p>
 
 <pre><code>s_tokens  = [B, 1500, 384]    # 3 pool × L=500 历史 → 经 SequentialTokenizer
 ns_tokens = [B,   16, 384]    # 11 sparse scalar + 4 dense → 经 AutoSplitTokenizer
@@ -801,7 +804,7 @@ for layer in self.blocks:
     x = block(x, mask=pyramid_mask, ...)       # MixedAttention 看到完整 x
 </code></pre>
 
-<p>在 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L85-L161"><code>MixedAttention</code></a> 里:</p>
+<p>在 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/onetrans.py#L85-L161"><code>MixedAttention</code></a> 里:</p>
 
 <table>
 <thead>
@@ -825,13 +828,13 @@ for layer in self.blocks:
 
 <ol>
   <li><strong>作为 Query</strong>:NS-token 可以 attend 到任何历史 S-token(回看用户历史)。</li>
-  <li><strong>作为 Key/Value</strong>:S-tokens 也能 attend 到 NS-tokens(把候选 + dense 信息融进每个历史位置),即 "<em>sequence positions attend over candidate and context tokens</em>"。</li>
-  <li><strong>金字塔裁剪只裁 S-tokens</strong>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L568-L572">onetrans.py:568-572</a>),NS-tokens(以及里面的 dense 信息)<strong>始终保留全部 16 个,贯穿所有层</strong>。</li>
+  <li><strong>作为 Key/Value</strong>:在 <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/onetrans.py#L64-L69">causal mask</a> 下,排在前面的 S-token 不能 attend 到后面的 NS-token;NS-token 能读取此前的 S-token 和更早的 NS-token。</li>
+  <li><strong>金字塔裁剪只裁 S-tokens</strong>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/onetrans.py#L568-L572">onetrans.py:568-572</a>),NS-tokens(以及里面的 dense 信息)<strong>始终保留全部 16 个,贯穿所有层</strong>。</li>
 </ol>
 
-<h3 id="sec5-7">5.7 Attention 输入的 token 排列(按 feature name)</h3>
+<h3 id="zh-sec5-7">5.7 Attention 输入的 token 排列(按 feature name)</h3>
 
-<p>§5.4 给出 token 化的概览,§5.5 给出每个 lookup 输出张量的形状。本节直接回答:<strong>送进 attention 的 <code>x: [B, 1516, 384]</code>,逐位置由哪些命名 feature 组成、按什么顺序排</strong>。</p>
+<p>lookup 输出经过两类 tokenizer 后形成 <code>x: [B, 1516, 384]</code>。前 1500 个位置保留行为池与时间顺序,后 16 个位置则由全部 non-sequential 输入共同生成。</p>
 
 <h4>S-tokens(位置 0..1499):3 pool × L,每段右对齐</h4>
 
@@ -853,7 +856,7 @@ position 2L  .. 3L-1     | hist_skip pool
 
 <h4>NS-tokens(位置 1500..1515):无 per-token feature 对位</h4>
 
-<p><strong>关键:</strong>这 16 个 token <strong>无法逐位映射回 feature 名</strong>。<code>AutoSplitTokenizer</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L260-L276">onetrans.py:260-276</a>)是 <code>Linear(844, 16·d_model) → GeLU → Linear(...) → view(B, 16, d_model)</code> &mdash; 每个输出 channel 是全部 844 维输入的线性混合,token 位置语义由训练学出。底层 844-d 原始向量按命名 feature 顺序拼(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L522-L532">onetrans.py:522-532</a>),逐段如下图,横向宽度按 dim 数等比:</p>
+<p><strong>NS-token</strong> 是 AutoSplitTokenizer 对完整 non-sequential 向量生成的学习表示。<code>AutoSplitTokenizer</code>(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/onetrans.py#L260-L276">onetrans.py:260-276</a>)执行 <code>Linear(844, 16·d_model) → GeLU → Linear(...) → view(B, 16, d_model)</code>,每个输出 channel 都混合全部 844 维输入,因而 16 个位置的语义由训练学习,不与单个 feature 一一对应。底层 844-d 原始向量仍按命名 feature 顺序拼接(<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/onetrans.py#L522-L532">onetrans.py:522-532</a>),逐段如下图,横向宽度按 dim 数等比:</p>
 
 <div style="overflow-x:auto; margin:1em 0;">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 290" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
@@ -944,7 +947,7 @@ position 2L  .. 3L-1     | hist_skip pool
 </svg>
 </div>
 
-<p>NS token 段虽然每个位置看不出对应哪个 feature,但 <code>MixedAttention</code>/<code>MixedFFN</code> 给 NS 段<strong>每个 token 位置配独立的 Q/K/V 权重</strong>(<code>ns_qkv_weight: [16, 3·d_model, d_model]</code>) &mdash; 训练后 token 位置本身就是身份编码。</p>
+<p>NS token 段虽然每个位置看不出对应哪个 feature,但 <code>MixedAttention</code>/<code>MixedFFN</code> 给 NS 段<strong>每个 token 位置配独立的 Q/K/V 权重</strong>(<code>ns_qkv_weight: [16, 3·d_model, d_model]</code>)；训练后 token 位置本身就是身份编码。</p>
 
 <h4>最终 attention 输入张量布局</h4>
 
@@ -970,7 +973,7 @@ pos:    仅 S 段在 SequentialTokenizer 内加了 per-pool pos_emb;
     </marker>
   </defs>
 
-  <text x="640" y="22" text-anchor="middle" font-size="13" font-weight="600">Attention 输入 x = [B, 1516, 384] — 逐位置 feature 排列 (5B config, L=500)</text>
+  <text x="640" y="22" text-anchor="middle" font-size="13" font-weight="600">Attention 输入 x = [B, 1516, 384]：逐位置 feature 排列 (5B config, L=500)</text>
 
   <!-- Top: position bar -->
   <text x="20"   y="60" font-size="10" fill="#666">position</text>
@@ -1057,8 +1060,8 @@ pos:    仅 S 段在 SequentialTokenizer 内加了 per-pool pos_emb;
   <g font-size="11" fill="#444">
     <text x="20" y="335" font-weight="600">备注</text>
     <text x="20" y="354">• Pool 顺序 [hist_lp, hist_like, hist_skip] 来自 YAML sequence_groups 字典插入顺序 (CPython 3.7+ 保序)。</text>
-    <text x="20" y="372">• 每个 S-token 含 3 个 entity (item/artist/album) 的 concat 后 MLP — 3 个 pool 各持独立 SeqTokenizer + 独立 pos_emb,不共享。</text>
-    <text x="20" y="390">• S 段时间方向: padded[L-n:] = items 右对齐 — index L-1 必是最新,index 0 可能是 0-pad (用户事件不足 L 时)。</text>
+    <text x="20" y="372">• 每个 S-token 含 3 个 entity (item/artist/album) 的 concat 后 MLP；3 个 pool 各持独立 SeqTokenizer + 独立 pos_emb,不共享。</text>
+    <text x="20" y="390">• S 段时间方向: padded[L-n:] = items 右对齐；index L-1 必是最新,index 0 可能是 0-pad (用户事件不足 L 时)。</text>
     <text x="20" y="408">• NS 段没有 global pos_emb;token-position 区分由 MixedAttention 的 ns_qkv_weight[16, 3·d_model, d_model] 完成。</text>
     <text x="20" y="426">• Causal pyramid mask 只作用于 S 段 (沿层逐渐裁短),NS 段每层都保留全部 16。</text>
   </g>
@@ -1067,9 +1070,9 @@ pos:    仅 S 段在 SequentialTokenizer 内加了 per-pool pos_emb;
 
 <hr>
 
-<h3 id="sec5-8">5.8 全流程可视化(Raw → Attention)</h3>
+<h3 id="zh-sec5-8">5.8 全流程可视化(Raw → Attention)</h3>
 
-<p>把数据流拆成两张图,在 <strong>Attention 输入 [B, 1516, 384]</strong> 处衔接:<strong>图 A</strong> 讲数据如何从 raw input 一路构造到 Attention 输入,<strong>图 B</strong> 讲 Attention 输入如何穿过 8 层 Transformer、split 出 NS-tokens、经 head 得到 prediction 再算 loss。5B 配置:<code>B=2048, L=500, D=64, d_model=384, n_ns_tokens=16, n_layers=8</code>。</p>
+<p>把数据流拆成两张图,在 <strong>Attention 输入 [B, 1516, 384]</strong> 处衔接:<strong>图 A</strong> 讲数据如何从 raw input 一路构造到 Attention 输入,<strong>图 B</strong> 讲 Attention 输入如何穿过 8 层 Transformer、split 出 NS-tokens、经 head 得到 prediction 再算 loss。5B 配置:<code>B=1024, L=500, D=64, d_model=384, n_ns_tokens=16, n_layers=8</code>。</p>
 
 <div style="overflow-x:auto; margin:1em 0;">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1100" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
@@ -1082,8 +1085,8 @@ pos:    仅 S 段在 SequentialTokenizer 内加了 per-pool pos_emb;
     </marker>
   </defs>
 
-  <text x="640" y="22" font-size="14" font-weight="700" text-anchor="middle" fill="#1f2328">图 A:数据构造 — Raw Input → Attention 输入</text>
-  <text x="640" y="40" font-size="10" text-anchor="middle" fill="#57606a">bottom-up · B=2048, L=500, D=64, d_model=384, n_ns_tokens=16</text>
+  <text x="640" y="22" font-size="14" font-weight="700" text-anchor="middle" fill="#1f2328">图 A:数据构造：Raw Input → Attention 输入</text>
+  <text x="640" y="40" font-size="10" text-anchor="middle" fill="#57606a">bottom-up · B=1024, L=500, D=64, d_model=384, n_ns_tokens=16</text>
 
   <!-- Attention input (top of this figure) -->
   <g>
@@ -1291,8 +1294,8 @@ pos:    仅 S 段在 SequentialTokenizer 内加了 per-pool pos_emb;
     </marker>
   </defs>
 
-  <text x="640" y="22" font-size="14" font-weight="700" text-anchor="middle" fill="#1f2328">图 B:模型推理 — Attention 输入 → 8 层 Transformer → Head → Loss</text>
-  <text x="640" y="40" font-size="10" text-anchor="middle" fill="#57606a">bottom-up · B=2048, d_model=384, n_ns_tokens=16, n_layers=8</text>
+  <text x="640" y="22" font-size="14" font-weight="700" text-anchor="middle" fill="#1f2328">图 B:模型推理：Attention 输入 → 8 层 Transformer → Head → Loss</text>
+  <text x="640" y="40" font-size="10" text-anchor="middle" fill="#57606a">bottom-up · B=1024, d_model=384, n_ns_tokens=16, n_layers=8</text>
 
   <!-- Loss (TOP) -->
   <g>
@@ -1474,14 +1477,14 @@ pos:    仅 S 段在 SequentialTokenizer 内加了 per-pool pos_emb;
 
 <div class="lang-en">
 
-<h1>oneTrans + YaMBDA study</h1>
+<h1>OneTrans and YaMBDA: Data Processing Flow and Feature Organization</h1>
 
-<p><strong>Repository</strong>: <a href="https://github.com/AMD-AGI/Primus-DLRM">github.com/AMD-AGI/Primus-DLRM</a>, AMD-AGI's open-source DLRM/OneTrans benchmark implementation. Code paths, line numbers, and config references were checked against the <code>main</code> branch at writing time; if upstream changes move the line numbers, prefer the file path and nearby symbol names.</p>
+<p class="lead">OneTrans constructs candidate features, user histories, and multi-task labels from music-interaction logs. Raw events first pass through temporal splitting and session organization; the DataLoader then derives categorical IDs, counters, and fixed-length histories. KJT assembly and embedding lookup turn those fields into the S-tokens and NS-tokens consumed by attention. This article follows that path from the YaMBDA schema through <code>ScoringPair</code> and into the runtime tensor shapes.</p>
 
-<p>This document walks through the complete data flow of the Yambda dataset inside Primus-DLRM: how it is preprocessed, featurized, and finally fed into the OneTrans model, from raw input all the way to the attention input and the loss.</p>
+<p><strong>Repository snapshot</strong>: <a href="https://github.com/AMD-AGI/Primus-DLRM/tree/52733ce83e20fb64137c79bb3508768de4975de5"><code>AMD-AGI/Primus-DLRM@52733ce</code></a>. Source behavior, configuration values, and line references in this article are scoped to this public commit.</p>
 
 <div class="callout note">
-Reading guide: §1 and §2 are the <strong>static feature inventory</strong> (dataset fields, training features, embedding tables); §3 is the <strong>preprocessing logic</strong>; §5 is the <strong>dynamic data flow</strong> (per-tensor shapes + per-layer seqlen evolution). The detailed take-aways are at the end, in §4.
+Calculations involving 7 cross tables and 20 KJT keys specifically use <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/configs/bench_onetrans_large_5b_cross_feat_shampoo.yaml"><code>bench_onetrans_large_5b_cross_feat_shampoo.yaml</code></a>; the base 5B config contains only 4 native tables.
 </div>
 
 <hr>
@@ -1490,8 +1493,8 @@ Reading guide: §1 and §2 are the <strong>static feature inventory</strong> (da
 
 <h3 id="en-sec1-1">1.1 Source and scale</h3>
 <ul>
-  <li><strong>Yambda</strong> (YaMBDA / Yandex Music Behavior Dataset) was publicly released by Yandex Music in <strong>2024</strong> through HuggingFace <code>yandex/yambda</code> (Apache 2.0).</li>
-  <li>Three tiers: <strong>50M / 500M / 5B</strong> events. Primus-DLRM defaults to <strong>Yambda-5B</strong> (4.79B real events).</li>
+  <li><strong>Yambda</strong> (YaMBDA / Yandex Music Behavior Dataset) was publicly released by Yandex Music in <strong>2025</strong> through its <a href="https://huggingface.co/datasets/yandex/yambda/blob/241f44fbc77206c8c414fb665de5046b36a0a3fb/README.md">Hugging Face dataset card</a> (Apache 2.0).</li>
+  <li>Three tiers: <strong>50M / 500M / 5B</strong> events. This article focuses on Primus-DLRM's <strong>Yambda-5B</strong> configuration (4.79B real events).</li>
   <li>5B-tier global stats:
     <ul>
       <li>Users: <strong>1M</strong></li>
@@ -1503,7 +1506,7 @@ Reading guide: §1 and §2 are the <strong>static feature inventory</strong> (da
 </ul>
 
 <h3 id="en-sec1-2">1.2 File inventory</h3>
-<p>Downloaded from HuggingFace, see <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/download.py#L11-L26">download.py:11-26</a>.</p>
+<p>Downloaded from HuggingFace, see <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/download.py#L11-L26">download.py:11-26</a>.</p>
 
 <table>
 <thead>
@@ -1518,7 +1521,7 @@ Reading guide: §1 and §2 are the <strong>static feature inventory</strong> (da
 </table>
 
 <h3 id="en-sec1-3">1.3 <code>multi_event.parquet</code> schema</h3>
-<p>From <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py#L166-L172">preprocessing.py:166-172</a>.</p>
+<p>From <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/preprocessing.py#L166-L172">preprocessing.py:166-172</a>.</p>
 
 <table>
 <thead>
@@ -1536,14 +1539,14 @@ Reading guide: §1 and §2 are the <strong>static feature inventory</strong> (da
 </table>
 
 <div class="callout note">
-Note: <code>artist_id / album_id</code> are <strong>not in the event table</strong>. They have to be joined on-the-fly via <code>artist_item_mapping / album_item_mapping</code> using <code>item_id</code>.
+<code>artist_id / album_id</code> are catalog attributes. The DataLoader resolves them at sample construction time by joining <code>artist_item_mapping / album_item_mapping</code> on the event table's <code>item_id</code>.
 </div>
 
 <hr>
 
 <h2 id="en-sec2">2. Training feature inventory</h2>
 
-<p>The repo's schema is defined in <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/schemas/yambda.yaml">configs/schemas/yambda.yaml</a>, and the embedding tables plus dense features are defined inside each config file. We split features below by <em>whether they are sequence-typed</em>.</p>
+<p>The repository schema lives in <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/configs/schemas/yambda.yaml">configs/schemas/yambda.yaml</a>, while each model configuration supplies its embedding tables and dense features. Training features divide into scalar fields, which contribute one value per sample, and sequential fields, which contribute a history; crossed and dense features add contextual signals to those two groups.</p>
 
 <h3 id="en-sec2-1">2.1 Sparse non-sequential features</h3>
 <p>Source: user context + the candidate track itself. 4 scalar features in total, mapping to <strong>4 native sparse tables</strong>.</p>
@@ -1560,15 +1563,15 @@ Note: <code>artist_id / album_id</code> are <strong>not in the event table</stro
 </tbody>
 </table>
 
-<p class="small">(See <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/bench_onetrans_large_5b.yaml#L46-L50">bench_onetrans_large_5b.yaml:46-50</a>.)</p>
+<p class="small">(See <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/configs/bench_onetrans_large_5b.yaml#L46-L50">bench_onetrans_large_5b.yaml:46-50</a>.)</p>
 
 <h3 id="en-sec2-2">2.2 Sparse sequential features</h3>
 
-<p>The soul of OneTrans: user history is sliced by behavior into <strong>3 pools</strong>, each pool records 3 kinds of entity IDs, so every sample carries <strong>9 sequences</strong>. <code>L = history_length</code> (5B config uses L=500 &rarr; S-token sequence length <code>L_S = 1500</code>).</p>
+<p>OneTrans divides user history into <strong>3 behavior pools</strong>. Each pool records 3 entity-ID types, so every sample carries <strong>9 sequences</strong>. With <code>L = history_length</code>, the 5B configuration uses <code>L=500</code> and therefore an S-token sequence length of <code>L_S=1500</code>.</p>
 
 <table>
 <thead>
-<tr><th>Pool (behavior pool)</th><th>Definition (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L189-L191">dataset.py:189-191</a>)</th><th>3 sequence names</th></tr>
+<tr><th>Pool (behavior pool)</th><th>Definition (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L189-L191">dataset.py:189-191</a>)</th><th>3 sequence names</th></tr>
 </thead>
 <tbody>
 <tr>
@@ -1590,13 +1593,13 @@ Note: <code>artist_id / album_id</code> are <strong>not in the event table</stro
 </table>
 
 <div class="callout note">
-Note: these 9 sequences have <strong>no independent embedding tables</strong>. Each one shares a table with its corresponding non-sequential scalar (one table each for item/artist/album):
+These 9 sequences share entity embedding tables with their corresponding non-sequential scalars: one table each for item, artist, and album.
 <pre><code>- { name: item, features: [item, hist_lp_item, hist_like_item, hist_skip_item], ... }</code></pre>
-i.e. the candidate track and the history tracks share the same 9.39M-row item table; the 4 native sparse features each own one table.
+The candidate track and history tracks therefore query the same 9.39M-row item table, and the four native sparse entity types each resolve to one table.
 </div>
 
 <h3 id="en-sec2-3">2.3 Dense features</h3>
-<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/bench_onetrans_large_5b.yaml#L58-L62">bench_onetrans_large_5b.yaml:58-62</a>:</p>
+<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/configs/bench_onetrans_large_5b.yaml#L58-L62">bench_onetrans_large_5b.yaml:58-62</a>:</p>
 
 <table>
 <thead>
@@ -1610,14 +1613,14 @@ i.e. the candidate track and the history tracks share the same 9.39M-row item ta
 </tbody>
 </table>
 
-<p>The counter features are computed at preprocessing time by <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/counters.py">primus_dlrm/data/counters.py</a> using Numba sliding windows.</p>
+<p>The counter features are computed at preprocessing time by <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/counters.py">primus_dlrm/data/counters.py</a> using Numba sliding windows.</p>
 
 <h3 id="en-sec2-4">2.4 Cross-product sparse features</h3>
-<p>Only enabled by <code>bench_onetrans_large_5b_cross_feat_shampoo.yaml</code>. These 7 cross tables (<code>user_x_artist</code> / <code>user_x_album</code> / <code>user_x_hour</code> / <code>item_x_hour</code> / <code>artist_x_hour</code> / <code>user_x_is_organic</code> / <code>user_x_artist_x_hour</code>) are the key design that blows up the embedding footprint.</p>
+<p>Only enabled by <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/configs/bench_onetrans_large_5b_cross_feat_shampoo.yaml#L32-L47"><code>bench_onetrans_large_5b_cross_feat_shampoo.yaml:32-47</code></a>. Its 7 cross tables are <code>user_x_artist</code> / <code>user_x_album</code> / <code>user_x_hour</code> / <code>item_x_hour</code> / <code>artist_x_hour</code> / <code>user_x_is_organic</code> / <code>user_x_artist_x_hour</code>.</p>
 
 <h3 id="en-sec2-5">2.5 Embedding table overview</h3>
 
-<p>Every sparse feature eventually hits one of these 11 tables:</p>
+<p>Under that cross-feature configuration, each sparse feature resolves through its KJT key to one of these 11 tables:</p>
 
 <table>
 <thead>
@@ -1639,12 +1642,12 @@ i.e. the candidate track and the history tracks share the same 9.39M-row item ta
 </table>
 
 <div class="callout note">
-<strong>Key mapping rule</strong> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/pipeline_batch.py">pipeline_batch.py</a>): for each sparse tensor in a batch, <code>schema.batch_to_feature</code> maps the "batch field name" to a "KJT feature name", and then <code>embedding_tables[*].features</code> resolves which table that feature belongs to. <strong>The 4 native tables are shared by 13 KJT features</strong> (candidate + 9 history sequences, sharing item/artist/album/uid); <strong>each of the 7 cross tables owns exactly 1 KJT feature</strong>.
+<strong>Field-to-table mapping</strong> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/pipeline_batch.py">pipeline_batch.py</a>): <code>schema.batch_to_feature</code> converts a batch field name into a KJT feature name, and <code>embedding_tables[*].features</code> then resolves that feature to an embedding table. <strong>The 4 native tables are shared by 13 KJT features</strong> (candidate + 9 history sequences, sharing item/artist/album/uid); <strong>each of the 7 cross tables corresponds to 1 KJT feature</strong>.
 </div>
 
 <h3 id="en-sec2-6">2.6 <code>ScoringPair</code> field index</h3>
 
-<p>Each training sample (defined in <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L110-L143">dataset.py:110-143</a>) corresponds to one <code>(user, candidate_item, target_event)</code> scoring, grouped by field family:</p>
+<p>Each training sample (defined in <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L110-L143">dataset.py:110-143</a>) corresponds to one <code>(user, candidate_item, target_event)</code> scoring, grouped by field family:</p>
 
 <table>
 <thead>
@@ -1662,7 +1665,7 @@ i.e. the candidate track and the history tracks share the same 9.39M-row item ta
 <p>Concrete field names, semantics, and padding behavior are in the sub-sections above. A worked <code>B=2</code> sample (with specific IDs / values per field) is unrolled in <a href="#en-sec5-1">§5.1</a>.</p>
 
 <h3 id="en-sec2-7">2.7 Multi-task labels</h3>
-<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L558-L561">dataset.py:558-561</a>:</p>
+<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L558-L561">dataset.py:558-561</a>:</p>
 
 <table>
 <thead>
@@ -1682,7 +1685,7 @@ i.e. the candidate track and the history tracks share the same 9.39M-row item ta
 
 <h2 id="en-sec3">3. Preprocessing and data loading</h2>
 
-<p>The <code>preprocess()</code> entry-point in <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py">primus_dlrm/data/preprocessing.py</a> does everything in one pass:</p>
+<p>Offline preprocessing builds reusable data assets, while the DataLoader assembles each training sample around a target event. The <code>preprocess()</code> entry point in <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/preprocessing.py">primus_dlrm/data/preprocessing.py</a> performs the following stages:</p>
 
 <pre><code>Raw parquet (4.79B rows, ~195 GB)
    &darr; (1) streaming load                                _load_chunked
@@ -1697,24 +1700,24 @@ event DataFrame (event_type text &rarr; uint8 encoded)
    '---&gt; data/shared_metadata/          (6) embeddings/artist/album mapping shared across all 3 tiers
 </code></pre>
 
-<p class="small">Key code: <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py#L123-L132">_compute_split_boundaries</a> &middot; <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py#L150-L176">_build_sessions</a> &middot; <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/preprocessing.py#L218-L287">_load_and_save_metadata</a>. <code>event_type</code> encoding: <code>listen=0, like=1, dislike=2, unlike=3, undislike=4</code>. Test users must have appeared in train, otherwise they are dropped.</p>
+<p class="small">Relevant code: <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/preprocessing.py#L123-L132">_compute_split_boundaries</a> &middot; <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/preprocessing.py#L150-L176">_build_sessions</a> &middot; <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/preprocessing.py#L218-L287">_load_and_save_metadata</a>. <code>event_type</code> is encoded as <code>listen=0, like=1, dislike=2, unlike=3, undislike=4</code>; the test split retains users that also appear in the training split.</p>
 
 <h3 id="en-sec3-1">3.1 DataLoader runtime derivation</h3>
-<p>See <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py">primus_dlrm/data/dataset.py</a>:</p>
+<p>See <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py">primus_dlrm/data/dataset.py</a>:</p>
 
 <ol>
-  <li>Flatten session events into NumPy arrays of <code>(uid, item, ts, event_type, played_ratio_pct, is_organic, ...)</code>, loaded as <strong>MAP_SHARED + PROT_READ</strong> mmap with zero virtual-memory commitment (this is critical: at 5B tier, 8 ranks &times; 700 GB cache would otherwise blow up overcommit).</li>
+  <li>Flatten session events into NumPy arrays. <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L21-L48"><code>_load_npy_readonly</code></a> uses a read-only shared mmap; its source comment says this avoids charging copy-on-write commit to every process. Exact accounting remains OS-dependent.</li>
   <li>Derived masks: <code>flat_is_listen_plus / flat_is_like / flat_is_skip</code> (three boolean arrays).</li>
   <li>After sampling <code>(user, target_event)</code>, <strong>scan back through the user's events before the target moment</strong>, and slice with the three masks to get 9 history sequences (clipped to <code>history_length</code>).</li>
-  <li>Compute <code>hour_of_day = (ts // 3600) % 24</code> on the fly (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L588">dataset.py:588</a>), read <code>is_organic</code>, used for cross-feature hashing.</li>
-  <li><strong>xxhash64 computes cross-feature IDs on the fly</strong> (not persisted, see <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/hashing.py">hashing.py</a>) &rarr; fed into the KeyedJaggedTensor.</li>
+  <li>Compute <code>hour_of_day = (ts // 3600) % 24</code> on the fly (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L588">dataset.py:588</a>), read <code>is_organic</code>, used for cross-feature hashing.</li>
+  <li><strong>xxhash64 computes cross-feature IDs on the fly</strong> (not persisted, see <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/hashing.py">hashing.py</a>) &rarr; fed into the KeyedJaggedTensor.</li>
 </ol>
 
 <h3 id="en-sec3-2">3.2 Candidate generation</h3>
 
-<p>The repo has <strong>no explicit negative sampling</strong>. The candidate of each training sample is just an actual event's item on the user's timeline, and the label comes from that event's <code>event_type</code> and <code>played_ratio</code>.</p>
+<p>A <strong>candidate</strong> here is the real event item selected as the supervision target on a user's timeline. Its <code>event_type</code> and <code>played_ratio</code> produce the multi-task labels, so the default training path obtains positive and negative feedback from the observed behavior distribution.</p>
 
-<h4>(a) Enumerating sample positions (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L458-L500"><code>_build_sample_positions</code></a>)</h4>
+<h4>(a) Enumerating sample positions (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L458-L500"><code>_build_sample_positions</code></a>)</h4>
 
 <pre><code>for uid in users:
     user_event_count = user_end[uid] - user_start[uid]
@@ -1724,7 +1727,7 @@ event DataFrame (event_type text &rarr; uint8 encoded)
 
 <p>On each user's timeline, <strong>every event position starting from the (L+1)-th is a training sample</strong>. 1M users &times; several thousand events on average &rarr; billions of training samples.</p>
 
-<h4>(b) Candidate derivation when fetching a sample (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L505-L564"><code>YambdaTrainDataset.__getitem__</code></a>)</h4>
+<h4>(b) Candidate derivation when fetching a sample (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L505-L564"><code>YambdaTrainDataset.__getitem__</code></a>)</h4>
 
 <pre><code>flat_pos      = self._positions[idx]                          # pick an event position
 uid           = self.store.flat_uid[flat_pos]
@@ -1751,13 +1754,13 @@ audio         = self.audio_embeddings[target_item]            # pretrained 128-d
 </tbody>
 </table>
 
-<p>Each event yields at most one label equal to 1. This is classic <strong>implicit-feedback multi-task ranking</strong>: listen+ negatives come from real "listened-but-not-finished" events, like / dislike negatives come from real events doing other actions; the training signal is entirely derived from the actual behavior distribution, so <strong>there is no need to sample negative items from all 9.39M items</strong>.</p>
+<p>Each event yields at most one label equal to 1, forming an <strong>implicit-feedback multi-task ranking</strong> problem. Listen+ negatives come from real listened-but-not-finished events, while like and dislike negatives come from real events with other actions. The default path uses these behavioral signals directly and does not draw additional negative items from the full 9.39M-item catalog.</p>
 
-<p class="small">Note: the repo's <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/negatives.py">data/negatives.py</a> does offer in-batch BPR negative sampling, but with <code>contrastive_weight=0</code> by default this path does not participate in default training.</p>
+<p class="small">The repository also provides in-batch BPR negative sampling in <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/negatives.py">data/negatives.py</a>; the default <code>contrastive_weight=0</code> disables that path.</p>
 
 <h3 id="en-sec3-3">3.3 Multi-event concatenation into long history sequences</h3>
 
-<p>Key insight: <strong>"concatenating a user's multiple interactions into one time-ordered long sequence" is NOT done by the DataLoader at <code>__getitem__</code> time. It is done once, in <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L146-L206"><code>FlatEventStore.__init__</code></a></strong>. Each <code>__getitem__</code> just slices a window from the already-built long array.</p>
+<p><strong><code>FlatEventStore</code></strong> is a contiguous-array store organized by user and event time. During loading, <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L146-L206"><code>FlatEventStore.__init__</code></a> performs session sorting, expansion, and array concatenation once. Each later <code>__getitem__</code> call slices a history window using the user's range and target position.</p>
 
 <h4>(a) One-shot flatten (preprocessing + Store-construction stage)</h4>
 
@@ -1796,11 +1799,12 @@ self.user_end[uid_vals]   = ends
 
 <p>For any <code>uid</code>, the user's complete time-ordered event history is the contiguous slice <code>flat_*[user_start[uid] : user_end[uid]]</code>: <strong>sessions are concatenated seamlessly</strong>, and session boundaries are not retained in the sequence.</p>
 
-<h4>(c) Window scanning when fetching a sample (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/dataset.py#L604-L636"><code>_get_split_history</code></a>)</h4>
+<h4>(c) Window scanning when fetching a sample (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/dataset.py#L604-L636"><code>_get_split_history</code></a>)</h4>
 
 <pre><code>L          = config.data.history_length                       # 5B config = 500
 scan_end   = flat_pos                                           # current event position (exclusive)
-scan_start = max(user_start[uid], flat_pos - 500)              # rewind window, capped at 500 events
+scan_window = config.data.scan_window                           # configurable; default 500
+scan_start  = max(user_start[uid], flat_pos - scan_window)      # raw-event scan window
 
 item_ids = self.store.flat_item_ids[scan_start:scan_end]
 is_lp    = self.store.flat_is_listen_plus[scan_start:scan_end]   # precomputed boolean masks
@@ -1816,7 +1820,7 @@ padded = np.zeros(L, dtype=np.int64)
 padded[L - n:] = items
 </code></pre>
 
-<h4>(d) One-picture summary</h4>
+<h4>(d) Storage layout and sampling path</h4>
 
 <pre><code>FlatEventStore (one-shot, shared across all users):
 
@@ -1839,33 +1843,35 @@ Each training sample (one __getitem__ call):
   '- ScoringPair(9 history sequences of shape [L] + candidate scalars + dense + cross + labels)
 </code></pre>
 
-<h4>Key design trade-offs</h4>
+<h4>Storage and sequence semantics</h4>
 
 <ul>
   <li><strong>Flatten once at preprocessing time, zero-copy window scan at training time</strong>: avoids the DataLoader worker having to repeatedly group / sort / explode.</li>
   <li><strong>Right-aligned padding + positional embedding 0..L-1</strong>: the newest event is always at index <code>L-1</code>, so "most recent time" is stable across users. Padding occupies the early positional embeddings, so the model has to learn to distinguish padding from a zero embedding.</li>
-  <li><strong>Session boundaries are dropped</strong>: the flat sequence has no "[SEP]" marker between sessions. The model can only infer them from <code>timestamps</code> gaps (which are not fed in as tokens), so no explicit session-aware modeling happens.</li>
-  <li><strong>Rewind window hard-coded at 500</strong>: regardless of how <code>history_length</code> is configured, the effective real-token count is capped at 500 (summed across 3 pools). Setting L &gt; 500 just yields more padding, not more signal.</li>
+  <li><strong>Continuous history across sessions</strong>: the flat sequence joins a user's sessions without inserting a "[SEP]" marker. Because <code>timestamps</code> are also absent from the token input, the model receives a continuous behavioral history.</li>
+  <li><strong>The training scan window and per-pool length are separate settings</strong>: <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/config.py#L84-L99"><code>scan_window</code></a> controls how many raw events are read before <code>history_length</code> keeps the latest L events from each pool. Their defaults are 500 and 20. The 5B configuration used here sets L to 500 but does not override <code>scan_window</code>, so training still scans only the latest 500 raw events. In the pinned revision, eval <code>get_user_history()</code> still uses a literal 500, so the training and evaluation paths are not fully symmetric.</li>
 </ul>
 
 <hr>
 
-<h2 id="en-sec4">4. Summary</h2>
+<h2 id="en-sec4">4. From Dataset Fields to Training Samples</h2>
+
+<p>The static schema and runtime data flow meet in <code>ScoringPair</code>. Each target event supplies the candidate and labels; preceding user events supply sequential context; catalog and statistics assets provide entity attributes and dense features. That produces four field paths:</p>
 
 <ul>
-  <li><strong>Raw data</strong>: Yambda is Yandex Music's public release of 4.79B real interaction events, each with 7 fields (<code>uid, item_id, timestamp, event_type, is_organic, played_ratio_pct, track_length_seconds</code>) plus three shared catalog files (audio embeddings, item&rarr;artist, item&rarr;album).</li>
-  <li><strong>Training time</strong>: 4 non-sequential sparse features (uid/item/artist/album) + 9 sequential sparse features (3 pool &times; 3 entity, sharing 4 native tables) + 4 dense families (audio_embed/user_counters/item_counters/cross_counters), plus 4 labels (listen+/like/dislike/played_ratio).</li>
-  <li><strong>Preprocessing</strong>: GTS temporal split (300d train + 30min gap + 1d test) &rarr; 30-minute session segmentation &rarr; listen+/like/skip three-pool split &rarr; multi-window counters.</li>
-  <li><strong>Cross-product implementation</strong>: the repo ships 7 cross tables (names, cardinalities, hashing behavior all defined), with cross-platform-reproducible xxhash64; current <code>embedding_dim=64</code> keeps the embedding footprint at ~75 GB.</li>
+  <li><strong>The target event</strong> supplies <code>uid/item</code>, event context, and four multi-task labels; catalog mappings add artist, album, and the audio embedding.</li>
+  <li><strong>The user window before the target</strong> is filtered into listen+, like, and skip pools, producing nine right-aligned entity-history sequences.</li>
+  <li><strong>Offline statistics assets</strong> provide user, item, and user-item counters; runtime fields provide the hour and <code>is_organic</code>.</li>
+  <li><strong>Runtime assembly</strong> creates seven cross IDs with xxhash64, then writes four native scalars, nine sequences, and seven crossed scalars into one KJT.</li>
 </ul>
 
 <hr>
 
-<h2 id="en-sec5">5. Batch tensor flow (B=2 example)</h2>
+<h2 id="en-sec5">5. Batch Tensor Flow and Token Layout</h2>
 
 <h3 id="en-sec5-1">5.1 Input example (B=2, L=4)</h3>
 
-<p>(The actual 5B config uses <code>B_per_gpu=2048, L=500</code>. We shrink L to 4 here for readability.)</p>
+<p>This section first uses <code>B=2, L=4</code> to expose every ID position, then substitutes the production dimensions into the same formulas. At the pinned commit, the cross-feature config specifies global <code>batch_size=8192</code> and 8 GPUs (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/configs/bench_onetrans_large_5b_cross_feat_shampoo.yaml#L69-L91">config</a>), while the runner divides by world size (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/scripts/run_distributed.py#L239">runner</a>). Production shapes therefore use <code>B_per_gpu=1024, L=500</code>. The “per-GPU batch=2048” header comment in the base config conflicts with these executable values.</p>
 
 <h4>Sample #0: user 42 scoring track #999</h4>
 <pre><code>uid              = 42
@@ -1878,9 +1884,9 @@ hist_lp_item_ids   = [101, 102, 103, 104]
 hist_lp_artist_ids = [ 11,  12,  11,  13]
 hist_lp_album_ids  = [201, 202, 201, 203]
 
-hist_like_item_ids   = [102, 105,   0,   0]   # only 2 likes, 0-padded at the tail
-hist_like_artist_ids = [ 12,  14,   0,   0]
-hist_like_album_ids  = [202, 204,   0,   0]
+hist_like_item_ids   = [  0,   0, 102, 105]   # only 2 likes; left-padded with zeros
+hist_like_artist_ids = [  0,   0,  12,  14]
+hist_like_album_ids  = [  0,   0, 202, 204]
 
 hist_skip_item_ids   = [301, 302, 303, 304]
 hist_skip_artist_ids = [ 21,  22,  21,  23]
@@ -1888,13 +1894,13 @@ hist_skip_album_ids  = [401, 402, 401, 403]
 
 # Cross-product IDs computed on the fly (assume the event's timestamp gives hour=14, is_organic=1)
 cross_ids = {
-  "user_x_artist":         xxhash64(42, 88)        % 100_000_000 = 42_103_771,
-  "user_x_album":          xxhash64(42, 333)       %  40_000_000 = 18_204_009,
-  "user_x_hour":           xxhash64(42, 14)        %  24_000_000 =  1_008_544,
-  "item_x_hour":           xxhash64(999, 14)       %  40_000_000 = 27_113_002,
-  "artist_x_hour":         xxhash64(88, 14)        %  32_000_000 = 14_750_388,
-  "user_x_is_organic":     xxhash64(42, 1)         %   2_000_000 =     31_557,
-  "user_x_artist_x_hour":  xxhash64(42, 88, 14)    %  40_000_000 = 33_902_115,
+  "user_x_artist":         xxhash64(42, 88)        % 100_000_000,
+  "user_x_album":          xxhash64(42, 333)       %  40_000_000,
+  "user_x_hour":           xxhash64(42, 14)        %  24_000_000,
+  "item_x_hour":           xxhash64(999, 14)       %  40_000_000,
+  "artist_x_hour":         xxhash64(88, 14)        %  32_000_000,
+  "user_x_is_organic":     xxhash64(42, 1)         %   2_000_000,
+  "user_x_artist_x_hour":  xxhash64(42, 88, 14)    %  40_000_000,
 }
 
 # Dense
@@ -1914,9 +1920,9 @@ listen_pct  = 0.85
 <pre><code>uid=7 &middot; item_id=2024 &middot; artist_id=501 &middot; album_id=1700
 
 # The same user has different real-history lengths per pool: lp=2 / like=4 / skip=2, padding sits at the head
-hist_lp_item_ids   = [555, 556,   0,   0]      # note 0-padding at the front (right-aligned)
+hist_lp_item_ids   = [  0,   0, 555, 556]      # left zero-padding; real events are right-aligned
 hist_like_item_ids = [556, 600, 700, 800]
-hist_skip_item_ids = [901, 902,   0,   0]
+hist_skip_item_ids = [  0,   0, 901, 902]
 # (artist / album use the same right-aligned padding, values omitted)
 
 # Cross IDs go through the same xxhash64 flow; assume hour=3, is_organic=0 here
@@ -1928,7 +1934,7 @@ listen_plus = 0.0   &middot;   like = 1.0   &middot;   dislike = 0.0   &middot; 
 
 <h3 id="en-sec5-2">5.2 Collated tensors</h3>
 
-<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/data/pipeline_batch.py#L103-L131"><code>collate_pipeline_batch</code></a> stitches a list of samples into a <code>PipelineBatch</code>:</p>
+<p><a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/data/pipeline_batch.py#L103-L131"><code>collate_pipeline_batch</code></a> stitches a list of samples into a <code>PipelineBatch</code>:</p>
 
 <h4>(a) Dense tensor dict (<code>PipelineBatch.tensors</code>)</h4>
 <pre><code>tensors = {
@@ -1985,15 +1991,15 @@ values = torch.cat([
   [ 88,  501],                                        # "artist"   scalar &times; B
   [333, 1700],                                        # "album"    scalar &times; B
   [ 42,    7],                                        # "uid"      scalar &times; B
-  [101,102,103,104,  555,556,  0,  0],                # "hist_lp_item"      B&times;L
-  [102,105,  0,  0,  556,600,700,800],                # "hist_like_item"    B&times;L
-  [301,302,303,304,  901,902,  0,  0],                # "hist_skip_item"    B&times;L
-  [ 11, 12, 11, 13,   70, 71,  0,  0],                # "hist_lp_artist"    B&times;L
+  [101,102,103,104,    0,  0,555,556],                # "hist_lp_item"      B&times;L
+  [  0,  0,102,105,  556,600,700,800],                # "hist_like_item"    B&times;L
+  [301,302,303,304,    0,  0,901,902],                # "hist_skip_item"    B&times;L
+  [ 11, 12, 11, 13,    0,  0, 70, 71],                # "hist_lp_artist"    B&times;L
   ...                                                  # same pattern continues (hist_like_artist, hist_skip_artist,
                                                        #             hist_lp_album, hist_like_album, hist_skip_album)
   # 7 cross-table scalar IDs (B=2 each)
-  [42_103_771, ...],                                  # "user_x_artist"
-  [18_204_009, ...],                                  # "user_x_album"
+  [hash_ua_0, hash_ua_1],                             # "user_x_artist"
+  [hash_ualbum_0, hash_ualbum_1],                     # "user_x_album"
   ...
 ])
 # total length of values = 4&times;B (scalar native) + 9&times;B&times;L (sequence native) + 7&times;B (cross)
@@ -2007,23 +2013,23 @@ values = torch.cat([
 
 <table>
 <thead>
-<tr><th>Table</th><th>Lookups per user</th><th>Batch lookup formula</th><th>B=2, L=4 example</th><th>Real 5B config (B=2048, L=500)</th></tr>
+<tr><th>Table</th><th>Lookups per user</th><th>Batch lookup formula</th><th>B=2, L=4 example</th><th>Real 5B config (B=1024, L=500)</th></tr>
 </thead>
 <tbody>
-<tr><td><code>item</code> (9.39M)</td><td>1 + 3L</td><td>B &times; (1 + 3L)</td><td>2 &times; 13 = <strong>26</strong></td><td>2048 &times; 1501 = <strong>3,074,048</strong></td></tr>
-<tr><td><code>artist</code> (1.29M)</td><td>1 + 3L</td><td>B &times; (1 + 3L)</td><td>26</td><td>3,074,048</td></tr>
-<tr><td><code>album</code> (3.37M)</td><td>1 + 3L</td><td>B &times; (1 + 3L)</td><td>26</td><td>3,074,048</td></tr>
-<tr><td><code>uid</code> (1M)</td><td>1</td><td>B</td><td>2</td><td>2,048</td></tr>
-<tr><td>each cross table (7 in total)</td><td>1 each &rarr; 7 in total</td><td>B each</td><td>2 each &rarr; 14 in total</td><td>2,048 each &rarr; 14,336 in total</td></tr>
-<tr><td><strong>Total</strong></td><td><strong>3&middot;(1+3L) + 1 + 7 = 9L + 11</strong></td><td><strong>B&middot;(9L + 11)</strong></td><td><strong>47/user &rarr; 94</strong></td><td><strong>4,511/user &rarr; 9,238,528</strong></td></tr>
+<tr><td><code>item</code> (9.39M)</td><td>1 + 3L</td><td>B &times; (1 + 3L)</td><td>2 &times; 13 = <strong>26</strong></td><td>1024 &times; 1501 = <strong>1,537,024</strong></td></tr>
+<tr><td><code>artist</code> (1.29M)</td><td>1 + 3L</td><td>B &times; (1 + 3L)</td><td>26</td><td>1,537,024</td></tr>
+<tr><td><code>album</code> (3.37M)</td><td>1 + 3L</td><td>B &times; (1 + 3L)</td><td>26</td><td>1,537,024</td></tr>
+<tr><td><code>uid</code> (1M)</td><td>1</td><td>B</td><td>2</td><td>1,024</td></tr>
+<tr><td>each cross table (7 in total)</td><td>1 each &rarr; 7 in total</td><td>B each</td><td>2 each &rarr; 14 in total</td><td>1,024 each &rarr; 7,168 in total</td></tr>
+<tr><td><strong>Total</strong></td><td><strong>3&middot;(1+3L) + 1 + 7 = 9L + 11</strong></td><td><strong>B&middot;(9L + 11)</strong></td><td><strong>47/user &rarr; 94</strong></td><td><strong>4,511/user &rarr; 4,619,264</strong></td></tr>
 </tbody>
 </table>
 
 <div class="callout">
-<strong>Observations:</strong>
+<p>The query distribution has three direct consequences:</p>
 <ul>
-  <li>~<strong>99.9% of sparse queries</strong> are concentrated on the 3 native sequence tables (item / artist / album). This is why sequence length L directly drives TBE throughput pressure.</li>
-  <li>There are many cross tables (7), but each gets only B lookups per batch, so total volume is small. The bottleneck is <strong>the size of the tables themselves</strong> (a single <code>user_x_artist</code> at 100M rows &times; dim=512 = 204.8 GB) and <strong>all-to-all</strong> communication shapes.</li>
+  <li>~<strong>99.8% of sparse queries</strong> are concentrated on the 3 native sequence tables (item / artist / album), so sequence length L directly determines the TBE query volume.</li>
+  <li>There are 7 cross tables, but each receives only B lookups per batch. With the configured <code>embedding_dim=64</code>, the 100M-row <code>user_x_artist</code> weights occupy about 25.6 GB in FP32; actual storage and communication depend on dtype, sharding, and runtime layout.</li>
   <li>Sequence padding zeros also hit row 0 (the placeholder embedding); if needed, the model side can mask them out.</li>
 </ul>
 </div>
@@ -2045,7 +2051,7 @@ final [B, 16, d_model] passes through head_proj &rarr; [B, 384] &rarr; task head
 
 <h3 id="en-sec5-5">5.5 Post-lookup tensor shapes</h3>
 
-<p>The repo defaults to <code>pooling="none"</code> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/config.py#L108">config.py:108</a>) &rarr; it goes through the <strong>unpooled <code>EmbeddingCollection</code> (EC)</strong> rather than EBC, so the sequence dimension is preserved. <code>TorchRecEmbeddings.forward</code> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/embedding.py#L126-L174">embedding.py:126-174</a>) output rule:</p>
+<p>The repo defaults to <code>pooling="none"</code> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/config.py#L108">config.py:108</a>) &rarr; it goes through the <strong>unpooled <code>EmbeddingCollection</code> (EC)</strong> rather than EBC, so the sequence dimension is preserved. <code>TorchRecEmbeddings.forward</code> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/embedding.py#L126-L174">embedding.py:126-174</a>) output rule:</p>
 
 <table>
 <thead>
@@ -2057,59 +2063,59 @@ final [B, 16, d_model] passes through head_proj &rarr; [B, 384] &rarr; task head
 </tbody>
 </table>
 
-<p>Plugging in the 5B config (<code>B=2048, L=500, D=embedding_dim=64</code>), here are the concrete post-lookup shapes for all 20 tensors (13 native KJT keys + 7 cross):</p>
+<p>Plugging in the 5B config (<code>B=1024, L=500, D=embedding_dim=64</code>), here are the concrete post-lookup shapes for all 20 tensors (13 native KJT keys + 7 cross):</p>
 
 <table>
 <thead>
-<tr><th>KJT feature</th><th>Source table</th><th>Type</th><th>Post-lookup shape (B=2048, L=500, D=64)</th></tr>
+<tr><th>KJT feature</th><th>Source table</th><th>Type</th><th>Post-lookup shape (B=1024, L=500, D=64)</th></tr>
 </thead>
 <tbody>
 <tr><td colspan="4"><strong>4 native scalars (non-sequential)</strong></td></tr>
-<tr><td><code>item</code></td><td><code>item</code> table (9.39M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>artist</code></td><td><code>artist</code> table (1.29M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>album</code></td><td><code>album</code> table (3.37M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>uid</code></td><td><code>uid</code> table (1M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>item</code></td><td><code>item</code> table (9.39M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>artist</code></td><td><code>artist</code> table (1.29M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>album</code></td><td><code>album</code> table (3.37M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>uid</code></td><td><code>uid</code> table (1M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
 <tr><td colspan="4"><strong>9 sequential (L-axis preserved)</strong></td></tr>
-<tr><td><code>hist_lp_item / hist_like_item / hist_skip_item</code></td><td><code>item</code> table (9.39M)</td><td>sequence</td><td>each <code>[2048, 500, 64]</code></td></tr>
-<tr><td><code>hist_lp_artist / hist_like_artist / hist_skip_artist</code></td><td><code>artist</code> table</td><td>sequence</td><td>each <code>[2048, 500, 64]</code></td></tr>
-<tr><td><code>hist_lp_album / hist_like_album / hist_skip_album</code></td><td><code>album</code> table</td><td>sequence</td><td>each <code>[2048, 500, 64]</code></td></tr>
+<tr><td><code>hist_lp_item / hist_like_item / hist_skip_item</code></td><td><code>item</code> table (9.39M)</td><td>sequence</td><td>each <code>[1024, 500, 64]</code></td></tr>
+<tr><td><code>hist_lp_artist / hist_like_artist / hist_skip_artist</code></td><td><code>artist</code> table</td><td>sequence</td><td>each <code>[1024, 500, 64]</code></td></tr>
+<tr><td><code>hist_lp_album / hist_like_album / hist_skip_album</code></td><td><code>album</code> table</td><td>sequence</td><td>each <code>[1024, 500, 64]</code></td></tr>
 <tr><td colspan="4"><strong>7 cross scalars (non-sequential)</strong></td></tr>
-<tr><td><code>user_x_artist</code></td><td><code>user_x_artist</code> table (100M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>user_x_album</code></td><td><code>user_x_album</code> (40M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>user_x_hour</code></td><td><code>user_x_hour</code> (24M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>item_x_hour</code></td><td><code>item_x_hour</code> (40M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>artist_x_hour</code></td><td><code>artist_x_hour</code> (32M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>user_x_is_organic</code></td><td><code>user_x_is_organic</code> (2M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>user_x_artist_x_hour</code></td><td><code>user_x_artist_x_hour</code> (40M)</td><td>scalar</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>user_x_artist</code></td><td><code>user_x_artist</code> table (100M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>user_x_album</code></td><td><code>user_x_album</code> (40M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>user_x_hour</code></td><td><code>user_x_hour</code> (24M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>item_x_hour</code></td><td><code>item_x_hour</code> (40M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>artist_x_hour</code></td><td><code>artist_x_hour</code> (32M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>user_x_is_organic</code></td><td><code>user_x_is_organic</code> (2M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>user_x_artist_x_hour</code></td><td><code>user_x_artist_x_hour</code> (40M)</td><td>scalar</td><td><code>[1024, 64]</code></td></tr>
 </tbody>
 </table>
 
 <div class="callout">
-<strong>Total sparse-side activation volume</strong>: 9 &times; (2048&times;500&times;64) + (4+7) &times; (2048&times;64) = <strong>&asymp; 590M floats &asymp; 2.36 GB / batch</strong> (halved to &asymp; 1.18 GB under BF16).<br>
-<strong>The 9 history sequences account for 99.6% of this</strong>, which is why OneTrans's S-token sequence is the main load source for the sparse backend's all-to-all communication.
+<strong>Total sparse-side activation volume</strong>: 9 &times; (1024&times;500&times;64) + (4+7) &times; (1024&times;64) = <strong>&asymp; 295.6M floats &asymp; 1.18 GB / batch</strong> (halved to &asymp; 0.59 GB under BF16).<br>
+<strong>By element count, the 9 history sequences account for 99.8% of this</strong>. This establishes that S-token sequences dominate lookup-output volume; actual all-to-all bytes also depend on TorchRec sharding, padding, and dtype.
 </div>
 
-<p class="small">Tip: the <code>scalar_feature_names</code> set (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/embedding.py#L169-L172">embedding.py:169-172</a>) decides whether the reshape goes to <code>[B,D]</code> or <code>[B,-1,D]</code>. This set is auto-registered from the config's <code>feature.scalar_features</code> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/bench_onetrans_large_5b.yaml#L57">bench_onetrans_large_5b.yaml:57</a>) plus the 7 cross scalars.</p>
+<p class="small">The <code>scalar_feature_names</code> set (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/embedding.py#L169-L172">embedding.py:169-172</a>) selects a reshape to either <code>[B,D]</code> or <code>[B,-1,D]</code>. It is populated from the configuration's <code>feature.scalar_features</code> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/configs/bench_onetrans_large_5b.yaml#L57">bench_onetrans_large_5b.yaml:57</a>) and the seven crossed scalars.</p>
 
 <h3 id="en-sec5-6">5.6 Dense feature processing path</h3>
 
-<p><strong>Conclusion: yes, dense features are used, and they are part of OneTrans's NS-token input.</strong> Dense features skip the embedding lookup (they are already float vectors) and travel down a separate path. The source / semantics of each dense family are in <a href="#en-sec2-3">§2.3</a>; this section covers <strong>the processing logic and shape evolution</strong> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/configs/bench_onetrans_large_5b.yaml#L58-L62">config fields</a>):</p>
+<p>Dense features feed the OneTrans NS-token input. They are already floating-point vectors, so they bypass embedding lookup and follow a separate path. The source and semantics of each dense family are in <a href="#en-sec2-3">§2.3</a>; this section covers <strong>the processing logic and shape evolution</strong> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/configs/bench_onetrans_large_5b.yaml#L58-L62">config fields</a>):</p>
 
 <table>
 <thead>
-<tr><th>Dense feature</th><th>Input (B=2048)</th><th>Processing</th><th>After projection</th></tr>
+<tr><th>Dense feature</th><th>Input (B=1024)</th><th>Processing</th><th>After projection</th></tr>
 </thead>
 <tbody>
-<tr><td><code>audio_embed</code></td><td><code>[2048, 128]</code></td><td><code>project=true</code> &middot; Linear(128&rarr;D) + GeLU</td><td><code>[2048, 64]</code></td></tr>
-<tr><td><code>user_counters</code></td><td><code>[2048, 6]</code></td><td><code>project=false</code> &middot; concat as-is</td><td><code>[2048, 6]</code></td></tr>
-<tr><td><code>item_counters</code></td><td><code>[2048, 6]</code></td><td><code>project=false</code> &middot; concat as-is</td><td><code>[2048, 6]</code></td></tr>
-<tr><td><code>cross_counters</code></td><td><code>[2048, 18]</code></td><td><code>project=true</code> &middot; Linear(18&rarr;D) + ReLU</td><td><code>[2048, 64]</code></td></tr>
+<tr><td><code>audio_embed</code></td><td><code>[1024, 128]</code></td><td><code>project=true</code> &middot; Linear(128&rarr;D) + GeLU</td><td><code>[1024, 64]</code></td></tr>
+<tr><td><code>user_counters</code></td><td><code>[1024, 6]</code></td><td><code>project=false</code> &middot; concat as-is</td><td><code>[1024, 6]</code></td></tr>
+<tr><td><code>item_counters</code></td><td><code>[1024, 6]</code></td><td><code>project=false</code> &middot; concat as-is</td><td><code>[1024, 6]</code></td></tr>
+<tr><td><code>cross_counters</code></td><td><code>[1024, 18]</code></td><td><code>project=true</code> &middot; Linear(18&rarr;D) + ReLU</td><td><code>[1024, 64]</code></td></tr>
 </tbody>
 </table>
 
-<p class="small">Note: the projection target dim is <code>embedding_dim = D = 64</code> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L341">onetrans.py:341</a>), not <code>d_model = 384</code>. This keeps dense projections at the same magnitude as sparse scalar embeddings, making them directly concat-able.</p>
+<p class="small">The projection target is <code>embedding_dim = D = 64</code> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/onetrans.py#L341">onetrans.py:341</a>), which gives dense projections the same width as sparse scalar embeddings for direct concatenation. AutoSplitTokenizer subsequently maps the combined vector to <code>d_model = 384</code>.</p>
 
-<h4>Destination inside OneTrans (code: <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L522-L532"><code>OneTransModel._build_ns_raw</code></a>)</h4>
+<h4>Destination inside OneTrans (code: <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/onetrans.py#L522-L532"><code>OneTransModel._build_ns_raw</code></a>)</h4>
 
 <pre><code>NS raw vector = concat([
   # 11 sparse scalar embeddings (already looked up, top half of &sect;5.5)
@@ -2129,18 +2135,18 @@ final [B, 16, d_model] passes through head_proj &rarr; [B, 384] &rarr; task head
 # ns_raw_dim = 11 &times; D + 2 &times; D + 2 &times; 6
 #           = 11 &times; 64 + 2 &times; 64 + 12
 #           = 704 + 128 + 12 = 844
-# shape: [B, 844] = [2048, 844]
+# shape: [B, 844] = [1024, 844]
 
 &darr; AutoSplitTokenizer (onetrans.py:260-276):
     proj = Linear(844, 16 &times; 384) &rarr; GeLU &rarr; Linear(16 &times; 384, 16 &times; 384)
     .view(B, 16, 384)
 
-NS-tokens = [B, n_ns_tokens, d_model] = [2048, 16, 384]
+NS-tokens = [B, n_ns_tokens, d_model] = [1024, 16, 384]
 </code></pre>
 
-<h4>Do dense features feed attention? <span class="ok">Yes, via the NS-tokens channel.</span></h4>
+<h4>Dense features enter attention through the NS-tokens channel</h4>
 
-<p>NS-tokens are concatenated directly with S-tokens before entering the Transformer block (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L565-L582"><code>_backbone</code></a>):</p>
+<p>NS-tokens are concatenated directly with S-tokens before entering the Transformer block (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/onetrans.py#L565-L582"><code>_backbone</code></a>):</p>
 
 <pre><code>s_tokens  = [B, 1500, 384]    # 3 pool &times; L=500 history &rarr; via SequentialTokenizer
 ns_tokens = [B,   16, 384]    # 11 sparse scalars + 4 dense &rarr; via AutoSplitTokenizer
@@ -2151,7 +2157,7 @@ for layer in self.blocks:
     x = block(x, mask=pyramid_mask, ...)       # MixedAttention sees the full x
 </code></pre>
 
-<p>Inside <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L85-L161"><code>MixedAttention</code></a>:</p>
+<p>Inside <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/onetrans.py#L85-L161"><code>MixedAttention</code></a>:</p>
 
 <table>
 <thead>
@@ -2175,13 +2181,13 @@ for layer in self.blocks:
 
 <ol>
   <li><strong>As Queries</strong>: NS-tokens can attend to any history S-token (looking back at user history).</li>
-  <li><strong>As Keys/Values</strong>: S-tokens can also attend to NS-tokens (fusing candidate + dense info into every history position), i.e. "<em>sequence positions attend over candidate and context tokens</em>".</li>
-  <li><strong>Pyramid trim only trims S-tokens</strong> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L568-L572">onetrans.py:568-572</a>); NS-tokens (and the dense info inside them) <strong>retain all 16 across every layer</strong>.</li>
+  <li><strong>As Keys/Values</strong>: under the <a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/onetrans.py#L64-L69">causal mask</a>, earlier S-tokens cannot attend to later NS-tokens; an NS-token can read preceding S-tokens and earlier NS-tokens.</li>
+  <li><strong>Pyramid trim only trims S-tokens</strong> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/onetrans.py#L568-L572">onetrans.py:568-572</a>); NS-tokens (and the dense info inside them) <strong>retain all 16 across every layer</strong>.</li>
 </ol>
 
 <h3 id="en-sec5-7">5.7 Attention input token layout (by feature name)</h3>
 
-<p>&sect;5.4 gave the tokenization overview, &sect;5.5 gave the per-lookup output shapes. This section answers directly: <strong>for the attention input <code>x: [B, 1516, 384]</code>, which named features sit at each position, and in what order?</strong></p>
+<p>After the two tokenizer paths consume the lookup outputs, they form <code>x: [B, 1516, 384]</code>. The first 1500 positions retain behavior-pool and temporal order, while the final 16 positions are generated jointly from all non-sequential inputs.</p>
 
 <h4>S-tokens (positions 0..1499): 3 pools &times; L, each segment right-aligned</h4>
 
@@ -2203,7 +2209,7 @@ Content of each S-token (per pool g, per event t):
 
 <h4>NS-tokens (positions 1500..1515): no per-token feature alignment</h4>
 
-<p><strong>Key:</strong> these 16 tokens <strong>cannot be mapped position-by-position back to named features</strong>. <code>AutoSplitTokenizer</code> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L260-L276">onetrans.py:260-276</a>) is <code>Linear(844, 16&middot;d_model) &rarr; GeLU &rarr; Linear(...) &rarr; view(B, 16, d_model)</code>: each output channel is a linear mixture of all 844 input dimensions, so token-position semantics are learned at training time. The underlying 844-d raw vector is laid out in named-feature order (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/main/primus_dlrm/models/onetrans.py#L522-L532">onetrans.py:522-532</a>), as in the diagram below (horizontal width proportional to dim count):</p>
+<p>An <strong>NS-token</strong> is a learned representation generated by AutoSplitTokenizer from the complete non-sequential vector. <code>AutoSplitTokenizer</code> (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/onetrans.py#L260-L276">onetrans.py:260-276</a>) applies <code>Linear(844, 16&middot;d_model) &rarr; GeLU &rarr; Linear(...) &rarr; view(B, 16, d_model)</code>. Every output channel mixes all 844 input dimensions, so the sixteen positions acquire their semantics during training rather than corresponding one-to-one with named features. The underlying 844-d vector still follows named-feature order (<a href="https://github.com/AMD-AGI/Primus-DLRM/blob/52733ce83e20fb64137c79bb3508768de4975de5/primus_dlrm/models/onetrans.py#L522-L532">onetrans.py:522-532</a>), as shown below with segment widths proportional to dimension count:</p>
 
 <div style="overflow-x:auto; margin:1em 0;">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 290" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
@@ -2419,7 +2425,7 @@ pos:    only the S segment adds per-pool pos_emb inside SequentialTokenizer;
 
 <h3 id="en-sec5-8">5.8 End-to-end visualization (Raw &rarr; Attention)</h3>
 
-<p>We split the data flow into two figures, joined at the <strong>attention input [B, 1516, 384]</strong>: <strong>Figure A</strong> shows how data is built from raw input up to the attention input; <strong>Figure B</strong> shows how the attention input passes through 8 Transformer layers, splits off NS-tokens, goes through the head to produce a prediction, and finally the loss. 5B config: <code>B=2048, L=500, D=64, d_model=384, n_ns_tokens=16, n_layers=8</code>.</p>
+<p>We split the data flow into two figures, joined at the <strong>attention input [B, 1516, 384]</strong>: <strong>Figure A</strong> shows how data is built from raw input up to the attention input; <strong>Figure B</strong> shows how the attention input passes through 8 Transformer layers, splits off NS-tokens, goes through the head to produce a prediction, and finally the loss. 5B config: <code>B=1024, L=500, D=64, d_model=384, n_ns_tokens=16, n_layers=8</code>.</p>
 
 <div style="overflow-x:auto; margin:1em 0;">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1100" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" style="max-width:100%; height:auto; display:block; border:1px solid #d0d7de; border-radius:6px; background:#fff;">
@@ -2433,7 +2439,7 @@ pos:    only the S segment adds per-pool pos_emb inside SequentialTokenizer;
   </defs>
 
   <text x="640" y="22" font-size="14" font-weight="700" text-anchor="middle" fill="#1f2328">Figure A: data construction, Raw Input &rarr; Attention input</text>
-  <text x="640" y="40" font-size="10" text-anchor="middle" fill="#57606a">bottom-up &middot; B=2048, L=500, D=64, d_model=384, n_ns_tokens=16</text>
+  <text x="640" y="40" font-size="10" text-anchor="middle" fill="#57606a">bottom-up &middot; B=1024, L=500, D=64, d_model=384, n_ns_tokens=16</text>
 
   <!-- Attention input (top of this figure) -->
   <g>
@@ -2642,7 +2648,7 @@ pos:    only the S segment adds per-pool pos_emb inside SequentialTokenizer;
   </defs>
 
   <text x="640" y="22" font-size="14" font-weight="700" text-anchor="middle" fill="#1f2328">Figure B: model forward, Attention input &rarr; 8-layer Transformer &rarr; Head &rarr; Loss</text>
-  <text x="640" y="40" font-size="10" text-anchor="middle" fill="#57606a">bottom-up &middot; B=2048, d_model=384, n_ns_tokens=16, n_layers=8</text>
+  <text x="640" y="40" font-size="10" text-anchor="middle" fill="#57606a">bottom-up &middot; B=1024, d_model=384, n_ns_tokens=16, n_layers=8</text>
 
   <!-- Loss (TOP) -->
   <g>

@@ -12,8 +12,8 @@
 <meta name="post:tags_en"         content="LLM, MoE, Architecture, Systems">
 <meta name="post:reading"         content="18 分钟">
 <meta name="post:reading_en"      content="18 min">
-<meta name="post:summary"         content="从 torch op 视角拆解现代 LLM MoE: router、top-k、indexer、dispatcher、grouped expert MLP、combine、专家并行和 MegaMoE 融合执行。">
-<meta name="post:summary_en"      content="A torch-op view of modern LLM MoE: router, top-k, indexer, dispatcher, grouped expert MLP, combine, expert parallelism, and MegaMoE fused execution.">
+<meta name="post:summary"         content="现代 sparse MoE 用 top-k 将 token 分配给少量 expert，使模型容量与单 token 计算量分别扩展。运行时还需索引、重排、GroupedGEMM、加权回填和 all-to-all；MegaMoE 改变量化与融合 contract，不改变路由方程。">
+<meta name="post:summary_en"      content="Modern sparse MoE routes each token to a small expert subset, decoupling total parameter capacity from per-token activated compute. Runtime execution still requires token-to-expert indexing, permutation, GroupedGEMM, weighted restoration, and cross-GPU all-to-all; MegaMoE changes the quantization and fusion contract of these stages without changing the routing equation.">
 <meta name="post:series"          content="llm-arch">
 <meta name="post:series_title"    content="LLM Attention 与实现">
 <meta name="post:series_title_en" content="LLM Attention and Implementations">
@@ -25,21 +25,7 @@
   };
 </script>
 <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
-<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js" defer></script>
 <script src="../lang-toggle.js" defer></script>
-<script>
-  window.addEventListener('load', () => {
-    if (window.mermaid) {
-      window.mermaid.initialize({
-        startOnLoad: false,
-        theme: 'neutral',
-        securityLevel: 'loose',
-        flowchart: { curve: 'basis', htmlLabels: true }
-      });
-      window.mermaid.run({ querySelector: '.mermaid' });
-    }
-  });
-</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
@@ -73,9 +59,12 @@
     margin-bottom: 10px;
     letter-spacing: 0;
   }
-  .diagram-frame .mermaid {
-    min-width: 720px;
-  }
+  .diagram-svg { display: block; width: 100%; min-width: 760px; height: auto; }
+  .diagram-svg text { fill: var(--fg); font-family: var(--font-sans); letter-spacing: 0; }
+  .diagram-svg .node { fill: var(--bg); stroke: var(--border-strong); stroke-width: 1.2; }
+  .diagram-svg .accent { fill: var(--accent-tint); stroke: var(--accent); stroke-width: 1.4; }
+  .diagram-svg .muted { fill: var(--fg-muted); font-size: 11px; }
+  .diagram-svg .edge { fill: none; stroke: var(--fg-muted); stroke-width: 1.4; }
   .term {
     font-family: var(--font-mono);
     font-size: 0.94em;
@@ -91,27 +80,27 @@
     <div class="toc-title">目录 · TOC</div>
     <div class="lang-zh">
     <ul>
-      <li><a href="#zh-scope">0. 范围</a></li>
-      <li><a href="#zh-block">1. MoE 在 block 里的位置</a></li>
-      <li><a href="#zh-torch">2. torch op 视角</a></li>
-      <li><a href="#zh-terms">3. 术语表</a></li>
-      <li><a href="#zh-arch">4. 当前架构类型</a></li>
+      <li><a href="#zh-scope">0. 模型边界</a></li>
+      <li><a href="#zh-block">1. MoE 对 FFN 的替换</a></li>
+      <li><a href="#zh-torch">2. 从路由到执行的数据流</a></li>
+      <li><a href="#zh-terms">3. 运行时术语</a></li>
+      <li><a href="#zh-arch">4. 架构与执行类型</a></li>
       <li><a href="#zh-history">5. 演进历史</a></li>
-      <li><a href="#zh-megamoe">6. MegaMoE</a></li>
-      <li><a href="#zh-problems">7. 实现问题</a></li>
+      <li><a href="#zh-megamoe">6. MegaMoE 执行 contract</a></li>
+      <li><a href="#zh-problems">7. 执行瓶颈与约束</a></li>
       <li><a href="#zh-refs">参考资料</a></li>
     </ul>
     </div>
     <div class="lang-en">
     <ul>
-      <li><a href="#en-scope">0. Scope</a></li>
-      <li><a href="#en-block">1. Where MoE sits</a></li>
-      <li><a href="#en-torch">2. Torch-op view</a></li>
-      <li><a href="#en-terms">3. Terms</a></li>
-      <li><a href="#en-arch">4. Architecture families</a></li>
+      <li><a href="#en-scope">0. Model boundary</a></li>
+      <li><a href="#en-block">1. Replacing the FFN</a></li>
+      <li><a href="#en-torch">2. Routing-to-execution dataflow</a></li>
+      <li><a href="#en-terms">3. Runtime terminology</a></li>
+      <li><a href="#en-arch">4. Architecture and execution patterns</a></li>
       <li><a href="#en-history">5. History</a></li>
-      <li><a href="#en-megamoe">6. MegaMoE</a></li>
-      <li><a href="#en-problems">7. Implementation issues</a></li>
+      <li><a href="#en-megamoe">6. The MegaMoE execution contract</a></li>
+      <li><a href="#en-problems">7. Execution bottlenecks</a></li>
       <li><a href="#en-refs">References</a></li>
     </ul>
     </div>
@@ -123,50 +112,63 @@
 
 <h1>现代 LLM MoE 架构：路由、分发与融合执行</h1>
 
-<p class="small">本文按 2026-08-07 可见的公开论文、文档和开源实现整理。MoE 不是 attention 变体,但它和 attention 一起决定了现代 Transformer block 的系统形态:attention 负责 token 之间的信息混合,MoE 通常替换 FFN/MLP,负责把每个 token 送到少量专家上计算。</p>
+<p class="lead">Transformer 的 FFN 保存了模型中很大一部分参数，dense 执行会让每个 token 经过同一组权重，扩展模型容量也会直接增加单 token 计算量。Sparse MoE 把 FFN 权重改为条件选择，使模型容量与每次前向实际激活的计算量可以分别扩展。</p>
 
-<h2 id="zh-scope">0. 范围</h2>
+<p>条件计算把 MLP 权重选择扩展成一条运行时数据路径。Router 输出需要转换成 token permutation 和 expert offset，跨 GPU 部署还要完成两次 all-to-all，低精度 kernel 则要求额外的量化布局。MoE 因而同时是模型架构与执行系统问题。</p>
 
-<p>LLM 里的 MoE 大多是 sparse MoE。模型有多个 expert,但每个 token 只激活其中 \(K\) 个。于是参数量可以增长,单 token 激活计算量却不按 expert 总数线性增长。</p>
+<p class="small">版本范围：下文按 2026-08-07 可见的公开论文、文档和开源实现整理。讨论对象是 Transformer block 中替换 FFN/MLP 的 sparse MoE；attention 仍负责 token 之间的信息混合。</p>
 
-<p>本文只讨论 Transformer block 里的 MLP-MoE。Embedding MoE、attention MoE、RL policy MoE 和传统 ensemble 不展开。范围收窄以后,router、indexer、dispatcher、expert parallel 和 MegaMoE 这条实现链更容易保持可追踪。</p>
+<h2 id="zh-scope">0. 模型边界</h2>
 
-<h2 id="zh-block">1. MoE 在 block 里的位置</h2>
+<p>Sparse MLP-MoE 是一类条件执行的 FFN：模型包含 \(E\) 个 expert，每个 token 根据 router 分数激活其中 \(K\) 个，并将这些 expert 的输出加权合并。在 \(K \ll E\) 时，模型可以增加总参数量，而每个 token 只支付被选 expert 的计算成本。</p>
 
-<p>Dense Transformer block 里,FFN 对所有 token 使用同一组 MLP 权重。MoE block 把这组 MLP 权重拆成多个 expert,再用 router 为每个 token 选择少量 expert。</p>
+<p>这一定义把讨论限定在 Transformer block 内的 MLP-MoE。Embedding MoE、attention MoE、RL policy MoE 与传统 ensemble 具有不同的选择对象和执行路径，不纳入下文。后续章节沿着 router、indexer、dispatcher、expert parallel 与 MegaMoE 的顺序追踪一次完整执行。</p>
+
+<h2 id="zh-block">1. MoE 对 FFN 的替换</h2>
+
+<p>在 dense Transformer block 中，FFN 对所有 token 使用同一组 MLP 权重。MoE block 保留 attention、residual 与 normalization 的位置，只把 FFN 替换为 router、expert 集合和 weighted combine。由此，attention 继续混合 token 信息，MoE 负责在参数空间中选择计算路径。</p>
 
 <div class="diagram-frame">
   <div class="diagram-title">Dense FFN 与 MoE FFN 的位置</div>
-<pre class="mermaid">flowchart LR
-  X["hidden x [B,S,H]"] --> A["self-attention"]
-  A --> N1["residual / norm"]
-  N1 --> F["dense FFN: one MLP for all tokens"]
-  F --> Y["output"]
+  <svg class="diagram-svg" viewBox="0 0 1040 395" role="img" aria-labelledby="zh-moe-block-title zh-moe-block-desc">
+    <title id="zh-moe-block-title">Dense FFN 与 MoE FFN 在 Transformer block 中的位置</title>
+    <desc id="zh-moe-block-desc">Dense 路径让所有 token 经过同一个 FFN；MoE 路径由 router 选择 expert，再加权合并输出。</desc>
+    <defs><marker id="zh-moe-block-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path></marker></defs>
+    <text x="20" y="58" font-size="13" font-weight="600">Dense block</text>
+    <text x="20" y="223" font-size="13" font-weight="600">MoE block</text>
+    <g font-size="12" text-anchor="middle">
+      <rect class="node" x="120" y="25" width="135" height="58" rx="4"></rect><text x="188" y="50">hidden x</text><text class="muted" x="188" y="68">[B, S, H]</text>
+      <rect class="node" x="310" y="25" width="135" height="58" rx="4"></rect><text x="378" y="59">self-attention</text>
+      <rect class="node" x="500" y="25" width="135" height="58" rx="4"></rect><text x="568" y="59">residual / norm</text>
+      <rect class="accent" x="690" y="25" width="165" height="58" rx="4"></rect><text x="773" y="50">dense FFN</text><text class="muted" x="773" y="68">one MLP</text>
+      <rect class="node" x="910" y="25" width="100" height="58" rx="4"></rect><text x="960" y="59">output</text>
+      <path class="edge" d="M255 54H310 M445 54H500 M635 54H690 M855 54H910" marker-end="url(#zh-moe-block-arrow)"></path>
 
-  X2["hidden x [B,S,H]"] --> A2["self-attention"]
-  A2 --> N2["residual / norm"]
-  N2 --> R["router: token -> expert ids"]
-  R --> E0["expert MLP 0"]
-  R --> E1["expert MLP 1"]
-  R --> E2["expert MLP ..."]
-  E0 --> C["weighted combine"]
-  E1 --> C
-  E2 --> C
-  C --> Y2["output"]
-</pre>
+      <rect class="node" x="120" y="190" width="135" height="58" rx="4"></rect><text x="188" y="215">hidden x</text><text class="muted" x="188" y="233">[B, S, H]</text>
+      <rect class="node" x="310" y="190" width="135" height="58" rx="4"></rect><text x="378" y="224">self-attention</text>
+      <rect class="node" x="500" y="190" width="135" height="58" rx="4"></rect><text x="568" y="224">residual / norm</text>
+      <rect class="accent" x="690" y="190" width="135" height="58" rx="4"></rect><text x="758" y="215">router</text><text class="muted" x="758" y="233">top-k experts</text>
+      <rect class="node" x="865" y="145" width="105" height="44" rx="4"></rect><text x="918" y="172">expert 0</text>
+      <rect class="node" x="865" y="200" width="105" height="44" rx="4"></rect><text x="918" y="227">expert 1</text>
+      <rect class="node" x="865" y="255" width="105" height="44" rx="4"></rect><text x="918" y="282">expert ...</text>
+      <rect class="accent" x="690" y="325" width="135" height="44" rx="4"></rect><text x="758" y="352">weighted combine</text>
+      <rect class="node" x="865" y="325" width="105" height="44" rx="4"></rect><text x="918" y="352">output</text>
+      <path class="edge" d="M255 219H310 M445 219H500 M635 219H690 M825 219L865 167 M825 219H865 M825 219L865 277 M865 167L825 340 M865 222L825 347 M865 277L825 354 M825 347H865" marker-end="url(#zh-moe-block-arrow)"></path>
+    </g>
+  </svg>
 </div>
 
-<p>数学上可以写成:</p>
+<p>对第 \(t\) 个 token，这个替换可以写成：</p>
 
 <p>\[
 y_t = \sum_{j \in \mathrm{TopK}(r(x_t))} p_{t,j} E_j(x_t)
 \]</p>
 
-<p>\(x_t\) 是第 \(t\) 个 token 的 hidden state。\(\mathrm{TopK}(r(x_t))\) 是 router 选出的 expert 集合。\(E_j\) 是第 \(j\) 个 expert MLP。\(p_{t,j}\) 是 combine 时的权重。</p>
+<p>其中 \(x_t\) 是 hidden state，\(r(x_t)\) 产生 \(E\) 个 expert 的 routing score，\(\mathrm{TopK}(r(x_t))\) 给出被激活的 expert 集合。\(E_j\) 表示第 \(j\) 个 expert MLP，\(p_{t,j}\) 是合并该 expert 输出时使用的权重。</p>
 
-<h2 id="zh-torch">2. torch op 视角</h2>
+<h2 id="zh-torch">2. 从路由到执行的数据流</h2>
 
-<p>把实现写成 torch-like 代码,MoE 层就是下面这段。真实系统会把 sort、prefix sum、all-to-all、GEMM 和 combine 拆到 CUDA kernel 或通信库里,但数据流没有变。</p>
+<p>公式只描述每个 token 的结果，kernel 还需要知道哪些 token 属于同一个 expert。下面的 torch-like 代码把这一步展开：router 先产生 top-k expert id 与权重，indexer 再按 expert 重排 token，GroupedGEMM 执行各个 expert，最后按原 token 顺序加权回填。</p>
 
 <pre class="code"># x: [T, H], T = batch * seq
 # E: number of experts, K: experts per token
@@ -192,21 +194,28 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
 
 <div class="diagram-frame">
   <div class="diagram-title">MoE 层的数据流</div>
-<pre class="mermaid">flowchart LR
-  X["tokens x"] --> R["router matmul"]
-  R --> K["top-k ids / weights"]
-  K --> I["indexer: token ids, expert ids, offsets"]
-  I --> D["dispatch: permute by expert"]
-  D --> G["grouped expert MLP"]
-  G --> U["unpermute"]
-  U --> C["combine: weighted index_add"]
-  C --> Y["tokens y"]
-</pre>
+  <svg class="diagram-svg" viewBox="0 0 1120 190" role="img" aria-labelledby="zh-moe-flow-title zh-moe-flow-desc">
+    <title id="zh-moe-flow-title">MoE 层从 router 到 combine 的数据流</title>
+    <desc id="zh-moe-flow-desc">Token 依次经过 router、top-k、indexer、按 expert 重排、grouped expert MLP、逆重排和加权合并。</desc>
+    <defs><marker id="zh-moe-flow-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path></marker></defs>
+    <g font-size="11.5" text-anchor="middle">
+      <rect class="node" x="15" y="63" width="100" height="58" rx="4"></rect><text x="65" y="97">tokens x</text>
+      <rect class="node" x="145" y="63" width="115" height="58" rx="4"></rect><text x="203" y="88">router</text><text class="muted" x="203" y="106">matmul</text>
+      <rect class="node" x="290" y="63" width="125" height="58" rx="4"></rect><text x="353" y="88">top-k</text><text class="muted" x="353" y="106">ids / weights</text>
+      <rect class="accent" x="445" y="50" width="155" height="84" rx="4"></rect><text x="523" y="78">indexer</text><text class="muted" x="523" y="98">token / expert ids</text><text class="muted" x="523" y="116">offsets / counts</text>
+      <rect class="node" x="630" y="63" width="125" height="58" rx="4"></rect><text x="693" y="88">dispatch</text><text class="muted" x="693" y="106">permute</text>
+      <rect class="accent" x="785" y="63" width="135" height="58" rx="4"></rect><text x="853" y="88">grouped</text><text x="853" y="106">expert MLP</text>
+      <rect class="node" x="950" y="50" width="155" height="84" rx="4"></rect><text x="1028" y="78">unpermute</text><text x="1028" y="98">+ weighted</text><text x="1028" y="116">combine</text>
+      <path class="edge" d="M115 92H145 M260 92H290 M415 92H445 M600 92H630 M755 92H785 M920 92H950" marker-end="url(#zh-moe-flow-arrow)"></path>
+    </g>
+  </svg>
 </div>
 
-<p>这段代码也解释了为什么 MoE 的系统复杂度高于 dense FFN。Dense FFN 是两三个大 GEMM。MoE 多了动态 top-k、索引生成、token 重排、按 expert 分桶、稀疏通信和加权回填。结构层面只增加了一个 router,实现层面却多出一条完整的数据搬运路径。</p>
+<p>生产实现会把 Python 层的 sort、prefix sum、索引、GroupedGEMM 与 combine 下沉到 CUDA kernel 和通信库中；当 expert 跨 GPU 分布时，dispatch 与 combine 之间还会加入 all-to-all。无论这些阶段是否融合，运行时都要把按 token 排列的数据转换成按 expert 排列的数据，再恢复原顺序。这次布局变换构成了 MoE 相对 dense FFN 的主要系统增量。</p>
 
-<h2 id="zh-terms">3. 术语表</h2>
+<h2 id="zh-terms">3. 运行时术语</h2>
+
+<p>MoE 系统中的术语分布在模型、布局和通信三个层级。下表沿着上一节的数据流给出它们的操作定义，并标出各阶段直接承受的运行时压力。</p>
 
 <div class="table-scroll">
 <table class="wide-table">
@@ -219,25 +228,27 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
     </tr>
   </thead>
   <tbody>
-    <tr><td class="term">expert</td><td>一个独立的 MLP,通常是 SwiGLU FFN</td><td><code>E_j(x)</code></td><td>单 expert token 数动态变化</td></tr>
-    <tr><td class="term">router / gate</td><td>给每个 token 算 expert 分数的小线性层</td><td><code>x @ router_w</code></td><td>可能把 token 压到少数 expert</td></tr>
-    <tr><td class="term">routing logits</td><td>router 输出的原始分数</td><td><code>logits: [T,E]</code></td><td>数值过大时 softmax 不稳定</td></tr>
-    <tr><td class="term">top-k</td><td>每个 token 选择 \(K\) 个 expert</td><td><code>torch.topk(score, K)</code></td><td>top-1 简单,top-2/top-8 表达力更强但更难实现</td></tr>
-    <tr><td class="term">gate weight</td><td>combine 时使用的 expert 权重</td><td><code>topk_w</code></td><td>是否归一化取决于 router recipe</td></tr>
-    <tr><td class="term">indexer</td><td>把 top-k 结果转成 kernel 可消费的索引和 offset</td><td><code>token_id/expert_id/order/counts</code></td><td>不同库里的 indexer 不是同一个稳定 API</td></tr>
-    <tr><td class="term">dispatcher</td><td>把 token 发到 expert 所在位置</td><td><code>x[token_id[order]]</code> 或 all-to-all</td><td>会产生重排和通信开销</td></tr>
-    <tr><td class="term">combiner</td><td>把 expert 输出按原 token 聚合回来</td><td><code>index_add_</code></td><td>top-k 大于 1 时存在多路累加</td></tr>
-    <tr><td class="term">capacity</td><td>每个 expert 允许接收的最大 token 数</td><td>固定长度 bucket</td><td>超出 capacity 时可能 drop token</td></tr>
-    <tr><td class="term">dropless</td><td>不丢 token,expert bucket 长度动态变化</td><td>动态 <code>counts</code></td><td>shape 动态,CUDA Graph 和 kernel tuning 更难</td></tr>
-    <tr><td class="term">expert parallel</td><td>expert 按 GPU 切分</td><td>dispatch/combine all-to-all</td><td>通信和负载均衡成为瓶颈</td></tr>
-    <tr><td class="term">GroupedGEMM</td><td>把多个 expert 的小 GEMM 合并执行</td><td><code>grouped_expert_mlp</code></td><td>bucket 太小时 tensor core 利用率差</td></tr>
+    <tr><td class="term">expert</td><td>具有独立参数的一组 MLP，通常采用 SwiGLU FFN</td><td><code>E_j(x)</code></td><td>每轮接收的 token 数动态变化</td></tr>
+    <tr><td class="term">router / gate</td><td>为每个 token 计算 expert score 的投影或打分函数</td><td><code>x @ router_w</code></td><td>token 可能集中到少数 expert</td></tr>
+    <tr><td class="term">routing logits</td><td>router 在归一化与选择前产生的原始 score</td><td><code>logits: [T,E]</code></td><td>大幅值会影响 softmax 数值稳定性</td></tr>
+    <tr><td class="term">top-k</td><td>按 score 为每个 token 选出 \(K\) 个 expert 的操作</td><td><code>torch.topk(score, K)</code></td><td>更大的 \(K\) 增加计算、分发与合并量</td></tr>
+    <tr><td class="term">gate weight</td><td>合并多个 expert 输出时使用的权重</td><td><code>topk_w</code></td><td>归一化方式取决于 routing recipe</td></tr>
+    <tr><td class="term">indexer</td><td>从 top-k 结果生成 permutation、offset、count 与 inverse map 的布局阶段</td><td><code>token_id/expert_id/order/counts</code></td><td>名称和输出 contract 随实现而异</td></tr>
+    <tr><td class="term">dispatcher</td><td>按 indexer metadata 将 token 搬到 expert bucket 或 expert rank 的阶段</td><td><code>x[token_id[order]]</code> 或 all-to-all</td><td>产生重排与通信开销</td></tr>
+    <tr><td class="term">combiner</td><td>将 expert 输出按原 token 顺序加权聚合的阶段</td><td><code>index_add_</code></td><td>\(K&gt;1\) 时包含多路累加</td></tr>
+    <tr><td class="term">capacity</td><td>一个 expert bucket 在一次执行中可接收的 token 上限</td><td>固定长度 bucket</td><td>溢出策略可能丢弃或改派 token</td></tr>
+    <tr><td class="term">dropless</td><td>保留全部 routed token，并让 bucket 长度随路由结果变化的执行策略</td><td>动态 <code>counts</code></td><td>动态 shape 增加 CUDA Graph 与 tuning 难度</td></tr>
+    <tr><td class="term">expert parallel</td><td>把 expert 参数切分到多个 GPU，并按路由结果迁移 token 的并行方式</td><td>dispatch/combine all-to-all</td><td>通信与负载均衡进入 critical path</td></tr>
+    <tr><td class="term">GroupedGEMM</td><td>在一次分组调度中执行多个不同 \(M\) 维的 expert GEMM</td><td><code>grouped_expert_mlp</code></td><td>小 bucket 的 tensor core 利用率较低</td></tr>
   </tbody>
 </table>
 </div>
 
-<p>其中 <code>indexer</code> 最容易混淆。它不是 MoE 论文里固定的数学概念,可以理解为系统实现里的 layout 生成器:把 router 的 top-k 输出变成 token permutation、expert offset、bucket size、combine inverse 等 metadata。DeepGEMM 语境里还会出现 FP4 Indexer、lightning indexer 这类更具体的 kernel primitive,不能直接拿来泛化到所有 MoE 框架。</p>
+<p><code>Indexer</code> 在本文中指布局生成阶段：它把 router 的 top-k 输出转换为 token permutation、expert offset、bucket size 与 combine inverse 等 metadata。MoE 论文没有规定统一的 indexer API，因此 DeepGEMM 的 FP4 Indexer、其它项目中的 lightning indexer 等名称只描述各自的 kernel primitive 和数据 contract。</p>
 
-<h2 id="zh-arch">4. 当前架构类型</h2>
+<h2 id="zh-arch">4. 架构与执行类型</h2>
+
+<p>MoE 设计通常同时选择路由基数、expert 粒度、共享路径、容量策略与并行方式。下表按这些相互独立的维度列出常见类型；同一个模型可以同时属于多行，例如 DeepSeek-V3 兼具 fine-grained、shared + routed 与 expert parallel 等特征。</p>
 
 <div class="table-scroll">
 <table class="wide-table">
@@ -250,36 +261,40 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
     </tr>
   </thead>
   <tbody>
-    <tr><td>Top-1 MoE</td><td>每个 token 只进 1 个 expert</td><td>Switch Transformer</td><td>路由和 combine 简单,但单 expert 选择更硬</td></tr>
-    <tr><td>Top-2 MoE</td><td>每个 token 进 2 个 expert,输出加权相加</td><td>GShard, GLaM, Mixtral 8x7B</td><td>表达更平滑,通信和计算翻倍到近似 \(2\times\)</td></tr>
-    <tr><td>Fine-grained MoE</td><td>expert 切得更细,每 token 激活更多小 expert</td><td>DeepSeekMoE, DeepSeek-V3</td><td>专家专门化更细,但 top-k 和调度压力更大</td></tr>
-    <tr><td>Shared + routed experts</td><td>shared expert 每个 token 都走,routed experts 稀疏选择</td><td>DeepSeekMoE, DeepSeek-V3</td><td>shared expert 承担公共知识,routed experts 承担差异化知识</td></tr>
-    <tr><td>Dropless MoE</td><td>不设硬性 token drop,每个 expert 动态接收 token</td><td>MegaBlocks, Megatron-Core dMoE</td><td>训练质量更稳,但动态 shape 更难优化</td></tr>
-    <tr><td>Expert Parallel MoE</td><td>experts 分布在多 GPU,token 通过 all-to-all 迁移</td><td>Megatron-Core, DeepEP 训练栈</td><td>可扩展到更多 expert,通信成为主要瓶颈</td></tr>
-    <tr><td>Fused MoE / MegaMoE</td><td>把 dispatch、GEMM、activation、combine、通信 overlap 尽量融合</td><td>DeepGEMM Mega MoE, vLLM prepare_megamoe</td><td>减少 launch 和中间内存,但 layout 约束严格</td></tr>
+    <tr><td>Top-1 MoE</td><td>每个 token 激活 1 个 expert</td><td>Switch Transformer</td><td>分发与合并量较小，路由选择更离散</td></tr>
+    <tr><td>Top-2 MoE</td><td>每个 token 激活 2 个 expert，并加权合并输出</td><td>GShard, GLaM, Mixtral 8x7B</td><td>路由更平滑，计算与通信量接近 top-1 的两倍</td></tr>
+    <tr><td>Fine-grained MoE</td><td>使用更小的 expert，并为每个 token 激活更多 expert</td><td>DeepSeekMoE, DeepSeek-V3</td><td>专门化粒度更细，top-k 与调度开销更高</td></tr>
+    <tr><td>Shared + routed experts</td><td>shared expert 处理全部 token，routed expert 按需激活</td><td>DeepSeekMoE, DeepSeek-V3</td><td>公共路径与稀疏专门化路径并存</td></tr>
+    <tr><td>Dropless MoE</td><td>保留全部 routed token，按实际计数形成动态 bucket</td><td>MegaBlocks, Megatron-Core dMoE</td><td>避免 overflow 丢弃，动态 shape 的优化成本更高</td></tr>
+    <tr><td>Expert Parallel MoE</td><td>expert 分布在多个 GPU，token 通过 all-to-all 迁移</td><td>Megatron-Core, DeepEP 训练栈</td><td>扩大 expert 容量，通信进入 critical path</td></tr>
+    <tr><td>Fused MoE / MegaMoE</td><td>融合 prepare、dispatch、GEMM、activation 或 combine 阶段</td><td>DeepGEMM Mega MoE, vLLM prepare_megamoe</td><td>减少 launch 与中间访存，要求特定量化和布局 contract</td></tr>
   </tbody>
 </table>
 </div>
 
-<p>DeepSeek-V3 是当前公开 MoE 设计里具有代表性的例子:技术报告写的是 671B total parameters、37B activated parameters,每层有 1 个 shared expert 和 256 个 routed experts,每个 token 激活 8 个 routed experts。它还使用 sigmoid affinity、top-k 归一化和 bias-based load balancing。这个配置说明现代 MoE 的设计目标已经扩展到细粒度专家、共享专家、负载均衡和系统调度的共同设计。</p>
+<p>DeepSeek-V3 展示了这些维度如何组合。其技术报告给出 671B total parameters 与 37B activated parameters；每层包含 1 个 shared expert 和 256 个 routed experts，每个 token 激活 8 个 routed experts。Sigmoid affinity、top-k 权重归一化和 bias-based load balancing 又共同约束路由分布。模型结构由此直接决定每轮执行中的 expert histogram 与通信负载。</p>
 
 <div class="diagram-frame">
   <div class="diagram-title">Expert parallel MoE</div>
-<pre class="mermaid">flowchart LR
-  T0["GPU0 local tokens"] --> R0["router"]
-  T1["GPU1 local tokens"] --> R1["router"]
-  R0 --> A1["dispatch all-to-all"]
-  R1 --> A1
-  A1 --> G0["GPU0 experts"]
-  A1 --> G1["GPU1 experts"]
-  A1 --> G2["GPU2 experts"]
-  A1 --> G3["GPU3 experts"]
-  G0 --> A2["combine all-to-all"]
-  G1 --> A2
-  G2 --> A2
-  G3 --> A2
-  A2 --> O["tokens return to original ranks"]
-</pre>
+  <svg class="diagram-svg" viewBox="0 0 1080 350" role="img" aria-labelledby="zh-ep-title zh-ep-desc">
+    <title id="zh-ep-title">Expert parallel MoE 的两次 all-to-all</title>
+    <desc id="zh-ep-desc">本地 token 经 router 后通过 dispatch all-to-all 送到 expert 所在 GPU，expert 输出再经 combine all-to-all 返回原 rank。</desc>
+    <defs><marker id="zh-ep-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path></marker></defs>
+    <g font-size="12" text-anchor="middle">
+      <rect class="node" x="20" y="75" width="130" height="52" rx="4"></rect><text x="85" y="106">GPU0 local tokens</text>
+      <rect class="node" x="20" y="210" width="130" height="52" rx="4"></rect><text x="85" y="241">GPU1 local tokens</text>
+      <rect class="node" x="190" y="75" width="90" height="52" rx="4"></rect><text x="235" y="106">router</text>
+      <rect class="node" x="190" y="210" width="90" height="52" rx="4"></rect><text x="235" y="241">router</text>
+      <rect class="accent" x="330" y="135" width="145" height="66" rx="4"></rect><text x="403" y="163">dispatch</text><text x="403" y="181">all-to-all</text>
+      <rect class="node" x="530" y="25" width="120" height="48" rx="4"></rect><text x="590" y="54">GPU0 experts</text>
+      <rect class="node" x="530" y="95" width="120" height="48" rx="4"></rect><text x="590" y="124">GPU1 experts</text>
+      <rect class="node" x="530" y="165" width="120" height="48" rx="4"></rect><text x="590" y="194">GPU2 experts</text>
+      <rect class="node" x="530" y="235" width="120" height="48" rx="4"></rect><text x="590" y="264">GPU3 experts</text>
+      <rect class="accent" x="710" y="135" width="145" height="66" rx="4"></rect><text x="783" y="163">combine</text><text x="783" y="181">all-to-all</text>
+      <rect class="node" x="910" y="135" width="150" height="66" rx="4"></rect><text x="985" y="161">tokens return</text><text class="muted" x="985" y="181">to original ranks</text>
+      <path class="edge" d="M150 101H190 M150 236H190 M280 101L330 158 M280 236L330 178 M475 168L530 49 M475 168L530 119 M475 168L530 189 M475 168L530 259 M650 49L710 151 M650 119L710 159 M650 189L710 177 M650 259L710 185 M855 168H910" marker-end="url(#zh-ep-arrow)"></path>
+    </g>
+  </svg>
 </div>
 
 <h2 id="zh-history">5. 演进历史</h2>
@@ -306,36 +321,47 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
 </table>
 </div>
 
-<p>这条历史线有个清晰转向。早期论文问的是"怎么让大模型只激活一小部分参数"。现在系统更关心"router 输出的动态 token 分布,怎么在多 GPU、低精度和 CUDA Graph 约束下获得稳定吞吐"。</p>
+<p>这段演进把研究重心从稀疏激活本身推向了可扩展执行。早期工作建立条件计算与负载均衡方法；随着 expert 数量、设备规模和低精度格式增加，token 分布、all-to-all、动态 shape 与融合 kernel 逐渐成为同一设计的一部分。</p>
 
-<h2 id="zh-megamoe">6. MegaMoE</h2>
+<h2 id="zh-megamoe">6. MegaMoE 执行 contract</h2>
 
-<p>MegaMoE 这个术语需要限定语境。按 DeepGEMM 和 vLLM 当前公开代码里的用法,它不是新的模型结构,而是 MoE expert 层的融合执行路径。它的目标是把 prepare/indexer、量化、dispatch、expert GEMM、activation、combine 以及通信 overlap 做成更少的 kernel 和更少的中间内存访问。</p>
+<p>在 DeepGEMM 与 vLLM 的公开代码语境中，MegaMoE 是面向 MoE expert 层的融合执行路径。它把 prepare/indexing、量化、dispatch、expert GEMM、activation 与 combine 中的若干阶段压缩到更少的 kernel 和中间内存访问中。模型的 routed-expert 语义保持不变，变化发生在后端执行 contract。</p>
 
 <div class="diagram-frame">
   <div class="diagram-title">常规 MoE 路径与 MegaMoE 路径</div>
-<pre class="mermaid">flowchart LR
-  H["hidden states"] --> R["router top-k"]
-  R --> P["prepare / indexer"]
-  P --> D["dispatch"]
-  D --> F1["expert FC1 GroupedGEMM"]
-  F1 --> S["SwiGLU"]
-  S --> F2["expert FC2 GroupedGEMM"]
-  F2 --> C["combine"]
-  C --> O["output"]
+  <svg class="diagram-svg" viewBox="0 0 1120 300" role="img" aria-labelledby="zh-megamoe-title zh-megamoe-desc">
+    <title id="zh-megamoe-title">常规 MoE 与 MegaMoE 执行路径</title>
+    <desc id="zh-megamoe-desc">常规路径显式经过 prepare、dispatch、两次 expert GEMM、activation 和 combine；MegaMoE 将布局准备、量化和 expert 计算压缩为更少的融合阶段。</desc>
+    <defs><marker id="zh-megamoe-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path></marker></defs>
+    <text x="15" y="58" font-size="13" font-weight="600">常规路径</text><text x="15" y="218" font-size="13" font-weight="600">MegaMoE</text>
+    <g font-size="11" text-anchor="middle">
+      <rect class="node" x="110" y="25" width="100" height="54" rx="4"></rect><text x="160" y="57">hidden</text>
+      <rect class="node" x="235" y="25" width="100" height="54" rx="4"></rect><text x="285" y="50">router</text><text class="muted" x="285" y="67">top-k</text>
+      <rect class="node" x="360" y="25" width="120" height="54" rx="4"></rect><text x="420" y="50">prepare</text><text class="muted" x="420" y="67">indexer</text>
+      <rect class="node" x="505" y="25" width="95" height="54" rx="4"></rect><text x="553" y="57">dispatch</text>
+      <rect class="node" x="625" y="25" width="105" height="54" rx="4"></rect><text x="678" y="50">expert FC1</text><text class="muted" x="678" y="67">GroupedGEMM</text>
+      <rect class="node" x="755" y="25" width="80" height="54" rx="4"></rect><text x="795" y="57">SwiGLU</text>
+      <rect class="node" x="860" y="25" width="105" height="54" rx="4"></rect><text x="913" y="50">expert FC2</text><text class="muted" x="913" y="67">GroupedGEMM</text>
+      <rect class="node" x="990" y="25" width="105" height="54" rx="4"></rect><text x="1043" y="57">combine</text>
+      <path class="edge" d="M210 52H235 M335 52H360 M480 52H505 M600 52H625 M730 52H755 M835 52H860 M965 52H990" marker-end="url(#zh-megamoe-arrow)"></path>
 
-  H2["hidden states"] --> R2["router top-k"]
-  R2 --> Q["prepare_megamoe: pack, quantize, index"]
-  Q --> M["MegaMoE fused execution"]
-  M --> O2["output"]
-</pre>
+      <rect class="node" x="110" y="185" width="120" height="58" rx="4"></rect><text x="170" y="219">hidden states</text>
+      <rect class="node" x="270" y="185" width="120" height="58" rx="4"></rect><text x="330" y="210">router</text><text class="muted" x="330" y="228">top-k</text>
+      <rect class="accent" x="430" y="168" width="240" height="92" rx="4"></rect><text x="550" y="198">prepare_megamoe</text><text class="muted" x="550" y="219">pack / quantize / index</text><text class="muted" x="550" y="238">kernel-specific layout</text>
+      <rect class="accent" x="710" y="185" width="210" height="58" rx="4"></rect><text x="815" y="210">MegaMoE</text><text class="muted" x="815" y="228">fused execution</text>
+      <rect class="node" x="960" y="185" width="120" height="58" rx="4"></rect><text x="1020" y="219">output</text>
+      <path class="edge" d="M230 214H270 M390 214H430 M670 214H710 M920 214H960" marker-end="url(#zh-megamoe-arrow)"></path>
+    </g>
+  </svg>
 </div>
 
-<p>vLLM 的 <code>prepare_megamoe</code> 文档直接给出执行 contract:它会把 hidden states 量化成 FP8,并把 routing top-k tensors 重新打包成 DeepGEMM MegaMoE kernel 需要的布局。MegaMoE 的入口不是普通的 <code>x, topk_ids, topk_weights</code> 就结束了,还要满足 kernel 对 quantization、scale、layout 和 metadata 的要求。</p>
+<p>vLLM 的 <code>prepare_megamoe</code> 给出了这个 contract 的入口：它将 hidden states 量化为 FP8，并把 routing top-k tensor 重新打包成 DeepGEMM MegaMoE kernel 使用的布局。因此，后端输入除了 <code>x</code>、<code>topk_ids</code> 与 <code>topk_weights</code>，还包含与 quantization、scale、layout 和 indexing 对应的 metadata。</p>
 
-<p>因此 MegaMoE 可以理解为 MoE 的 "kernel contract"。模型层仍然是 routed experts,系统层换成了更激进的执行方式。这个区分需要保留:同一个 MoE 架构可以用常规 GroupedGEMM 跑,也可以用 MegaMoE 类 fused kernel 跑。</p>
+<p>同一个 routed-expert 模型可以映射到常规 GroupedGEMM，也可以映射到 MegaMoE 类 fused kernel。两条路径共享路由数学定义，却采用不同的量化格式、布局 metadata 和阶段划分；评估实现时应分别检查模型语义与 backend contract。</p>
 
-<h2 id="zh-problems">7. 实现问题</h2>
+<h2 id="zh-problems">7. 执行瓶颈与约束</h2>
+
+<p>MoE 的动态路由会同时改变 GEMM 形状、通信量和中间布局，这些开销彼此耦合：expert histogram 决定 bucket 大小，bucket 大小影响 GroupedGEMM 利用率，expert placement 又把同一分布转换成 all-to-all 流量。</p>
 
 <div class="table-scroll">
 <table class="wide-table">
@@ -359,7 +385,7 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
 </table>
 </div>
 
-<p>看 MoE 性能时,不能只看 expert GEMM 的 TFLOPS。router、indexer、dispatch、combine 和 all-to-all 都在 critical path 上。MoE 的快慢往往取决于数据是否以 kernel 需要的顺序出现,以及通信空泡能不能被计算盖住。</p>
+<p>Expert GEMM TFLOPS 只覆盖这条路径中的计算阶段。端到端延迟还包含 router、indexer、dispatch、combine 与 all-to-all，吞吐取决于数据到达 kernel 时的布局、各 expert 的实际 \(M\) 维，以及计算对通信等待的覆盖程度。</p>
 
 <h2 id="zh-refs">参考资料</h2>
 
@@ -373,9 +399,9 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
   <li>Gale et al., <a href="https://arxiv.org/abs/2211.15841">MegaBlocks: Efficient Sparse Training with Mixture-of-Experts</a>, 2022.</li>
   <li>Dai et al., <a href="https://arxiv.org/abs/2401.06066">DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models</a>, 2024.</li>
   <li>DeepSeek-AI, <a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 Technical Report</a>, 2024.</li>
-  <li>NVIDIA, <a href="https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/features/moe.html">Megatron-Core MoE documentation</a>.</li>
-  <li>DeepSeek-AI, <a href="https://github.com/deepseek-ai/DeepGEMM">DeepGEMM</a> and <a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a>.</li>
-  <li>vLLM, <a href="https://docs.vllm.ai/en/latest/api/vllm/models/deepseek_v4/nvidia/ops/prepare_megamoe/">prepare_megamoe API</a>.</li>
+  <li>NVIDIA, <a href="https://docs.nvidia.com/megatron-core/developer-guide/0.16.0/user-guide/features/moe.html">Megatron-Core 0.16.0 MoE documentation</a>.</li>
+  <li>DeepSeek-AI, <a href="https://github.com/deepseek-ai/DeepGEMM/tree/559d79fb6994a58b8a15b4b93bf13ccc16edf247">DeepGEMM at 559d79f</a> and <a href="https://github.com/deepseek-ai/DeepEP/tree/01dc3aaac82068020353dce2c302e38153c0bfaa">DeepEP at 01dc3aa</a>.</li>
+  <li>vLLM, <a href="https://github.com/vllm-project/vllm/blob/d1922cb5a718259976fcb9044c18c9711c9ca694/vllm/models/deepseek_v4/nvidia/ops/prepare_megamoe.py">prepare_megamoe.py at d1922cb</a>.</li>
 </ul>
 
 </div>
@@ -384,30 +410,66 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
 
 <h1>Modern LLM MoE Architectures: Routing, Dispatch, and Fused Execution</h1>
 
-<p class="small">This note reflects public papers, documentation, and open-source implementations visible on 2026-08-07. MoE is not an attention variant, but it sits next to attention in the modern Transformer block. Attention mixes information across tokens. MoE usually replaces the FFN/MLP and sends each token to a small number of experts.</p>
+<p class="lead">The FFN stores a large share of a Transformer's parameters. Dense execution sends every token through the same weights, so increasing model capacity also raises per-token compute. Sparse MoE makes the FFN weights conditional, allowing model capacity and the computation activated by each forward pass to scale separately.</p>
 
-<h2 id="en-scope">0. Scope</h2>
+<p>Conditional computation extends weight selection into a runtime data path. Router output must become token permutations and expert offsets; a multi-GPU deployment adds two all-to-all phases; low-precision kernels impose quantization and layout contracts. MoE is consequently both a model architecture and an execution-system problem.</p>
 
-<p>Most LLM MoE layers are sparse MoE layers. A model owns many experts, but each token activates only \(K\) of them. Total parameters can grow while per-token activated compute stays bounded by \(K\), not by the total number of experts.</p>
+<p class="small">Version scope: the discussion follows public papers, documentation, and open-source implementations visible on 2026-08-07. It covers sparse MoE layers that replace the FFN/MLP in a Transformer block; attention continues to mix information across tokens.</p>
 
-<p>This note focuses on MLP-MoE inside Transformer blocks. It does not cover embedding MoE, attention MoE, RL policy MoE, or ordinary ensembles.</p>
+<h2 id="en-scope">0. Model boundary</h2>
 
-<h2 id="en-block">1. Where MoE sits</h2>
+<p>A sparse MLP-MoE is a conditionally executed FFN with \(E\) experts. Router scores select \(K\) experts for each token, and their outputs are combined with routing weights. When \(K \ll E\), total parameters can grow while each token pays for only the selected experts.</p>
 
-<p>A dense Transformer block uses one FFN for every token. A MoE block splits that FFN into experts and uses a router to choose a few experts per token.</p>
+<p>This definition limits the discussion to MLP-MoE inside Transformer blocks. Embedding MoE, attention MoE, RL policy MoE, and conventional ensembles select different objects and follow different execution paths. The sections below trace one MLP-MoE execution through the router, indexer, dispatcher, expert-parallel runtime, and MegaMoE backend.</p>
+
+<h2 id="en-block">1. Replacing the FFN</h2>
+
+<p>In a dense Transformer block, every token uses the same FFN weights. A MoE block leaves attention, residual connections, and normalization in place, replacing only the FFN with a router, an expert pool, and a weighted combine. Attention continues to mix information among tokens; MoE chooses a parameter-space compute path for each token.</p>
+
+<p>For token \(t\), the replacement is:</p>
 
 <p>\[
 y_t = \sum_{j \in \mathrm{TopK}(r(x_t))} p_{t,j} E_j(x_t)
 \]</p>
 
-<p>\(x_t\) is the hidden state of token \(t\). \(E_j\) is expert \(j\). \(p_{t,j}\) is the combine weight for that expert output.</p>
+<p>Here \(x_t\) is the hidden state, \(r(x_t)\) produces scores for \(E\) experts, and \(\mathrm{TopK}(r(x_t))\) is the activated expert set. \(E_j\) denotes expert MLP \(j\), and \(p_{t,j}\) weights its output during combination.</p>
 
-<h2 id="en-torch">2. Torch-op view</h2>
+<div class="diagram-frame">
+  <div class="diagram-title">Dense FFN and MoE FFN inside a Transformer block</div>
+  <svg class="diagram-svg" viewBox="0 0 1040 395" role="img" aria-labelledby="en-moe-block-title en-moe-block-desc">
+    <title id="en-moe-block-title">Dense FFN and MoE FFN paths</title>
+    <desc id="en-moe-block-desc">The dense path sends every token through one FFN. The MoE path routes tokens to selected experts and combines their outputs.</desc>
+    <defs><marker id="en-moe-block-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path></marker></defs>
+    <text x="20" y="58" font-size="13" font-weight="600">Dense block</text><text x="20" y="223" font-size="13" font-weight="600">MoE block</text>
+    <g font-size="12" text-anchor="middle">
+      <rect class="node" x="130" y="25" width="130" height="58" rx="4"></rect><text x="195" y="50">hidden x</text><text class="muted" x="195" y="68">[B, S, H]</text>
+      <rect class="node" x="315" y="25" width="130" height="58" rx="4"></rect><text x="380" y="59">self-attention</text>
+      <rect class="node" x="500" y="25" width="130" height="58" rx="4"></rect><text x="565" y="59">residual / norm</text>
+      <rect class="accent" x="685" y="25" width="150" height="58" rx="4"></rect><text x="760" y="50">dense FFN</text><text class="muted" x="760" y="68">one MLP</text>
+      <rect class="node" x="890" y="25" width="110" height="58" rx="4"></rect><text x="945" y="59">output</text>
+      <path class="edge" d="M260 54H315 M445 54H500 M630 54H685 M835 54H890" marker-end="url(#en-moe-block-arrow)"></path>
+      <rect class="node" x="130" y="190" width="130" height="58" rx="4"></rect><text x="195" y="215">hidden x</text><text class="muted" x="195" y="233">[B, S, H]</text>
+      <rect class="node" x="315" y="190" width="130" height="58" rx="4"></rect><text x="380" y="224">self-attention</text>
+      <rect class="node" x="500" y="190" width="130" height="58" rx="4"></rect><text x="565" y="224">residual / norm</text>
+      <rect class="accent" x="685" y="190" width="130" height="58" rx="4"></rect><text x="750" y="215">router</text><text class="muted" x="750" y="233">top-k experts</text>
+      <rect class="node" x="865" y="145" width="110" height="44" rx="4"></rect><text x="920" y="172">expert 0</text>
+      <rect class="node" x="865" y="200" width="110" height="44" rx="4"></rect><text x="920" y="227">expert 1</text>
+      <rect class="node" x="865" y="255" width="110" height="44" rx="4"></rect><text x="920" y="282">expert ...</text>
+      <rect class="accent" x="685" y="325" width="130" height="44" rx="4"></rect><text x="750" y="352">weighted combine</text>
+      <rect class="node" x="865" y="325" width="110" height="44" rx="4"></rect><text x="920" y="352">output</text>
+      <path class="edge" d="M260 219H315 M445 219H500 M630 219H685 M815 219L865 167 M815 219H865 M815 219L865 277 M865 167L815 340 M865 222L815 347 M865 277L815 354 M815 347H865" marker-end="url(#en-moe-block-arrow)"></path>
+    </g>
+  </svg>
+</div>
+
+<h2 id="en-torch">2. Routing-to-execution dataflow</h2>
+
+<p>The equation specifies a token's output, but a kernel also needs to know which tokens belong to each expert. The torch-like code below makes that transformation explicit. The router emits top-k expert ids and weights, the indexer groups tokens by expert, GroupedGEMM executes the expert MLPs, and the final accumulation restores token order.</p>
 
 <pre class="code"># x: [T, H], T = batch * seq
 # E: number of experts, K: experts per token
 logits = x @ router_w
-score = torch.softmax(logits, dim=-1)
+score = torch.softmax(logits, dim=-1)          # or sigmoid + normalize
 
 topk_w, topk_e = torch.topk(score, K, dim=-1)
 
@@ -426,9 +488,30 @@ y_perm = grouped_expert_mlp(x_perm, counts)
 y = torch.zeros_like(x)
 y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
 
-<p>The code is the shape of most MoE systems. Production implementations replace the Python-level sort, indexing, communication, grouped GEMM, and combine with CUDA kernels and collectives. The dataflow is still router, indexer, dispatcher, expert MLP, and combiner.</p>
+<p>Production systems lower the Python-level sort, prefix sum, indexing, GroupedGEMM, and combination into CUDA kernels and communication libraries. When experts span GPUs, dispatch and combine also contain all-to-all collectives. Fused or unfused, the runtime must transform token-major data into expert-major data and then restore the original order. That layout round trip is the main systems work added to a dense FFN.</p>
 
-<h2 id="en-terms">3. Terms</h2>
+<div class="diagram-frame">
+  <div class="diagram-title">MoE dataflow from routing to combination</div>
+  <svg class="diagram-svg" viewBox="0 0 1120 190" role="img" aria-labelledby="en-moe-flow-title en-moe-flow-desc">
+    <title id="en-moe-flow-title">MoE layer dataflow</title>
+    <desc id="en-moe-flow-desc">Tokens pass through routing, top-k selection, indexing, expert permutation, grouped expert MLPs, inverse permutation, and weighted combination.</desc>
+    <defs><marker id="en-moe-flow-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path></marker></defs>
+    <g font-size="11.5" text-anchor="middle">
+      <rect class="node" x="15" y="63" width="100" height="58" rx="4"></rect><text x="65" y="97">tokens x</text>
+      <rect class="node" x="145" y="63" width="115" height="58" rx="4"></rect><text x="203" y="88">router</text><text class="muted" x="203" y="106">matmul</text>
+      <rect class="node" x="290" y="63" width="125" height="58" rx="4"></rect><text x="353" y="88">top-k</text><text class="muted" x="353" y="106">ids / weights</text>
+      <rect class="accent" x="445" y="50" width="155" height="84" rx="4"></rect><text x="523" y="78">indexer</text><text class="muted" x="523" y="98">token / expert ids</text><text class="muted" x="523" y="116">offsets / counts</text>
+      <rect class="node" x="630" y="63" width="125" height="58" rx="4"></rect><text x="693" y="88">dispatch</text><text class="muted" x="693" y="106">permute</text>
+      <rect class="accent" x="785" y="63" width="135" height="58" rx="4"></rect><text x="853" y="88">grouped</text><text x="853" y="106">expert MLP</text>
+      <rect class="node" x="950" y="50" width="155" height="84" rx="4"></rect><text x="1028" y="78">unpermute</text><text x="1028" y="98">+ weighted</text><text x="1028" y="116">combine</text>
+      <path class="edge" d="M115 92H145 M260 92H290 M415 92H445 M600 92H630 M755 92H785 M920 92H950" marker-end="url(#en-moe-flow-arrow)"></path>
+    </g>
+  </svg>
+</div>
+
+<h2 id="en-terms">3. Runtime terminology</h2>
+
+<p>MoE terminology spans model selection, data layout, and communication. The table follows the dataflow above, giving each term an operational definition and the runtime pressure attached to that stage.</p>
 
 <div class="table-scroll">
 <table class="wide-table">
@@ -436,19 +519,27 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
     <tr><th>Term</th><th>Meaning</th><th>Torch-op view</th><th>Common issue</th></tr>
   </thead>
   <tbody>
-    <tr><td class="term">expert</td><td>An independent MLP, often a SwiGLU FFN</td><td><code>E_j(x)</code></td><td>Dynamic token count per expert</td></tr>
-    <tr><td class="term">router / gate</td><td>A small projection that scores experts per token</td><td><code>x @ router_w</code></td><td>Can overload a few experts</td></tr>
-    <tr><td class="term">top-k</td><td>Selects \(K\) experts per token</td><td><code>torch.topk(score, K)</code></td><td>Higher \(K\) raises dispatch and combine cost</td></tr>
-    <tr><td class="term">indexer</td><td>Builds permutations, offsets, counts, and inverse maps from top-k output</td><td><code>token_id/expert_id/order/counts</code></td><td>Not a stable concept across libraries</td></tr>
-    <tr><td class="term">dispatcher</td><td>Sends tokens to expert buckets or expert ranks</td><td><code>x[token_id[order]]</code></td><td>Reordering and all-to-all cost</td></tr>
-    <tr><td class="term">combiner</td><td>Aggregates expert outputs back to token order</td><td><code>index_add_</code></td><td>Multiple expert outputs per token</td></tr>
-    <tr><td class="term">dropless</td><td>Keeps every routed token instead of dropping overflow</td><td>Dynamic <code>counts</code></td><td>Harder CUDA Graph capture and tuning</td></tr>
-    <tr><td class="term">GroupedGEMM</td><td>Runs many expert GEMMs as a grouped operation</td><td><code>grouped_expert_mlp</code></td><td>Small expert buckets underuse tensor cores</td></tr>
+    <tr><td class="term">expert</td><td>An independently parameterized MLP, commonly a SwiGLU FFN</td><td><code>E_j(x)</code></td><td>Its token count changes on every routing step</td></tr>
+    <tr><td class="term">router / gate</td><td>A projection or scoring function that assigns expert scores to each token</td><td><code>x @ router_w</code></td><td>Tokens may concentrate on a few experts</td></tr>
+    <tr><td class="term">routing logits</td><td>Router scores before normalization and selection</td><td><code>logits: [T,E]</code></td><td>Large magnitudes affect softmax stability</td></tr>
+    <tr><td class="term">top-k</td><td>The operation that selects \(K\) experts for each token by score</td><td><code>torch.topk(score, K)</code></td><td>Larger \(K\) increases compute, dispatch, and combine work</td></tr>
+    <tr><td class="term">gate weight</td><td>The weight used to combine selected expert outputs</td><td><code>topk_w</code></td><td>Normalization depends on the routing recipe</td></tr>
+    <tr><td class="term">indexer</td><td>The layout stage that derives permutations, offsets, counts, and inverse maps from top-k output</td><td><code>token_id/expert_id/order/counts</code></td><td>Names and output contracts vary by implementation</td></tr>
+    <tr><td class="term">dispatcher</td><td>The stage that moves tokens to expert buckets or ranks using indexer metadata</td><td><code>x[token_id[order]]</code></td><td>Reordering and all-to-all traffic</td></tr>
+    <tr><td class="term">combiner</td><td>The stage that weights expert outputs and aggregates them in original token order</td><td><code>index_add_</code></td><td>\(K&gt;1\) requires multi-source accumulation</td></tr>
+    <tr><td class="term">capacity</td><td>The token limit of one expert bucket for an execution step</td><td>Fixed-size bucket</td><td>Overflow policy may drop or reroute tokens</td></tr>
+    <tr><td class="term">dropless</td><td>An execution policy that retains every routed token and lets bucket lengths follow routing counts</td><td>Dynamic <code>counts</code></td><td>Dynamic shapes complicate CUDA Graph capture and tuning</td></tr>
+    <tr><td class="term">expert parallel</td><td>A parallel layout that shards expert parameters across GPUs and moves tokens by route</td><td>Dispatch/combine all-to-all</td><td>Communication and load balance enter the critical path</td></tr>
+    <tr><td class="term">GroupedGEMM</td><td>A grouped launch that executes expert GEMMs with different \(M\) dimensions</td><td><code>grouped_expert_mlp</code></td><td>Small buckets underuse tensor cores</td></tr>
   </tbody>
 </table>
 </div>
 
-<h2 id="en-arch">4. Architecture families</h2>
+<p>In this article, <code>indexer</code> names the layout-building stage that turns router top-k output into token permutations, expert offsets, bucket sizes, and combine metadata. MoE papers do not prescribe a common indexer API, so names such as FP4 Indexer in DeepGEMM or lightning indexer elsewhere refer to implementation-specific kernel primitives and data contracts.</p>
+
+<h2 id="en-arch">4. Architecture and execution patterns</h2>
+
+<p>An MoE design chooses routing cardinality, expert granularity, shared paths, capacity policy, and parallel placement. These dimensions are independent, so one model may occupy several rows. DeepSeek-V3, for example, combines fine-grained experts, a shared expert path, and expert-parallel execution.</p>
 
 <div class="table-scroll">
 <table class="wide-table">
@@ -456,37 +547,122 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
     <tr><th>Family</th><th>Structure</th><th>Examples</th><th>Systems tradeoff</th></tr>
   </thead>
   <tbody>
-    <tr><td>Top-1 MoE</td><td>One expert per token</td><td>Switch Transformer</td><td>Simple dispatch and combine, harder expert choice</td></tr>
-    <tr><td>Top-2 MoE</td><td>Two experts per token, weighted sum</td><td>GShard, GLaM, Mixtral 8x7B</td><td>Smoother routing, more compute and traffic</td></tr>
-    <tr><td>Fine-grained MoE</td><td>Smaller experts, more active experts per token</td><td>DeepSeekMoE, DeepSeek-V3</td><td>Finer specialization, heavier top-k and scheduling</td></tr>
-    <tr><td>Shared + routed experts</td><td>Shared experts for all tokens, routed experts for sparse specialization</td><td>DeepSeekMoE, DeepSeek-V3</td><td>Separates common and specialized knowledge paths</td></tr>
-    <tr><td>Dropless MoE</td><td>No routed token is dropped</td><td>MegaBlocks, Megatron-Core dMoE</td><td>Better training behavior, more dynamic shapes</td></tr>
-    <tr><td>Expert Parallel MoE</td><td>Experts are sharded across GPUs</td><td>Megatron-Core, DeepEP stacks</td><td>Scales expert count, shifts pressure to all-to-all</td></tr>
-    <tr><td>Fused MoE / MegaMoE</td><td>Fuses prepare, dispatch, GEMM, activation, combine, or communication overlap</td><td>DeepGEMM Mega MoE, vLLM prepare_megamoe</td><td>Less intermediate memory, stricter layout contract</td></tr>
+    <tr><td>Top-1 MoE</td><td>Each token activates one expert</td><td>Switch Transformer</td><td>Smaller dispatch and combine volume, more discrete routing</td></tr>
+    <tr><td>Top-2 MoE</td><td>Each token activates two experts and combines their weighted outputs</td><td>GShard, GLaM, Mixtral 8x7B</td><td>Smoother routing, with nearly twice the top-1 compute and traffic</td></tr>
+    <tr><td>Fine-grained MoE</td><td>Uses smaller experts and activates more of them per token</td><td>DeepSeekMoE, DeepSeek-V3</td><td>Finer specialization, heavier top-k and scheduling work</td></tr>
+    <tr><td>Shared + routed experts</td><td>Shared experts process every token; routed experts activate selectively</td><td>DeepSeekMoE, DeepSeek-V3</td><td>Combines a common path with sparse specialization</td></tr>
+    <tr><td>Dropless MoE</td><td>Retains all routed tokens in dynamically sized buckets</td><td>MegaBlocks, Megatron-Core dMoE</td><td>Avoids overflow drops at the cost of more dynamic shapes</td></tr>
+    <tr><td>Expert Parallel MoE</td><td>Distributes experts across GPUs and moves tokens with all-to-all</td><td>Megatron-Core, DeepEP stacks</td><td>Expands expert capacity while moving communication onto the critical path</td></tr>
+    <tr><td>Fused MoE / MegaMoE</td><td>Fuses prepare, dispatch, GEMM, activation, or combine stages</td><td>DeepGEMM Mega MoE, vLLM prepare_megamoe</td><td>Reduces launches and intermediate traffic under a specific quantization and layout contract</td></tr>
   </tbody>
 </table>
 </div>
 
+<p>DeepSeek-V3 shows how these dimensions combine. Its technical report specifies 671B total parameters and 37B activated parameters, with one shared expert and 256 routed experts per layer; each token activates eight routed experts. Sigmoid affinities, normalized top-k weights, and bias-based load balancing jointly shape the routing distribution. The model configuration therefore determines the expert histogram and communication load seen by each execution step.</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">Expert parallel MoE uses dispatch and combine all-to-all</div>
+  <svg class="diagram-svg" viewBox="0 0 1080 350" role="img" aria-labelledby="en-ep-title en-ep-desc">
+    <title id="en-ep-title">Two all-to-all phases in expert parallel MoE</title>
+    <desc id="en-ep-desc">Local tokens are routed and sent to expert-owning GPUs by dispatch all-to-all. Expert outputs return to their original ranks through combine all-to-all.</desc>
+    <defs><marker id="en-ep-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path></marker></defs>
+    <g font-size="12" text-anchor="middle">
+      <rect class="node" x="20" y="75" width="130" height="52" rx="4"></rect><text x="85" y="106">GPU0 local tokens</text>
+      <rect class="node" x="20" y="210" width="130" height="52" rx="4"></rect><text x="85" y="241">GPU1 local tokens</text>
+      <rect class="node" x="190" y="75" width="90" height="52" rx="4"></rect><text x="235" y="106">router</text>
+      <rect class="node" x="190" y="210" width="90" height="52" rx="4"></rect><text x="235" y="241">router</text>
+      <rect class="accent" x="330" y="135" width="145" height="66" rx="4"></rect><text x="403" y="163">dispatch</text><text x="403" y="181">all-to-all</text>
+      <rect class="node" x="530" y="25" width="120" height="48" rx="4"></rect><text x="590" y="54">GPU0 experts</text>
+      <rect class="node" x="530" y="95" width="120" height="48" rx="4"></rect><text x="590" y="124">GPU1 experts</text>
+      <rect class="node" x="530" y="165" width="120" height="48" rx="4"></rect><text x="590" y="194">GPU2 experts</text>
+      <rect class="node" x="530" y="235" width="120" height="48" rx="4"></rect><text x="590" y="264">GPU3 experts</text>
+      <rect class="accent" x="710" y="135" width="145" height="66" rx="4"></rect><text x="783" y="163">combine</text><text x="783" y="181">all-to-all</text>
+      <rect class="node" x="910" y="135" width="150" height="66" rx="4"></rect><text x="985" y="161">tokens return</text><text class="muted" x="985" y="181">to original ranks</text>
+      <path class="edge" d="M150 101H190 M150 236H190 M280 101L330 158 M280 236L330 178 M475 168L530 49 M475 168L530 119 M475 168L530 189 M475 168L530 259 M650 49L710 151 M650 119L710 159 M650 189L710 177 M650 259L710 185 M855 168H910" marker-end="url(#en-ep-arrow)"></path>
+    </g>
+  </svg>
+</div>
+
 <h2 id="en-history">5. History</h2>
 
-<p>The path is fairly direct. Early MoE work asked how to route examples to local experts. Sparsely-gated MoE brought conditional computation into large neural networks. GShard, Switch Transformer, and GLaM made it a Transformer scaling method. Mixtral made FFN-MoE familiar in open LLMs. DeepSeekMoE and DeepSeek-V3 moved the design toward finer expert granularity, shared experts, and more aggressive routing. The recent systems work is about grouped GEMM, expert parallel all-to-all, low precision layout, CUDA Graph constraints, and fused kernels.</p>
+<div class="table-scroll">
+<table class="wide-table">
+  <thead>
+    <tr><th>Period</th><th>Stage</th><th>Change</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1991</td><td>Local experts</td><td>Jacobs, Jordan, Nowlan, and Hinton introduced Adaptive Mixtures of Local Experts, with a gating network assigning examples to local experts.</td></tr>
+    <tr><td>2017</td><td>Sparsely-gated MoE</td><td>Shazeer et al. applied sparse expert activation at large scale and exposed top-k gating and load-balancing problems.</td></tr>
+    <tr><td>2020</td><td>GShard</td><td>MoE was combined with automatic sharding, establishing top-2 routing as a common path for large Transformer MoE systems.</td></tr>
+    <tr><td>2021</td><td>Switch Transformer</td><td>Top-1 routing simplified scaling, while capacity and token dropping became explicit systems concerns.</td></tr>
+    <tr><td>2021-2022</td><td>GLaM</td><td>Decoder-only sparse MoE entered the LLM line, trading sparse activation for a much larger total parameter count.</td></tr>
+    <tr><td>2024</td><td>Open LLM MoE</td><td>Mixtral 8x7B made top-2 FFN-MoE a familiar design in openly available LLMs.</td></tr>
+    <tr><td>2024-2025</td><td>Fine-grained and shared experts</td><td>DeepSeekMoE and DeepSeek-V3 used smaller routed experts together with a shared expert path.</td></tr>
+    <tr><td>2025-2026</td><td>Systems fusion</td><td>GroupedGEMM, DeepEP, HybridEP, FP8/FP4, MegaMoE, and FlashMoE-style work shifted attention toward communication-compute overlap and fused kernels.</td></tr>
+  </tbody>
+</table>
+</div>
 
-<h2 id="en-megamoe">6. MegaMoE</h2>
+<p>This progression moved the research focus from sparse activation itself toward scalable execution. Early work established conditional computation and load-balancing methods. As expert counts, device scale, and low-precision formats grew, token distributions, all-to-all traffic, dynamic shapes, and fused kernels became parts of the same design problem.</p>
 
-<p>In the DeepGEMM and vLLM usage, MegaMoE is not a new model architecture. It is a fused execution path for the MoE expert layer. It tries to collapse prepare/indexing, quantization, dispatch, expert GEMM, activation, combine, and communication overlap into fewer kernels and fewer intermediate memory passes.</p>
+<h2 id="en-megamoe">6. The MegaMoE execution contract</h2>
 
-<p>The vLLM <code>prepare_megamoe</code> API is explicit about the contract: it quantizes hidden states to FP8 and repacks routing top-k tensors into the layout consumed by the DeepGEMM MegaMoE kernel. The model layer is still routed experts. The systems layer changes how those experts execute.</p>
+<p>In the public DeepGEMM and vLLM code, MegaMoE is a fused execution path for an MoE expert layer. It collapses selected parts of prepare/indexing, quantization, dispatch, expert GEMM, activation, and combination into fewer kernels and intermediate memory passes. The routed-expert model semantics stay fixed; the backend execution contract changes.</p>
 
-<h2 id="en-problems">7. Implementation issues</h2>
+<p>The vLLM <code>prepare_megamoe</code> entry point exposes that contract. It quantizes hidden states to FP8 and repacks routing top-k tensors into the layout consumed by the DeepGEMM MegaMoE kernel. Backend input therefore includes quantization scales, layout metadata, and indexing metadata in addition to <code>x</code>, <code>topk_ids</code>, and <code>topk_weights</code>.</p>
 
-<ul class="compact-list">
-  <li>Routing is dynamic. Each batch produces a different expert histogram.</li>
-  <li>Dispatch and combine are data movement problems before they are math problems.</li>
-  <li>Expert parallelism adds all-to-all traffic on the critical path.</li>
-  <li>Decode batches often give each expert too few tokens to fill tensor cores.</li>
-  <li>FP8/FP4 paths require the activation layout, scale metadata, weight packing, and kernel contract to agree.</li>
-  <li>Dropless MoE creates dynamic shapes, which makes CUDA Graph capture and tuning harder.</li>
-</ul>
+<div class="diagram-frame">
+  <div class="diagram-title">Conventional MoE path and MegaMoE fused path</div>
+  <svg class="diagram-svg" viewBox="0 0 1120 300" role="img" aria-labelledby="en-megamoe-title en-megamoe-desc">
+    <title id="en-megamoe-title">Conventional MoE and MegaMoE execution paths</title>
+    <desc id="en-megamoe-desc">The conventional path materializes preparation, dispatch, expert GEMMs, activation, and combination. MegaMoE reduces intermediate stages through kernel-specific packing, quantization, and fused expert execution.</desc>
+    <defs><marker id="en-megamoe-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path></marker></defs>
+    <text x="15" y="58" font-size="13" font-weight="600">Conventional</text><text x="15" y="218" font-size="13" font-weight="600">MegaMoE</text>
+    <g font-size="11" text-anchor="middle">
+      <rect class="node" x="110" y="25" width="100" height="54" rx="4"></rect><text x="160" y="57">hidden</text>
+      <rect class="node" x="235" y="25" width="100" height="54" rx="4"></rect><text x="285" y="50">router</text><text class="muted" x="285" y="67">top-k</text>
+      <rect class="node" x="360" y="25" width="120" height="54" rx="4"></rect><text x="420" y="50">prepare</text><text class="muted" x="420" y="67">indexer</text>
+      <rect class="node" x="505" y="25" width="95" height="54" rx="4"></rect><text x="553" y="57">dispatch</text>
+      <rect class="node" x="625" y="25" width="105" height="54" rx="4"></rect><text x="678" y="50">expert FC1</text><text class="muted" x="678" y="67">GroupedGEMM</text>
+      <rect class="node" x="755" y="25" width="80" height="54" rx="4"></rect><text x="795" y="57">SwiGLU</text>
+      <rect class="node" x="860" y="25" width="105" height="54" rx="4"></rect><text x="913" y="50">expert FC2</text><text class="muted" x="913" y="67">GroupedGEMM</text>
+      <rect class="node" x="990" y="25" width="105" height="54" rx="4"></rect><text x="1043" y="57">combine</text>
+      <path class="edge" d="M210 52H235 M335 52H360 M480 52H505 M600 52H625 M730 52H755 M835 52H860 M965 52H990" marker-end="url(#en-megamoe-arrow)"></path>
+      <rect class="node" x="110" y="185" width="120" height="58" rx="4"></rect><text x="170" y="219">hidden states</text>
+      <rect class="node" x="270" y="185" width="120" height="58" rx="4"></rect><text x="330" y="210">router</text><text class="muted" x="330" y="228">top-k</text>
+      <rect class="accent" x="430" y="168" width="240" height="92" rx="4"></rect><text x="550" y="198">prepare_megamoe</text><text class="muted" x="550" y="219">pack / quantize / index</text><text class="muted" x="550" y="238">kernel-specific layout</text>
+      <rect class="accent" x="710" y="185" width="210" height="58" rx="4"></rect><text x="815" y="210">MegaMoE</text><text class="muted" x="815" y="228">fused execution</text>
+      <rect class="node" x="960" y="185" width="120" height="58" rx="4"></rect><text x="1020" y="219">output</text>
+      <path class="edge" d="M230 214H270 M390 214H430 M670 214H710 M920 214H960" marker-end="url(#en-megamoe-arrow)"></path>
+    </g>
+  </svg>
+</div>
+
+<p>The same routed-expert model can map to a conventional GroupedGEMM path or a MegaMoE-style fused kernel. Both implement the same routing equation, but they use different quantization formats, metadata layouts, and stage boundaries. Implementation analysis must therefore keep model semantics separate from the backend contract.</p>
+
+<h2 id="en-problems">7. Execution bottlenecks and constraints</h2>
+
+<p>Dynamic routing changes GEMM shapes, communication volume, and intermediate layouts together. The following costs interact: the expert histogram sets bucket sizes, bucket sizes determine GroupedGEMM utilization, and expert placement converts that same distribution into all-to-all traffic.</p>
+
+<div class="table-scroll">
+<table class="wide-table">
+  <thead>
+    <tr><th>Issue</th><th>Why it is difficult</th><th>Common treatment</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Dynamic expert histogram</td><td>Every batch changes the top-k distribution and therefore the GEMM \(M\) dimension for each expert.</td><td>GroupedGEMM, bucket padding, dropless kernels, runtime metadata</td></tr>
+    <tr><td>Load imbalance</td><td>Hot experts determine layer latency while cold experts waste memory and parameters.</td><td>Auxiliary loss, bias-based balancing, capacity, expert-parallel placement</td></tr>
+    <tr><td>Token dispatch</td><td>Top-k routing may copy one token into several expert buckets.</td><td>Prefix sums, stable permutations, fused indexers</td></tr>
+    <tr><td>Combine accumulation</td><td>For \(K&gt;1\), several weighted expert outputs return to the same token.</td><td>Weighted <code>index_add</code>, segmented reduction, fused combine</td></tr>
+    <tr><td>Cross-GPU communication</td><td>Expert parallelism requires dispatch and combine all-to-all operations.</td><td>DeepEP, HybridEP, communication-compute overlap</td></tr>
+    <tr><td>Small decode batches</td><td>Each expert receives too few tokens to use tensor cores efficiently.</td><td>Persistent kernels, expert batching, separate prefill and decode paths</td></tr>
+    <tr><td>Low-precision layout</td><td>FP8/FP4 scales, block layouts, and packed weights must match the kernel contract.</td><td>Prepacked weights and a prepare stage that emits quantized activations and index metadata</td></tr>
+    <tr><td>CUDA Graph</td><td>Dropless execution makes shapes dynamic and full-graph capture difficult.</td><td>Padding, bucketing, capture of stable subgraphs, or specialized dispatchers</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Expert GEMM TFLOPS covers only the compute stage of this path. End-to-end latency also includes the router, indexer, dispatch, combine, and all-to-all phases. Throughput depends on the layout presented to each kernel, the realized \(M\) dimension of every expert, and the extent to which computation covers communication waits.</p>
 
 <h2 id="en-refs">References</h2>
 
@@ -500,9 +676,9 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
   <li>Gale et al., <a href="https://arxiv.org/abs/2211.15841">MegaBlocks: Efficient Sparse Training with Mixture-of-Experts</a>, 2022.</li>
   <li>Dai et al., <a href="https://arxiv.org/abs/2401.06066">DeepSeekMoE</a>, 2024.</li>
   <li>DeepSeek-AI, <a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 Technical Report</a>, 2024.</li>
-  <li>NVIDIA, <a href="https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/features/moe.html">Megatron-Core MoE documentation</a>.</li>
-  <li>DeepSeek-AI, <a href="https://github.com/deepseek-ai/DeepGEMM">DeepGEMM</a> and <a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a>.</li>
-  <li>vLLM, <a href="https://docs.vllm.ai/en/latest/api/vllm/models/deepseek_v4/nvidia/ops/prepare_megamoe/">prepare_megamoe API</a>.</li>
+  <li>NVIDIA, <a href="https://docs.nvidia.com/megatron-core/developer-guide/0.16.0/user-guide/features/moe.html">Megatron-Core 0.16.0 MoE documentation</a>.</li>
+  <li>DeepSeek-AI, <a href="https://github.com/deepseek-ai/DeepGEMM/tree/559d79fb6994a58b8a15b4b93bf13ccc16edf247">DeepGEMM at 559d79f</a> and <a href="https://github.com/deepseek-ai/DeepEP/tree/01dc3aaac82068020353dce2c302e38153c0bfaa">DeepEP at 01dc3aa</a>.</li>
+  <li>vLLM, <a href="https://github.com/vllm-project/vllm/blob/d1922cb5a718259976fcb9044c18c9711c9ca694/vllm/models/deepseek_v4/nvidia/ops/prepare_megamoe.py">prepare_megamoe.py at d1922cb</a>.</li>
 </ul>
 
 </div>

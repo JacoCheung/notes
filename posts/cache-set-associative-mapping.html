@@ -3,17 +3,17 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>四路组相联 Cache：顺序访问后的映射与替换</title>
-<meta name="post:title"           content="四路组相联 Cache：顺序访问后的映射与替换">
-<meta name="post:title_en"        content="Four-Way Set-Associative Cache: Mapping and Replacement After a Sequential Scan">
+<title>四路组相联 Cache 的地址映射与 LRU 替换</title>
+<meta name="post:title"           content="四路组相联 Cache 的地址映射与 LRU 替换">
+<meta name="post:title_en"        content="Address Mapping and LRU Replacement in a Four-Way Set-Associative Cache">
 <meta name="post:slug"            content="cache-set-associative-mapping">
 <meta name="post:date"            content="2026-08-24">
 <meta name="post:tags"            content="计算机体系结构, Cache, 组相联, LRU">
 <meta name="post:tags_en"         content="Computer Architecture, Cache, Set Associativity, LRU">
 <meta name="post:reading"         content="4 分钟">
 <meta name="post:reading_en"      content="4 min">
-<meta name="post:summary"         content="以 4 路、256 组、共 1024 条 cache line 为例，说明顺序遍历后的 set/way 映射，以及继续访问第 1025 条 line 时的 LRU 替换。">
-<meta name="post:summary_en"      content="Uses a four-way, 256-set cache to explain set and way placement after a sequential scan and the LRU replacement caused by the 1025th line.">
+<meta name="post:summary"         content="四路组相联 Cache 先由 index 选择 set，再由替换策略选择 way。对 256 组的严格 LRU 模型，扫描 line 0–1023 后，set s 保存 s、s+256、s+512、s+768；line 1024 只与 set 0 冲突，并淘汰 line 0。">
+<meta name="post:summary_en"      content="Four-way set-associative caches use address index bits to select a set, then a fill or replacement policy to choose one way. In the stated 256-set strict-LRU model, scanning lines 0–1023 leaves set s with s, s+256, s+512, and s+768; line 1024 conflicts only in set 0 and evicts line 0.">
 <meta name="post:series"          content="programmer-essentials">
 <meta name="post:series_title"    content="程序员必备清单">
 <meta name="post:series_title_en" content="Programmer Essentials">
@@ -86,22 +86,39 @@
 <div class="layout">
   <aside class="toc">
     <div class="toc-title">目录 · TOC</div>
+    <div class="lang-zh">
     <ul>
-      <li><a href="#layout">1. Cache 组织</a></li>
-      <li><a href="#scan">2. 顺序遍历</a></li>
-      <li><a href="#next">3. 第 1025 条 line</a></li>
+      <li><a href="#zh-layout">1. Cache 组织</a></li>
+      <li><a href="#zh-scan">2. 顺序遍历</a></li>
+      <li><a href="#zh-next">3. 第 1025 条 line</a></li>
+      <li><a href="#zh-refs">参考资料</a></li>
     </ul>
+    </div>
+    <div class="lang-en">
+    <ul>
+      <li><a href="#en-layout">1. Cache organization</a></li>
+      <li><a href="#en-scan">2. Sequential scan</a></li>
+      <li><a href="#en-next">3. The 1,025th line</a></li>
+      <li><a href="#en-refs">References</a></li>
+    </ul>
+    </div>
   </aside>
 
 <main class="content">
 
-<h1>四路组相联 Cache：顺序访问后的映射与替换</h1>
+<div class="lang-zh">
 
-<p class="lead">一块 4 路组相联 Cache，每个 way 有 256 条 line，总共能保存 1024 条 line。地址先决定 set，再由该 set 的填充或替换策略选择 way。下面用连续的主存 cache line 编号说明这一过程。</p>
+<h1>四路组相联 Cache 的地址映射与 LRU 替换</h1>
 
-<h2 id="layout">1. Cache 组织</h2>
+<p class="lead">组相联 Cache 把地址映射和替换分成两步：地址中的 index 选择 set，填充或替换策略再从该 set 的多个 way 中选择位置。这里用一块包含 256 个 set、每个 set 4 个 way 的 Cache，推导顺序访问 1024 条主存 line 后的状态，以及下一次冲突访问触发的 LRU 替换。</p>
 
-<p>4 路、每路 256 条 line，等价于：</p>
+<div class="note-box">
+  <p>这是一个人为设定的 Cache 模型，不对应某款 CPU 或 GPU。例子假设 256 个 set、空 way 按编号填充，并在需要替换时采用严格 LRU；真实硬件可能采用 PLRU、Random 或未公开策略。</p>
+</div>
+
+<h2 id="zh-layout">1. Cache 组织</h2>
+
+<p>组相联 Cache 是由多个 set 组成的存储结构，每个 set 包含固定数量的 way。同一主存 line 只能映射到一个 set，却可以占用该 set 内任一 way。4 路、每路 256 条 line，等价于：</p>
 
 <p>\[
 256\ \text{sets}\times 4\ \text{ways}=1024\ \text{cache lines}.
@@ -117,7 +134,7 @@
 
 <p>地址映射只规定 set，不规定具体 way。同一个 set 内的四个位置地位相同，硬件按空 way 选择或替换策略决定写入哪一路。</p>
 
-<h2 id="scan">2. 顺序遍历 1024 条 line</h2>
+<h2 id="zh-scan">2. 顺序遍历 1024 条 line</h2>
 
 <p>假设 Cache 初始为空，依次访问主存 line 0 到 1023，期间没有其他访问。前 256 条 line 分别进入 set 0 到 set 255；接下来的三轮重复相同的 set index，并占用各 set 的其余 way。</p>
 
@@ -144,7 +161,7 @@
 </table>
 </div>
 
-<p>因此，任意 set $s$ 保存的四条主存 line 是：</p>
+<p>四轮访问分别贡献一个 tag，因此任意 set $s$ 保存的四条主存 line 是：</p>
 
 <p>\[
 \boxed{s,\quad s+256,\quad s+512,\quad s+768}.
@@ -152,7 +169,7 @@
 
 <p>表中的 way 顺序只是一种可能的硬件状态。无论 way 如何编号，set $s$ 中保存的四个 line 编号不变。此时 1024 个 Cache 位置全部有效；若立即再次遍历 line 0 到 1023，所有访问都会命中。</p>
 
-<h2 id="next">3. 继续访问第 1025 条 line</h2>
+<h2 id="zh-next">3. 继续访问第 1025 条 line</h2>
 
 <p>本文使用 0-based 编号，所以第 1025 条 line 是 line 1024。它的映射为：</p>
 
@@ -176,10 +193,121 @@
 \{1024,256,512,768\}.
 \]</p>
 
-<p>set 1 到 set 255 保持不变，Cache 仍然保存 1024 条 line。若被淘汰的 line 0 是 dirty line，硬件需要先把它写回下一级存储；clean line 可以直接覆盖。</p>
+<p>set 1 到 set 255 保持不变，Cache 仍然保存 1024 条 line。若被淘汰的 line 0 是 dirty line，硬件必须保留其写回下一级存储的过程；writeback buffer 可以让该过程与当前 miss 的完成部分解耦。clean line 不需要写回。</p>
 
 <div class="note-box">
   <p>LRU 决定上述例子淘汰 line 0。若硬件采用 Random 或 PLRU，victim 可能不同，但 line 1024 仍然只能进入 set 0。</p>
+</div>
+
+<h2 id="zh-refs">参考资料</h2>
+
+<ul>
+  <li><a href="https://www.intel.com/content/dam/doc/manual/64-ia-32-architectures-optimization-manual.pdf" target="_blank" rel="noopener">Intel 64 and IA-32 Architectures Optimization Reference Manual</a>：set associativity、way 竞争与 capacity limit。</li>
+  <li><a href="https://www.intel.com/content/www/us/en/docs/advisor/user-guide/2023-0/cachesim-associativity.html" target="_blank" rel="noopener">Intel Advisor: Cache Simulation Associativity</a>：四路组相联模型的公开示例。</li>
+</ul>
+
+</div>
+
+<div class="lang-en">
+
+<h1>Address Mapping and LRU Replacement in a Four-Way Set-Associative Cache</h1>
+
+<p class="lead">A set-associative cache separates address mapping from replacement: the index bits select a set, then the fill or replacement policy chooses one of that set's ways. This example uses 256 sets with four ways each to derive the state after a sequential scan of 1,024 memory lines and the LRU replacement caused by the next conflicting access.</p>
+
+<div class="note-box">
+  <p>This is a hypothetical cache model rather than the specification of a particular CPU or GPU. It assumes 256 sets, fills empty ways in numeric order, and uses strict LRU when replacement is required. Real hardware may use PLRU, random replacement, or an undisclosed policy.</p>
+</div>
+
+<h2 id="en-layout">1. Cache Organization</h2>
+
+<p>A set-associative cache consists of sets with a fixed number of ways. A memory line maps to exactly one set but may occupy any way in that set. Four ways with 256 lines per way is equivalent to:</p>
+
+<p>\[
+256\ \text{sets}\times 4\ \text{ways}=1024\ \text{cache lines}.
+\]</p>
+
+<p>Let $L$ be the memory cache-line number. Ignoring the byte offset within a line:</p>
+
+<p>\[
+\text{set}(L)=L\bmod256,
+\qquad
+\text{tag}(L)=\left\lfloor\frac{L}{256}\right\rfloor.
+\]</p>
+
+<p>Address mapping determines the set, not the exact way. The four positions within a set are peers; hardware chooses a way according to the empty-way selection or replacement policy.</p>
+
+<h2 id="en-scan">2. Sequentially Scanning 1,024 Lines</h2>
+
+<p>Assume the cache starts empty and memory lines 0 through 1023 are accessed in order, with no intervening accesses. The first 256 lines occupy sets 0 through 255. The next three rounds repeat the same set indices and fill the remaining ways in each set.</p>
+
+<p>For illustration, suppose empty ways are filled from Way 0 through Way 3. After the scan, the hardware numbering is:</p>
+
+<div class="table-scroll">
+<table class="mapping-table">
+  <thead>
+    <tr>
+      <th>Set</th>
+      <th>Way 0</th>
+      <th>Way 1</th>
+      <th>Way 2</th>
+      <th>Way 3</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>0</td><td>0</td><td>256</td><td>512</td><td>768</td></tr>
+    <tr><td>1</td><td>1</td><td>257</td><td>513</td><td>769</td></tr>
+    <tr><td>2</td><td>2</td><td>258</td><td>514</td><td>770</td></tr>
+    <tr><td>...</td><td>...</td><td>...</td><td>...</td><td>...</td></tr>
+    <tr><td>255</td><td>255</td><td>511</td><td>767</td><td>1023</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>The four passes contribute one tag apiece, so each set $s$ contains these four memory lines:</p>
+
+<p>\[
+\boxed{s,\quad s+256,\quad s+512,\quad s+768}.
+\]</p>
+
+<p>The way order shown in the table is only one possible hardware state. Regardless of way numbering, set $s$ contains the same four line numbers. All 1,024 cache positions are now valid. An immediate second scan of lines 0 through 1023 would hit on every access.</p>
+
+<h2 id="en-next">3. Accessing the 1,025th Line</h2>
+
+<p>This article uses zero-based numbering, so the 1,025th line is line 1024. Its mapping is:</p>
+
+<p>\[
+\text{set}(1024)=0,
+\qquad
+\text{tag}(1024)=4.
+\]</p>
+
+<p>Set 0 already contains lines 0, 256, 512, and 768, so one line must be selected as the victim. Under strict LRU, those lines were touched in this order during the sequential scan:</p>
+
+<p>\[
+0\rightarrow256\rightarrow512\rightarrow768.
+\]</p>
+
+<p>Line 0 has gone unused for the longest time. The cache evicts it and places line 1024 in its former way. Set 0 changes from:</p>
+
+<p>\[
+\{0,256,512,768\}
+\quad\longrightarrow\quad
+\{1024,256,512,768\}.
+\]</p>
+
+<p>Sets 1 through 255 remain unchanged, and the cache still holds 1,024 lines. If line 0 is dirty, hardware must preserve its writeback to the next level; a writeback buffer may partially decouple that work from completion of the current miss. A clean line needs no writeback.</p>
+
+<div class="note-box">
+  <p>LRU selects line 0 in this example. With random replacement or PLRU, the victim could differ, but line 1024 can still enter only set 0.</p>
+</div>
+
+<h2 id="en-refs">References</h2>
+
+<ul>
+  <li><a href="https://www.intel.com/content/dam/doc/manual/64-ia-32-architectures-optimization-manual.pdf" target="_blank" rel="noopener">Intel 64 and IA-32 Architectures Optimization Reference Manual</a>: set associativity, way contention, and capacity limits.</li>
+  <li><a href="https://www.intel.com/content/www/us/en/docs/advisor/user-guide/2023-0/cachesim-associativity.html" target="_blank" rel="noopener">Intel Advisor: Cache Simulation Associativity</a>: a public example of a four-way set-associative model.</li>
+</ul>
+
 </div>
 
 </main>

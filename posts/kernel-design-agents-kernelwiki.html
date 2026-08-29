@@ -1,0 +1,726 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kernel Design Agents 与 KernelWiki：面向 GPU Kernel 优化的证据驱动工作流</title>
+<meta name="post:title"           content="Kernel Design Agents 与 KernelWiki：面向 GPU Kernel 优化的证据驱动工作流">
+<meta name="post:title_en"        content="Kernel Design Agents and KernelWiki: An Evidence-Driven Workflow for GPU Kernel Optimization">
+<meta name="post:slug"            content="kernel-design-agents-kernelwiki">
+<meta name="post:date"            content="2026-08-28">
+<meta name="post:tags"            content="Agentic Coding, KernelWiki, Kernel Design Agents, GPU Kernel, 工程实践">
+<meta name="post:tags_en"         content="Agentic Coding, KernelWiki, Kernel Design Agents, GPU Kernel, Engineering">
+<meta name="post:reading"         content="14 分钟">
+<meta name="post:reading_en"      content="14 min">
+<meta name="post:summary"         content="GPU kernel 优化受正确性、可比较测量和目标架构约束，agent 搜索也增加证据管理成本。KDA 固定任务契约并记录候选决策，KernelWiki 提供带版本和来源的知识线索；当前实现仍须由本地 validation、benchmark 与 profile 验证。">
+<meta name="post:summary_en"      content="GPU kernel optimization must satisfy input-domain correctness, comparable measurement, and target-architecture constraints; agent-driven search also increases the cost of evidence management. KDA fixes the task contract and records candidate decisions, while KernelWiki supplies versioned, sourced hypotheses. Local validation, benchmarks, and profiles still determine whether a technique works for the current kernel.">
+<meta name="post:series"          content="agentic-coding-practice">
+<meta name="post:series_title"    content="Agentic Coding Practice">
+<meta name="post:series_title_en" content="Agentic Coding Practice">
+<meta name="post:series_order"    content="2">
+<script src="../lang-toggle.js" defer></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  .lead {
+    margin: -6px 0 30px;
+    color: var(--fg-muted);
+    font-size: 17px;
+    line-height: 1.8;
+  }
+  .note-box {
+    margin: 18px 0 24px;
+    padding: 12px 16px;
+    border-left: 3px solid var(--accent);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    background: var(--accent-tint);
+  }
+  .note-box p { margin: 6px 0; }
+  .table-scroll {
+    max-width: 100%;
+    margin: 18px 0 26px;
+    overflow-x: auto;
+  }
+  table.note-table {
+    width: 100%;
+    min-width: 760px;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  table.note-table th,
+  table.note-table td {
+    padding: 9px 12px;
+    text-align: left;
+    vertical-align: top;
+  }
+  .diagram-frame {
+    max-width: 100%;
+    margin: 20px 0 30px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    box-sizing: border-box;
+  }
+  .diagram-title {
+    margin-bottom: 10px;
+    color: var(--fg-subtle);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  .diagram-svg {
+    display: block;
+    width: 100%;
+    min-width: 760px;
+    height: auto;
+  }
+  .diagram-svg text {
+    fill: var(--fg);
+    font-family: var(--font-sans);
+    letter-spacing: 0;
+  }
+  .diagram-svg .mono { font-family: var(--font-mono); }
+  .diagram-svg .muted { fill: var(--fg-muted); }
+  .diagram-svg .box { fill: var(--bg); stroke: var(--border-strong); stroke-width: 1.3; }
+  .diagram-svg .knowledge { fill: rgba(37, 99, 235, 0.10); stroke: #2563eb; }
+  .diagram-svg .process { fill: rgba(181, 9, 172, 0.08); stroke: #b509ac; }
+  .diagram-svg .measure { fill: rgba(5, 150, 105, 0.10); stroke: #059669; }
+  .diagram-svg .record { fill: rgba(217, 119, 6, 0.10); stroke: #d97706; }
+  .diagram-svg .arrow { fill: none; stroke: var(--fg-muted); stroke-width: 1.5; }
+  @media (max-width: 720px) {
+    .lead { font-size: 16px; }
+    .diagram-frame { padding: 12px; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录 · TOC</div>
+    <div class="lang-zh">
+    <ul>
+      <li><a href="#zh-roles">1. 两个项目的分工</a></li>
+      <li><a href="#zh-problem">2. Kernel 优化的证据闭环</a></li>
+      <li><a href="#zh-kda">3. KDA 的执行模型</a></li>
+      <li><a href="#zh-records">4. 候选与实验记录</a></li>
+      <li><a href="#zh-wiki">5. KernelWiki 的知识结构</a></li>
+      <li><a href="#zh-query">6. 查询路径</a></li>
+      <li><a href="#zh-evidence">7. 证据等级</a></li>
+      <li><a href="#zh-example">8. 一次完整优化任务</a></li>
+      <li><a href="#zh-install">9. 安装与边界</a></li>
+      <li><a href="#zh-refs">参考资料</a></li>
+    </ul>
+    </div>
+    <div class="lang-en">
+    <ul>
+      <li><a href="#en-roles">1. Project responsibilities</a></li>
+      <li><a href="#en-problem">2. Evidence loops in kernel optimization</a></li>
+      <li><a href="#en-kda">3. KDA execution model</a></li>
+      <li><a href="#en-records">4. Candidates and experiment records</a></li>
+      <li><a href="#en-wiki">5. KernelWiki knowledge structure</a></li>
+      <li><a href="#en-query">6. Query path</a></li>
+      <li><a href="#en-evidence">7. Evidence levels</a></li>
+      <li><a href="#en-example">8. A complete optimization task</a></li>
+      <li><a href="#en-install">9. Installation and scope</a></li>
+      <li><a href="#en-refs">References</a></li>
+    </ul>
+    </div>
+  </aside>
+
+<main class="content">
+
+<div class="lang-zh">
+
+<h1>Kernel Design Agents 与 KernelWiki：面向 GPU Kernel 优化的证据驱动工作流</h1>
+
+<p class="lead">GPU kernel 优化是一项受约束的实验工作：实现必须覆盖目标输入域，性能数据必须来自可比较的测量，所用技巧还要落在目标架构与工具链的能力范围内。Coding agent 扩大了候选搜索的速度，也随之增加了记录假设、验证结果和来源证据的负担。Kernel Design Agents 负责组织这条实验流程，KernelWiki 负责提供可追溯的硬件与实现知识；两者共同把候选生成接到可复查的工程决策上。</p>
+
+<div class="note-box">
+  <p><strong>证据范围：</strong>本文分别固定到 Kernel Design Agents commit <a href="https://github.com/mit-han-lab/kernel-design-agents/tree/dda6be3cf1baedd3ed9c76511ef02f72243cc14c" target="_blank" rel="noopener"><code>dda6be3</code></a> 与 KernelWiki commit <a href="https://github.com/mit-han-lab/KernelWiki/tree/b6b4301f15e8ce6955a56776690643ce5db369e6" target="_blank" rel="noopener"><code>b6b4301</code></a>。项目能力的描述来自这两个公开快照；流程效果仍需在具体任务中验证。</p>
+</div>
+
+<h2 id="zh-roles">1. 两个项目的分工</h2>
+
+<p><a href="https://github.com/mit-han-lab/kernel-design-agents/tree/dda6be3cf1baedd3ed9c76511ef02f72243cc14c" target="_blank" rel="noopener">Kernel Design Agents</a>，下文简称 KDA，是一套面向性能敏感任务的 agent 工作流。固定版本的 README 与 <code>agent-flow.md</code> 要求先定义任务契约，再围绕候选实现进行正确性验证、性能测量和晋级判断；代码、测试、数据集与生成物由独立的任务仓库保存。</p>
+
+<p><a href="https://github.com/mit-han-lab/KernelWiki/tree/b6b4301f15e8ce6955a56776690643ce5db369e6" target="_blank" rel="noopener">KernelWiki</a> 是 KDA 仓库引用的领域知识 skill。该快照的 README 将范围限定为 NVIDIA Blackwell SM100 与 Hopper SM90 kernel，并列出硬件、技术、kernel、上游 PR、竞赛材料和语言指南等内容。KDA 定义实验流程；KernelWiki 提供候选线索及其来源入口。</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">KDA、KernelWiki 与任务仓库的职责边界</div>
+  <svg class="diagram-svg" viewBox="0 0 980 430" role="img" aria-labelledby="ecosystem-title ecosystem-desc">
+    <title id="ecosystem-title">Kernel Design Agents 组件关系</title>
+    <desc id="ecosystem-desc">KDA 驱动任务仓库中的实现循环，KernelWiki 提供技术与源码证据，profiling 工具提供运行时证据。</desc>
+    <defs>
+      <marker id="arrow-ecosystem" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+        <path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path>
+      </marker>
+    </defs>
+
+    <rect class="box process" x="350" y="28" width="280" height="72" rx="5"></rect>
+    <text x="490" y="58" text-anchor="middle" font-size="17" font-weight="600">Kernel Design Agents</text>
+    <text class="muted" x="490" y="82" text-anchor="middle" font-size="13">task contract · plan · promotion rule</text>
+
+    <rect class="box knowledge" x="36" y="156" width="250" height="104" rx="5"></rect>
+    <text x="161" y="188" text-anchor="middle" font-size="17" font-weight="600">KernelWiki</text>
+    <text class="muted" x="161" y="213" text-anchor="middle" font-size="13">hardware · technique · PR · code</text>
+    <text class="muted" x="161" y="236" text-anchor="middle" font-size="13">可查询的领域证据</text>
+
+    <rect class="box" x="350" y="146" width="280" height="124" rx="5"></rect>
+    <text x="490" y="178" text-anchor="middle" font-size="17" font-weight="600">Task Workspace</text>
+    <text class="mono muted" x="490" y="205" text-anchor="middle" font-size="12">code · tests · benchmark</text>
+    <text class="mono muted" x="490" y="228" text-anchor="middle" font-size="12">candidates.jsonl · profile/</text>
+    <text class="muted" x="490" y="251" text-anchor="middle" font-size="13">当前任务的事实来源</text>
+
+    <rect class="box measure" x="694" y="156" width="250" height="104" rx="5"></rect>
+    <text x="819" y="188" text-anchor="middle" font-size="17" font-weight="600">Validator / Benchmark / NCU</text>
+    <text class="muted" x="819" y="213" text-anchor="middle" font-size="13">correctness · latency · profile</text>
+    <text class="muted" x="819" y="236" text-anchor="middle" font-size="13">本机运行产生的实验数据</text>
+
+    <rect class="box record" x="350" y="326" width="280" height="72" rx="5"></rect>
+    <text x="490" y="356" text-anchor="middle" font-size="17" font-weight="600">Promotion Decision</text>
+    <text class="muted" x="490" y="380" text-anchor="middle" font-size="13">keep · revise · reject</text>
+
+    <path class="arrow" d="M490 100 L490 142" marker-end="url(#arrow-ecosystem)"></path>
+    <path class="arrow" d="M286 208 L346 208" marker-end="url(#arrow-ecosystem)"></path>
+    <path class="arrow" d="M634 208 L690 208" marker-end="url(#arrow-ecosystem)"></path>
+    <path class="arrow" d="M819 264 C819 312 646 310 574 324" marker-end="url(#arrow-ecosystem)"></path>
+    <path class="arrow" d="M406 324 C330 305 301 270 349 232" marker-end="url(#arrow-ecosystem)"></path>
+  </svg>
+</div>
+
+<p>这套组合包含三种相互独立的证据。KernelWiki 说明某项技术在来源材料中的适用条件；任务仓库的 validation、benchmark 与 profile 记录当前实现的实验结果；KDA 则规定如何保存候选关系并作出晋级决定。历史性能数字适合生成假设，当前环境中的实验负责确认结论。</p>
+
+<h2 id="zh-problem">2. Kernel 优化的证据闭环</h2>
+
+<p>Kernel 候选的验收条件同时覆盖数值、测量和架构三个方面。测试套件先判断实现是否保持语义，benchmark 再判断性能变化是否稳定，架构与工具链约束则决定某种实现能否在目标环境成立：</p>
+
+<ul>
+  <li><strong>数值约束：</strong>不同 dtype、shape、stride 和边界 tile 可能要求不同容差；随机样例通过不代表整个输入域正确。</li>
+  <li><strong>测量约束：</strong>首轮 JIT、GPU 时钟、cache 状态、样本数量和同步位置都会影响计时。单个 latency 数字缺少解释力。</li>
+  <li><strong>架构约束：</strong><code>wgmma</code>、<code>tcgen05</code>、TMEM、TMA 和 2-SM cooperative MMA 有明确的 compute capability 与工具链边界。</li>
+</ul>
+
+<p>这三类约束使候选历史成为实验的一部分。Baseline 提供共同参照，父子关系记录每次改动基于哪一版实现，验证与性能结果决定候选去留，被拒绝的原因则避免后续搜索重复进入同一分支。KDA 用 task contract 固定验收条件，再用候选记录保存这些决策。</p>
+
+<h2 id="zh-kda">3. KDA 的执行模型</h2>
+
+<p>KDA 从 task contract 开始。仓库中的 <a href="https://github.com/mit-han-lab/kernel-design-agents/blob/dda6be3cf1baedd3ed9c76511ef02f72243cc14c/prompts/basic-flow.md" target="_blank" rel="noopener"><code>basic-flow.md</code></a> 把需要预先固定的内容写成一份模板：</p>
+
+<p class="small">下表的 B200 任务、5% 门槛和命令用于说明字段含义，不是 KDA 仓库公布的 benchmark 结果。</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>字段</th><th>要回答的问题</th><th>Kernel 任务示例</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Objective</td><td>究竟优化什么</td><td>降低 B200 上 BF16 attention forward 的 latency</td></tr>
+    <tr><td>Correctness requirements</td><td>怎样判定结果正确</td><td>覆盖指定 shape，和 reference 比较，给出 <code>atol</code>/<code>rtol</code></td></tr>
+    <tr><td>Constraints</td><td>哪些实现路径允许使用</td><td>CuTe DSL；不改接口；限定 shared memory 用量</td></tr>
+    <tr><td>Validation command</td><td>什么命令证明正确性</td><td><code>pytest tests/test_attention.py -q</code></td></tr>
+    <tr><td>Evaluation command</td><td>什么命令产生可比较指标</td><td>固定 GPU 与 shape 的 benchmark 脚本</td></tr>
+    <tr><td>Promotion criteria</td><td>候选满足什么条件才能保留</td><td>全部测试通过，p50 至少提升 5%，无目标 shape 退化</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Task contract 在搜索开始前固定目标、约束和测量口径，使所有候选沿同一组条件比较。性能门槛未达到时，测试 shape、数值容差和计时方法仍保持不变，实验结果因而具有可比性。</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">KDA 的候选迭代闭环</div>
+  <svg class="diagram-svg" viewBox="0 0 1040 350" role="img" aria-labelledby="loop-title loop-desc">
+    <title id="loop-title">Kernel Design Agents 候选迭代流程</title>
+    <desc id="loop-desc">任务契约经过基线分析、知识检索、实现、正确性验证和性能评测后形成晋级或拒绝决策。</desc>
+    <defs>
+      <marker id="arrow-loop" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+        <path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path>
+      </marker>
+    </defs>
+
+    <rect class="box process" x="24" y="48" width="144" height="66" rx="5"></rect>
+    <text x="96" y="76" text-anchor="middle" font-size="15" font-weight="600">Task Contract</text>
+    <text class="muted" x="96" y="98" text-anchor="middle" font-size="12">目标与晋级标准</text>
+
+    <rect class="box" x="200" y="48" width="144" height="66" rx="5"></rect>
+    <text x="272" y="76" text-anchor="middle" font-size="15" font-weight="600">Baseline</text>
+    <text class="muted" x="272" y="98" text-anchor="middle" font-size="12">代码与测量方法</text>
+
+    <rect class="box knowledge" x="376" y="48" width="144" height="66" rx="5"></rect>
+    <text x="448" y="76" text-anchor="middle" font-size="15" font-weight="600">Research</text>
+    <text class="muted" x="448" y="98" text-anchor="middle" font-size="12">KernelWiki / source</text>
+
+    <rect class="box" x="552" y="48" width="144" height="66" rx="5"></rect>
+    <text x="624" y="76" text-anchor="middle" font-size="15" font-weight="600">Candidate</text>
+    <text class="muted" x="624" y="98" text-anchor="middle" font-size="12">一次只实现一个假设</text>
+
+    <rect class="box measure" x="728" y="48" width="144" height="66" rx="5"></rect>
+    <text x="800" y="76" text-anchor="middle" font-size="15" font-weight="600">Validate</text>
+    <text class="muted" x="800" y="98" text-anchor="middle" font-size="12">正确性与边界输入</text>
+
+    <rect class="box measure" x="872" y="164" width="144" height="66" rx="5"></rect>
+    <text x="944" y="192" text-anchor="middle" font-size="15" font-weight="600">Benchmark</text>
+    <text class="muted" x="944" y="214" text-anchor="middle" font-size="12">latency / NCU</text>
+
+    <rect class="box record" x="552" y="258" width="212" height="66" rx="5"></rect>
+    <text x="658" y="286" text-anchor="middle" font-size="15" font-weight="600">Promotion Decision</text>
+    <text class="muted" x="658" y="308" text-anchor="middle" font-size="12">keep · revise · reject</text>
+
+    <path class="arrow" d="M168 81 L196 81" marker-end="url(#arrow-loop)"></path>
+    <path class="arrow" d="M344 81 L372 81" marker-end="url(#arrow-loop)"></path>
+    <path class="arrow" d="M520 81 L548 81" marker-end="url(#arrow-loop)"></path>
+    <path class="arrow" d="M696 81 L724 81" marker-end="url(#arrow-loop)"></path>
+    <path class="arrow" d="M872 81 C946 82 962 111 950 160" marker-end="url(#arrow-loop)"></path>
+    <path class="arrow" d="M900 230 C862 274 803 290 768 290" marker-end="url(#arrow-loop)"></path>
+    <path class="arrow" d="M552 290 C439 290 412 168 555 107" marker-end="url(#arrow-loop)"></path>
+  </svg>
+</div>
+
+<p>固定版本的流程文档要求先在 <code>docs/draft.md</code> 写出 baseline、风险、候选方向和验证命令，再整理成可执行的 <code>docs/plan.md</code>。这会在代码修改前留下研究假设，便于后续区分实现问题与假设问题。</p>
+
+<h2 id="zh-records">4. 候选与实验记录</h2>
+
+<p>KDA 建议把实现工作放在独立 task workspace 中。代码、测试、benchmark harness 和私有约束属于任务仓库；KDA 仓库只保存可复用流程。一个最小目录可以是：</p>
+
+<pre class="code">task-workspace/
+├── docs/
+│   ├── draft.md
+│   └── plan.md
+├── runs/
+├── outputs/
+├── profile/
+├── benchmark.csv
+└── candidates.jsonl</pre>
+
+<p><code>candidates.jsonl</code> 不需要复杂 schema，但至少要能恢复候选之间的关系和结论：</p>
+
+<p class="small">以下记录为格式示例，latency 与退化原因均为示意数据。</p>
+
+<pre class="code">{"id":"c0","parent":null,"change":"baseline","correct":true,"p50_us":42.8,"status":"baseline"}
+{"id":"c1","parent":"c0","change":"double-buffer K/V TMA load","correct":true,"p50_us":39.6,"status":"keep"}
+{"id":"c2","parent":"c1","change":"increase software stages 3 -> 4","correct":true,"p50_us":41.1,"status":"reject","reason":"register pressure reduced occupancy"}</pre>
+
+<p>拒绝记录为后续搜索提供负向实验结果。下一轮 agent 读到 <code>c2</code> 的寄存器压力与 occupancy 变化后，可以跳过已经测过的 stage 配置，把预算留给新的假设。最终代码说明“采用了什么”，候选历史补上“为什么采用”；至于下一批假设从哪里来，则进入 KernelWiki 的知识组织与检索范围。</p>
+
+<h2 id="zh-wiki">5. KernelWiki 的知识结构</h2>
+
+<p>KernelWiki 是一套带 provenance 的结构化知识库。它把原始来源、整理后的知识页和面向检索的索引分为三层：</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>层</th><th>目录</th><th>保存内容</th><th>主要用途</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Source</td><td><code>sources/</code></td><td>PR、官方文档、论文、博客与竞赛材料的来源页</td><td>追溯原始事实，避免综合结论失去出处</td></tr>
+    <tr><td>Wiki</td><td><code>wiki/</code></td><td>hardware、technique、kernel、pattern、language、migration 知识页</td><td>把分散材料整理成可直接使用的技术说明</td></tr>
+    <tr><td>Query</td><td><code>queries/</code></td><td>按架构、问题、技术、硬件特性、仓库、kernel 类型和语言生成的索引</td><td>缩小候选页面集合</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>每个页面都有 YAML frontmatter。<code>id</code> 是跨页引用的稳定入口，<code>sources</code> 指向证据页，<code>related</code> 和 <code>prerequisites</code> 组成知识图。<code>data/tags.yaml</code> 约束术语，<code>data/aliases.yaml</code> 把 <code>UMMA</code> 归一为 <code>tcgen05</code>、把 <code>B200</code> 归一为 <code>sm100</code>。版本相关能力则通过 <code>version_sensitive</code> 指针连接到中央声明表。</p>
+
+<p><code>artifacts/</code> 保存固定到 upstream SHA 的代码、patch 或摘录，<code>PROVENANCE.yaml</code> 记录来源、许可证、文件模式与 SHA-256。知识页据此提供技术概览，artifact 则把概览接回对应版本的实现。检索过程需要先定位知识页，再沿 provenance 展开源码证据。</p>
+
+<h2 id="zh-query">6. 从问题到源码的查询路径</h2>
+
+<p>KernelWiki 的 <a href="https://github.com/mit-han-lab/KernelWiki/blob/b6b4301f15e8ce6955a56776690643ce5db369e6/SKILL.md" target="_blank" rel="noopener"><code>SKILL.md</code></a> 定义了五条查询路径。下面列出前三条：</p>
+
+<pre class="code"># 1. 自然语言与结构化过滤
+python3 scripts/query.py "ping-pong attention" --limit 5
+python3 scripts/query.py --architecture B200 --type kernel
+python3 scripts/query.py --symptom tail-effect --compact
+
+# 2. 读取指定知识页，并展开它引用的来源
+python3 scripts/get_page.py kernel-flash-attention-4 --follow-sources
+
+# 3. 对 wiki 正文与 PR 页做正则搜索
+python3 scripts/grep_wiki.py "tcgen05" --only wiki</pre>
+
+<p><code>query.py</code> 负责召回，<code>get_page.py</code> 负责展开具体页面和来源，<code>grep_wiki.py</code> 适合查指令名、API 或代码片段。问题比较宽时，可以先读 <code>references/primer.md</code>；已经知道 kernel 或 PR ID 时，直接调用 <code>get_page.py</code> 更省上下文。</p>
+
+<p>以 <a href="https://github.com/mit-han-lab/KernelWiki/blob/b6b4301f15e8ce6955a56776690643ce5db369e6/wiki/kernels/flash-attention-4.md" target="_blank" rel="noopener"><code>kernel-flash-attention-4</code></a> 为例，页面的 frontmatter 同时记录架构、语言、相关技术、来源和结构化性能数据。正文还整理了 ping-pong scheduling、software exponential 与 2-CTA backward。这里的内容属于知识库作者的综合；工程结论仍应沿 <code>sources</code> 回到论文、博客和上游 PR。</p>
+
+<h2 id="zh-evidence">7. 证据等级与可复现性</h2>
+
+<p>KernelWiki 用 confidence 描述结论的证据强度，用 reproducibility 描述实现材料能够运行到什么阶段。这两个维度相互正交：来源可靠的架构说明可以停留在概念层，而能够编译的实验代码也可能依赖尚未形成公开契约的行为。</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Confidence</th><th>含义</th><th>回答时的处理</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>verified</code></td><td>同时有官方文档与上游代码支持</td><td>仍需注明适用架构与版本</td></tr>
+    <tr><td><code>source-reported</code></td><td>由论文、主要项目或作者材料报告</td><td>明确写成来源报告的结论</td></tr>
+    <tr><td><code>inferred</code></td><td>从多个来源综合推断，没有单一权威陈述</td><td>把推断与源码事实分开</td></tr>
+    <tr><td><code>experimental</code></td><td>未文档化技巧或版本敏感行为</td><td>给出 CUDA、PTX 或工具链版本并要求本地复验</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>可复现性沿 <code>concept → pseudocode → snippet → runnable → benchmarked</code> 递进。仓库的 validator 要求 technique、kernel 和 language 页面至少达到 <code>snippet</code>。这一等级确认知识页带有可编译片段；把片段接入当前项目仍需满足接口、shape、dtype 与工具链条件。</p>
+
+<p>性能数据也不能脱离上下文。KernelWiki 要求至少同时报告 <code>gpu</code>、<code>dtype</code>、<code>shape</code>、<code>metric</code>、<code>value</code> 和 <code>source_id</code>。缺少任意一项，诸如“比 cuDNN 快 1.2 倍”的描述都很难用于工程决策。</p>
+
+<h2 id="zh-example">8. 一个 B200 attention 优化任务</h2>
+
+<p>假设任务是在 B200 上优化 BF16 attention forward。KDA 与 KernelWiki 可以按以下顺序配合：</p>
+
+<ol>
+  <li><strong>固定契约。</strong>列出 shape 集合、reference、容差、允许的 DSL、benchmark 命令和 5% 晋级门槛。</li>
+  <li><strong>建立 baseline。</strong>运行 correctness suite 与 benchmark，记录 kernel 时间、端到端时间、编译版本和 GPU 时钟策略。</li>
+  <li><strong>检索候选。</strong>按 <code>sm100</code>、<code>attention</code>、<code>tcgen05</code>、<code>tmem</code> 查询；打开相关 kernel 页并跟随 <code>sources</code>。</li>
+  <li><strong>写出假设。</strong>例如“用 ping-pong scheduling 隐藏 softmax 延迟”，同时写明它依赖哪些 shape、warp 分工与 TMEM 布局。</li>
+  <li><strong>一次实现一个候选。</strong>不要同时改 tile shape、stage count 和 epilogue，否则无法归因。</li>
+  <li><strong>先验证正确性。</strong>覆盖满 tile、尾块、极值和非连续输入；失败的候选不进入性能比较。</li>
+  <li><strong>再测量与 profile。</strong>重复计时，并用 NCU 判断预期机制是否真的发生，例如 tensor pipe 利用率是否上升、stall 是否从 dependency 转向 memory。</li>
+  <li><strong>记录晋级决定。</strong>结果写入 <code>benchmark.csv</code> 和 <code>candidates.jsonl</code>。达到契约才晋级，否则记录退化原因并回到下一个候选。</li>
+</ol>
+
+<div class="note-box">
+  <p><strong>知识证据与实验事实必须分开。</strong>KernelWiki 能证明某种技术在特定来源中出现过，也能提供实现入口；只有任务仓库里的 validation、benchmark 和 profile 才能证明它适合当前 kernel。</p>
+</div>
+
+<h2 id="zh-install">9. 安装方式与适用边界</h2>
+
+<p>KDA 仓库把 KernelWiki 和 NCU report skill 作为 submodule 组织。按照当前 README，可以一次拉取完整工作流：</p>
+
+<pre class="code">git clone --recurse-submodules \
+  https://github.com/mit-han-lab/kernel-design-agents.git
+cd kernel-design-agents
+
+mkdir -p ~/.claude/skills
+ln -s "$(pwd)/skills/KernelWiki" ~/.claude/skills/KernelWiki
+ln -s "$(pwd)/skills/ncu-report-skill" ~/.claude/skills/ncu-report-skill</pre>
+
+<p>也可以只安装 KernelWiki：</p>
+
+<pre class="code">git clone https://github.com/mit-han-lab/KernelWiki.git \
+  ~/.claude/skills/KernelWiki
+
+cd ~/.claude/skills/KernelWiki
+python3 scripts/query.py --tag nvfp4 --type kernel --compact
+python3 scripts/get_page.py kernel-flash-attention-4 --frontmatter-only</pre>
+
+<p>仓库当前的自动注册说明面向 Claude Code。换用其他 coding agent 时，<code>query.py</code>、<code>get_page.py</code> 和 <code>grep_wiki.py</code> 仍是普通 Python 脚本，但 skill 能否自动发现取决于宿主的扩展机制。</p>
+
+<p>KernelWiki 以 Blackwell 为主，同时保留与 Blackwell 迁移相关的 Hopper 内容。通用 CUDA 问答、host 侧框架集成以及 DeepEP、EPLB、DualPipe 这类分布式系统主题不在收录范围内。正文以英文为准，CuTe DSL、CUDA C++、PTX 和 Triton 是一等语言入口。</p>
+
+<p>知识库也有时间边界。本文写作时，项目 README 标注上游 PR 审计截止到 2026-05-20，文档、release 与 leaderboard 快照验证到 2026-08-18 UTC。查询结果应和本机 CUDA、CUTLASS、Triton 版本一起核对。KDA 本身则被作者称为仍在开发的早期研究原型，适合借鉴其流程，不应把目录结构或文件格式当成稳定 API。</p>
+
+<h2 id="zh-refs">参考资料</h2>
+
+<ul>
+  <li><a href="https://github.com/mit-han-lab/kernel-design-agents/tree/dda6be3cf1baedd3ed9c76511ef02f72243cc14c" target="_blank" rel="noopener">Kernel Design Agents repository at <code>dda6be3</code></a></li>
+  <li><a href="https://github.com/mit-han-lab/kernel-design-agents/blob/dda6be3cf1baedd3ed9c76511ef02f72243cc14c/docs/agent-flow.md" target="_blank" rel="noopener">KDA Agent Flow</a></li>
+  <li><a href="https://github.com/mit-han-lab/kernel-design-agents/blob/dda6be3cf1baedd3ed9c76511ef02f72243cc14c/prompts/basic-flow.md" target="_blank" rel="noopener">KDA Basic Flow Prompt</a></li>
+  <li><a href="https://github.com/mit-han-lab/KernelWiki/tree/b6b4301f15e8ce6955a56776690643ce5db369e6" target="_blank" rel="noopener">KernelWiki repository at <code>b6b4301</code></a></li>
+  <li><a href="https://github.com/mit-han-lab/KernelWiki/blob/b6b4301f15e8ce6955a56776690643ce5db369e6/SKILL.md" target="_blank" rel="noopener">KernelWiki skill contract and query paths</a></li>
+  <li><a href="https://github.com/mit-han-lab/KernelWiki/blob/b6b4301f15e8ce6955a56776690643ce5db369e6/references/schema.md" target="_blank" rel="noopener">KernelWiki schema, confidence and reproducibility levels</a></li>
+  <li><a href="https://github.com/mit-han-lab/KernelWiki/blob/b6b4301f15e8ce6955a56776690643ce5db369e6/wiki/kernels/flash-attention-4.md" target="_blank" rel="noopener">KernelWiki FlashAttention-4 page</a></li>
+</ul>
+
+</div>
+
+<div class="lang-en">
+
+<h1>Kernel Design Agents and KernelWiki: An Evidence-Driven Workflow for GPU Kernel Optimization</h1>
+
+<p class="lead">GPU kernel optimization is a constrained experimental discipline. An implementation must cover the target input domain, performance data must come from comparable measurements, and every technique must fit the target architecture and toolchain. Coding agents expand the rate of candidate exploration, which increases the need to record hypotheses, validation results, and source provenance. Kernel Design Agents organizes that experimental process, while KernelWiki supplies traceable hardware and implementation knowledge. Together they connect candidate generation to reviewable engineering decisions.</p>
+
+<div class="note-box">
+  <p><strong>Evidence boundary:</strong> This article pins Kernel Design Agents to commit <a href="https://github.com/mit-han-lab/kernel-design-agents/tree/dda6be3cf1baedd3ed9c76511ef02f72243cc14c" target="_blank" rel="noopener"><code>dda6be3</code></a> and KernelWiki to commit <a href="https://github.com/mit-han-lab/KernelWiki/tree/b6b4301f15e8ce6955a56776690643ce5db369e6" target="_blank" rel="noopener"><code>b6b4301</code></a>. Descriptions of project capabilities come from these public snapshots. Their effectiveness still has to be tested on each concrete task.</p>
+</div>
+
+<h2 id="en-roles">1. Responsibilities of the two projects</h2>
+
+<p><a href="https://github.com/mit-han-lab/kernel-design-agents/tree/dda6be3cf1baedd3ed9c76511ef02f72243cc14c" target="_blank" rel="noopener">Kernel Design Agents</a>, abbreviated KDA below, is an agent workflow for performance-sensitive work. The pinned README and <code>agent-flow.md</code> begin with a task contract, then iterate over candidate implementations through correctness validation, performance measurement, and promotion decisions. A separate task repository holds code, tests, datasets, and generated artifacts.</p>
+
+<p><a href="https://github.com/mit-han-lab/KernelWiki/tree/b6b4301f15e8ce6955a56776690643ce5db369e6" target="_blank" rel="noopener">KernelWiki</a> is the domain-knowledge skill referenced by the KDA repository. Its README limits this snapshot to NVIDIA Blackwell SM100 and Hopper SM90 kernels, with material on hardware, techniques, kernels, upstream pull requests, competition entries, and programming-language guidance. KDA defines the experiment process; KernelWiki supplies candidate ideas and routes back to their sources.</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">Responsibility boundaries among KDA, KernelWiki, and the task repository</div>
+  <svg class="diagram-svg" viewBox="0 0 980 430" role="img" aria-labelledby="en-ecosystem-title en-ecosystem-desc">
+    <title id="en-ecosystem-title">Kernel Design Agents component relationships</title>
+    <desc id="en-ecosystem-desc">KDA drives the implementation loop in a task repository, KernelWiki supplies technical and source evidence, and profiling tools produce runtime evidence.</desc>
+    <defs>
+      <marker id="en-arrow-ecosystem" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+        <path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path>
+      </marker>
+    </defs>
+
+    <rect class="box process" x="350" y="28" width="280" height="72" rx="5"></rect>
+    <text x="490" y="58" text-anchor="middle" font-size="17" font-weight="600">Kernel Design Agents</text>
+    <text class="muted" x="490" y="82" text-anchor="middle" font-size="13">task contract · plan · promotion rule</text>
+
+    <rect class="box knowledge" x="36" y="156" width="250" height="104" rx="5"></rect>
+    <text x="161" y="188" text-anchor="middle" font-size="17" font-weight="600">KernelWiki</text>
+    <text class="muted" x="161" y="213" text-anchor="middle" font-size="13">hardware · technique · PR · code</text>
+    <text class="muted" x="161" y="236" text-anchor="middle" font-size="13">queryable domain evidence</text>
+
+    <rect class="box" x="350" y="146" width="280" height="124" rx="5"></rect>
+    <text x="490" y="178" text-anchor="middle" font-size="17" font-weight="600">Task Workspace</text>
+    <text class="mono muted" x="490" y="205" text-anchor="middle" font-size="12">code · tests · benchmark</text>
+    <text class="mono muted" x="490" y="228" text-anchor="middle" font-size="12">candidates.jsonl · profile/</text>
+    <text class="muted" x="490" y="251" text-anchor="middle" font-size="13">source of truth for the current task</text>
+
+    <rect class="box measure" x="694" y="156" width="250" height="104" rx="5"></rect>
+    <text x="819" y="188" text-anchor="middle" font-size="17" font-weight="600">Validator / Benchmark / NCU</text>
+    <text class="muted" x="819" y="213" text-anchor="middle" font-size="13">correctness · latency · profile</text>
+    <text class="muted" x="819" y="236" text-anchor="middle" font-size="13">experimental data from the target machine</text>
+
+    <rect class="box record" x="350" y="326" width="280" height="72" rx="5"></rect>
+    <text x="490" y="356" text-anchor="middle" font-size="17" font-weight="600">Promotion Decision</text>
+    <text class="muted" x="490" y="380" text-anchor="middle" font-size="13">keep · revise · reject</text>
+
+    <path class="arrow" d="M490 100 L490 142" marker-end="url(#en-arrow-ecosystem)"></path>
+    <path class="arrow" d="M286 208 L346 208" marker-end="url(#en-arrow-ecosystem)"></path>
+    <path class="arrow" d="M634 208 L690 208" marker-end="url(#en-arrow-ecosystem)"></path>
+    <path class="arrow" d="M819 264 C819 312 646 310 574 324" marker-end="url(#en-arrow-ecosystem)"></path>
+    <path class="arrow" d="M406 324 C330 305 301 270 349 232" marker-end="url(#en-arrow-ecosystem)"></path>
+  </svg>
+</div>
+
+<p>This arrangement produces three independent forms of evidence. KernelWiki records the conditions under which a technique appears in its sources. Validation, benchmarks, and profiles in the task repository capture experimental results for the current implementation. KDA defines how candidate relationships and promotion decisions are recorded. Historical performance numbers generate hypotheses; experiments in the target environment establish conclusions.</p>
+
+<h2 id="en-problem">2. Evidence loops in kernel optimization</h2>
+
+<p>A kernel candidate is accepted against numerical, measurement, and architecture constraints. The test suite first establishes semantic fidelity, benchmarks determine whether the performance change is stable, and architecture or toolchain limits determine whether the implementation is valid for the target environment:</p>
+
+<ul>
+  <li><strong>Numerical constraints:</strong> Different dtypes, shapes, strides, and boundary tiles may require different tolerances. Passing a set of random cases does not establish correctness over the whole input domain.</li>
+  <li><strong>Measurement constraints:</strong> Initial JIT compilation, GPU clocks, cache state, sample count, and synchronization placement all affect timing. One latency number says very little on its own.</li>
+  <li><strong>Architecture constraints:</strong> <code>wgmma</code>, <code>tcgen05</code>, TMEM, TMA, and two-SM cooperative MMA each have explicit compute-capability and toolchain limits.</li>
+</ul>
+
+<p>These constraints make candidate history part of the experiment. The baseline supplies a common reference, parent-child links identify the implementation behind each change, validation and performance results decide promotion, and rejection reasons prevent the search from revisiting a measured branch. KDA fixes the acceptance conditions in a task contract and preserves the decisions in candidate records.</p>
+
+<h2 id="en-kda">3. KDA execution model</h2>
+
+<p>KDA starts with a task contract. The repository's <a href="https://github.com/mit-han-lab/kernel-design-agents/blob/dda6be3cf1baedd3ed9c76511ef02f72243cc14c/prompts/basic-flow.md" target="_blank" rel="noopener"><code>basic-flow.md</code></a> provides a template for the fields that must be fixed in advance:</p>
+
+<p class="small">The B200 task, 5% threshold, and commands below are illustrative field values, not benchmark results reported by the KDA repository.</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Field</th><th>Question to answer</th><th>Example for a kernel task</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Objective</td><td>What exactly is being optimized?</td><td>Reduce BF16 attention forward latency on B200</td></tr>
+    <tr><td>Correctness requirements</td><td>What counts as a correct result?</td><td>Cover specified shapes, compare with a reference, and define <code>atol</code>/<code>rtol</code></td></tr>
+    <tr><td>Constraints</td><td>Which implementation paths are allowed?</td><td>CuTe DSL; unchanged interface; bounded shared-memory use</td></tr>
+    <tr><td>Validation command</td><td>Which command proves correctness?</td><td><code>pytest tests/test_attention.py -q</code></td></tr>
+    <tr><td>Evaluation command</td><td>Which command produces comparable metrics?</td><td>A benchmark script with fixed GPU and shapes</td></tr>
+    <tr><td>Promotion criteria</td><td>What must a candidate achieve to survive?</td><td>All tests pass, p50 improves by at least 5%, and no target shape regresses</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>The task contract fixes the objective, constraints, and measurement protocol before the search begins, so every candidate is compared under the same conditions. Test shapes, numerical tolerances, and timing methodology remain fixed when a candidate misses its performance threshold.</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">KDA candidate iteration loop</div>
+  <svg class="diagram-svg" viewBox="0 0 1040 350" role="img" aria-labelledby="en-loop-title en-loop-desc">
+    <title id="en-loop-title">Kernel Design Agents candidate iteration</title>
+    <desc id="en-loop-desc">A task contract proceeds through baseline analysis, research, implementation, correctness validation, and performance evaluation before a candidate is promoted or rejected.</desc>
+    <defs>
+      <marker id="en-arrow-loop" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+        <path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path>
+      </marker>
+    </defs>
+
+    <rect class="box process" x="24" y="48" width="144" height="66" rx="5"></rect>
+    <text x="96" y="76" text-anchor="middle" font-size="15" font-weight="600">Task Contract</text>
+    <text class="muted" x="96" y="98" text-anchor="middle" font-size="12">goal and promotion criteria</text>
+
+    <rect class="box" x="200" y="48" width="144" height="66" rx="5"></rect>
+    <text x="272" y="76" text-anchor="middle" font-size="15" font-weight="600">Baseline</text>
+    <text class="muted" x="272" y="98" text-anchor="middle" font-size="12">code and measurement method</text>
+
+    <rect class="box knowledge" x="376" y="48" width="144" height="66" rx="5"></rect>
+    <text x="448" y="76" text-anchor="middle" font-size="15" font-weight="600">Research</text>
+    <text class="muted" x="448" y="98" text-anchor="middle" font-size="12">KernelWiki / source</text>
+
+    <rect class="box" x="552" y="48" width="144" height="66" rx="5"></rect>
+    <text x="624" y="76" text-anchor="middle" font-size="15" font-weight="600">Candidate</text>
+    <text class="muted" x="624" y="98" text-anchor="middle" font-size="12">one hypothesis at a time</text>
+
+    <rect class="box measure" x="728" y="48" width="144" height="66" rx="5"></rect>
+    <text x="800" y="76" text-anchor="middle" font-size="15" font-weight="600">Validate</text>
+    <text class="muted" x="800" y="98" text-anchor="middle" font-size="12">correctness and edge cases</text>
+
+    <rect class="box measure" x="872" y="164" width="144" height="66" rx="5"></rect>
+    <text x="944" y="192" text-anchor="middle" font-size="15" font-weight="600">Benchmark</text>
+    <text class="muted" x="944" y="214" text-anchor="middle" font-size="12">latency / NCU</text>
+
+    <rect class="box record" x="552" y="258" width="212" height="66" rx="5"></rect>
+    <text x="658" y="286" text-anchor="middle" font-size="15" font-weight="600">Promotion Decision</text>
+    <text class="muted" x="658" y="308" text-anchor="middle" font-size="12">keep · revise · reject</text>
+
+    <path class="arrow" d="M168 81 L196 81" marker-end="url(#en-arrow-loop)"></path>
+    <path class="arrow" d="M344 81 L372 81" marker-end="url(#en-arrow-loop)"></path>
+    <path class="arrow" d="M520 81 L548 81" marker-end="url(#en-arrow-loop)"></path>
+    <path class="arrow" d="M696 81 L724 81" marker-end="url(#en-arrow-loop)"></path>
+    <path class="arrow" d="M872 81 C946 82 962 111 950 160" marker-end="url(#en-arrow-loop)"></path>
+    <path class="arrow" d="M900 230 C862 274 803 290 768 290" marker-end="url(#en-arrow-loop)"></path>
+    <path class="arrow" d="M552 290 C439 290 412 168 555 107" marker-end="url(#en-arrow-loop)"></path>
+  </svg>
+</div>
+
+<p>The pinned process asks the agent to record the baseline, risks, candidate directions, and validation commands in <code>docs/draft.md</code>, then turn that material into an executable <code>docs/plan.md</code>. This leaves the research hypothesis in place before code changes begin, which helps separate a faulty implementation from a faulty hypothesis later.</p>
+
+<h2 id="en-records">4. Candidate and experiment records</h2>
+
+<p>KDA recommends keeping implementation work in a separate task workspace. Code, tests, the benchmark harness, and private constraints belong to that repository; KDA holds only the reusable process. A minimal layout could be:</p>
+
+<pre class="code">task-workspace/
+├── docs/
+│   ├── draft.md
+│   └── plan.md
+├── runs/
+├── outputs/
+├── profile/
+├── benchmark.csv
+└── candidates.jsonl</pre>
+
+<p><code>candidates.jsonl</code> does not need an elaborate schema, but it should preserve candidate relationships and decisions:</p>
+
+<p class="small">The following entries illustrate the record format. Their latency values and regression explanation are not project measurements.</p>
+
+<pre class="code">{"id":"c0","parent":null,"change":"baseline","correct":true,"p50_us":42.8,"status":"baseline"}
+{"id":"c1","parent":"c0","change":"double-buffer K/V TMA load","correct":true,"p50_us":39.6,"status":"keep"}
+{"id":"c2","parent":"c1","change":"increase software stages 3 -> 4","correct":true,"p50_us":41.1,"status":"reject","reason":"register pressure reduced occupancy"}</pre>
+
+<p>A rejection record preserves a negative experimental result. Once the next agent sees the register-pressure and occupancy effect associated with <code>c2</code>, it can skip that measured stage configuration and spend its budget on a new hypothesis. The final code records what survived; candidate history records why. KernelWiki supplies the knowledge structure and retrieval path from which the next set of hypotheses can be formed.</p>
+
+<h2 id="en-wiki">5. KernelWiki knowledge structure</h2>
+
+<p>KernelWiki is a structured knowledge base with source provenance. It separates original sources, synthesized knowledge pages, and retrieval-oriented indexes into three layers:</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Layer</th><th>Directory</th><th>Contents</th><th>Main use</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Source</td><td><code>sources/</code></td><td>Source pages for pull requests, official documentation, papers, articles, and competition material</td><td>Trace facts back to their origins</td></tr>
+    <tr><td>Wiki</td><td><code>wiki/</code></td><td>Knowledge pages for hardware, techniques, kernels, patterns, languages, and migrations</td><td>Turn scattered material into usable technical notes</td></tr>
+    <tr><td>Query</td><td><code>queries/</code></td><td>Indexes generated by architecture, problem, technique, hardware feature, repository, kernel type, and language</td><td>Narrow the candidate page set</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Every page has YAML frontmatter. <code>id</code> is the stable cross-page reference; <code>sources</code> points to evidence pages; <code>related</code> and <code>prerequisites</code> form a knowledge graph. <code>data/tags.yaml</code> constrains terminology, while <code>data/aliases.yaml</code> normalizes <code>UMMA</code> to <code>tcgen05</code> and <code>B200</code> to <code>sm100</code>. Version-sensitive capabilities point to a central declaration table through <code>version_sensitive</code>.</p>
+
+<p><code>artifacts/</code> contains code, patches, or excerpts pinned to upstream SHAs. <code>PROVENANCE.yaml</code> records origin, license, file patterns, and SHA-256 values. A knowledge page provides the technical overview, while its artifact reconnects that overview to the matching implementation revision. Retrieval therefore begins with a knowledge page and expands through provenance to source evidence.</p>
+
+<h2 id="en-query">6. Query path from a problem to source code</h2>
+
+<p>KernelWiki's <a href="https://github.com/mit-han-lab/KernelWiki/blob/b6b4301f15e8ce6955a56776690643ce5db369e6/SKILL.md" target="_blank" rel="noopener"><code>SKILL.md</code></a> defines five query paths. The first three are shown below:</p>
+
+<pre class="code"># 1. Natural-language and structured filters
+python3 scripts/query.py "ping-pong attention" --limit 5
+python3 scripts/query.py --architecture B200 --type kernel
+python3 scripts/query.py --symptom tail-effect --compact
+
+# 2. Read a knowledge page and expand its cited sources
+python3 scripts/get_page.py kernel-flash-attention-4 --follow-sources
+
+# 3. Search wiki and PR pages with a regular expression
+python3 scripts/grep_wiki.py "tcgen05" --only wiki</pre>
+
+<p><code>query.py</code> handles retrieval, <code>get_page.py</code> expands a selected page and its sources, and <code>grep_wiki.py</code> is useful for instruction names, APIs, and code fragments. For a broad question, start with <code>references/primer.md</code>. If the kernel or pull-request ID is already known, <code>get_page.py</code> uses less context.</p>
+
+<p>The <a href="https://github.com/mit-han-lab/KernelWiki/blob/b6b4301f15e8ce6955a56776690643ce5db369e6/wiki/kernels/flash-attention-4.md" target="_blank" rel="noopener"><code>kernel-flash-attention-4</code></a> page, for example, records architecture, language, related techniques, sources, and structured performance data in its frontmatter. The body summarizes ping-pong scheduling, software exponential, and two-CTA backward. These are the knowledge-base author's synthesis; engineering conclusions should still follow <code>sources</code> back to papers, articles, and upstream pull requests.</p>
+
+<h2 id="en-evidence">7. Evidence levels and reproducibility</h2>
+
+<p>KernelWiki uses confidence to describe the strength of evidence behind a claim and reproducibility to describe how far the implementation material can run. The dimensions are orthogonal: a well-sourced architecture description may remain conceptual, while compilable experimental code may rely on behavior that has not become a public contract.</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Confidence</th><th>Meaning</th><th>How to present it</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>verified</code></td><td>Supported by both official documentation and upstream code</td><td>Still state the applicable architecture and version</td></tr>
+    <tr><td><code>source-reported</code></td><td>Reported by a paper, primary project, or author material</td><td>Attribute the conclusion to that source</td></tr>
+    <tr><td><code>inferred</code></td><td>Synthesized from several sources without one authoritative statement</td><td>Separate the inference from source-code facts</td></tr>
+    <tr><td><code>experimental</code></td><td>An undocumented technique or version-sensitive behavior</td><td>Give the CUDA, PTX, or toolchain version and require local verification</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Reproducibility progresses through <code>concept → pseudocode → snippet → runnable → benchmarked</code>. The repository validator requires technique, kernel, and language pages to reach at least <code>snippet</code>. That level confirms the presence of a compilable fragment; integration into the current project still depends on its interface, shapes, dtypes, and toolchain.</p>
+
+<p>Performance data also needs context. KernelWiki requires at least <code>gpu</code>, <code>dtype</code>, <code>shape</code>, <code>metric</code>, <code>value</code>, and <code>source_id</code>. Without them, a statement such as “1.2× faster than cuDNN” is difficult to use in an engineering decision.</p>
+
+<h2 id="en-example">8. A B200 attention optimization task</h2>
+
+<p>Suppose the task is to optimize BF16 attention forward on B200. KDA and KernelWiki can be combined in this order:</p>
+
+<ol>
+  <li><strong>Fix the contract.</strong> List the shape set, reference, tolerances, permitted DSL, benchmark command, and a 5% promotion threshold.</li>
+  <li><strong>Establish the baseline.</strong> Run the correctness suite and benchmark; record kernel time, end-to-end time, compiler versions, and GPU clock policy.</li>
+  <li><strong>Retrieve candidates.</strong> Query for <code>sm100</code>, <code>attention</code>, <code>tcgen05</code>, and <code>tmem</code>; open the relevant kernel pages and follow their <code>sources</code>.</li>
+  <li><strong>State the hypothesis.</strong> For example, “use ping-pong scheduling to hide softmax latency,” together with the required shapes, warp roles, and TMEM layout.</li>
+  <li><strong>Implement one candidate at a time.</strong> Do not change tile shape, stage count, and epilogue together, because the result would be hard to attribute.</li>
+  <li><strong>Validate correctness first.</strong> Cover full tiles, tails, extreme values, and non-contiguous inputs. A failing candidate does not enter performance comparison.</li>
+  <li><strong>Measure and profile.</strong> Repeat timings, then use NCU to check whether the expected mechanism occurred, such as higher tensor-pipe utilization or a shift in stalls from dependency to memory.</li>
+  <li><strong>Record the decision.</strong> Write the result to <code>benchmark.csv</code> and <code>candidates.jsonl</code>. Promote only when the contract is met; otherwise record the regression and move to the next candidate.</li>
+</ol>
+
+<div class="note-box">
+  <p><strong>Keep knowledge evidence separate from experimental fact.</strong> KernelWiki can show that a technique appeared in a specific source and point to an implementation. Only validation, benchmarks, and profiles in the task repository can establish that it fits the current kernel.</p>
+</div>
+
+<h2 id="en-install">9. Installation and scope</h2>
+
+<p>The KDA repository organizes KernelWiki and the NCU report skill as submodules. The current README installs the complete workflow as follows:</p>
+
+<pre class="code">git clone --recurse-submodules \
+  https://github.com/mit-han-lab/kernel-design-agents.git
+cd kernel-design-agents
+
+mkdir -p ~/.claude/skills
+ln -s "$(pwd)/skills/KernelWiki" ~/.claude/skills/KernelWiki
+ln -s "$(pwd)/skills/ncu-report-skill" ~/.claude/skills/ncu-report-skill</pre>
+
+<p>KernelWiki can also be installed by itself:</p>
+
+<pre class="code">git clone https://github.com/mit-han-lab/KernelWiki.git \
+  ~/.claude/skills/KernelWiki
+
+cd ~/.claude/skills/KernelWiki
+python3 scripts/query.py --tag nvfp4 --type kernel --compact
+python3 scripts/get_page.py kernel-flash-attention-4 --frontmatter-only</pre>
+
+<p>The repository's automatic registration instructions currently target Claude Code. With another coding agent, <code>query.py</code>, <code>get_page.py</code>, and <code>grep_wiki.py</code> remain ordinary Python scripts, but automatic skill discovery depends on the host's extension mechanism.</p>
+
+<p>KernelWiki focuses on Blackwell and retains Hopper material relevant to Blackwell migration. General CUDA questions, host-framework integration, and distributed-system topics such as DeepEP, EPLB, and DualPipe are outside its scope. English is the canonical article language; CuTe DSL, CUDA C++, PTX, and Triton are first-class language entry points.</p>
+
+<p>The knowledge base also has a time boundary. At the time of writing, its README says that upstream pull requests were audited through 2026-05-20, while documentation, release, and leaderboard snapshots were verified through 2026-08-18 UTC. Query results should be checked against the local CUDA, CUTLASS, and Triton versions. KDA describes itself as an early research prototype under active development, so its process is useful, but its directory layout and file formats should not be treated as stable APIs.</p>
+
+<h2 id="en-refs">References</h2>
+
+<ul>
+  <li><a href="https://github.com/mit-han-lab/kernel-design-agents/tree/dda6be3cf1baedd3ed9c76511ef02f72243cc14c" target="_blank" rel="noopener">Kernel Design Agents repository at <code>dda6be3</code></a></li>
+  <li><a href="https://github.com/mit-han-lab/kernel-design-agents/blob/dda6be3cf1baedd3ed9c76511ef02f72243cc14c/docs/agent-flow.md" target="_blank" rel="noopener">KDA Agent Flow</a></li>
+  <li><a href="https://github.com/mit-han-lab/kernel-design-agents/blob/dda6be3cf1baedd3ed9c76511ef02f72243cc14c/prompts/basic-flow.md" target="_blank" rel="noopener">KDA Basic Flow Prompt</a></li>
+  <li><a href="https://github.com/mit-han-lab/KernelWiki/tree/b6b4301f15e8ce6955a56776690643ce5db369e6" target="_blank" rel="noopener">KernelWiki repository at <code>b6b4301</code></a></li>
+  <li><a href="https://github.com/mit-han-lab/KernelWiki/blob/b6b4301f15e8ce6955a56776690643ce5db369e6/SKILL.md" target="_blank" rel="noopener">KernelWiki skill contract and query paths</a></li>
+  <li><a href="https://github.com/mit-han-lab/KernelWiki/blob/b6b4301f15e8ce6955a56776690643ce5db369e6/references/schema.md" target="_blank" rel="noopener">KernelWiki schema, confidence, and reproducibility levels</a></li>
+  <li><a href="https://github.com/mit-han-lab/KernelWiki/blob/b6b4301f15e8ce6955a56776690643ce5db369e6/wiki/kernels/flash-attention-4.md" target="_blank" rel="noopener">KernelWiki FlashAttention-4 page</a></li>
+</ul>
+
+</div>
+
+</main>
+</div>
+</body>
+</html>

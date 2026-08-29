@@ -3,17 +3,17 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LLM Attention 变体 Zoo: 可点击的家族树</title>
-<meta name="post:title"           content="LLM Attention 变体 Zoo: 可点击的家族树">
-<meta name="post:title_en"        content="LLM Attention Variant Zoo: A Clickable Family Tree">
+<title>LLM 序列混合机制分类与模型谱系</title>
+<meta name="post:title"           content="LLM 序列混合机制分类与模型谱系">
+<meta name="post:title_en"        content="LLM Sequence-Mixing Mechanisms: A Taxonomy and Model Lineage">
 <meta name="post:slug"            content="llm-attention-zoo">
 <meta name="post:date"            content="2026-06-03">
 <meta name="post:tags"            content="LLM, Attention, 架构">
 <meta name="post:tags_en"         content="LLM, Attention, Architecture">
 <meta name="post:reading"         content="15 分钟">
 <meta name="post:reading_en"      content="15 min">
-<meta name="post:summary"         content="按计算形式 × KV head 结构整理现代 LLM 的 attention 变体(dense softmax / sparse / linear / SSM / mLSTM 五大主支),每分支挂到具体模型与开源实现,另含正交件辅助树(QK-Norm、PE 变体、Gated Attention 等)。">
-<meta name="post:summary_en"      content="A family-tree inventory of modern LLM attention variants, organised by computation form (dense softmax / sparse / linear / SSM / mLSTM) and KV-head structure, with concrete models and open-source implementations under each branch. Plus an orthogonal-building-blocks tree (QK-Norm, positional encoding variants, gated attention).">
+<meta name="post:summary"         content="LLM 报告中的 MHA、SWA、Mamba 分属计算形式、KV 组织与正交结构，单一演进线会混淆层级。谱系以序列混合形式为主坐标，规定 dense、sparse、linear/stateful 与混合模型的归档规则，并标记公开证据不足的 2025 至 2026 年节点。">
+<meta name="post:summary_en"      content="Terms such as MHA, SWA, and Mamba describe different coordinates: computation form, KV organization, or orthogonal structure. The taxonomy uses sequence-mixing form as its primary axis, defines placement rules for dense, sparse, linear/stateful, and hybrid models, and retains verification markers for 2025–2026 nodes with limited public evidence.">
 <meta name="post:series"          content="llm-arch">
 <meta name="post:series_title"    content="LLM Attention 与实现">
 <meta name="post:series_title_en" content="LLM Attention and Implementations">
@@ -108,24 +108,24 @@
     <div class="toc-title">目录 · TOC</div>
     <div class="lang-zh">
     <ul>
-      <li><a href="#zh-intro">引子</a></li>
-      <li><a href="#zh-howto">怎么读这棵树</a></li>
-      <li><a href="#zh-main">主树:Attention 形式 × KV head</a></li>
-      <li><a href="#zh-static-index">静态索引</a></li>
-      <li><a href="#zh-aux">辅助树:正交维度</a></li>
-      <li><a href="#zh-notes">几点注释</a></li>
+      <li><a href="#zh-intro">分类背景</a></li>
+      <li><a href="#zh-howto">分类坐标与归档规则</a></li>
+      <li><a href="#zh-main">主树:计算形式 × KV 组织</a></li>
+      <li><a href="#zh-static-index">分类索引</a></li>
+      <li><a href="#zh-aux">正交机制</a></li>
+      <li><a href="#zh-notes">归档边界</a></li>
       <li><a href="#zh-impl">实现 / 库</a></li>
       <li><a href="#zh-refs">参考资料</a></li>
     </ul>
     </div>
     <div class="lang-en">
     <ul>
-      <li><a href="#en-intro">Intro</a></li>
-      <li><a href="#en-howto">How to read it</a></li>
-      <li><a href="#en-main">Main tree</a></li>
-      <li><a href="#en-static-index">Static index</a></li>
-      <li><a href="#en-aux">Auxiliary tree</a></li>
-      <li><a href="#en-notes">Notes</a></li>
+      <li><a href="#en-intro">Classification context</a></li>
+      <li><a href="#en-howto">Coordinates and placement rules</a></li>
+      <li><a href="#en-main">Main taxonomy</a></li>
+      <li><a href="#en-static-index">Taxonomy index</a></li>
+      <li><a href="#en-aux">Orthogonal mechanisms</a></li>
+      <li><a href="#en-notes">Placement boundaries</a></li>
       <li><a href="#en-impl">Implementations</a></li>
       <li><a href="#en-refs">References</a></li>
     </ul>
@@ -137,76 +137,56 @@
 <!-- ===== INTRO + HOW-TO + MAIN-TREE INTRO (bilingual prose) ===== -->
 <div class="lang-zh">
 
-<h1>LLM Attention 变体 Zoo: 可点击的家族树</h1>
+<h1>LLM 序列混合机制分类与模型谱系</h1>
 
-<h2 id="zh-intro">引子</h2>
+<h2 id="zh-intro">分类背景</h2>
 
-<p>现代 LLM 的 attention 沿几个相对独立的轴在演化:KV head 结构(MHA / MQA / GQA / MLA / CCA)、计算形式(dense softmax / sparse / linear / SSM / mLSTM)、稀疏模式(SWA / NSA / DSA / MoBA)、混合架构(KDA+MLA、Lightning+MLA、Mamba+Attn)、正交件(QK-Norm、Partial RoPE、NoPE、Gated Attention)。 静态表格能塞下信息但读起来累,纯描述容易丢全局。</p>
+<p class="lead">阅读 LLM 的技术报告或模型配置时，MHA、GQA、MLA、SWA、linear attention 与 Mamba 常会同时出现在 attention 相关章节里。这些名称描述的层面并不相同：有些规定 Q/K/V 的 head 组织，有些改变 token 之间的计算范围，还有一些用固定大小的状态替代显式 KV cache。若把它们排在一条演进线上，模型之间的关系很快就会失真。</p>
 
-<p><strong>核对范围</strong>:本文最后核对日期是 2026-06-04。MHA / MQA / GQA / MLA、FlashAttention、Mamba、RWKV、xLSTM 这类成熟分支按公开论文和主流实现整理;2025-2026 的新模型叶节点按公开 model card、技术报告或项目页整理。带 <code>(?)</code> 的仓库或模型归类只是待核对线索,不应当当成已确认事实引用。</p>
+<p>这份谱系以<strong>序列混合的计算形式</strong>作为主坐标，再在适用的分支下区分 KV head 组织、稀疏模式和具体模型。QK-Norm、Partial RoPE、NoPE、gating 等可以与多条主分支组合，因此单独放在正交机制树中。这种拆分把复杂度、状态规模和实现组合关系放在各自适用的坐标上。</p>
 
-<p>这篇把它们放进一棵 <strong>可点击展开的家族树</strong>:</p>
-<ul>
-  <li>第一层按 attention <strong>计算形式</strong>分大类。</li>
-  <li>第二层按 <strong>KV head 结构</strong>或<strong>子家族</strong>。</li>
-  <li>叶节点是具体<strong>模型/论文</strong>。</li>
-  <li>点击节点展开/折叠它的子树,hover 显示一句话定义。</li>
-</ul>
+<p><strong>核对范围：</strong>内容最后核对于 2026-06-04。MHA、MQA、GQA、MLA、FlashAttention、Mamba、RWKV 与 xLSTM 等成熟分支按公开论文和主流实现整理；2025 至 2026 年的模型叶节点依据公开 model card、技术报告或项目页归档。标有 <code>(?)</code> 的仓库或归类仍是待核对线索，不作为已确认的引用关系。</p>
 
-<h2 id="zh-howto">怎么读这棵树</h2>
+<h2 id="zh-howto">分类坐标与归档规则</h2>
 
-<ul>
-  <li><strong>圆点是蓝的</strong>:这个节点有可展开的子节点(branch)。点一下展开 / 收起。</li>
-  <li><strong>圆点是灰的</strong>:叶节点(具体模型)。</li>
-  <li><strong>hover 任意节点</strong>:鼠标旁弹出一句话定义。</li>
-  <li>右上角两个按钮可以一键<strong>全部展开</strong>或<strong>仅留第 1 层</strong>。</li>
-  <li>所有节点都是同一个语义层。 Hybrid 混合架构归到它<strong>占主导</strong>的那一支(比如 Kimi Linear 走 linear,即使 25% 的层是 MLA 全注意)。</li>
-</ul>
+<p>主树的第一层区分 dense softmax、sparse softmax、linear/stateful 与其它占据同一模型位置的序列混合机制。第二层根据该分支最有解释力的结构继续细分：dense 分支侧重 KV head，sparse 分支侧重选择模式，linear、SSM 与 mLSTM 则按状态更新形式组织。叶节点对应具体模型或论文。</p>
 
-<h2 id="zh-main">主树:Attention 形式 × KV head × 模型</h2>
+<p>混合模型按层数或计算占比最高的机制确定主归档位置，并在其它相关分支保留交叉引用。树中的蓝色圆点表示可展开分支，灰色圆点表示叶节点；点击可展开或收起，hover 可查看简要定义。</p>
 
-<p>第一层是 attention 的<strong>计算形式</strong>(决定复杂度数量级),第二层是 <strong>KV head 结构</strong>或子家族,叶节点是具体模型。</p>
+<h2 id="zh-main">主树：计算形式 × KV 组织 × 模型</h2>
+
+<p>主树先回答序列信息如何混合，再回答 KV 或状态如何组织。这个顺序把计算复杂度、推理状态和模型谱系放在同一视图中，同时保留不同分支各自的分类语义。</p>
 
 </div>
 
 <div class="lang-en">
 
-<h1>LLM Attention Variant Zoo: A Clickable Family Tree</h1>
+<h1>LLM Sequence-Mixing Mechanisms: A Taxonomy and Model Lineage</h1>
 
-<h2 id="en-intro">Intro</h2>
+<h2 id="en-intro">Classification context</h2>
 
-<p>Modern LLM attention evolves along several mostly independent axes: KV-head structure (MHA / MQA / GQA / MLA / CCA), computation form (dense softmax / sparse / linear / SSM / mLSTM), sparsity pattern (SWA / NSA / DSA / MoBA), hybrid architectures (KDA+MLA, Lightning+MLA, Mamba+Attn), and orthogonal building blocks (QK-Norm, Partial RoPE, NoPE, Gated Attention). A static table fits the information but reads dryly, and a pure narrative loses the global shape.</p>
+<p class="lead">LLM technical reports and model configurations often place MHA, GQA, MLA, SWA, linear attention, and Mamba in the same discussion. These names operate at different levels. Some specify the organization of Q/K/V heads, some change which tokens interact, and others replace an explicit KV cache with a fixed-size state. A single evolutionary ladder therefore gives a misleading account of how the mechanisms relate.</p>
 
-<p><strong>Scope</strong>: last checked on 2026-06-04. Established branches such as MHA / MQA / GQA / MLA, FlashAttention, Mamba, RWKV, and xLSTM are organized from papers and common implementations. Newer 2025-2026 model leaves are based on public model cards, technical reports, or project pages. A <code>(?)</code> marker means the repo or placement is still a lead to verify, not a confirmed citation.</p>
+<p>This taxonomy uses the <strong>computation form of sequence mixing</strong> as its primary coordinate, then distinguishes KV-head organization, sparsity patterns, and model lineages where those dimensions apply. QK-Norm, Partial RoPE, NoPE, and gating combine with several main branches, so they live in a separate tree of orthogonal mechanisms. The split assigns compute complexity, state size, and implementation composition to the coordinates where each can be compared meaningfully.</p>
 
-<p>This article puts them into a <strong>clickable family tree</strong>:</p>
-<ul>
-  <li>Top level by <strong>computation form</strong>.</li>
-  <li>Middle level by <strong>KV-head structure</strong> or <strong>sub-family</strong>.</li>
-  <li>Leaves are specific <strong>models / papers</strong>.</li>
-  <li>Click a node to expand or collapse its subtree; hover for a one-line definition.</li>
-</ul>
+<p><strong>Scope:</strong> the content was last checked on 2026-06-04. Established branches such as MHA, MQA, GQA, MLA, FlashAttention, Mamba, RWKV, and xLSTM follow public papers and widely used implementations. Model leaves from 2025 and 2026 follow public model cards, technical reports, or project pages. A <code>(?)</code> marker identifies a repository or placement that still requires verification and should not be treated as a confirmed source mapping.</p>
 
-<h2 id="en-howto">How to read it</h2>
+<h2 id="en-howto">Coordinates and placement rules</h2>
 
-<ul>
-  <li><strong>Blue dot</strong>: branch node with children. Click to expand or collapse.</li>
-  <li><strong>Grey dot</strong>: leaf node (a specific model).</li>
-  <li><strong>Hover any node</strong>: a tooltip appears with a one-line definition.</li>
-  <li>Top-right buttons toggle <strong>expand-all</strong> or <strong>collapse to depth 1</strong>.</li>
-  <li>Every node sits in exactly one place. Hybrid architectures are filed under the <strong>dominant</strong> branch (for example Kimi Linear sits under linear attention even though 25% of its layers are full MLA).</li>
-</ul>
+<p>The first level separates dense softmax, sparse softmax, linear or stateful forms, and other sequence mixers that occupy the same architectural role. The second level uses the most informative structure for each branch: KV-head organization for dense attention, selection patterns for sparse attention, and state-update forms for linear attention, SSMs, and mLSTMs. Leaves identify concrete models or papers.</p>
 
-<h2 id="en-main">Main tree: attention form × KV head × models</h2>
+<p>A hybrid model is filed under the mechanism that accounts for most layers or compute, with cross-references under related branches. Blue dots mark expandable branches and grey dots mark leaves; clicking toggles a branch, while hovering shows its short definition.</p>
 
-<p>Top level is the <strong>computation form</strong> (which sets the asymptotic compute and memory class); middle level is the <strong>KV-head structure</strong> or sub-family; leaves are concrete models.</p>
+<h2 id="en-main">Main taxonomy: computation form × KV organization × models</h2>
+
+<p>The main tree first records how sequence information is mixed, then how KV tensors or recurrent state are organized. This order places compute complexity, inference state, and model lineage in one view while preserving the native classification logic of each branch.</p>
 
 </div>
 
 <!-- ===== MAIN TREE (shared, outside lang divs) ===== -->
 <div class="tree-frame">
   <div class="tree-meta">
-    <span><span class="lang-zh">主树 · main attention tree</span><span class="lang-en">Main attention tree</span></span>
+    <span><span class="lang-zh">主树 · sequence-mixing tree</span><span class="lang-en">Main sequence-mixing tree</span></span>
     <span class="tree-actions">
       <button onclick="expandAll('tree-main')">
         <span class="lang-zh">全部展开</span><span class="lang-en">Expand all</span>
@@ -222,17 +202,17 @@
 <!-- ===== STATIC INDEX (bilingual fallback / scan aid) ===== -->
 <div class="lang-zh">
 
-<h2 id="zh-static-index">静态索引</h2>
+<h2 id="zh-static-index">分类索引</h2>
 
-<p>如果浏览器没有跑 D3,先看这张表也能知道主树的骨架。它不是逐模型证据表;新模型的 source mapping 仍以参考资料和实现表中的链接为准。</p>
+<p>下表压缩了主树的骨架，适合比较各分支的分类依据和证据成熟度。逐模型的来源仍以参考资料及实现表中的链接为准。</p>
 
 <table>
   <thead><tr><th>主分支</th><th>放什么</th><th>可信度提示</th></tr></thead>
   <tbody>
-    <tr><td>Dense softmax</td><td>MHA / MQA / GQA / MLA / CCA 以及 FlashAttention 系列实现</td><td>MHA 到 MLA 较稳;CCA / DeepSeek V4 相关叶节点按 2026 公开报告处理</td></tr>
-    <tr><td>Sparse softmax</td><td>SWA、block-sparse、NSA / MoBA / DSA、DeepSeek V4 CSA/HCA</td><td>传统 sparse 较稳;2025 以后方案需要看论文或官方仓库版本</td></tr>
-    <tr><td>Linear / SSM / mLSTM</td><td>Performer、RetNet、GLA、DeltaNet、Mamba、RWKV、xLSTM 等</td><td>基础论文较稳;Kimi / Qwen 等产品化组合按公开材料标注</td></tr>
-    <tr><td>Orthogonal blocks</td><td>QK-Norm、Partial RoPE、NoPE、PLE、gating、KV sharing</td><td>这些不是互斥分类,同一个模型可能同时使用多项</td></tr>
+    <tr><td>Dense softmax</td><td>MHA / MQA / GQA / MLA / CCA 以及 FlashAttention 系列实现</td><td>MHA 至 MLA 的资料较完整；CCA / DeepSeek V4 相关节点按 2026 年公开报告处理</td></tr>
+    <tr><td>Sparse softmax</td><td>SWA、block-sparse、NSA / MoBA / DSA、DeepSeek V4 CSA/HCA</td><td>经典 sparse attention 的资料较稳定；2025 年以后的方案需核对论文或官方仓库版本</td></tr>
+    <tr><td>Linear / SSM / mLSTM</td><td>Performer、RetNet、GLA、DeltaNet、Mamba、RWKV、xLSTM 等</td><td>基础论文较完整；Kimi / Qwen 等组合依据公开材料归档</td></tr>
+    <tr><td>Orthogonal blocks</td><td>QK-Norm、Partial RoPE、NoPE、PLE、gating、KV sharing</td><td>一个模型可以同时采用其中多项</td></tr>
   </tbody>
 </table>
 
@@ -240,9 +220,9 @@
 
 <div class="lang-en">
 
-<h2 id="en-static-index">Static index</h2>
+<h2 id="en-static-index">Taxonomy index</h2>
 
-<p>If D3 does not run, this table gives the shape of the main tree. It is not a per-model evidence table; for newer models, use the linked references and implementation table as the source trail.</p>
+<p>The table compresses the main tree into a view suited to comparing classification criteria and evidence maturity. Per-model source trails remain in the references and implementation tables.</p>
 
 <table>
   <thead><tr><th>Main branch</th><th>What lives there</th><th>Confidence note</th></tr></thead>
@@ -259,17 +239,17 @@
 <!-- ===== AUX TREE INTRO (bilingual prose) ===== -->
 <div class="lang-zh">
 
-<h2 id="zh-aux">辅助树:正交维度</h2>
+<h2 id="zh-aux">正交机制</h2>
 
-<p>下面这些维度<strong>跟主树正交</strong>:同一个模型可以在主树里走 GQA + dense softmax,同时在这棵辅助树里挂上 QK-Norm + Partial RoPE + Gated Attention。</p>
+<p>正交机制是可以与多种主树分支独立组合的结构选择。同一个模型可以采用 GQA + dense softmax，同时使用 QK-Norm、Partial RoPE 与 Gated Attention；这些机制改变数值稳定性、位置信息或输出控制，却不单独决定序列混合的计算形式。</p>
 
 </div>
 
 <div class="lang-en">
 
-<h2 id="en-aux">Auxiliary tree: orthogonal dimensions</h2>
+<h2 id="en-aux">Orthogonal mechanisms</h2>
 
-<p>These dimensions are <strong>orthogonal</strong> to the main tree: a single model can sit under GQA + dense softmax in the main tree while also carrying QK-Norm + Partial RoPE + Gated Attention in this auxiliary tree.</p>
+<p>An orthogonal mechanism is a structural choice that can combine independently with several main-tree branches. A model may use GQA with dense softmax while also applying QK-Norm, Partial RoPE, and Gated Attention. These mechanisms alter numerical stability, positional information, or output control without defining the sequence-mixing computation by themselves.</p>
 
 </div>
 
@@ -292,18 +272,17 @@
 <!-- ===== NOTES (bilingual prose) ===== -->
 <div class="lang-zh">
 
-<h2 id="zh-notes">几点注释</h2>
+<h2 id="zh-notes">归档边界</h2>
 
 <ol>
-  <li><strong>Hybrid 模型的归属</strong>:层间混合(layer-interleave)的模型按"占多数的那一支"归类。比如 Kimi Linear 的 KDA:MLA = 3:1,主支是 KDA,所以挂在 linear 这一支;它在 MLA 那一支也会被提到,但只作为引用。</li>
-  <li><strong>"no KV / stateful"</strong>:这一支<strong>放弃了显式 KV cache</strong>,改用一个固定大小的 state(矩阵或向量)替代。它在树里跟 MHA / GQA / MLA 同层,但所在的概念空间不一样,既不是 KV-head 结构的延伸,也不是稀疏化路线的延伸。</li>
-  <li><strong>DeepSeek V4 家族(CCA / CSA / HCA / mHC)</strong>:挂在 sparse 一支下,但实际上跨多个轴(KV 压缩 + sparse + hyper-connection)。 2026 年新东西,公开材料有限,树里只放占位,具体语义建议直接读 V4 技术报告。</li>
-  <li><strong>把每一支单独写成深度笔记</strong>是这个系列接下来要做的事:KV head 演进(MHA → MLA)、Linear attention 家族数学推导、Sparse attention(NSA / MoBA / DSA)的硬件对齐、SSM 与 attention 的等价性。</li>
+  <li><strong>Hybrid 模型</strong>按占多数的层或主要计算路径确定主归档位置，其余分支保留交叉引用。Kimi Linear 的 KDA:MLA = 3:1，因此主节点位于 linear 分支。</li>
+  <li><strong>Stateful / no-KV</strong>分支用固定大小的矩阵或向量状态承载历史信息。它与 MHA、GQA、MLA 处在相同的模型组件层级，但分类依据是状态更新形式，而非 KV head 数量或稀疏模式。</li>
+  <li><strong>DeepSeek V4 家族（CCA / CSA / HCA / mHC）</strong>同时涉及 KV 压缩、稀疏选择与 hyper-connection。主树按 sparse 路径归档，但公开材料有限，节点只保留索引作用，具体语义应以 V4 技术报告为准。</li>
 </ol>
 
 <h2 id="zh-impl">实现 / 库</h2>
 
-<p>按主树分支整理对应的开源实现。仓库 URL 不完全确定的标 <code>(?)</code>;这些条目只表示“值得继续核对”,不表示已经确认。</p>
+<p>实现表沿用主树分支，便于从模型机制追到可运行的软件栈。标有 <code>(?)</code> 的条目只有检索线索的效力，其仓库地址或映射关系尚未确认。</p>
 
 <h3>通用底层工具(DSL / 模板,跨多个变体)</h3>
 
@@ -314,8 +293,8 @@
   <tbody>
     <tr><td><strong>CUTLASS / CuTe</strong>(NVIDIA)</td><td><a href="https://github.com/NVIDIA/cutlass" target="_blank" rel="noopener">NVIDIA/cutlass</a></td><td>C++ 模板;Hopper 上的 FlashAttention v3、WGMMA、TMA 参考实现在 <code>examples/</code></td></tr>
     <tr><td><strong>Triton</strong>(OpenAI)</td><td><a href="https://github.com/triton-lang/triton" target="_blank" rel="noopener">triton-lang/triton</a></td><td>GPU DSL;FLA 与大半学界都用它写 attention</td></tr>
-    <tr><td><strong>ThunderKittens</strong>(Stanford HazyResearch)</td><td><a href="https://github.com/HazyResearch/ThunderKittens" target="_blank" rel="noopener">HazyResearch/ThunderKittens</a></td><td>low-level CUDA DSL;attention / GEMM 例子完整,Hopper 适配</td></tr>
-    <tr><td><strong>TileLang</strong></td><td><a href="https://github.com/tile-ai/tilelang" target="_blank" rel="noopener">tile-ai/tilelang</a></td><td>新一代 tile-level DSL,带 attention demo</td></tr>
+    <tr><td><strong>ThunderKittens</strong>(Stanford HazyResearch)</td><td><a href="https://github.com/HazyResearch/ThunderKittens" target="_blank" rel="noopener">HazyResearch/ThunderKittens</a></td><td>low-level CUDA DSL，提供 attention / GEMM 示例与 Hopper 支持</td></tr>
+    <tr><td><strong>TileLang</strong></td><td><a href="https://github.com/tile-ai/tilelang" target="_blank" rel="noopener">tile-ai/tilelang</a></td><td>tile-level DSL，提供 attention 示例</td></tr>
     <tr><td><strong>TransformerEngine</strong>(NVIDIA)</td><td><a href="https://github.com/NVIDIA/TransformerEngine" target="_blank" rel="noopener">NVIDIA/TransformerEngine</a></td><td>FP8 fused attention(<code>DotProductAttention</code>),GQA / SWA</td></tr>
   </tbody>
 </table>
@@ -328,7 +307,7 @@
     <tr><td><strong>FlashAttention v1 / v2 / v3</strong></td><td><a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noopener">Dao-AILab/flash-attention</a></td><td>默认支持 GQA / MQA,v3 是 Hopper-only(TMA + WGMMA)</td></tr>
     <tr><td><strong>xformers</strong>(Meta)</td><td><a href="https://github.com/facebookresearch/xformers" target="_blank" rel="noopener">facebookresearch/xformers</a></td><td><code>memory_efficient_attention</code>,有 block-sparse / SWA / causal mask 等多分支</td></tr>
     <tr><td><strong>PyTorch SDPA</strong></td><td>内置 <code>torch.nn.functional.scaled_dot_product_attention</code></td><td>math / mem-eff / FA backend 自动选,Hopper 上下发 cuDNN 或 FA</td></tr>
-    <tr><td><strong>cuDNN attention</strong></td><td>NVIDIA(闭源,SDPA / TE / TRT-LLM 调用)</td><td>sm_90+ 的最优 SDPA fallback 路径</td></tr>
+    <tr><td><strong>cuDNN attention</strong></td><td>NVIDIA（通过 SDPA / TE / TRT-LLM 调用）</td><td>由上层框架按 shape、dtype 与设备能力选择的 attention backend</td></tr>
     <tr><td><strong>SageAttention</strong></td><td><a href="https://github.com/thu-ml/SageAttention" target="_blank" rel="noopener">thu-ml/SageAttention</a></td><td>INT8 / INT4 量化 attention(图像 / 视频生成常用)</td></tr>
   </tbody>
 </table>
@@ -339,10 +318,10 @@
   <thead><tr><th>项目</th><th>链接</th><th>备注</th></tr></thead>
   <tbody>
     <tr><td><strong>FlashMLA</strong>(DeepSeek)</td><td><a href="https://github.com/deepseek-ai/FlashMLA" target="_blank" rel="noopener">deepseek-ai/FlashMLA</a></td><td>Hopper MLA 的官方内核实现,Paged KV</td></tr>
-    <tr><td><strong>FlashInfer</strong></td><td><a href="https://github.com/flashinfer-ai/flashinfer" target="_blank" rel="noopener">flashinfer-ai/flashinfer</a></td><td>推理用 attention 总集;MLA / Paged / Speculative 都有,vLLM 与 SGLang 都依赖它</td></tr>
-    <tr><td><strong>vLLM</strong>(MLA backend)</td><td><a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a></td><td>DeepSeek V2 / V3 推理的产品级路径</td></tr>
-    <tr><td><strong>SGLang</strong>(MLA backend)</td><td><a href="https://github.com/sgl-project/sglang" target="_blank" rel="noopener">sgl-project/sglang</a></td><td>自带 MLA 实现,长上下文友好</td></tr>
-    <tr><td><strong>TensorRT-LLM</strong></td><td><a href="https://github.com/NVIDIA/TensorRT-LLM" target="_blank" rel="noopener">NVIDIA/TensorRT-LLM</a></td><td>NVIDIA backend,MLA + FA 全套</td></tr>
+    <tr><td><strong>FlashInfer</strong></td><td><a href="https://github.com/flashinfer-ai/flashinfer" target="_blank" rel="noopener">flashinfer-ai/flashinfer</a></td><td>推理 kernel 库，覆盖 MLA、Paged 与 Speculative attention；vLLM 和 SGLang 均有集成</td></tr>
+    <tr><td><strong>vLLM</strong>(MLA backend)</td><td><a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a></td><td>DeepSeek V2 / V3 的 MLA 推理 backend</td></tr>
+    <tr><td><strong>SGLang</strong>(MLA backend)</td><td><a href="https://github.com/sgl-project/sglang" target="_blank" rel="noopener">sgl-project/sglang</a></td><td>SGLang 集成的 MLA 推理实现</td></tr>
+    <tr><td><strong>TensorRT-LLM</strong></td><td><a href="https://github.com/NVIDIA/TensorRT-LLM" target="_blank" rel="noopener">NVIDIA/TensorRT-LLM</a></td><td>NVIDIA 推理 backend，覆盖 MLA 与 FlashAttention 路径</td></tr>
   </tbody>
 </table>
 
@@ -380,7 +359,7 @@
   </tbody>
 </table>
 
-<h3>Linear / kernelized:几乎都集中在 FLA 一个仓库</h3>
+<h3>Linear / kernelized：FLA 生态</h3>
 
 <table>
   <thead><tr><th>项目</th><th>链接</th><th>备注</th></tr></thead>
@@ -467,7 +446,7 @@
   <li><strong>Mamba / Mamba-2</strong>: Gu &amp; Dao, 2023-2024;Mamba-2 来自 <em>Transformers are SSMs</em>, 2024</li>
   <li><strong>Jamba</strong>: AI21 Labs, <em>Jamba: A Hybrid Transformer-Mamba Language Model</em>, 2024</li>
   <li><strong>xLSTM</strong>: Beck et al., <em>xLSTM: Extended Long Short-Term Memory</em>, 2024</li>
-  <li><strong>FlashAttention v1/v2/v3</strong>: Dao 等,2022-2024(本文未深入,但所有 dense softmax 实现都在它之上)</li>
+  <li><strong>FlashAttention v1/v2/v3</strong>: Dao 等，2022-2024；dense exact attention 的代表性高效实现</li>
   <li><strong>DeepSeek V4 系列(CCA / CSA / HCA / mHC)</strong>: DeepSeek-AI 2026 技术报告。公开材料较少,本文只挂占位</li>
 </ul>
 
@@ -477,18 +456,17 @@
 
 <div class="lang-en">
 
-<h2 id="en-notes">A few notes</h2>
+<h2 id="en-notes">Placement boundaries</h2>
 
 <ol>
-  <li><strong>Where hybrids live</strong>: layer-interleave models are placed under the dominant branch. Kimi Linear's KDA:MLA = 3:1 puts it under linear attention; it also appears as a cross-reference under MLA but only as a pointer.</li>
-  <li><strong>The "no KV / stateful" branch</strong>: this family gives up the explicit KV cache entirely and stores a fixed-size state (matrix or vector) instead. It sits at the same tree level as MHA / GQA / MLA but in a different conceptual space, separate from both the KV-head axis and the sparsity axis.</li>
-  <li><strong>The DeepSeek V4 cluster (CCA / CSA / HCA / mHC)</strong> is filed under sparse but actually spans multiple axes (KV compression, sparsity, hyper-connections). These are 2026 entries with limited public detail; the tree carries placeholders, and the V4 technical report is the authoritative reference.</li>
-  <li><strong>Each major branch deserves its own deep-dive post</strong>, which is the plan for the rest of this series: KV-head evolution (MHA → MLA), the math of the linear-attention family, sparse-attention hardware alignment (NSA / MoBA / DSA), the equivalence between SSM and linear attention.</li>
+  <li><strong>Hybrid models</strong> receive a primary location according to the dominant layer count or compute path, with cross-references under related branches. Kimi Linear has a 3:1 KDA-to-MLA ratio, so its primary node sits under linear attention.</li>
+  <li><strong>Stateful / no-KV mechanisms</strong> carry history in a fixed-size matrix or vector state. They occupy the same model-component level as MHA, GQA, and MLA, but their classification criterion is the state update rather than KV-head count or sparsity.</li>
+  <li><strong>The DeepSeek V4 cluster (CCA / CSA / HCA / mHC)</strong> spans KV compression, sparse selection, and hyper-connections. The primary placement follows its sparse path, while the nodes remain index entries because public detail is limited. The V4 technical report should govern their precise interpretation.</li>
 </ol>
 
 <h2 id="en-impl">Implementations / libraries</h2>
 
-<p>Grouped by main-tree branch; <code>(?)</code> marks entries where the repository URL is not fully confirmed. Treat those rows as leads to verify, not as confirmed source mapping.</p>
+<p>The implementation tables follow the main-tree branches so that each model mechanism leads to a runnable software stack. Rows marked <code>(?)</code> are search leads whose repository URL or source mapping has not yet been confirmed.</p>
 
 <h3>General-purpose toolkits (DSL / templates, span multiple variants)</h3>
 
@@ -497,8 +475,8 @@
   <tbody>
     <tr><td><strong>CUTLASS / CuTe</strong> (NVIDIA)</td><td><a href="https://github.com/NVIDIA/cutlass" target="_blank" rel="noopener">NVIDIA/cutlass</a></td><td>C++ templates; Hopper-side FlashAttention v3 / WGMMA / TMA reference in <code>examples/</code></td></tr>
     <tr><td><strong>Triton</strong> (OpenAI)</td><td><a href="https://github.com/triton-lang/triton" target="_blank" rel="noopener">triton-lang/triton</a></td><td>GPU DSL; the FLA stack and most academic kernels are written in it</td></tr>
-    <tr><td><strong>ThunderKittens</strong> (Stanford HazyResearch)</td><td><a href="https://github.com/HazyResearch/ThunderKittens" target="_blank" rel="noopener">HazyResearch/ThunderKittens</a></td><td>low-level CUDA DSL; complete attention / GEMM examples, Hopper-ready</td></tr>
-    <tr><td><strong>TileLang</strong></td><td><a href="https://github.com/tile-ai/tilelang" target="_blank" rel="noopener">tile-ai/tilelang</a></td><td>newer tile-level DSL with attention demos</td></tr>
+    <tr><td><strong>ThunderKittens</strong> (Stanford HazyResearch)</td><td><a href="https://github.com/HazyResearch/ThunderKittens" target="_blank" rel="noopener">HazyResearch/ThunderKittens</a></td><td>low-level CUDA DSL with attention and GEMM examples and Hopper support</td></tr>
+    <tr><td><strong>TileLang</strong></td><td><a href="https://github.com/tile-ai/tilelang" target="_blank" rel="noopener">tile-ai/tilelang</a></td><td>tile-level DSL with attention examples</td></tr>
     <tr><td><strong>TransformerEngine</strong> (NVIDIA)</td><td><a href="https://github.com/NVIDIA/TransformerEngine" target="_blank" rel="noopener">NVIDIA/TransformerEngine</a></td><td>FP8 fused attention (<code>DotProductAttention</code>); covers GQA and SWA</td></tr>
   </tbody>
 </table>
@@ -511,7 +489,7 @@
     <tr><td><strong>FlashAttention v1 / v2 / v3</strong></td><td><a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noopener">Dao-AILab/flash-attention</a></td><td>GQA / MQA out of the box; v3 is Hopper-only (TMA + WGMMA)</td></tr>
     <tr><td><strong>xformers</strong> (Meta)</td><td><a href="https://github.com/facebookresearch/xformers" target="_blank" rel="noopener">facebookresearch/xformers</a></td><td><code>memory_efficient_attention</code> with block-sparse, SWA, causal-mask paths</td></tr>
     <tr><td><strong>PyTorch SDPA</strong></td><td>built-in <code>torch.nn.functional.scaled_dot_product_attention</code></td><td>math / mem-eff / FA backend autoselected; on Hopper dispatches to cuDNN or FA</td></tr>
-    <tr><td><strong>cuDNN attention</strong></td><td>NVIDIA (closed source, used via SDPA / TE / TRT-LLM)</td><td>the optimal SDPA fallback path on sm_90+</td></tr>
+    <tr><td><strong>cuDNN attention</strong></td><td>NVIDIA (used through SDPA / TE / TRT-LLM)</td><td>an attention backend selected by the caller according to shape, dtype, and device capability</td></tr>
     <tr><td><strong>SageAttention</strong></td><td><a href="https://github.com/thu-ml/SageAttention" target="_blank" rel="noopener">thu-ml/SageAttention</a></td><td>INT8 / INT4 quantised attention (common in image / video generation)</td></tr>
   </tbody>
 </table>
@@ -522,10 +500,10 @@
   <thead><tr><th>Project</th><th>Link</th><th>Notes</th></tr></thead>
   <tbody>
     <tr><td><strong>FlashMLA</strong> (DeepSeek)</td><td><a href="https://github.com/deepseek-ai/FlashMLA" target="_blank" rel="noopener">deepseek-ai/FlashMLA</a></td><td>the official MLA kernel implementation for Hopper, with Paged KV</td></tr>
-    <tr><td><strong>FlashInfer</strong></td><td><a href="https://github.com/flashinfer-ai/flashinfer" target="_blank" rel="noopener">flashinfer-ai/flashinfer</a></td><td>inference-side attention hub; MLA, Paged, Speculative all supported; both vLLM and SGLang depend on it</td></tr>
-    <tr><td><strong>vLLM</strong> (MLA backend)</td><td><a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a></td><td>production inference path for DeepSeek V2 / V3</td></tr>
-    <tr><td><strong>SGLang</strong> (MLA backend)</td><td><a href="https://github.com/sgl-project/sglang" target="_blank" rel="noopener">sgl-project/sglang</a></td><td>own MLA impl; long-context friendly</td></tr>
-    <tr><td><strong>TensorRT-LLM</strong></td><td><a href="https://github.com/NVIDIA/TensorRT-LLM" target="_blank" rel="noopener">NVIDIA/TensorRT-LLM</a></td><td>NVIDIA backend; MLA + FA full stack</td></tr>
+    <tr><td><strong>FlashInfer</strong></td><td><a href="https://github.com/flashinfer-ai/flashinfer" target="_blank" rel="noopener">flashinfer-ai/flashinfer</a></td><td>inference kernel library covering MLA, paged, and speculative attention, with integrations in vLLM and SGLang</td></tr>
+    <tr><td><strong>vLLM</strong> (MLA backend)</td><td><a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a></td><td>MLA inference backend for DeepSeek V2 / V3</td></tr>
+    <tr><td><strong>SGLang</strong> (MLA backend)</td><td><a href="https://github.com/sgl-project/sglang" target="_blank" rel="noopener">sgl-project/sglang</a></td><td>SGLang's integrated MLA inference implementation</td></tr>
+    <tr><td><strong>TensorRT-LLM</strong></td><td><a href="https://github.com/NVIDIA/TensorRT-LLM" target="_blank" rel="noopener">NVIDIA/TensorRT-LLM</a></td><td>NVIDIA inference backend with MLA and FlashAttention paths</td></tr>
   </tbody>
 </table>
 
@@ -563,7 +541,7 @@
   </tbody>
 </table>
 
-<h3>Linear / kernelized: mostly concentrated in FLA</h3>
+<h3>Linear / kernelized: the FLA ecosystem</h3>
 
 <table>
   <thead><tr><th>Project</th><th>Link</th><th>Notes</th></tr></thead>
@@ -650,7 +628,7 @@
   <li><strong>Mamba / Mamba-2</strong>: Gu and Dao, 2023-2024; Mamba-2 from <em>Transformers are SSMs</em>, 2024</li>
   <li><strong>Jamba</strong>: AI21 Labs, <em>Jamba: A Hybrid Transformer-Mamba Language Model</em>, 2024</li>
   <li><strong>xLSTM</strong>: Beck et al., <em>xLSTM: Extended Long Short-Term Memory</em>, 2024</li>
-  <li><strong>FlashAttention v1 / v2 / v3</strong>: Dao et al., 2022-2024 (not deep-dived here, but every dense-softmax implementation sits on top of it)</li>
+  <li><strong>FlashAttention v1 / v2 / v3</strong>: Dao et al., 2022-2024; representative high-performance implementations of dense exact attention</li>
   <li><strong>DeepSeek V4 family (CCA / CSA / HCA / mHC)</strong>: DeepSeek-AI 2026 technical report. Public material is limited; this article carries placeholders only.</li>
 </ul>
 

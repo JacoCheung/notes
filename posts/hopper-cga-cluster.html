@@ -3,17 +3,17 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hopper Cluster (CGA): DSMEM、集群 barrier 与 TMA 跨 CTA</title>
-<meta name="post:title"      content="Hopper Cluster (CGA): DSMEM、集群 barrier 与 TMA 跨 CTA">
-<meta name="post:title_en"   content="Hopper Cluster (CGA): DSMEM, Cluster-scope Barriers and Cross-CTA TMA">
+<title>Hopper Thread Block Cluster 的执行语义：DSMEM、Cluster Barrier 与跨 CTA TMA</title>
+<meta name="post:title"      content="Hopper Thread Block Cluster 的执行语义：DSMEM、Cluster Barrier 与跨 CTA TMA">
+<meta name="post:title_en"   content="Execution Semantics of Hopper Thread Block Clusters: DSMEM, Cluster Barriers, and Cross-CTA TMA">
 <meta name="post:slug"       content="hopper-cga-cluster">
 <meta name="post:date"       content="2026-06-02">
 <meta name="post:tags"       content="GPU, CUDA, Hopper, CUTLASS">
 <meta name="post:tags_en"    content="GPU, CUDA, Hopper, CUTLASS">
 <meta name="post:reading"    content="35 分钟">
 <meta name="post:reading_en" content="35 min">
-<meta name="post:summary"    content="Hopper 引入的 Thread Block Cluster（CGA）把 GPC 内多个 CTA 绑成一组,从硬件上提供跨 CTA 的 smem 直连(DSMEM)、cluster scope barrier / mbarrier、以及 TMA 写到 shared::cluster 的能力。本篇梳理 cluster 的几何与硬件约束、cluster size 的编译期 vs 运行期指定方式、cudaLaunchKernelEx 完整 launch API、四个核心能力的语义,并给出 CUDA C++(带编译命令)和 CuTe DSL（Python）双版本的可运行例子。">
-<meta name="post:summary_en" content="Hopper introduces Thread Block Clusters (CGA), grouping multiple CTAs on the same GPC into a unit with hardware-supported cross-CTA shared memory (DSMEM), cluster-scope barrier / mbarrier, and TMA stores into shared::cluster. The article covers cluster geometry and hardware constraints, compile-time vs runtime cluster size specification, the full cudaLaunchKernelEx launch API, the semantics of each capability, and runnable CUDA C++ examples (with compile commands) plus CuTe DSL (Python) counterparts.">
+<meta name="post:summary"    content="Hopper Thread Block Cluster 将若干 CTA 共调度到同一 GPC，并以 barrier、DSMEM 与 mbarrier/TMA 状态实现跨 CTA 协作。CUDA 12.6.3 和 PTX ISA 8.5 规定可观察语义，资源分派与物理路由不在公开保证内。">
+<meta name="post:summary_en" content="Hopper Thread Block Clusters co-schedule several CTAs on one GPC and provide cluster-scope barriers, DSMEM addressing, and mbarrier/TMA completion state for cross-CTA protocols. CUDA 12.6.3 and PTX ISA 8.5 define shape, launch, synchronization, and address semantics, while resource allocation and physical routing remain outside the public contract.">
 <meta name="post:series"          content="gemm-cutlass">
 <meta name="post:series_title"    content="GEMM · CUTLASS 专题">
 <meta name="post:series_title_en" content="GEMM · CUTLASS Deep Dive">
@@ -27,6 +27,23 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
 <link rel="stylesheet" href="../assets/site.css">
+<style>
+  .diagram-frame {
+    margin: 20px 0 30px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+  }
+  .diagram-svg { display: block; width: 100%; min-width: 820px; height: auto; }
+  .diagram-svg text { fill: var(--fg); font-family: var(--font-sans); letter-spacing: 0; }
+  .diagram-svg .muted { fill: var(--fg-muted); }
+  .diagram-svg .cluster-box { fill: none; stroke: var(--border-strong); stroke-width: 1.5; stroke-dasharray: 7 5; }
+  .diagram-svg .cta-box { fill: var(--bg); stroke: var(--border-strong); stroke-width: 1.2; }
+  .diagram-svg .smem-box { fill: var(--accent-tint); stroke: var(--accent); stroke-width: 1; }
+  .diagram-svg .edge { fill: none; stroke: var(--fg-muted); stroke-width: 1.4; }
+</style>
 </head>
 <body>
 <div class="layout">
@@ -34,14 +51,14 @@
     <div class="toc-title">目录 · TOC</div>
     <div class="lang-zh">
     <ul>
-      <li><a href="#zh-1">1. 为什么引入 cluster</a></li>
-      <li><a href="#zh-2">2. 硬件如何保证同时驻留</a>
+      <li><a href="#zh-1">1. Cluster 协作作用域</a></li>
+      <li><a href="#zh-2">2. CUDA 编程契约与证据边界</a>
         <ul>
-          <li><a href="#zh-2-1">2.1 CWD 原子分派</a></li>
-          <li><a href="#zh-2-2">2.2 GPC 是硬约束</a></li>
-          <li><a href="#zh-2-3">2.3 gang-lock 不抽出</a></li>
-          <li><a href="#zh-2-4">2.4 资源 + 地址翻译表</a></li>
-          <li><a href="#zh-2-5">2.5 准入失败</a></li>
+          <li><a href="#zh-2-1">2.1 CUDA 的共调度保证</a></li>
+          <li><a href="#zh-2-2">2.2 单个 GPC 约束</a></li>
+          <li><a href="#zh-2-3">2.3 资源可行性查询</a></li>
+          <li><a href="#zh-2-4">2.4 DSMEM 地址语义</a></li>
+          <li><a href="#zh-2-5">2.5 公开证据的覆盖范围</a></li>
         </ul>
       </li>
       <li><a href="#zh-3">3. cluster 几何与约束</a>
@@ -59,7 +76,7 @@
         </ul>
       </li>
       <li><a href="#zh-5">5. 运行时 launch API</a></li>
-      <li><a href="#zh-6">6. 四个核心能力</a>
+      <li><a href="#zh-6">6. 协作原语及其执行关系</a>
         <ul>
           <li><a href="#zh-6-1">6.1 cluster barrier</a></li>
           <li><a href="#zh-6-2">6.2 DSMEM</a></li>
@@ -71,24 +88,24 @@
         <ul>
           <li><a href="#zh-7-1">7.1 Hello cluster</a></li>
           <li><a href="#zh-7-2">7.2 DSMEM 跨 CTA 读</a></li>
-          <li><a href="#zh-7-3">7.3 cluster mbarrier 同步</a></li>
-          <li><a href="#zh-7-4">7.4 TMA 落到别人 smem</a></li>
+          <li><a href="#zh-7-3">7.3 mbarrier PTX 边界</a></li>
+          <li><a href="#zh-7-4">7.4 TMA 固定源码入口</a></li>
         </ul>
       </li>
-      <li><a href="#zh-8">8. CuTe DSL (Python) 例子</a></li>
-      <li><a href="#zh-9">9. 坑与边界</a></li>
+      <li><a href="#zh-8">8. CUTLASS 固定版本源码导航</a></li>
+      <li><a href="#zh-9">9. 兼容性与使用边界</a></li>
     </ul>
     </div>
     <div class="lang-en">
     <ul>
-      <li><a href="#en-1">1. Why clusters</a></li>
-      <li><a href="#en-2">2. How HW guarantees co-residency</a>
+      <li><a href="#en-1">1. Cluster cooperation scope</a></li>
+      <li><a href="#en-2">2. CUDA Contract and Evidence Boundary</a>
         <ul>
-          <li><a href="#en-2-1">2.1 Atomic CWD dispatch</a></li>
-          <li><a href="#en-2-2">2.2 GPC as hard constraint</a></li>
-          <li><a href="#en-2-3">2.3 Gang-lock after launch</a></li>
-          <li><a href="#en-2-4">2.4 Resource + translation table</a></li>
-          <li><a href="#en-2-5">2.5 Admission failure modes</a></li>
+          <li><a href="#en-2-1">2.1 CUDA co-scheduling guarantee</a></li>
+          <li><a href="#en-2-2">2.2 Single-GPC constraint</a></li>
+          <li><a href="#en-2-3">2.3 Resource feasibility queries</a></li>
+          <li><a href="#en-2-4">2.4 DSMEM address semantics</a></li>
+          <li><a href="#en-2-5">2.5 Scope of the public evidence</a></li>
         </ul>
       </li>
       <li><a href="#en-3">3. Cluster geometry &amp; constraints</a>
@@ -106,7 +123,7 @@
         </ul>
       </li>
       <li><a href="#en-5">5. Runtime launch API</a></li>
-      <li><a href="#en-6">6. Four core capabilities</a>
+      <li><a href="#en-6">6. Collaboration Primitives and Execution Relationships</a>
         <ul>
           <li><a href="#en-6-1">6.1 Cluster barrier</a></li>
           <li><a href="#en-6-2">6.2 DSMEM</a></li>
@@ -118,12 +135,12 @@
         <ul>
           <li><a href="#en-7-1">7.1 Hello cluster</a></li>
           <li><a href="#en-7-2">7.2 DSMEM cross-CTA read</a></li>
-          <li><a href="#en-7-3">7.3 Cluster mbarrier sync</a></li>
-          <li><a href="#en-7-4">7.4 TMA into a peer CTA's smem</a></li>
+          <li><a href="#en-7-3">7.3 mbarrier PTX boundary</a></li>
+          <li><a href="#en-7-4">7.4 Pinned TMA source</a></li>
         </ul>
       </li>
-      <li><a href="#en-8">8. CuTe DSL (Python) examples</a></li>
-      <li><a href="#en-9">9. Pitfalls and boundaries</a></li>
+      <li><a href="#en-8">8. Pinned CUTLASS source map</a></li>
+      <li><a href="#en-9">9. Compatibility and usage boundaries</a></li>
     </ul>
     </div>
   </aside>
@@ -133,100 +150,87 @@
 <!-- ============================= 中文版 ============================= -->
 <div class="lang-zh">
 
-<h1>Hopper Cluster (CGA): DSMEM、集群 barrier 与 TMA 跨 CTA</h1>
+<h1>Hopper Thread Block Cluster 的执行语义：DSMEM、Cluster Barrier 与跨 CTA TMA</h1>
 
-<p>Hopper 把 SM 之上多加了一层硬件感知的执行层级 <strong>Thread Block Cluster</strong>(Cooperative Grid Array,CGA),它把 GPC 内的若干 CTA 绑成一个组,硬件保证它们同时驻留并提供跨 CTA 的直连原语:</p>
+<p class="lead">CUDA kernel 通常由彼此独立的 thread block 组成，每个 block 拥有自己的 shared memory，并由硬件在可用 SM 上调度。需要交换 tile 或同步阶段的算法若跨越 block 边界，往往要借助 global memory、原子操作或额外的 kernel launch。Compute Capability 9.0 引入 <strong>Thread Block Cluster</strong>，在 block 之上增加一个 CUDA 可见的协作层级：若干 CTA 被组织为 cluster，共调度到同一个 GPC，并可使用 cluster-scope 同步和 distributed shared memory。</p>
 
-<p class="small">版本口径:本文按 CUDA 12.x / Hopper SM90a 的 CUDA C++ Programming Guide、CUDA Runtime API 与 PTX ISA 描述。官方文档明确给出 cluster、DSMEM、cluster-scope barrier / mbarrier、<code>.shared::cluster</code> 等编程语义;对 CWD、GPC 内部调度和路由表的解释是基于这些公开语义整理出的工程模型,不是 NVIDIA 对微架构细节的逐字承诺。</p>
+<p class="small">版本口径：本文以 <a href="https://docs.nvidia.com/cuda/archive/12.6.3/cuda-c-programming-guide/index.html#thread-block-clusters" target="_blank" rel="noopener">CUDA C++ Programming Guide 12.6.3</a>、<a href="https://docs.nvidia.com/cuda/archive/12.6.3/parallel-thread-execution/index.html" target="_blank" rel="noopener">PTX ISA 8.5</a> 和 Hopper（Compute Capability 9.0）为准。文中只把公开文档定义的行为作为保证；资源分派、路由和地址转换的内部实现均视为未公开。</p>
 
 <table>
   <thead>
-    <tr><th>能力</th><th>对应 CUDA / PTX 原语</th><th>本质</th></tr>
+    <tr><th>能力</th><th>对应 CUDA / PTX 原语</th><th>编程语义</th></tr>
   </thead>
   <tbody>
-    <tr><td><strong>Distributed Shared Memory</strong></td><td><code>cluster.map_shared_rank()</code> / <code>__cluster_shared_*</code></td><td>跨 CTA 直读/写 smem,走 SM-to-SM 网络</td></tr>
-    <tr><td><strong>Cluster barrier</strong></td><td><code>cluster.sync()</code> / <code>barrier.cluster.arrive</code></td><td>整个 cluster 所有线程对齐</td></tr>
-    <tr><td><strong>Cluster mbarrier</strong></td><td><code>mbarrier.arrive.shared::cluster</code></td><td>把 mbarrier 暴露成集群可见,跨 CTA arrive/wait</td></tr>
+    <tr><td><strong>Distributed Shared Memory</strong></td><td><code>cluster.map_shared_rank()</code> / PTX <code>mapa</code></td><td>访问同一 cluster 中其它 CTA 的 shared memory</td></tr>
+    <tr><td><strong>Cluster barrier</strong></td><td><code>cluster.sync()</code> / <code>barrier.cluster.arrive</code></td><td>cluster-wide 同步与相应的内存可见性</td></tr>
+    <tr><td><strong>Cluster mbarrier</strong></td><td><code>mbarrier.arrive.shared::cluster</code></td><td>允许远端 arrive；wait 在 mbarrier 所属 CTA 上完成</td></tr>
     <tr><td><strong>TMA → shared::cluster</strong></td><td><code>cp.async.bulk.tensor.*.shared::cluster.global</code></td><td>bulk async copy 直接落到 cluster 内另一个 CTA 的 smem</td></tr>
   </tbody>
 </table>
 
-<p>这四个能力是 Hopper GEMM(WGMMA)、FlashAttention v3、CUTLASS 3.x producer-consumer 流水线背后的硬件基础。</p>
-
-<hr>
-
-<h2 id="zh-1">1. 为什么引入 cluster</h2>
-
-<p>Hopper 之前,跨 CTA 唯一的合法通信路径是 global memory(走 L2)。即使两个 CTA 物理上落在同一个 SM 邻居上,语言层面也必须当成"远端"对待:</p>
-
-<ul>
-  <li>跨 CTA 的 smem 是<strong>不可见的</strong>,只能通过 global 中转;</li>
-  <li>跨 CTA 同步只能用 <code>__threadfence()</code> + atomic + spin,粒度粗、开销大;</li>
-  <li>当 GEMM 的 producer-consumer 流水线被切到多 CTA 时,中间张量必须落 L2/global,等同于失去了 smem 复用。</li>
-</ul>
-
-<p>Hopper 硬件层级在 <strong>SM</strong> 和 <strong>GPU</strong> 之间多了一层 <strong>GPC</strong>(Graphics Processing Cluster,H100 上有 8 个 GPC,每个 GPC 含 ~18 个 SM)。GPC 内部 SM 之间有直连的 SM-to-SM 网络,带宽远高于 L2 出口。Cluster 就是把这个硬件结构暴露到编程模型:把若干 CTA 同时调度到<strong>同一个 GPC</strong>,允许它们直读对方 smem、共享 barrier。</p>
-
-<hr>
-
-
-<h2 id="zh-2">2. 硬件如何保证 cluster 内 CTA 同时驻留</h2>
-
-<p>§1 说了 cluster 提供的能力,但要理解这些能力的硬件基础,需要看 Hopper 在分派器上做了什么。Hopper 之前 CWD(Compute Work Distributor)是 CTA 粒度的流式分发器,完全不保证"同时性"。Hopper 把 cluster 升级成<strong>原子调度单位</strong>,分四层落地。</p>
-
-<h3 id="zh-2-1">2.1 CWD 原子分派</h3>
-
-<ul>
-  <li>CWD 知道 SM ↔ GPC 的拓扑,内部维护 <strong>per-GPC 的空闲 SM 计数器</strong>。</li>
-  <li>待分派的 cluster($N$ 个 CTA)在 CWD 队列里等,直到<strong>某一个 GPC 单独空出 $\ge N$ 个 SM</strong> 才被取出。任何 GPC 都凑不齐 $N$ 个 slot 时,cluster 继续排队。</li>
-  <li>派发是<strong>原子的</strong>:cluster 的 $N$ 个 CTA 同一拍全部进入 running,要么 $N$ 个一起,要么一个都不上。不存在"先派 2 个、剩 2 个排队"的中间态。</li>
-</ul>
-
-<p>这一条直接保证了"开始时同时驻留"——同时性不是事后凑齐的,是派发那一拍就同时。</p>
-
-<h3 id="zh-2-2">2.2 GPC 是硬约束(不可跨 GPC)</h3>
-
-<p>CWD 的可用性检查不是"全 GPU 一共有 $N$ 个空 SM",而是"<strong>某一个 GPC 单独有 $N$ 个空 SM</strong>"。理由:cluster 的所有跨 CTA 原语(DSMEM、cluster mbarrier、TMA → <code>shared::cluster</code>)都走 GPC 内部的 SM-to-SM 网络,这个网络物理上不跨 GPC。</p>
-
-<p>H100 一个 GPC 约 18 个 SM,portable 上限 8 既是历史保守值,也是给同 GPC 内其它 cluster 留出 occupancy 的余量。</p>
-
-<h3 id="zh-2-3">2.3 已驻留就 gang-lock,不会被单独抽出</h3>
-
-<p>cluster 进入 SM 后,Hopper 调度器还有一条 gang-scheduling 锁:</p>
-
-<ul>
-  <li>不允许把 cluster 的某个 CTA 单独 evict 而保留其它的(普通 CTA 没这层保护)。</li>
-  <li>不允许 cluster 内 CTA 在 SM 间迁移。</li>
-  <li>退出是整体退出:所有 CTA 都 exit 后才把这一组 SM 资源归还给 CWD。</li>
-</ul>
-
-<p>这条保证"运行期间持续同时驻留",不只是"刚开始时同时"。</p>
-
-<h3 id="zh-2-4">2.4 资源预留与地址翻译表</h3>
-
-<p>派发的那一拍硬件同时完成几件事:</p>
-
-<ul>
-  <li>每个 CTA 在它的 SM 上拿到完整的 RF / smem / barrier slot 配额(与普通 CTA 相同)。</li>
-  <li>CWD 给这个 cluster 分配一个 <strong>cluster ID</strong>,并配置 GPC 内 SM-to-SM 网络的 peer 路由表:某个 SM 上的 CTA 发起 <code>shared::cluster</code> 访存时,硬件根据 cluster ID + target block_rank 把请求路由到正确对端 SM 的 smem。</li>
-  <li>每个 CTA 拿到一个硬件分配的 <strong>cluster-local rank</strong>(<code>cluster.block_rank()</code> 看到的就是它),不是 <code>blockIdx</code> 的函数。</li>
-  <li><strong>DSMEM 的地址翻译表</strong>填好:<code>cluster.map_shared_rank(local_smem, k)</code> 返回的指针被 SM MMU 翻译成"目标 SM 的 smem 基址 + 同 offset"。表的内容是派发瞬间一次性写入,运行期间不再变。</li>
-</ul>
-
-<p>任意一步资源凑不齐(RF / smem 超 SM 上限、路由表 slot 用完等),CWD 在派发阶段就拒掉,整个 cluster 不会进 running。</p>
-
-<h3 id="zh-2-5">2.5 准入失败的两种情形</h3>
-
-<ul>
-  <li><strong>永远不可能凑齐</strong>:cluster size 超过单个 GPC 的 SM 数,或者 kernel 的 RF / smem 需求让单 GPC 容不下 $N$ 个 CTA。这种情况 driver 在 <code>cudaLaunchKernelEx</code> 阶段就返回错误(典型是 <code>cudaErrorLaunchOutOfResources</code> 或 <code>cudaErrorInvalidConfiguration</code>)。launch 一旦成功,硬件就承诺了至少这一组 cluster 能落地。</li>
-  <li><strong>暂时凑不齐</strong>:其它 kernel 正在用 SM。cluster 在 CWD 队列里等,这是正常的流水线 backpressure,语义跟普通 CTA 排队一样。</li>
-</ul>
-
-<p><code>cudaOccupancyMaxActiveClusters()</code> 把"GPC 内同一个 cluster 配置能并发驻留多少个"算出来,数值直接对应 CWD 这个准入逻辑。返回 0 说明这个 cluster shape 在当前 kernel 资源用量下不可行。</p>
-
-<div class="callout note">
-  <strong>一句话总结。</strong>CWD 升级成 <strong>cluster-granularity 的原子调度器</strong>;GPC 拓扑成为<strong>硬约束</strong>;一旦驻留就 <strong>gang-lock 不可分割</strong>;SM-to-SM 网络的<strong>路由表在派发瞬间一次性配置</strong>。你从 PTX 层只看到"这 $N$ 个 CTA 一定同时在跑、彼此 smem 互通",但这是 CWD + GPC fabric + 资源管理器 + MMU 协作的结果。
+<div class="diagram-frame">
+<svg class="diagram-svg" viewBox="0 0 940 430" role="img" aria-labelledby="zh-cluster-model-title zh-cluster-model-desc">
+  <title id="zh-cluster-model-title">CUDA 可见的 Thread Block Cluster 协作语义</title>
+  <desc id="zh-cluster-model-desc">一个 cluster 包含四个示意 CTA。每个 CTA 保有本地 shared memory，DSMEM 地址映射允许访问 peer CTA 的 shared memory，cluster barrier 提供集群范围同步，TMA 可把数据复制到 shared cluster 地址。图不表示 GPC 内物理互连。</desc>
+  <defs><marker id="zh-cluster-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path></marker></defs>
+  <rect class="cluster-box" x="130" y="54" width="680" height="280" rx="8"></rect>
+  <text x="470" y="38" text-anchor="middle" font-size="17" font-weight="600">Thread Block Cluster</text>
+  <text class="muted" x="470" y="326" text-anchor="middle" font-size="12">co-scheduled in one GPC（CUDA guarantee）</text>
+  <g><rect class="cta-box" x="166" y="92" width="132" height="126" rx="5"></rect><text x="232" y="120" text-anchor="middle" font-size="15" font-weight="600">CTA rank 0</text><rect class="smem-box" x="184" y="146" width="96" height="46" rx="4"></rect><text x="232" y="174" text-anchor="middle" font-size="12">local smem</text></g>
+  <g><rect class="cta-box" x="324" y="92" width="132" height="126" rx="5"></rect><text x="390" y="120" text-anchor="middle" font-size="15" font-weight="600">CTA rank 1</text><rect class="smem-box" x="342" y="146" width="96" height="46" rx="4"></rect><text x="390" y="174" text-anchor="middle" font-size="12">local smem</text></g>
+  <g><rect class="cta-box" x="482" y="92" width="132" height="126" rx="5"></rect><text x="548" y="120" text-anchor="middle" font-size="15" font-weight="600">CTA rank 2</text><rect class="smem-box" x="500" y="146" width="96" height="46" rx="4"></rect><text x="548" y="174" text-anchor="middle" font-size="12">local smem</text></g>
+  <g><rect class="cta-box" x="640" y="92" width="132" height="126" rx="5"></rect><text x="706" y="120" text-anchor="middle" font-size="15" font-weight="600">CTA rank 3</text><rect class="smem-box" x="658" y="146" width="96" height="46" rx="4"></rect><text x="706" y="174" text-anchor="middle" font-size="12">local smem</text></g>
+  <path class="edge" d="M280 169 C304 244 476 244 500 169" marker-end="url(#zh-cluster-arrow)"></path><text class="muted" x="390" y="263" text-anchor="middle" font-size="12">map_shared_rank / shared::cluster</text>
+  <rect class="cta-box" x="828" y="124" width="92" height="58" rx="4"></rect><text x="874" y="149" text-anchor="middle" font-size="13">Global</text><text class="muted" x="874" y="168" text-anchor="middle" font-size="11">memory</text>
+  <path class="edge" d="M824 153 L758 169" marker-end="url(#zh-cluster-arrow)"></path><text class="muted" x="793" y="143" text-anchor="middle" font-size="12">TMA</text>
+  <rect class="cta-box" x="346" y="278" width="248" height="44" rx="4"></rect><text x="470" y="305" text-anchor="middle" font-size="13">cluster barrier / cluster mbarrier</text>
+  <text class="muted" x="470" y="390" text-anchor="middle" font-size="13">逻辑编程模型；不表示 GPC 内部路由、端口或物理距离</text>
+</svg>
 </div>
+
+<p>CUTLASS 的 Hopper kernel 会按选定的 kernel schedule 组合 cluster shape、TMA 与 mbarrier。固定版本源码由此成为连接 CUDA 编程模型与实际 GEMM 配置的例子，后文据此分析 launch 与配置语义。</p>
+
+<hr>
+
+<h2 id="zh-1">1. Cluster 协作作用域</h2>
+
+<p>Thread Block Cluster 的编程契约由成员关系、共同驻留和 cluster-scope 操作组成。launch 配置中的 cluster shape 将 grid 划分为若干 CTA 组；CUDA 保证同组 CTA 共调度到一个 GPC。kernel 通过 Cooperative Groups 取得 cluster 内的逻辑 rank 和 shape，并使用 <code>cluster.sync()</code> 建立组内阶段边界。</p>
+
+<p>DSMEM 把这组 CTA 的 shared-memory allocation 纳入同一个可寻址作用域。一个 CTA 先在本地 shared memory 写入数据，cluster 完成同步后，peer CTA 再通过 <code>map_shared_rank()</code> 得到目标 rank 的对应地址并访问数据。成员、同步和地址映射共同构成跨 CTA 生产者—消费者协议；该作用域止于当前 cluster。</p>
+
+<hr>
+
+
+<h2 id="zh-2">2. CUDA 编程契约与证据边界</h2>
+
+<p>Cluster kernel 的正确性建立在 CUDA 对调度、地址空间和同步的编程契约上。公开指南足以规定程序可观察的行为；性能分析中的内部拓扑与容量则需要独立的公开证据或目标设备测量。</p>
+
+<h3 id="zh-2-1">2.1 CUDA 的共调度保证</h3>
+
+<p><a href="https://docs.nvidia.com/cuda/archive/12.6.3/cuda-c-programming-guide/index.html#thread-block-clusters" target="_blank" rel="noopener">CUDA 12.6.3 编程指南</a>规定，同一 cluster 的 thread blocks 会被 co-scheduled。这项保证为 <code>cluster.sync()</code> 和 DSMEM 提供执行前提，其粒度是 cluster 生命周期内的共同驻留，而非某个内部时钟周期的状态描述。</p>
+
+<h3 id="zh-2-2">2.2 单个 GPC 约束</h3>
+
+<p>同一份指南还规定，cluster 中的所有 thread blocks 被调度到<strong>单个 GPC</strong>。这个可移植约束确定了协作作用域的放置边界；GPC 内部如何完成资源分派和 DSMEM 路由属于另一层微架构问题。</p>
+
+<h3 id="zh-2-3">2.3 资源可行性查询</h3>
+
+<p>cluster 是否可用以及能保持多少并发，取决于设备、MIG 配置、cluster shape 和 kernel 资源需求。CUDA 提供两类查询：</p>
+
+<ul>
+  <li><a href="https://docs.nvidia.com/cuda/archive/12.6.3/cuda-runtime-api/group__CUDART__OCCUPANCY.html" target="_blank" rel="noopener"><code>cudaOccupancyMaxPotentialClusterSize()</code></a> 查询给定 launch 配置可支持的最大 cluster size；</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/12.6.3/cuda-runtime-api/group__CUDART__OCCUPANCY.html" target="_blank" rel="noopener"><code>cudaOccupancyMaxActiveClusters()</code></a> 估算给定配置下可同时活跃的 cluster 数。<a href="https://docs.nvidia.com/cuda/archive/12.6.3/hopper-tuning-guide/index.html#thread-block-clusters" target="_blank" rel="noopener">Hopper Tuning Guide 12.6.3</a> 建议 cluster kernel 使用该接口评估 occupancy。</li>
+</ul>
+
+<p>这两个 API 把设备能力、MIG 配置和 kernel 资源需求汇总为运行时可用性与 occupancy 结果。应用应依据查询值和 launch 返回值选择配置，内部准入结构不属于接口契约。</p>
+
+<h3 id="zh-2-4">2.4 DSMEM 地址语义</h3>
+
+<p>在 C++ 层，<code>cluster.map_shared_rank(ptr, rank)</code> 将本 CTA 的 shared-memory 地址映射到同一 cluster 中目标 CTA 的对应地址。在 PTX ISA 8.5 中，<a href="https://docs.nvidia.com/cuda/archive/12.6.3/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-mapa" target="_blank" rel="noopener"><code>mapa</code></a> 生成相应的 <code>.shared::cluster</code> 地址，<code>%cluster_ctarank</code> 等 special register 暴露 cluster 内的逻辑 rank。这些接口共同定义了地址空间、目标 CTA 和指令作用域。</p>
+
+<h3 id="zh-2-5">2.5 公开证据的覆盖范围</h3>
+
+<p>本文的硬件事实限定为 CUDA 12.6.3、PTX ISA 8.5、Hopper Tuning Guide 与固定版本 CUTLASS 源码直接支持的语义。work distributor、GPC 内资源分派和 DSMEM 物理路由的组织方式未纳入执行模型；kernel 的正确性只依赖共调度、单 GPC、DSMEM 地址与 cluster 同步这些公开保证。</p>
 
 <hr>
 
@@ -234,35 +238,35 @@
 
 <h3 id="zh-3-1">3.1 shape 与层级</h3>
 
-<p>Hopper 编程模型现在的层级:</p>
+<p>加入 cluster 后，Hopper 上与本文相关的执行层级为：</p>
 
 <pre class="code">grid  --&gt;  cluster  --&gt;  block (CTA)  --&gt;  warp  --&gt;  thread</pre>
 
-<p>cluster 的 shape 是三维的 <code>(cluster_dim.x, cluster_dim.y, cluster_dim.z)</code>,描述一个 cluster 包含多少 CTA、按什么形状排列。常见配置:</p>
+<p>Cluster shape 是三维元组 <code>(cluster_dim.x, cluster_dim.y, cluster_dim.z)</code>，描述一个 cluster 包含多少 CTA 以及它们的逻辑排列。常见配置包括：</p>
 
 <ul>
-  <li><code>(2, 1, 1)</code>:1D,2 个 CTA: Hopper GEMM 的典型 producer / consumer 配对</li>
-  <li><code>(2, 2, 1)</code>:2D,4 个 CTA: 多消费者扇出</li>
-  <li><code>(4, 2, 1)</code>:2D,8 个 CTA: portable size 上限</li>
+  <li><code>(2, 1, 1)</code>：一维，2 个 CTA</li>
+  <li><code>(2, 2, 1)</code>：二维，4 个 CTA</li>
+  <li><code>(4, 2, 1)</code>：二维，8 个 CTA，达到 portable size 上限</li>
 </ul>
 
 <h3 id="zh-3-2">3.2 size 上限</h3>
 
 <ul>
-  <li><strong>Portable 上限:8 CTA</strong>,任何 sm_90 设备都支持。</li>
-  <li><strong>Non-portable 上限:16 CTA</strong>,需要在 launch 时显式打开 <code>cudaLaunchAttributeNonPortableClusterSizeAllowed</code>,且只在部分 SKU 上可用。生产代码默认走 8。</li>
-  <li>cluster 不能跨 GPC;cluster size 越大,可同时驻留的 cluster 越少。</li>
+  <li>CUDA 定义的 <strong>portable cluster size 上限是 8 CTA</strong>；过小的 GPU 或 MIG 配置可能连 8 都不支持。</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/12.6.3/hopper-tuning-guide/index.html#thread-block-clusters" target="_blank" rel="noopener">Hopper Tuning Guide 12.6.3</a> 说明 H100 可在 opt-in 后使用 16 CTA 的 non-portable cluster。启用方式是 <code>cudaFuncSetAttribute(..., cudaFuncAttributeNonPortableClusterSizeAllowed, 1)</code>。</li>
+  <li>实际上限应由 <code>cudaOccupancyMaxPotentialClusterSize()</code> 查询，不能由型号名或假定的每 GPC SM 数推导。</li>
 </ul>
 
-<h3 id="zh-3-3">3.3 <span class="tag">important</span> gridDim 与 clusterDim 的整除约束</h3>
+<h3 id="zh-3-3">3.3 gridDim 与 clusterDim 的整除约束</h3>
 
-<p>Hopper 硬件要求 <strong>grid 的每一维都必须能被 cluster 的对应维整除</strong>:</p>
+<p>CUDA 编程指南要求 <strong>grid 的每一维都能被 cluster 的对应维整除</strong>：</p>
 
 <div class="eq">
   $$\text{gridDim.x} \bmod \text{clusterDim.x} \;=\; 0,\quad \text{gridDim.y} \bmod \text{clusterDim.y} \;=\; 0,\quad \text{gridDim.z} \bmod \text{clusterDim.z} \;=\; 0$$
 </div>
 
-<p>违反任意一维都会导致 <code>cudaLaunchKernelEx</code> 返回 <code>cudaErrorInvalidConfiguration</code> 或 <code>cudaErrorInvalidValue</code>。常见违规场景:</p>
+<p>不满足整除条件的 launch 配置无效；应用应检查 API 返回值，不应依赖某个固定错误码。常见配置如下：</p>
 
 <table>
   <thead><tr><th>gridDim</th><th>clusterDim</th><th>结果</th></tr></thead>
@@ -275,23 +279,23 @@
   </tbody>
 </table>
 
-<p>实战中处理方式:</p>
+<p>Host 侧通常按问题尺寸采用以下配置方式：</p>
 
 <ul>
-  <li><strong>静态 GEMM(已知 M, N)</strong>:host 端按 tile shape 算出 grid,确保对齐到 cluster shape。比如 cluster=(2,2,1), tile=128x128,要求 M, N 都对齐到 256(2 × 128),否则 padding 或者切回 cluster=(1,1,1)。</li>
-  <li><strong>动态 shape</strong>:host 端检查 gridDim,如果不整除就动态降级 cluster shape(2x2 → 2x1 → 1x1),或者使用 persistent kernel + cluster size = 1 fallback。CUTLASS 3.x 的 <code>TileScheduler</code> 内置了这个 fallback 逻辑。</li>
-  <li><strong>用 <code>cudaOccupancyMaxActiveClusters()</code> 探测</strong>:运行时拿到当前 cluster shape 下能同时驻留的 cluster 数,如果是 0 说明这个 shape 不可行。</li>
+  <li><strong>静态问题尺寸</strong>：host 按 tile 数计算 grid，并确保 grid 的各维可被 cluster shape 整除。边界 tile 是否采用 padding 或 predication 由具体 kernel 决定。</li>
+  <li><strong>动态问题尺寸</strong>：host 可以选择另一组已编译并验证过的 cluster 配置，或改用非 cluster kernel。CUDA 不会自动把任意 cluster shape 降级为 <code>(1,1,1)</code>。</li>
+  <li><strong>occupancy 查询</strong>：使用 <code>cudaOccupancyMaxPotentialClusterSize()</code> 和 <code>cudaOccupancyMaxActiveClusters()</code> 检查设备与 kernel 的实际限制。</li>
 </ul>
 
 <hr>
 
-<h2 id="zh-4">4. cluster size 怎么定:编译期 vs 运行期</h2>
+<h2 id="zh-4">4. Cluster size 的编译期与运行期约束</h2>
 
-<p>两种互斥的方式,二选一。CUTLASS 在不同模板路径下会走不同的方式。</p>
+<p>CUDA 允许 cluster shape 固定在 kernel 属性中，也允许 host 在 launch 时提供。两种方式分别服务于静态算法配置和运行时选择，同一个 kernel 定义只采用其中一种。</p>
 
 <h3 id="zh-4-1">4.1 编译期:<code>__cluster_dims__(X, Y, Z)</code> kernel 属性</h3>
 
-<p>在 kernel 定义上直接打属性,nvcc 会把它编进 PTX 的 <code>.reqnctapercluster</code>:</p>
+<p>在 kernel 定义上直接添加属性，cluster shape 随 kernel 固定：</p>
 
 <pre class="code"><span class="cm">// kernel.cu — cluster size 写死成 (2, 2, 1)</span>
 <span class="kw">#include</span> &lt;cooperative_groups.h&gt;
@@ -306,9 +310,9 @@ __global__ <span class="kw">__cluster_dims__</span>(2, 2, 1)
 }
 </pre>
 
-<p>这种方式下,kernel 自带 cluster 形状,launch 时<strong>不需要</strong>额外指定 cluster 属性(实际上指定了反而会冲突)。Driver 看到 kernel 的 <code>.reqnctapercluster</code>,直接按这个 shape 调度。</p>
+<p>这种方式下，kernel 自带 cluster 形状，launch 时<strong>不需要</strong>额外指定 cluster attribute，而且运行时不能改成另一种 shape。</p>
 
-<p>适用场景:cluster shape 是算法本身的常量(比如 CUTLASS 内核的 ClusterShape 模板参数),不会运行时变化。</p>
+<p>当 cluster shape 是算法配置的一部分时，编译期属性最直接。CUTLASS 的 <code>ClusterShape</code> 模板参数就是这一类静态配置。</p>
 
 <h3 id="zh-4-2">4.2 运行期:<code>cudaLaunchAttributeClusterDimension</code> 通过 <code>cudaLaunchKernelEx</code></h3>
 
@@ -339,11 +343,11 @@ config.numAttrs      = 1;
 cudaLaunchKernelEx(&amp;config, my_kernel, x);
 </pre>
 
-<p>适用场景:cluster shape 在运行时根据问题尺寸动态选(比如 GEMM 里根据 M, N 决定走 1x1 / 2x1 / 2x2)。</p>
+<p>当 host 需要根据问题尺寸在已验证的 shape 之间选择时，运行期 attribute 可以复用同一个 kernel 入口，例如 GEMM 按 M、N 选择 1x1、2x1 或 2x2。</p>
 
 <h3 id="zh-4-3">4.3 CUTLASS:<code>ClusterShape_MNK</code> 模板参数</h3>
 
-<p>CUTLASS 3.x 的 Hopper 内核(<code>cutlass::gemm::collective::CollectiveBuilder</code> / <code>cutlass::gemm::kernel::GemmUniversal</code>)把 cluster shape 当成模板参数:</p>
+<p>以下说明固定到 CUTLASS commit <a href="https://github.com/NVIDIA/cutlass/tree/ffa119a1255d78998536107466cc7097ecefa393" target="_blank" rel="noopener"><code>ffa119a</code></a>。该版本的 <a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/include/cutlass/gemm/collective/collective_builder.hpp" target="_blank" rel="noopener">Hopper collective builder</a> 把 cluster shape 作为 kernel 配置的一部分：</p>
 
 <pre class="code"><span class="kw">using</span> ClusterShape_MNK = cute::Shape&lt;cute::_2, cute::_1, cute::_1&gt;;  <span class="cm">// 2x1x1 cluster</span>
 <span class="kw">using</span> TileShape_MNK    = cute::Shape&lt;cute::_128, cute::_256, cute::_64&gt;;
@@ -364,22 +368,15 @@ cudaLaunchKernelEx(&amp;config, my_kernel, x);
     CollectiveEpilogue&gt;;
 </pre>
 
-<p>CUTLASS 内部根据这个 <code>ClusterShape_MNK</code> 同时做两件事:</p>
+<p><code>ClusterShape_MNK</code> 参与 collective 和 kernel schedule 的实例化，因此不能把它理解为任意可变的运行时参数。固定版本的 <a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/include/cutlass/cluster_launch.hpp#L1241-L1330" target="_blank" rel="noopener"><code>cluster_launch.hpp</code></a> 会构造 <code>cudaLaunchAttributeClusterDimension</code> 并通过 <code>cudaLaunchKernelExC</code> 启动 kernel。</p>
 
-<ol>
-  <li>在 kernel 实现里使用对应 cluster size 的 <code>cluster_*</code> 原语(WGMMA producer-consumer split、DSMEM 跨 CTA TMA 的目标 CTA rank 计算等);</li>
-  <li>在<strong>启动时</strong>通过 <code>GemmUniversalAdapter::run()</code> 自动设置 <code>cudaLaunchAttributeClusterDimension</code>。换句话说 CUTLASS 走的是<strong>运行期 attribute</strong>路径(原因是同一个编译产物可能在不同 problem shape 下用不同 cluster size,需要 host 端动态决定)。</li>
-</ol>
-
-<p>用户层面只看到 <code>ClusterShape_MNK</code> 这个模板参数,但底层走的就是 3.2 节那套 <code>cudaLaunchKernelEx</code> 流程。CUTLASS 的 <code>device_kernel</code> launch helper 还会自动处理 <code>cudaOccupancyMaxActiveClusters</code> 检查和不可整除时的报错。</p>
-
-<p>额外:CUTLASS 还支持<strong>动态 cluster size</strong>(在 <code>GemmUniversal::Arguments</code> 里运行时填),走的也是 <code>cudaLaunchAttributeClusterDimension</code>。</p>
+<p>同一文件还提供 <a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/include/cutlass/cluster_launch.hpp#L1414-L1473" target="_blank" rel="noopener"><code>launch_with_fallback_cluster()</code></a>：调用者显式传入 preferred 与 fallback shape；在支持 preferred-cluster attribute 的构建中，helper 将 fallback 作为实际 cluster dimension，并把 preferred shape 写入相应 attribute。该 helper 负责启动调用者已经选定的两组配置，配置搜索仍由上层逻辑完成。</p>
 
 <hr>
 
 <h2 id="zh-5">5. 运行时 launch API:<code>cudaLaunchKernelEx</code> 完整签名</h2>
 
-<p>传统 <code>kernel&lt;&lt;&lt;grid, block, smem, stream&gt;&gt;&gt;(args)</code> 不支持传递 attribute(它在 CUDA C++ 里被翻译成 <code>cudaLaunchKernel</code>),所以 cluster 必须走新的 <code>cudaLaunchKernelEx</code> 接口。</p>
+<p>运行时指定 cluster shape 时，需要用 <code>cudaLaunchKernelEx</code> 传递 launch attribute。带有编译期 <code>__cluster_dims__</code> 的 kernel 仍可使用传统 <code>&lt;&lt;&lt;...&gt;&gt;&gt;</code> 语法。</p>
 
 <pre class="code"><span class="kw">cudaError_t</span> cudaLaunchKernelEx(
     <span class="kw">const</span> cudaLaunchConfig_t* config,
@@ -405,8 +402,8 @@ cudaLaunchKernelEx(&amp;config, my_kernel, x);
 
 <ul>
   <li><code>cudaLaunchAttributeClusterDimension</code>: 指定 cluster shape</li>
-  <li><code>cudaLaunchAttributeNonPortableClusterSizeAllowed</code>: 允许 size &gt; 8</li>
-  <li><code>cudaLaunchAttributeClusterSchedulingPolicyPreference</code>: 选 <code>spread</code>(分散到不同 GPC)或 <code>load_balancing</code>(默认),只影响调度倾向、不影响正确性</li>
+  <li><code>cudaLaunchAttributeClusterSchedulingPolicyPreference</code>: 为不同 cluster 在 GPC 间的放置提供调度偏好，不改变单个 cluster 位于同一 GPC 的保证</li>
+  <li><code>cudaFuncAttributeNonPortableClusterSizeAllowed</code>: 通过 <code>cudaFuncSetAttribute</code> 为支持的设备启用 non-portable cluster size</li>
 </ul>
 
 <p>完整 host 侧 launch 模板(2x2x1 cluster,gridDim 必须能被 2 × 2 整除):</p>
@@ -439,23 +436,25 @@ cudaLaunchKernelEx(&amp;config, my_kernel, x);
 }
 </pre>
 
-<p>如果 kernel 自带 <code>__cluster_dims__(2, 2, 1)</code>,把上面的 attribute 部分整段去掉就行;driver 会从 kernel 自带的 cluster shape 推 cluster grid。</p>
+<p>如果 kernel 自带 <code>__cluster_dims__(2, 2, 1)</code>，应直接使用普通 launch 语法，不能在 launch 时改成另一种 cluster shape。</p>
 
 <hr>
 
-<h2 id="zh-6">6. 四个核心能力</h2>
+<h2 id="zh-6">6. 协作原语及其执行关系</h2>
+
+<p>共调度只建立共同驻留条件，跨 CTA 协作还需要地址、同步和异步完成协议。Cluster barrier 负责阶段边界，DSMEM 提供远端 shared-memory 地址，mbarrier 跟踪细粒度到达与事务完成，TMA 则把异步数据搬运接入这套协议。</p>
 
 <h3 id="zh-6-1">6.1 Cluster barrier</h3>
 
-<p>整个 cluster 里所有 CTA 的所有线程对齐:</p>
+<p>Cluster barrier 是覆盖 cluster 内所有参与线程的同步操作。<code>cluster.sync()</code> 等待这些线程到达同一阶段，并建立文档规定的内存可见性：</p>
 
 <pre class="code"><span class="kw">auto</span> cluster = cg::this_cluster();
 cluster.sync();                                   <span class="cm">// 整 cluster barrier</span>
 </pre>
 
-<p>底层是 PTX 的 <code>barrier.cluster.arrive</code> + <code>barrier.cluster.wait</code>,实现上是 cluster 内 SM-to-SM 网络的硬件 fence,延迟比走 global 的 atomic 同步低一个量级。</p>
+<p>PTX ISA 8.5 提供对应的 <a href="https://docs.nvidia.com/cuda/archive/12.6.3/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-barrier-cluster" target="_blank" rel="noopener"><code>barrier.cluster.arrive</code> / <code>barrier.cluster.wait</code></a>。文档定义了参与线程和内存可见性，但没有给出固定延迟，也没有把它描述成某种具体互连上的 fence。</p>
 
-<p>常见 idiom:让所有 CTA 同时完成 GEMM 第一阶段、再进入第二阶段(producer→consumer 切换):</p>
+<p>在分阶段 GEMM 中，各 CTA 可以先完成本地 tile 装载，再通过 barrier 进入跨 CTA 的消费阶段：</p>
 
 <pre class="code"><span class="cm">// 阶段 1: 各 CTA 把自己负责的 A_tile / B_tile 加载到本地 smem</span>
 load_tile_to_smem();
@@ -468,7 +467,7 @@ cluster.sync();                                   <span class="cm">// 必要时�
 
 <h3 id="zh-6-2">6.2 Distributed Shared Memory (DSMEM)</h3>
 
-<p>一个 CTA 可以拿到其它同 cluster CTA 的 smem 指针:</p>
+<p>DSMEM 是由同一 cluster 内各 CTA 的 shared memory 共同构成的可寻址空间。每块 shared memory 仍由所属 CTA 分配，peer CTA 通过 rank 映射得到对应地址：</p>
 
 <pre class="code">__shared__ <span class="kw">float</span> local_buf[256];
 
@@ -480,66 +479,55 @@ cluster.sync();                                   <span class="cm">// 必要时�
 <span class="kw">float</span> v = peer_buf[threadIdx.x];                 <span class="cm">// 直接跨 CTA 读 smem</span>
 </pre>
 
-<p>语义和访存:</p>
+<p>地址与同步遵循以下规则：</p>
 
 <ul>
-  <li>语言层面是 generic 指针;底层 nvcc 编成 PTX 里带 <code>shared::cluster</code> address space 的 ld/st 指令。</li>
-  <li>访问延迟 ≈ L2 命中(~30 cycle),但带宽显著高于走 L2 的 global 间接访问。</li>
-  <li>同步:从 peer smem 读之前,必须保证 peer 已经完成对那块 smem 的写。所以一般的写法是: peer 写完 → <code>cluster.sync()</code> → 本 CTA 用 <code>map_shared_rank</code> 读。</li>
-  <li>对应的 PTX 是 <code>ld.shared::cluster.b32</code> / <code>st.shared::cluster.b32</code> 等。</li>
+  <li>PTX ISA 使用 <code>mapa.shared::cluster</code> 生成 cluster-scope 地址，并提供 <code>ld.shared::cluster.b32</code>、<code>st.shared::cluster.b32</code> 等 load/store 形式。具体编译结果应以当前工具链生成的 PTX/SASS 为准。</li>
+  <li>公开指南没有规定 DSMEM 的固定延迟或相对 L2 的带宽比例；这些数值需要在目标设备上测量。</li>
+  <li>peer shared memory 的读取需要遵循写入完成后的同步关系：peer 写入 → <code>cluster.sync()</code> → 当前 CTA 通过 <code>map_shared_rank()</code> 读取。</li>
 </ul>
 
 <h3 id="zh-6-3">6.3 Cluster scope mbarrier</h3>
 
-<p>mbarrier(memory barrier)是 sm_80 引入的 smem 内一个 64-bit object,支持 arrive / wait 语义,Hopper 把它的作用域扩展到 cluster scope:</p>
+<p>mbarrier 是 shared memory 中 8 字节对齐的 64-bit opaque object，用 arrival count 和 transaction count 表示异步阶段的完成状态。PTX ISA 8.5 按 owner CTA 与 peer CTA 分配本地和远端操作：</p>
 
-<pre class="code"><span class="cm">// 在某个 CTA(比如 rank=0)的 smem 上放一个 mbarrier</span>
-__shared__ <span class="kw">uint64_t</span> mbar;
+<pre class="code"><span class="cm">// PTX 语义示意：mbarrier 必须由拥有它的 CTA 在 shared::cta 中初始化</span>
+mbarrier.init.shared::cta.b64 [local_mbar], expected_arrivals;
+barrier.cluster.arrive;
+barrier.cluster.wait;
 
-<span class="kw">if</span> (cluster.block_rank() == 0 &amp;&amp; threadIdx.x == 0) {
-    asm <span class="kw">volatile</span>(<span class="cm">"mbarrier.init.shared::cluster.b64 [%0], %1;"</span>
-                 :: <span class="cm">"r"</span>(__cvta_generic_to_shared(&amp;mbar)),
-                    <span class="cm">"r"</span>(expected_arrivals));
-}
-cluster.sync();
+<span class="cm">// 其它 CTA 先用 mapa 得到远端地址，再执行不返回 state 的 remote arrive</span>
+mapa.shared::cluster.u64 remote_mbar, local_mbar, owner_cta_rank;
+mbarrier.arrive.release.cluster.shared::cluster.b64 _, [remote_mbar];
 
-<span class="cm">// 其它 CTA arrive 到 rank=0 这个 mbarrier</span>
-<span class="kw">if</span> (threadIdx.x == 0) {
-    <span class="kw">uint64_t</span>* remote_mbar = cluster.map_shared_rank(&amp;mbar, 0);
-    asm <span class="kw">volatile</span>(<span class="cm">"mbarrier.arrive.shared::cluster.b64 _, [%0];"</span>
-                 :: <span class="cm">"r"</span>(__cvta_generic_to_shared(remote_mbar)));
-}
-
-<span class="cm">// rank=0 等够 expected_arrivals 个 arrive</span>
-<span class="kw">if</span> (cluster.block_rank() == 0 &amp;&amp; threadIdx.x == 0) {
-    asm <span class="kw">volatile</span>(<span class="cm">"mbarrier.try_wait.shared::cluster.b64 ...;"</span> : ...);
-}
+<span class="cm">// owner CTA 在本地 shared::cta 地址上执行 try_wait/test_wait</span>
+mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 done, [local_mbar], phase;
 </pre>
 
-<p>用途:把 producer / consumer 流水线的状态 token 放在 mbarrier 上,producer 完成一个阶段就 arrive,consumer wait 到 N 个 arrive 后开始消费。Hopper GEMM 的 TMA 流水线(包括 <code>cutlass::PipelineTmaAsync</code>)就建立在这套语义上。</p>
+<p><a href="https://docs.nvidia.com/cuda/archive/12.6.3/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-init" target="_blank" rel="noopener">PTX ISA 8.5 的支持表</a>规定：远端 <code>.shared::cluster</code> mbarrier 支持 <code>arrive</code>、<code>expect_tx</code> 和 <code>complete_tx</code>；初始化、等待及其它操作只支持本地 <code>.shared::cta</code> 地址。分阶段协议可以利用 arrival count 与 tx-count 关联生产者、消费者和异步 copy，但具体协议必须由 kernel 明确定义。</p>
 
 <h3 id="zh-6-4">6.4 TMA → <code>shared::cluster</code></h3>
 
-<p>TMA(Tensor Memory Accelerator,Hopper 引入的硬件 DMA 引擎)的 bulk async copy 既可以目的是<strong>本地 smem</strong>,也可以是<strong>cluster 内其它 CTA 的 smem</strong>:</p>
+<p><a href="https://docs.nvidia.com/cuda/archive/12.6.3/hopper-tuning-guide/index.html#tensor-memory-accelerator" target="_blank" rel="noopener">Hopper Tuning Guide</a> 将 TMA（Tensor Memory Accelerator）描述为 asynchronous copy engine。其 bulk async copy 的目的地可以是<strong>本地 shared memory</strong>，也可以是<strong>同一 cluster 中其它 CTA 的 shared memory</strong>：</p>
 
 <pre class="code"><span class="cm">// PTX 伪码:bulk async copy 一个 2D tile,目的是 cluster 内 dst_cta_rank 的 smem</span>
 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
     [dst_smem_ptr_in_peer_cta], [tensor_map], {coord_x, coord_y}, [mbar_in_peer_cta];
 </pre>
 
-<p>关键点:</p>
+<p>事务关系如下：</p>
 
 <ul>
-  <li>目的 smem 地址是<strong>另一个 CTA 的 smem 起始 + 偏移</strong>。一个 CTA 可以发起 TMA,把数据落到 cluster 内任何 peer 的 smem。</li>
-  <li>complete_tx 信号会更新到<strong>peer CTA 的 mbarrier</strong>,所以 peer CTA 自己用 <code>mbarrier.wait</code> 就能知道"我自己的 smem 已经被某 producer CTA 写好了"。</li>
-  <li>这是 Hopper GEMM "single TMA → multi consumer" 模式的硬件支撑:一个 producer CTA 发起 TMA,把 A_tile 同时落到 N 个 consumer CTA 的 smem,N 个 consumer 并行做 wgmma。</li>
+  <li>目的地址位于 <code>.shared::cluster</code>，可以指向 cluster 内另一个 CTA 的 shared memory。</li>
+  <li><code>mbarrier::complete_tx::bytes</code> 在 copy 完成时更新指定 mbarrier 的 tx-count；等待操作由拥有该 mbarrier 的 CTA 在本地地址上执行。</li>
+  <li>一次普通 copy 对应一个目的地址。向多个 CTA 复制需要显式使用 <code>.multicast::cluster</code> 和 CTA mask。PTX ISA 8.5 规定这些指令要求 <code>sm_90</code> 或更高，并建议 multicast 以 <code>sm_90a</code> 为目标以获得合适性能。</li>
 </ul>
 
 <hr>
 
 <h2 id="zh-7">7. CUDA C++ 例子</h2>
 
-<p>所有例子都假设 H100(sm_90)+ CUDA 12.x。下面 4 个例子从最简单的 hello cluster 逐步过渡到 TMA 跨 CTA。</p>
+<p>前两个例子使用 CUDA 12.6.3 公开编程接口，可在 Compute Capability 9.0 上编译。mbarrier 与 TMA 的示例停留在 PTX 语义和固定版本源码入口，因为完整程序还需要与工具链匹配的包装层、tensor map 和异步完成协议。</p>
 
 <h3 id="zh-7-1">7.1 例 1:Hello cluster: 用 <code>cluster.sync()</code> 同步</h3>
 
@@ -572,14 +560,14 @@ __global__ <span class="kw">__cluster_dims__</span>(2, 2, 1)
 </pre>
 
 <p class="caption">编译:</p>
-<pre class="code">nvcc -arch=sm_90a -std=c++17 -O3 hello_cluster.cu -o hello_cluster
+<pre class="code">nvcc -arch=sm_90 -std=c++17 -O3 hello_cluster.cu -o hello_cluster
 ./hello_cluster
 </pre>
 
 <p>要点:</p>
 <ul>
-  <li><code>-arch=sm_90a</code> 而非 <code>sm_90</code> —— cluster + TMA 都需要 architecture-specific PTX(<code>a</code> 后缀)。<code>sm_90</code> 只能编通用 PTX,cluster 原语无法使用。</li>
-  <li>kernel 自带 <code>__cluster_dims__(2, 2, 1)</code>,所以 launch 写 <code>&lt;&lt;&lt;dim3(4,4,1), 32&gt;&gt;&gt;</code> 就行,gridDim 4 × 4 = 16 个 CTA = 4 个 cluster。注意 4 % 2 = 0,符合整除约束。</li>
+  <li>PTX ISA 8.5 规定 cluster、<code>.shared::cluster</code> 与 TMA bulk-copy 指令要求 <code>sm_90</code> 或更高；只有部分 architecture-specific 特性（例如推荐的 TMA multicast 路径）需要单独考虑 <code>sm_90a</code>。</li>
+  <li>kernel 已声明 <code>__cluster_dims__(2, 2, 1)</code>，launch 因而使用普通的 <code>&lt;&lt;&lt;dim3(4,4,1), 32&gt;&gt;&gt;</code> 语法。gridDim 为 4 × 4，共 16 个 CTA、4 个 cluster；两个维度均满足 4 % 2 = 0 的整除约束。</li>
 </ul>
 
 <h3 id="zh-7-2">7.2 例 2:DSMEM 跨 CTA 读: 运行期指定 cluster size</h3>
@@ -631,11 +619,11 @@ __global__ <span class="kw">void</span> dsmem_demo(<span class="kw">int</span>* 
 </pre>
 
 <p class="caption">编译:</p>
-<pre class="code">nvcc -arch=sm_90a -std=c++17 -O3 dsmem_read.cu -o dsmem_read
+<pre class="code">nvcc -arch=sm_90 -std=c++17 -O3 dsmem_read.cu -o dsmem_read
 ./dsmem_read
 </pre>
 
-<p>预期输出(rank 顺序与你的 GPC 调度有关,但每个 cluster 内的 rotation 是确定的):</p>
+<p>前四个 block 构成第一个 cluster，预期输出如下；后续 cluster 按同样的 rank rotation 计算：</p>
 
 <pre class="code">block 0 read peer = 142      <span class="cm"># rank 0 读 rank 1 的 local_buf = 1*100+42</span>
 block 1 read peer = 242
@@ -644,276 +632,56 @@ block 3 read peer = 42       <span class="cm"># rank 3 读 rank 0 的 local_buf 
 ...
 </pre>
 
-<h3 id="zh-7-3">7.3 例 3:Cluster mbarrier 同步 producer-consumer</h3>
+<h3 id="zh-7-3">7.3 mbarrier：以 PTX 支持表为边界</h3>
 
-<p>2 个 CTA 一组,rank=0 当 producer,rank=1 当 consumer。Producer 把数据写到 consumer 的 smem,通过 cluster scope mbarrier 通知 consumer:</p>
+<p>远端 mbarrier 协议区分 owner CTA 与访问它的 peer CTA。初始化和等待发生在 owner 的 <code>.shared::cta</code> 地址；peer 通过 <code>mapa</code> 得到 <code>.shared::cluster</code> 地址后，使用 PTX 支持表列出的远端操作。完整的操作范围与内存语义见 <a href="https://docs.nvidia.com/cuda/archive/12.6.3/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-init" target="_blank" rel="noopener">PTX ISA 8.5 mbarrier</a>。</p>
 
-<pre class="code"><span class="cm">// mbarrier_pc.cu</span>
-<span class="kw">#include</span> &lt;cstdio&gt;
-<span class="kw">#include</span> &lt;cooperative_groups.h&gt;
-<span class="kw">#include</span> &lt;cuda/barrier&gt;
-<span class="kw">namespace</span> cg = cooperative_groups;
+<h3 id="zh-7-4">7.4 TMA：从 PTX 指令与固定源码入手</h3>
 
-__global__ <span class="kw">__cluster_dims__</span>(2, 1, 1)
-<span class="kw">void</span> producer_consumer(<span class="kw">int</span>* out) {
-    __shared__ <span class="kw">int</span> shared_buf[32];
-    __shared__ cuda::barrier&lt;cuda::thread_scope_block&gt; mbar;     <span class="cm">// 等价于 mbarrier</span>
-
-    <span class="kw">auto</span> cluster = cg::this_cluster();
-    <span class="kw">int</span> rank = cluster.block_rank();
-
-    <span class="cm">// 全 cluster 一次性 init 一个 mbarrier(只有 rank=1 的实例会被远端 arrive)</span>
-    <span class="kw">if</span> (threadIdx.x == 0) {
-        init(&amp;mbar, 32 + 1);          <span class="cm">// 1 个 producer + 32 个本地 consumer thread</span>
-    }
-    cluster.sync();                  <span class="cm">// 所有 mbarrier 已 init</span>
-
-    <span class="kw">if</span> (rank == 0) {
-        <span class="cm">// producer: 把数据写到 consumer 的 shared_buf,然后远端 arrive 它的 mbarrier</span>
-        <span class="kw">int</span>* peer_buf  = cluster.map_shared_rank(shared_buf, 1);
-        <span class="kw">auto</span>* peer_mbar = cluster.map_shared_rank(&amp;mbar, 1);
-        peer_buf[threadIdx.x] = threadIdx.x * 7;
-
-        __syncthreads();                                  <span class="cm">// 本 CTA 内对齐</span>
-        <span class="kw">if</span> (threadIdx.x == 0) {
-            peer_mbar-&gt;arrive();                          <span class="cm">// 远端 arrive,等价于 mbarrier.arrive.shared::cluster</span>
-        }
-    } <span class="kw">else</span> {
-        <span class="cm">// consumer: 等 mbarrier,然后读自己的 shared_buf</span>
-        <span class="kw">auto</span> tok = mbar.arrive();                          <span class="cm">// 本地 thread 也 arrive 一次</span>
-        mbar.wait(std::move(tok));                        <span class="cm">// 等够 32+1 次 arrive</span>
-        out[threadIdx.x] = shared_buf[threadIdx.x];
-    }
-}
-
-<span class="kw">int</span> main() {
-    <span class="kw">int</span>* d_out; cudaMalloc(&amp;d_out, 32 * <span class="kw">sizeof</span>(<span class="kw">int</span>));
-    producer_consumer&lt;&lt;&lt;dim3(2, 1, 1), 32&gt;&gt;&gt;(d_out);    <span class="cm">// 1 cluster, 2 CTA</span>
-    cudaDeviceSynchronize();
-    <span class="kw">int</span> h[32]; cudaMemcpy(h, d_out, <span class="kw">sizeof</span> h, cudaMemcpyDeviceToHost);
-    <span class="kw">for</span> (<span class="kw">int</span> i = 0; i &lt; 32; ++i) printf(<span class="cm">"%d "</span>, h[i]);
-}
-</pre>
-
-<p class="caption">编译:</p>
-<pre class="code">nvcc -arch=sm_90a -std=c++17 -O3 mbarrier_pc.cu -o mbarrier_pc
-./mbarrier_pc
-</pre>
-
-<p>要点:</p>
-<ul>
-  <li><code>cuda::barrier&lt;cuda::thread_scope_block&gt;</code> 是 <code>&lt;cuda/barrier&gt;</code> 提供的 C++ 包装,底层就是 PTX 的 mbarrier。<code>arrive()</code> / <code>wait()</code> 实际编出 <code>mbarrier.arrive</code> / <code>mbarrier.try_wait</code> 指令。</li>
-  <li>通过 <code>cluster.map_shared_rank(&amp;mbar, 1)</code> 拿到 peer 的 mbarrier 指针,producer 在上面 arrive,nvcc 自动选 <code>mbarrier.arrive.shared::cluster</code> 变体(目标是 cluster 内非本 CTA 的 smem)。</li>
-</ul>
-
-<h3 id="zh-7-4">7.4 例 4:TMA 把 global 数据落到 cluster 内 peer 的 smem</h3>
-
-<p>这是最贴近 Hopper GEMM 的模式:一个 CTA 发起 TMA bulk copy,把数据同时落到自己 + cluster 内其它 CTA 的 smem。下面给一个化简版:</p>
-
-<pre class="code"><span class="cm">// tma_to_cluster.cu — 化简版,只展示 cp.async.bulk 落到 peer smem 的形态</span>
-<span class="kw">#include</span> &lt;cstdio&gt;
-<span class="kw">#include</span> &lt;cooperative_groups.h&gt;
-<span class="kw">#include</span> &lt;cuda/barrier&gt;
-<span class="kw">namespace</span> cg = cooperative_groups;
-
-__global__ <span class="kw">__cluster_dims__</span>(2, 1, 1)
-<span class="kw">void</span> tma_demo(<span class="kw">const</span> __grid_constant__ CUtensorMap tmap, <span class="kw">int</span>* out) {
-    __shared__ <span class="kw">alignas</span>(128) <span class="kw">float</span> tile[256];                 <span class="cm">// 16×16 tile</span>
-    __shared__ cuda::barrier&lt;cuda::thread_scope_block&gt; mbar;
-
-    <span class="kw">auto</span> cluster = cg::this_cluster();
-    <span class="kw">int</span> rank = cluster.block_rank();
-
-    <span class="kw">if</span> (threadIdx.x == 0) init(&amp;mbar, 1);
-    cluster.sync();
-
-    <span class="kw">if</span> (rank == 0 &amp;&amp; threadIdx.x == 0) {
-        <span class="cm">// 计算 peer CTA(rank=1)的 tile 在 cluster smem space 里的地址</span>
-        <span class="kw">float</span>* peer_tile = cluster.map_shared_rank(tile, 1);
-        <span class="kw">auto</span>*  peer_mbar = cluster.map_shared_rank(&amp;mbar, 1);
-
-        cuda::memcpy_async(peer_tile,
-                           &amp;tmap,
-                           {0 /* x */, 0 /* y */},
-                           <span class="kw">sizeof</span>(<span class="kw">float</span>) * 256,
-                           *peer_mbar);                <span class="cm">// TMA → peer smem, 完成时 signal peer mbar</span>
-    }
-
-    <span class="kw">if</span> (rank == 1) {
-        <span class="kw">auto</span> tok = mbar.arrive();
-        mbar.wait(std::move(tok));                    <span class="cm">// 等 TMA 写完</span>
-        <span class="kw">if</span> (threadIdx.x &lt; 16) out[threadIdx.x] = (<span class="kw">int</span>)tile[threadIdx.x];
-    }
-}
-
-<span class="cm">// host 端用 cuTensorMapEncodeTiled / cuTensorMapEncodeIm2col 构造 tmap,</span>
-<span class="cm">// 然后用 cudaLaunchKernelEx 启动(略,见 CUDA samples bulk_tensor)</span>
-</pre>
-
-<p class="caption">编译(含 CUDA driver API 头):</p>
-<pre class="code">nvcc -arch=sm_90a -std=c++17 -O3 \
-     -lcuda \
-     tma_to_cluster.cu -o tma_to_cluster
-</pre>
-
-<p>注意点:</p>
-<ul>
-  <li><code>cuda::memcpy_async</code> 配合 <code>CUtensorMap</code> 会生成 <code>cp.async.bulk.tensor.*</code> PTX。当目标 smem 来自 <code>map_shared_rank</code>,nvcc 自动选 <code>shared::cluster</code> 变体。</li>
-  <li><code>CUtensorMap</code> 是 host 端用 <code>cuTensorMapEncodeTiled()</code>(driver API)预先构造的描述符,之后作为 <code>__grid_constant__</code> 参数传入 kernel。这一步在所有 TMA 例子里都要做。</li>
-  <li>编译时记得 <code>-lcuda</code> 链接 driver API(<code>cuTensorMap*</code> 在 driver lib 里,不在 runtime lib)。</li>
-</ul>
+<p><a href="https://docs.nvidia.com/cuda/archive/12.6.3/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-tensor" target="_blank" rel="noopener">PTX ISA 8.5 的 <code>cp.async.bulk.tensor</code></a> 定义了 global 与 <code>.shared::cluster</code> 之间的异步 tensor copy、mbarrier completion 和可选 multicast。C++ 包装层的参数、tensor-map 构造与同步协议容易随工具链变化；可运行实现应直接参考与项目版本一致的 CUDA sample 或 CUTLASS 源码。</p>
 
 <hr>
 
-<h2 id="zh-8">8. CuTe DSL (Python) 例子</h2>
+<h2 id="zh-8">8. CUTLASS 固定版本源码导航</h2>
 
-<p>CUTLASS 4.x 的 Python 前端(<code>cutlass.cute</code> 命名空间下)直接暴露 cluster / DSMEM / TMA 原语,JIT 编译成跟 C++ 同等的 SASS。下面是和 §7 对应的 Python 写法。</p>
+<p>以下链接统一固定到 CUTLASS commit <a href="https://github.com/NVIDIA/cutlass/tree/ffa119a1255d78998536107466cc7097ecefa393" target="_blank" rel="noopener"><code>ffa119a</code></a>，避免把 <code>main</code> 上持续变化的接口写成稳定 API。</p>
 
-<p class="callout">下面有少数 API 名我不是 100% 确认(CuTe DSL 在 2025 年还在快速迭代),会在出现处标注。涉及到的接口出处:<code>cutlass.cute.arch</code>(底层 PTX wrapper)、<code>cutlass.cute</code>(layout / tensor)、<code>cutlass.cute.kernel</code>(kernel 装饰器)、<code>cutlass.runtime</code>(launch)。</p>
+<table>
+  <thead><tr><th>主题</th><th>固定源码</th><th>可确认的内容</th></tr></thead>
+  <tbody>
+    <tr><td>cluster 原语</td><td><a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/include/cute/arch/cluster_sm90.hpp" target="_blank" rel="noopener"><code>cluster_sm90.hpp</code></a></td><td><code>cluster_arrive</code>、<code>cluster_wait</code>、rank 查询与 <code>mapa</code> 包装</td></tr>
+    <tr><td>TMA 指令包装</td><td><a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/include/cute/arch/copy_sm90_tma.hpp" target="_blank" rel="noopener"><code>copy_sm90_tma.hpp</code></a></td><td>该版本实际使用的 TMA copy 类型与 PTX 包装</td></tr>
+    <tr><td>cluster launch</td><td><a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/include/cutlass/cluster_launch.hpp" target="_blank" rel="noopener"><code>cluster_launch.hpp</code></a></td><td>cluster attribute、non-portable opt-in、preferred/fallback launch helper</td></tr>
+    <tr><td>Hopper GEMM</td><td><a href="https://github.com/NVIDIA/cutlass/tree/ffa119a1255d78998536107466cc7097ecefa393/examples/48_hopper_warp_specialized_gemm" target="_blank" rel="noopener">Example 48</a></td><td>cluster shape 在一个完整 Hopper GEMM 配置中的用法</td></tr>
+  </tbody>
+</table>
 
-<h3>8.1 launch 时指定 cluster shape</h3>
-
-<pre class="code"><span class="kw">import</span> cutlass
-<span class="kw">import</span> cutlass.cute <span class="kw">as</span> cute
-<span class="kw">from</span> cutlass.cute.kernel <span class="kw">import</span> kernel
-<span class="kw">from</span> cutlass.cute.arch <span class="kw">import</span> cluster_sync, this_cluster_rank   <span class="cm"># 名字可能略有差异</span>
-
-@kernel(cluster_shape=(2, 2, 1))                  <span class="cm"># 等价于 C++ 的 __cluster_dims__</span>
-<span class="kw">def</span> hello_cluster():
-    rank = this_cluster_rank()
-    cute.printf(<span class="cm">"cluster rank=%d, blockIdx=(%d,%d)\n"</span>,
-                rank, cute.block_idx().x, cute.block_idx().y)
-    cluster_sync()
-    cute.printf(<span class="cm">"after cluster_sync from rank %d\n"</span>, rank)
-
-<span class="cm"># launch</span>
-hello_cluster.launch(grid=(4, 4, 1), block=(32, 1, 1))   <span class="cm"># gridDim 4×4 % cluster 2×2 == 0</span>
-</pre>
-
-<p>要点:</p>
-<ul>
-  <li><code>@kernel(cluster_shape=...)</code> 等价于 C++ kernel 上的 <code>__cluster_dims__</code>,是编译期常量;launch 时只需传 grid / block。如果想运行时变 cluster shape,把 <code>cluster_shape</code> 设成 <code>None</code> 然后在 <code>launch(cluster_shape=...)</code> 里传(对应 C++ 的 <code>cudaLaunchAttributeClusterDimension</code> 路径)。</li>
-  <li><code>cute.block_idx()</code> / <code>cute.thread_idx()</code> 是 layout-aware 的 grid 索引,等价于 CUDA 的 <code>blockIdx</code> / <code>threadIdx</code>。</li>
-</ul>
-
-<h3>8.2 DSMEM 跨 CTA 读</h3>
-
-<pre class="code"><span class="kw">from</span> cutlass.cute.arch <span class="kw">import</span> dsmem_ptr, cluster_block_rank, cluster_num_blocks
-
-@kernel(cluster_shape=(4, 1, 1))
-<span class="kw">def</span> dsmem_demo(out: cute.Tensor):
-    local_buf = cute.shared_alloc(cute.Int32, 1)        <span class="cm"># __shared__ int local_buf[1]</span>
-    rank      = cluster_block_rank()
-    n_cta     = cluster_num_blocks()
-
-    <span class="kw">if</span> cute.thread_idx().x == 0:
-        local_buf[0] = rank * 100 + 42
-    cluster_sync()                                       <span class="cm"># 等 peer 写完</span>
-
-    peer_rank = (rank + 1) % n_cta
-    peer_buf  = dsmem_ptr(local_buf, peer_rank)          <span class="cm"># 等价于 cluster.map_shared_rank()</span>
-    <span class="kw">if</span> cute.thread_idx().x == 0:
-        out[cute.block_idx().x] = peer_buf[0]
-    cluster_sync()
-</pre>
-
-<p>对应的 C++ 概念在 Python 里基本一一对应。<code>cute.shared_alloc</code> 是显式 smem 分配,<code>dsmem_ptr</code> 是 <code>cluster_group::map_shared_rank</code> 的 wrapper。</p>
-
-<h3>8.3 Cluster mbarrier 同步</h3>
-
-<pre class="code"><span class="kw">from</span> cutlass.cute.arch <span class="kw">import</span> mbarrier_init, mbarrier_arrive, mbarrier_wait, dsmem_ptr
-
-@kernel(cluster_shape=(2, 1, 1))
-<span class="kw">def</span> pc_demo(out: cute.Tensor):
-    shared_buf = cute.shared_alloc(cute.Int32, 32)
-    mbar       = cute.shared_alloc(cute.Uint64, 1)              <span class="cm"># mbarrier 一个 64-bit 槽</span>
-
-    rank = cluster_block_rank()
-    tid  = cute.thread_idx().x
-
-    <span class="kw">if</span> tid == 0:
-        mbarrier_init(mbar, expected_arrivals=32 + 1)
-    cluster_sync()
-
-    <span class="kw">if</span> rank == 0:
-        peer_buf  = dsmem_ptr(shared_buf, 1)
-        peer_mbar = dsmem_ptr(mbar, 1)
-        peer_buf[tid] = tid * 7
-        cute.syncthreads()
-        <span class="kw">if</span> tid == 0:
-            mbarrier_arrive(peer_mbar)                          <span class="cm"># scope=cluster 自动推导</span>
-    <span class="kw">else</span>:
-        mbarrier_arrive(mbar)                                   <span class="cm"># 本地 thread 也 arrive 一次</span>
-        mbarrier_wait(mbar, phase=0)                            <span class="cm"># 等够 33 次 arrive</span>
-        out[tid] = shared_buf[tid]
-</pre>
-
-<p class="callout warn">注意:<code>mbarrier_arrive</code>(以及目标在远端 smem 时是否自动选 <code>shared::cluster</code> 变体)在 CuTe DSL 里的具体函数名我不是 100% 确认 —— 在最新版 CUTLASS Python 里可能叫 <code>mbarrier.arrive_cta</code> / <code>mbarrier.cta_arrive</code> / <code>tcgen05.mbarrier.*</code> 等,请以你装的版本的 <code>cutlass.cute.arch</code> 模块为准。</p>
-
-<h3>8.4 TMA bulk async copy 到 cluster 内 peer smem</h3>
-
-<pre class="code"><span class="kw">from</span> cutlass.cute.arch <span class="kw">import</span> cp_async_bulk_tensor_to_shared_cluster, mbarrier_init, mbarrier_wait
-
-@kernel(cluster_shape=(2, 1, 1))
-<span class="kw">def</span> tma_to_cluster(A_gmem: cute.Tensor, A_tma_desc: cute.TmaDescriptor, out: cute.Tensor):
-    A_smem = cute.shared_alloc(cute.Float32, (16, 16))
-    mbar   = cute.shared_alloc(cute.Uint64, 1)
-
-    rank = cluster_block_rank()
-    tid  = cute.thread_idx().x
-
-    <span class="kw">if</span> tid == 0:
-        mbarrier_init(mbar, expected_arrivals=1)
-    cluster_sync()
-
-    <span class="kw">if</span> rank == 0 <span class="kw">and</span> tid == 0:
-        peer_smem = dsmem_ptr(A_smem, 1)
-        peer_mbar = dsmem_ptr(mbar, 1)
-        cp_async_bulk_tensor_to_shared_cluster(
-            dst        = peer_smem,
-            tma_desc   = A_tma_desc,
-            coord      = (0, 0),
-            mbar       = peer_mbar,
-        )
-
-    <span class="kw">if</span> rank == 1:
-        mbarrier_wait(mbar, phase=0)
-        <span class="kw">if</span> tid &lt; 16:
-            out[tid] = cute.Int32(A_smem[tid, 0])
-
-<span class="cm"># host 侧构造 TMA descriptor + launch</span>
-A_desc = cute.TmaDescriptor.encode_tiled(A_gmem, tile_shape=(16, 16))
-tma_to_cluster.launch(grid=(2, 1, 1), block=(32, 1, 1),
-                       A_gmem=A_gmem, A_tma_desc=A_desc, out=out)
-</pre>
-
-<p class="callout warn">同样,<code>cp_async_bulk_tensor_to_shared_cluster</code> 这个函数名是按语义命名的占位 —— CUTLASS Python 当前版本里更准确的入口在 <code>cutlass.cute.nvgpu.cpasync</code> 或 <code>cutlass.cute.tma</code> 命名空间下,签名细节请查最新源码 <code>python/cutlass/cute/arch.py</code>。</p>
-
-<p>整体感觉是:CuTe DSL 把"配 cluster shape 是<strong>装饰器</strong>"、"DSMEM 是 <code>dsmem_ptr</code>"、"TMA 是 <code>cp_async_bulk_*</code>"——语义跟 C++ 一一对应,但少了 host 端 attribute 拼装的样板。</p>
+<p>CUTLASS 的 Python 与 C++ 接口都会跨版本调整。使用这些入口时，代码与源码链接应共同锁定到项目采用的 commit 或 release。</p>
 
 <hr>
 
-<h2 id="zh-9">9. 坑与边界</h2>
+<h2 id="zh-9">9. 兼容性与使用边界</h2>
 
 <ol>
-  <li><strong><code>sm_90a</code> vs <code>sm_90</code></strong>:cluster / TMA / wgmma 所有 Hopper 新原语都需要 architecture-specific PTX,编译时务必 <code>-arch=sm_90a</code>。如果不带 <code>a</code> 后缀,nvcc 会让你用<strong>编译能过</strong>但运行时 illegal instruction 或者 PTX assembler error。</li>
-  <li><strong>gridDim 不整除 → launch 报错</strong>:见 §3.3。host 端处理 dynamic shape 时一定要先做整除检查并准备 fallback(降到 cluster=(1,1,1))。</li>
-  <li><strong>cluster size 与 occupancy 倒挂</strong>:cluster size 越大,可同时驻留的 cluster 越少。H100 一个 GPC 约 18 SM,cluster=8 时同 GPC 内顶多 2 个 cluster 并发,跨 GPC 也只能放 16 个 cluster(8 GPC × 2)。<code>cudaOccupancyMaxActiveClusters</code> 给出实际数。</li>
-  <li><strong>cluster 不跨 GPC</strong>:这是硬件约束,不能突破。即便你显式打开 <code>NonPortableClusterSizeAllowed</code> 把 size 拉到 16,16 个 CTA 也必须落在同一个 GPC,而一个 GPC SM 数有限,会让某些 SKU(尤其是阉割版)直接拒绝 launch。</li>
-  <li><strong>DSMEM 不能跨 cluster</strong>:<code>map_shared_rank(ptr, k)</code> 的 k 只能在当前 cluster 内取值。跨 cluster 沟通仍然只能走 global。</li>
-  <li><strong>cluster mbarrier 的 arrive 必须用 cluster scope 变体</strong>:对远端 mbarrier 直接用普通 <code>mbarrier.arrive</code> 是<strong>未定义行为</strong>(可能编出指令但不会通过 SM-to-SM 网络发出)。<code>cuda::barrier</code> 包装层会按指针 address space 自动选,但写 inline PTX 时要自己写对 <code>.shared::cluster</code> 后缀。</li>
-  <li><strong>cluster 内 CTA rank 编号</strong>:用 <code>cluster.block_rank()</code> 而不是 <code>blockIdx</code>。<code>blockIdx</code> 是全 grid 的 rank,跨 cluster 间会跳变。</li>
-  <li><strong>CUTLASS 的 cluster size 动态选取</strong>:<code>GemmUniversal::Arguments</code> 里可以填运行时 cluster shape,但<strong>实际可选的</strong> shape 受 ClusterShape_MNK 这个模板参数约束(CUTLASS 在 collective builder 阶段会按这个 shape 生成对应的 PipelineTmaAsync stage 数和 DSMEM 路由)。运行时只能在<strong>不变 stage 数</strong>的前提下变 cluster shape。</li>
+  <li><strong><code>sm_90</code> 与 <code>sm_90a</code></strong>：PTX ISA 8.5 将 cluster、<code>.shared::cluster</code> 和 TMA bulk copy 的最低目标写为 <code>sm_90</code>。TMA multicast 在该版本中建议使用 <code>sm_90a</code>；其它 WGMMA 变体应分别检查各自的 Target ISA Notes。</li>
+  <li><strong>grid 与 cluster shape</strong>：grid 的每一维必须能被 cluster 对应维整除。动态问题尺寸应选择经过验证的 launch 配置；fallback 是应用或库的显式策略，不是 CUDA 自动行为。</li>
+  <li><strong>occupancy</strong>：更大的 cluster 可能降低最大活跃 block 数，但不能用假定的 SM/GPC 数直接计算并发 cluster。使用 <code>cudaOccupancyMaxPotentialClusterSize()</code> 和 <code>cudaOccupancyMaxActiveClusters()</code> 查询。</li>
+  <li><strong>单 GPC 保证</strong>：同一 cluster 的 block 被调度到一个 GPC。H100 的 16-CTA non-portable cluster 仍需 opt-in，实际支持情况由 occupancy API 判断。</li>
+  <li><strong>DSMEM 作用域</strong>：<code>map_shared_rank(ptr, rank)</code> 的目标必须属于当前 cluster。该接口不提供跨 cluster 的 shared-memory 地址。</li>
+  <li><strong>远端 mbarrier</strong>：目标必须是有效的 <code>.shared::cluster</code> 地址，并且只能使用 PTX 支持表允许的远端操作。远端 wait 不受支持；owner CTA 应在本地 <code>.shared::cta</code> 地址上等待。</li>
+  <li><strong>cluster rank</strong>：使用 <code>cluster.block_rank()</code> 获取 cluster 内逻辑 rank；<code>blockIdx</code> 仍表示 grid 内 block 坐标。</li>
+  <li><strong>CUTLASS preferred/fallback</strong>：固定 commit 的 helper 接受调用者提供的两组 shape。它不证明 <code>GemmUniversal::Arguments</code> 可在不重新实例化 kernel 的情况下接受任意 cluster shape，也不代表库会自动搜索最优 fallback。</li>
 </ol>
 
 <hr>
 
 <h2 id="zh-refs">参考资料</h2>
 <ul>
-  <li><a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html" target="_blank" rel="noopener">CUDA C++ Programming Guide</a>:Thread Block Cluster、Distributed Shared Memory、cluster launch 与 Cooperative Groups 编程接口。</li>
-  <li><a href="https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EXECUTION.html" target="_blank" rel="noopener">CUDA Runtime API: execution control</a>:<code>cudaLaunchKernelEx</code>、<code>cudaLaunchConfig_t</code> 与 launch attribute。</li>
-  <li><a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html" target="_blank" rel="noopener">PTX ISA</a>:<code>barrier.cluster</code>、cluster-scope <code>mbarrier</code>、<code>.shared::cluster</code>、<code>mapa</code>、cluster special registers。</li>
-  <li><a href="https://github.com/NVIDIA/cutlass" target="_blank" rel="noopener">NVIDIA CUTLASS / CuTe</a>:Hopper GEMM、TMA pipeline、cluster shape 与 CuTe DSL 示例。</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/12.6.3/cuda-c-programming-guide/index.html#thread-block-clusters" target="_blank" rel="noopener">CUDA C++ Programming Guide 12.6.3：Thread Block Clusters</a>。</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/12.6.3/hopper-tuning-guide/index.html#thread-block-clusters" target="_blank" rel="noopener">Hopper Tuning Guide 12.6.3：Thread Block Clusters</a>。</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/12.6.3/cuda-runtime-api/group__CUDART__EXECUTION.html" target="_blank" rel="noopener">CUDA Runtime API 12.6.3：Execution Control</a>。</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/12.6.3/parallel-thread-execution/index.html" target="_blank" rel="noopener">PTX ISA 8.5</a>：<code>barrier.cluster</code>、mbarrier、<code>.shared::cluster</code>、<code>mapa</code> 与 TMA。</li>
+  <li><a href="https://github.com/NVIDIA/cutlass/tree/ffa119a1255d78998536107466cc7097ecefa393" target="_blank" rel="noopener">NVIDIA CUTLASS commit <code>ffa119a</code></a>。</li>
 </ul>
 
 <hr>
@@ -922,100 +690,87 @@ tma_to_cluster.launch(grid=(2, 1, 1), block=(32, 1, 1),
 <!-- ============================= 英文版 ============================= -->
 <div class="lang-en">
 
-<h1>Hopper Cluster (CGA): DSMEM, Cluster-scope Barriers and Cross-CTA TMA</h1>
+<h1>Execution Semantics of Hopper Thread Block Clusters: DSMEM, Cluster Barriers, and Cross-CTA TMA</h1>
 
-<p>Hopper adds a new hardware-aware execution layer above the SM called <strong>Thread Block Cluster</strong> (Cooperative Grid Array, CGA). It groups several CTAs on the same GPC into a unit that is guaranteed to be co-resident and exposes cross-CTA primitives:</p>
+<p class="lead">A CUDA kernel normally consists of independently scheduled thread blocks, each with its own shared memory. Algorithms that exchange tiles or synchronize phases across block boundaries therefore tend to use global memory, atomics, or another kernel launch. Compute Capability 9.0 adds <strong>Thread Block Clusters</strong> as a CUDA-visible cooperation level above the block: several CTAs form a cluster, are co-scheduled on one GPC, and may use cluster-scope synchronization and distributed shared memory.</p>
 
-<p class="small">Version scope: this article follows the CUDA 12.x / Hopper SM90a CUDA C++ Programming Guide, CUDA Runtime API, and PTX ISA. NVIDIA's public docs specify the programming semantics for clusters, DSMEM, cluster-scope barriers / mbarriers, and <code>.shared::cluster</code>. The discussion of CWD, GPC-local scheduling, and routing tables is an engineering model inferred from those public semantics, not a verbatim NVIDIA microarchitecture contract.</p>
+<p class="small">Version scope: this article follows the <a href="https://docs.nvidia.com/cuda/archive/12.6.3/cuda-c-programming-guide/index.html#thread-block-clusters" target="_blank" rel="noopener">CUDA C++ Programming Guide 12.6.3</a>, <a href="https://docs.nvidia.com/cuda/archive/12.6.3/parallel-thread-execution/index.html" target="_blank" rel="noopener">PTX ISA 8.5</a>, and Hopper (Compute Capability 9.0). Only behavior defined by those public documents is treated as a guarantee. The internal implementation of resource dispatch, routing, and address translation is not public.</p>
 
 <table>
   <thead>
-    <tr><th>Capability</th><th>CUDA / PTX primitive</th><th>What it really is</th></tr>
+    <tr><th>Capability</th><th>CUDA / PTX primitive</th><th>Programming semantics</th></tr>
   </thead>
   <tbody>
-    <tr><td><strong>Distributed Shared Memory</strong></td><td><code>cluster.map_shared_rank()</code> / <code>__cluster_shared_*</code></td><td>Direct read/write of another CTA's smem over the SM-to-SM fabric</td></tr>
+    <tr><td><strong>Distributed Shared Memory</strong></td><td><code>cluster.map_shared_rank()</code> / PTX <code>mapa</code></td><td>Access to another CTA's shared memory within the cluster</td></tr>
     <tr><td><strong>Cluster barrier</strong></td><td><code>cluster.sync()</code> / <code>barrier.cluster.arrive</code></td><td>All threads in all CTAs of the cluster align</td></tr>
-    <tr><td><strong>Cluster mbarrier</strong></td><td><code>mbarrier.arrive.shared::cluster</code></td><td>Exposes an mbarrier across the cluster for cross-CTA arrive/wait</td></tr>
+    <tr><td><strong>Cluster mbarrier</strong></td><td><code>mbarrier.arrive.shared::cluster</code></td><td>Remote arrive; wait is performed by the CTA that owns the mbarrier</td></tr>
     <tr><td><strong>TMA → shared::cluster</strong></td><td><code>cp.async.bulk.tensor.*.shared::cluster.global</code></td><td>Bulk async copy that lands data into another CTA's smem</td></tr>
   </tbody>
 </table>
 
-<p>Together they form the hardware backbone for Hopper GEMM (WGMMA), FlashAttention v3, and the CUTLASS 3.x producer-consumer pipeline.</p>
-
-<hr>
-
-<h2 id="en-1">1. Why clusters</h2>
-
-<p>Before Hopper, the only legal cross-CTA communication path was global memory through L2. Even when two CTAs happened to land on neighbouring SMs, the language model treated them as remote:</p>
-
-<ul>
-  <li>One CTA's smem was <strong>invisible</strong> to another; data had to round-trip through global memory.</li>
-  <li>Cross-CTA sync used <code>__threadfence()</code> + atomic + spin: coarse and expensive.</li>
-  <li>When a GEMM producer-consumer pipeline was split across multiple CTAs, the intermediate tile had to land in L2 or global, which essentially threw away smem reuse.</li>
-</ul>
-
-<p>Hopper adds a <strong>GPC</strong> (Graphics Processing Cluster) layer between the SM and the GPU (H100 has 8 GPCs, ~18 SMs each). Within a GPC, SMs are linked by a direct SM-to-SM network with much higher bandwidth than the L2 exit. The cluster construct exposes that hardware to the programming model: it schedules a group of CTAs onto the <strong>same GPC</strong> and lets them read each other's smem and share barriers.</p>
-
-<hr>
-
-
-<h2 id="en-2">2. How the hardware guarantees CTA co-residency</h2>
-
-<p>§1 listed the capabilities clusters expose; understanding their hardware basis means looking at what Hopper changed in the work distributor. Before Hopper, the CWD (Compute Work Distributor) streamed CTAs one at a time to any free SM and offered no "simultaneity" guarantee. Hopper promotes the cluster into an <strong>atomic scheduling unit</strong>, with four pieces that make it real.</p>
-
-<h3 id="en-2-1">2.1 Atomic dispatch by the CWD</h3>
-
-<ul>
-  <li>The CWD knows the SM ↔ GPC topology and maintains a <strong>per-GPC free-SM counter</strong>.</li>
-  <li>A pending cluster of $N$ CTAs sits in the CWD queue until <strong>some single GPC has $\ge N$ free SMs</strong>. While no GPC can muster $N$ slots, the cluster waits.</li>
-  <li>Dispatch is <strong>atomic</strong>: all $N$ CTAs enter the running state in the same cycle. Either all $N$ go in together, or none. There is no "ship 2 now, queue the other 2" intermediate state.</li>
-</ul>
-
-<p>This is what makes co-residency true at launch time, not stitched together post hoc.</p>
-
-<h3 id="en-2-2">2.2 GPC is a hard constraint (no cross-GPC clusters)</h3>
-
-<p>The CWD's admission check is not "the GPU as a whole has $N$ free SMs" but "<strong>some single GPC has $N$ free SMs</strong>." The reason: every cross-CTA primitive (DSMEM, cluster mbarrier, TMA into <code>shared::cluster</code>) runs over the GPC-local SM-to-SM fabric, which physically does not cross GPCs.</p>
-
-<p>A H100 GPC has roughly 18 SMs, so the portable cap of 8 is both a historical safety margin and headroom for other clusters to be co-resident within the same GPC.</p>
-
-<h3 id="en-2-3">2.3 Once resident, gang-locked and not evicted in isolation</h3>
-
-<p>After a cluster is dispatched onto SMs, the Hopper scheduler enforces a gang-scheduling lock:</p>
-
-<ul>
-  <li>A cluster CTA cannot be evicted while its peers keep running (ordinary CTAs have no such protection).</li>
-  <li>A cluster CTA cannot migrate between SMs.</li>
-  <li>Exit is collective: only after every CTA of the cluster exits does the resource bundle return to the CWD.</li>
-</ul>
-
-<p>This guarantees "continuous co-residency across the cluster's lifetime," not just "co-resident at launch."</p>
-
-<h3 id="en-2-4">2.4 Resource reservation and the address-translation table</h3>
-
-<p>The dispatch cycle simultaneously does several things:</p>
-
-<ul>
-  <li>Each CTA gets its full RF / smem / barrier-slot allocation on its SM (identical to a non-cluster CTA).</li>
-  <li>The CWD assigns the cluster a <strong>cluster ID</strong> and configures the GPC's SM-to-SM peer routing table: when a CTA issues a <code>shared::cluster</code> access, the fabric uses (cluster ID, target block_rank) to route the request to the correct peer SM's smem.</li>
-  <li>Each CTA receives a hardware-assigned <strong>cluster-local rank</strong> (what <code>cluster.block_rank()</code> returns); it is not a function of <code>blockIdx</code>.</li>
-  <li>The <strong>DSMEM address-translation table</strong> is populated: pointers returned by <code>cluster.map_shared_rank(local_smem, k)</code> are translated by the SM's MMU into "the target SM's smem base + the same offset". The table is written once at dispatch time and stays put for the cluster's lifetime.</li>
-</ul>
-
-<p>If any of these resources cannot be satisfied (RF / smem exceeds the SM cap, routing-table slots are exhausted, etc.), the CWD rejects the dispatch and the cluster never enters running.</p>
-
-<h3 id="en-2-5">2.5 Two admission failure modes</h3>
-
-<ul>
-  <li><strong>Permanently infeasible</strong>: cluster size exceeds the SM count of a single GPC, or the kernel's RF / smem demand prevents any GPC from holding $N$ CTAs at once. The driver fails at <code>cudaLaunchKernelEx</code> time with <code>cudaErrorLaunchOutOfResources</code> or <code>cudaErrorInvalidConfiguration</code>. Once launch succeeds, the hardware has committed that at least one cluster of this configuration can be resident.</li>
-  <li><strong>Temporarily infeasible</strong>: another kernel is using the SMs. The cluster waits in the CWD queue. This is ordinary pipeline backpressure, the same as a regular CTA queue.</li>
-</ul>
-
-<p><code>cudaOccupancyMaxActiveClusters()</code> exposes "how many clusters of this configuration can be co-resident inside a GPC," which is the exact quantity the CWD's admission logic computes. A return value of 0 means the chosen cluster shape is infeasible for the current kernel's resource usage.</p>
-
-<div class="callout note">
-  <strong>In one line.</strong> The CWD became an <strong>atomic cluster-granularity scheduler</strong>; the GPC became a <strong>hard topology constraint</strong>; once resident the cluster is <strong>gang-locked and indivisible</strong>; the SM-to-SM <strong>routing table is configured once at dispatch time</strong>. From PTX you only see "these $N$ CTAs definitely run concurrently and can share smem," but it is delivered by the CWD, the GPC fabric, the resource manager, and the MMU working together.
+<div class="diagram-frame">
+<svg class="diagram-svg" viewBox="0 0 940 430" role="img" aria-labelledby="en-cluster-model-title en-cluster-model-desc">
+  <title id="en-cluster-model-title">CUDA-visible cooperation semantics of a Thread Block Cluster</title>
+  <desc id="en-cluster-model-desc">A schematic cluster contains four CTAs. Each CTA retains local shared memory, DSMEM address mapping reaches a peer CTA's shared memory, cluster barriers provide cluster-wide synchronization, and TMA may copy data to a shared-cluster address. The diagram does not represent physical interconnects inside a GPC.</desc>
+  <defs><marker id="en-cluster-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path></marker></defs>
+  <rect class="cluster-box" x="130" y="54" width="680" height="280" rx="8"></rect>
+  <text x="470" y="38" text-anchor="middle" font-size="17" font-weight="600">Thread Block Cluster</text>
+  <text class="muted" x="470" y="326" text-anchor="middle" font-size="12">co-scheduled in one GPC (CUDA guarantee)</text>
+  <g><rect class="cta-box" x="166" y="92" width="132" height="126" rx="5"></rect><text x="232" y="120" text-anchor="middle" font-size="15" font-weight="600">CTA rank 0</text><rect class="smem-box" x="184" y="146" width="96" height="46" rx="4"></rect><text x="232" y="174" text-anchor="middle" font-size="12">local smem</text></g>
+  <g><rect class="cta-box" x="324" y="92" width="132" height="126" rx="5"></rect><text x="390" y="120" text-anchor="middle" font-size="15" font-weight="600">CTA rank 1</text><rect class="smem-box" x="342" y="146" width="96" height="46" rx="4"></rect><text x="390" y="174" text-anchor="middle" font-size="12">local smem</text></g>
+  <g><rect class="cta-box" x="482" y="92" width="132" height="126" rx="5"></rect><text x="548" y="120" text-anchor="middle" font-size="15" font-weight="600">CTA rank 2</text><rect class="smem-box" x="500" y="146" width="96" height="46" rx="4"></rect><text x="548" y="174" text-anchor="middle" font-size="12">local smem</text></g>
+  <g><rect class="cta-box" x="640" y="92" width="132" height="126" rx="5"></rect><text x="706" y="120" text-anchor="middle" font-size="15" font-weight="600">CTA rank 3</text><rect class="smem-box" x="658" y="146" width="96" height="46" rx="4"></rect><text x="706" y="174" text-anchor="middle" font-size="12">local smem</text></g>
+  <path class="edge" d="M280 169 C304 244 476 244 500 169" marker-end="url(#en-cluster-arrow)"></path><text class="muted" x="390" y="263" text-anchor="middle" font-size="12">map_shared_rank / shared::cluster</text>
+  <rect class="cta-box" x="828" y="124" width="92" height="58" rx="4"></rect><text x="874" y="149" text-anchor="middle" font-size="13">Global</text><text class="muted" x="874" y="168" text-anchor="middle" font-size="11">memory</text>
+  <path class="edge" d="M824 153 L758 169" marker-end="url(#en-cluster-arrow)"></path><text class="muted" x="793" y="143" text-anchor="middle" font-size="12">TMA</text>
+  <rect class="cta-box" x="346" y="278" width="248" height="44" rx="4"></rect><text x="470" y="305" text-anchor="middle" font-size="13">cluster barrier / cluster mbarrier</text>
+  <text class="muted" x="470" y="390" text-anchor="middle" font-size="13">Logical programming model; physical GPC routing, ports, and distance are not shown</text>
+</svg>
 </div>
+
+<p>CUTLASS Hopper kernels combine cluster shapes, TMA, and mbarriers according to the selected kernel schedule. A pinned source revision therefore provides a concrete link between the CUDA programming model and a complete GEMM launch configuration.</p>
+
+<hr>
+
+<h2 id="en-1">1. Cluster cooperation scope</h2>
+
+<p>The Thread Block Cluster programming contract combines membership, common residency, and cluster-scope operations. The cluster shape in the launch configuration partitions the grid into CTA groups, and CUDA guarantees that the CTAs in one group are co-scheduled on a single GPC. Inside the kernel, Cooperative Groups exposes the logical rank and shape, while <code>cluster.sync()</code> establishes phase boundaries across the group.</p>
+
+<p>DSMEM brings the shared-memory allocations of those CTAs into one addressable scope. A CTA writes data to its local shared memory; after cluster synchronization, a peer maps the corresponding address for the target rank through <code>map_shared_rank()</code> and accesses the data. Membership, synchronization, and address mapping together form a cross-CTA producer-consumer protocol whose scope ends at the current cluster.</p>
+
+<hr>
+
+
+<h2 id="en-2">2. CUDA Contract and Evidence Boundary</h2>
+
+<p>Cluster correctness rests on CUDA's contracts for scheduling, address spaces, and synchronization. The public guides specify the observable behavior needed by a program; internal topology and capacity claims require separate public evidence or measurements on the target device.</p>
+
+<h3 id="en-2-1">2.1 CUDA co-scheduling guarantee</h3>
+
+<p>The <a href="https://docs.nvidia.com/cuda/archive/12.6.3/cuda-c-programming-guide/index.html#thread-block-clusters" target="_blank" rel="noopener">CUDA 12.6.3 Programming Guide</a> states that thread blocks in a cluster are co-scheduled. This guarantee establishes the common-residency condition needed by <code>cluster.sync()</code> and DSMEM; it applies over the cluster's execution lifetime rather than defining an internal clock-cycle state.</p>
+
+<h3 id="en-2-2">2.2 Single-GPC constraint</h3>
+
+<p>The same guide guarantees that all thread blocks in a cluster are scheduled on a <strong>single GPC</strong>. This portable constraint fixes the placement boundary of the cooperation scope. Resource dispatch and DSMEM routing inside that GPC remain separate microarchitectural questions.</p>
+
+<h3 id="en-2-3">2.3 Resource feasibility queries</h3>
+
+<p>Cluster feasibility and concurrency depend on the device, MIG configuration, cluster shape, and kernel resource use. CUDA provides two relevant queries:</p>
+
+<ul>
+  <li><a href="https://docs.nvidia.com/cuda/archive/12.6.3/cuda-runtime-api/group__CUDART__OCCUPANCY.html" target="_blank" rel="noopener"><code>cudaOccupancyMaxPotentialClusterSize()</code></a> queries the maximum cluster size supported by a launch configuration.</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/12.6.3/cuda-runtime-api/group__CUDART__OCCUPANCY.html" target="_blank" rel="noopener"><code>cudaOccupancyMaxActiveClusters()</code></a> estimates the number of active clusters for a configuration. The <a href="https://docs.nvidia.com/cuda/archive/12.6.3/hopper-tuning-guide/index.html#thread-block-clusters" target="_blank" rel="noopener">Hopper Tuning Guide 12.6.3</a> recommends using it for cluster-kernel occupancy.</li>
+</ul>
+
+<p>These APIs combine device capability, MIG configuration, and kernel resource use into runtime feasibility and occupancy results. Applications select configurations from the query values and launch return codes; the internal admission structures are outside the interface contract.</p>
+
+<h3 id="en-2-4">2.4 DSMEM address semantics</h3>
+
+<p>At the C++ level, <code>cluster.map_shared_rank(ptr, rank)</code> maps a shared-memory address in the current CTA to the corresponding address in another CTA of the cluster. In PTX ISA 8.5, <a href="https://docs.nvidia.com/cuda/archive/12.6.3/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-mapa" target="_blank" rel="noopener"><code>mapa</code></a> produces the corresponding <code>.shared::cluster</code> address, while special registers such as <code>%cluster_ctarank</code> expose the logical rank. Together, these interfaces define the address space, target CTA, and instruction scope.</p>
+
+<h3 id="en-2-5">2.5 Scope of the public evidence</h3>
+
+<p>The hardware facts used here are limited to semantics directly supported by CUDA 12.6.3, PTX ISA 8.5, the Hopper Tuning Guide, and the pinned CUTLASS source. Work distribution, GPC-local resource allocation, and the physical organization of DSMEM routing are outside this execution model. Kernel correctness relies only on the public guarantees for co-scheduling, one-GPC placement, DSMEM addresses, and cluster synchronization.</p>
 
 <hr>
 
@@ -1023,35 +778,35 @@ tma_to_cluster.launch(grid=(2, 1, 1), block=(32, 1, 1),
 
 <h3 id="en-3-1">3.1 Shape and hierarchy</h3>
 
-<p>The Hopper hierarchy:</p>
+<p>With clusters included, the hierarchy relevant to this discussion is:</p>
 
 <pre class="code">grid  --&gt;  cluster  --&gt;  block (CTA)  --&gt;  warp  --&gt;  thread</pre>
 
-<p>A cluster's shape is a 3D tuple <code>(cluster_dim.x, cluster_dim.y, cluster_dim.z)</code> describing how many CTAs the cluster contains and how they are arranged. Common configurations:</p>
+<p>A cluster shape is the 3D tuple <code>(cluster_dim.x, cluster_dim.y, cluster_dim.z)</code>. It specifies both the CTA count and their logical arrangement. Common configurations include:</p>
 
 <ul>
-  <li><code>(2, 1, 1)</code>: 1D, 2 CTAs. The typical Hopper GEMM producer/consumer pair.</li>
-  <li><code>(2, 2, 1)</code>: 2D, 4 CTAs. A small consumer fan-out.</li>
-  <li><code>(4, 2, 1)</code>: 2D, 8 CTAs. The portable upper bound.</li>
+  <li><code>(2, 1, 1)</code>: one-dimensional, 2 CTAs.</li>
+  <li><code>(2, 2, 1)</code>: two-dimensional, 4 CTAs.</li>
+  <li><code>(4, 2, 1)</code>: two-dimensional, 8 CTAs, the portable upper bound.</li>
 </ul>
 
 <h3 id="en-3-2">3.2 Size limits</h3>
 
 <ul>
-  <li><strong>Portable cap: 8 CTAs</strong>, supported on every sm_90 device.</li>
-  <li><strong>Non-portable cap: 16 CTAs</strong>, requires the <code>cudaLaunchAttributeNonPortableClusterSizeAllowed</code> attribute at launch and is only available on some SKUs. Production code defaults to 8.</li>
-  <li>A cluster cannot cross GPC boundaries; larger clusters mean fewer resident clusters in flight.</li>
+  <li>CUDA defines <strong>8 CTAs as the portable cluster-size limit</strong>; smaller GPUs or MIG configurations may support fewer than 8.</li>
+  <li>The <a href="https://docs.nvidia.com/cuda/archive/12.6.3/hopper-tuning-guide/index.html#thread-block-clusters" target="_blank" rel="noopener">Hopper Tuning Guide 12.6.3</a> says H100 supports a non-portable 16-CTA cluster after opt-in with <code>cudaFuncSetAttribute(..., cudaFuncAttributeNonPortableClusterSizeAllowed, 1)</code>.</li>
+  <li>Use <code>cudaOccupancyMaxPotentialClusterSize()</code> for the device-specific limit instead of deriving it from a product name or an assumed SMs-per-GPC count.</li>
 </ul>
 
-<h3 id="en-3-3">3.3 <span class="tag">important</span> gridDim divisibility constraint</h3>
+<h3 id="en-3-3">3.3 gridDim divisibility constraint</h3>
 
-<p>Hopper requires <strong>each grid dimension to be divisible by the corresponding cluster dimension</strong>:</p>
+<p>The CUDA Programming Guide requires <strong>each grid dimension to be divisible by the corresponding cluster dimension</strong>:</p>
 
 <div class="eq">
   $$\text{gridDim.x} \bmod \text{clusterDim.x} \;=\; 0,\quad \text{gridDim.y} \bmod \text{clusterDim.y} \;=\; 0,\quad \text{gridDim.z} \bmod \text{clusterDim.z} \;=\; 0$$
 </div>
 
-<p>Violating any axis makes <code>cudaLaunchKernelEx</code> return <code>cudaErrorInvalidConfiguration</code> or <code>cudaErrorInvalidValue</code>. Common failure cases:</p>
+<p>A launch configuration that violates divisibility is invalid. Applications should check the API result instead of depending on a fixed error code. Common configurations:</p>
 
 <table>
   <thead><tr><th>gridDim</th><th>clusterDim</th><th>Result</th></tr></thead>
@@ -1064,23 +819,23 @@ tma_to_cluster.launch(grid=(2, 1, 1), block=(32, 1, 1),
   </tbody>
 </table>
 
-<p>How to handle this in production:</p>
+<p>Host code normally handles problem sizes through these configuration paths:</p>
 
 <ul>
-  <li><strong>Static GEMM (known M, N)</strong>: compute the grid on the host from the tile shape and make sure it aligns to the cluster. For cluster=(2,2,1), tile=128x128, that means M and N must be multiples of 256 (= 2 × 128); otherwise either pad or fall back to cluster=(1,1,1).</li>
-  <li><strong>Dynamic shape</strong>: check gridDim on the host, then downgrade the cluster shape (2x2 → 2x1 → 1x1) until everything is divisible, or use a persistent kernel with cluster size 1 as the fallback. CUTLASS 3.x's <code>TileScheduler</code> bakes this fallback in.</li>
-  <li><strong>Probe with <code>cudaOccupancyMaxActiveClusters()</code></strong>: returns the max clusters resident for a given cluster shape. A return value of 0 means the chosen shape is infeasible.</li>
+  <li><strong>Static problems</strong>: compute the grid from the tile count on the host and make every grid dimension divisible by the cluster shape. Padding or predicating boundary tiles is a kernel-specific decision.</li>
+  <li><strong>Dynamic problems</strong>: choose another compiled and validated cluster configuration, or use a non-cluster kernel. CUDA does not automatically downgrade an arbitrary shape to <code>(1,1,1)</code>.</li>
+  <li><strong>Occupancy queries</strong>: use <code>cudaOccupancyMaxPotentialClusterSize()</code> and <code>cudaOccupancyMaxActiveClusters()</code> to check the limits for the device and kernel.</li>
 </ul>
 
 <hr>
 
 <h2 id="en-4">4. Cluster size: compile-time vs runtime</h2>
 
-<p>Two mutually exclusive ways. CUTLASS uses one or the other depending on the template path.</p>
+<p>CUDA can bind the cluster shape to a kernel attribute or accept it from the host at launch. The two forms serve static algorithm configuration and runtime selection respectively; a kernel definition uses one form.</p>
 
 <h3 id="en-4-1">4.1 Compile-time: <code>__cluster_dims__(X, Y, Z)</code> kernel attribute</h3>
 
-<p>Annotate the kernel directly; nvcc bakes the value into PTX's <code>.reqnctapercluster</code>:</p>
+<p>Annotate the kernel directly so that its cluster shape is fixed with the kernel:</p>
 
 <pre class="code"><span class="cm">// kernel.cu — cluster size is fixed at (2, 2, 1)</span>
 <span class="kw">#include</span> &lt;cooperative_groups.h&gt;
@@ -1095,9 +850,9 @@ __global__ <span class="kw">__cluster_dims__</span>(2, 2, 1)
 }
 </pre>
 
-<p>With this style the kernel carries its cluster shape; the launch site does <strong>not</strong> need a separate cluster attribute (and supplying one would actually conflict). The driver reads the kernel's <code>.reqnctapercluster</code> and schedules accordingly.</p>
+<p>With this style the kernel carries its cluster shape. The launch site does <strong>not</strong> need a cluster attribute, and the shape cannot be changed at runtime.</p>
 
-<p>Good fit when the cluster shape is an algorithmic constant (e.g. the ClusterShape template parameter of a CUTLASS kernel) and never changes at runtime.</p>
+<p>The compile-time attribute fits algorithms whose cluster shape is part of the kernel configuration. CUTLASS's <code>ClusterShape</code> template parameter is one such static configuration.</p>
 
 <h3 id="en-4-2">4.2 Runtime: <code>cudaLaunchAttributeClusterDimension</code> via <code>cudaLaunchKernelEx</code></h3>
 
@@ -1128,11 +883,11 @@ config.numAttrs      = 1;
 cudaLaunchKernelEx(&amp;config, my_kernel, x);
 </pre>
 
-<p>Good fit when the cluster shape is chosen at runtime based on the problem (a GEMM picking 1x1 / 2x1 / 2x2 from M, N).</p>
+<p>The runtime attribute lets the host choose among validated shapes for the problem while reusing one kernel entry, for example selecting 1x1, 2x1, or 2x2 from GEMM dimensions M and N.</p>
 
 <h3 id="en-4-3">4.3 CUTLASS: <code>ClusterShape_MNK</code> template parameter</h3>
 
-<p>CUTLASS 3.x Hopper kernels (<code>cutlass::gemm::collective::CollectiveBuilder</code> / <code>cutlass::gemm::kernel::GemmUniversal</code>) take cluster shape as a template parameter:</p>
+<p>This discussion is pinned to CUTLASS commit <a href="https://github.com/NVIDIA/cutlass/tree/ffa119a1255d78998536107466cc7097ecefa393" target="_blank" rel="noopener"><code>ffa119a</code></a>. In that revision, the <a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/include/cutlass/gemm/collective/collective_builder.hpp" target="_blank" rel="noopener">Hopper collective builder</a> includes cluster shape in the kernel configuration:</p>
 
 <pre class="code"><span class="kw">using</span> ClusterShape_MNK = cute::Shape&lt;cute::_2, cute::_1, cute::_1&gt;;  <span class="cm">// 2x1x1 cluster</span>
 <span class="kw">using</span> TileShape_MNK    = cute::Shape&lt;cute::_128, cute::_256, cute::_64&gt;;
@@ -1153,22 +908,15 @@ cudaLaunchKernelEx(&amp;config, my_kernel, x);
     CollectiveEpilogue&gt;;
 </pre>
 
-<p>From this single <code>ClusterShape_MNK</code> CUTLASS does two things at once:</p>
+<p><code>ClusterShape_MNK</code> participates in collective and kernel-schedule instantiation, so it is not an arbitrary runtime knob. The pinned <a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/include/cutlass/cluster_launch.hpp#L1241-L1330" target="_blank" rel="noopener"><code>cluster_launch.hpp</code></a> constructs <code>cudaLaunchAttributeClusterDimension</code> and launches the kernel through <code>cudaLaunchKernelExC</code>.</p>
 
-<ol>
-  <li>Inside the kernel implementation it uses the matching <code>cluster_*</code> primitives (the WGMMA producer-consumer split, the target CTA rank for cross-CTA TMA, etc.);</li>
-  <li>At <strong>launch time</strong> <code>GemmUniversalAdapter::run()</code> automatically sets <code>cudaLaunchAttributeClusterDimension</code>. CUTLASS goes through the <strong>runtime attribute</strong> path (because one compiled binary may need different cluster sizes across problem shapes, which is a host-side decision).</li>
-</ol>
-
-<p>At the user level only the <code>ClusterShape_MNK</code> template parameter is visible, but under the hood it is exactly the <code>cudaLaunchKernelEx</code> flow from §4.2. CUTLASS's <code>device_kernel</code> launch helper also calls <code>cudaOccupancyMaxActiveClusters</code> and surfaces the divisibility error if the configuration is infeasible.</p>
-
-<p>Extra: CUTLASS also supports a <strong>dynamic cluster size</strong> (filled at runtime through <code>GemmUniversal::Arguments</code>) and routes it through <code>cudaLaunchAttributeClusterDimension</code>.</p>
+<p>The same file provides <a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/include/cutlass/cluster_launch.hpp#L1414-L1473" target="_blank" rel="noopener"><code>launch_with_fallback_cluster()</code></a>. Its caller supplies both preferred and fallback shapes; when preferred-cluster attributes are enabled, the helper launches with the fallback dimension and records the preferred shape in the corresponding attribute. The helper launches two configurations already selected by its caller, while configuration search remains an upper-layer responsibility.</p>
 
 <hr>
 
 <h2 id="en-5">5. Runtime launch API: full <code>cudaLaunchKernelEx</code> signature</h2>
 
-<p>The classic <code>kernel&lt;&lt;&lt;grid, block, smem, stream&gt;&gt;&gt;(args)</code> does not let you pass launch attributes (it lowers to <code>cudaLaunchKernel</code>), so cluster work has to go through <code>cudaLaunchKernelEx</code>.</p>
+<p>A runtime cluster shape requires <code>cudaLaunchKernelEx</code> so that launch attributes can be supplied. A kernel with a compile-time <code>__cluster_dims__</code> annotation can still use the classic <code>&lt;&lt;&lt;...&gt;&gt;&gt;</code> syntax.</p>
 
 <pre class="code"><span class="kw">cudaError_t</span> cudaLaunchKernelEx(
     <span class="kw">const</span> cudaLaunchConfig_t* config,
@@ -1194,8 +942,8 @@ cudaLaunchKernelEx(&amp;config, my_kernel, x);
 
 <ul>
   <li><code>cudaLaunchAttributeClusterDimension</code>: pass the cluster shape</li>
-  <li><code>cudaLaunchAttributeNonPortableClusterSizeAllowed</code>: allow sizes &gt; 8</li>
-  <li><code>cudaLaunchAttributeClusterSchedulingPolicyPreference</code>: pick <code>spread</code> (across GPCs) or <code>load_balancing</code> (default); affects scheduling preference, not correctness</li>
+  <li><code>cudaLaunchAttributeClusterSchedulingPolicyPreference</code>: a placement preference for different clusters across GPCs; it does not change the one-GPC guarantee for each cluster</li>
+  <li><code>cudaFuncAttributeNonPortableClusterSizeAllowed</code>: set with <code>cudaFuncSetAttribute</code> to opt into non-portable sizes on supported devices</li>
 </ul>
 
 <p>A complete host-side launch template (2x2x1 cluster, gridDim must divide by 2 × 2):</p>
@@ -1228,23 +976,25 @@ cudaLaunchKernelEx(&amp;config, my_kernel, x);
 }
 </pre>
 
-<p>If the kernel already carries <code>__cluster_dims__(2, 2, 1)</code>, drop the attribute block entirely; the driver derives the cluster grid from the kernel's own cluster shape.</p>
+<p>If the kernel carries <code>__cluster_dims__(2, 2, 1)</code>, launch it with the ordinary syntax; its cluster shape cannot be changed at launch.</p>
 
 <hr>
 
-<h2 id="en-6">6. Four core capabilities</h2>
+<h2 id="en-6">6. Collaboration Primitives and Execution Relationships</h2>
+
+<p>Co-scheduling establishes common residency; cross-CTA cooperation still needs addressing, synchronization, and asynchronous completion protocols. Cluster barriers delimit phases, DSMEM supplies remote shared-memory addresses, mbarriers track arrivals and transaction completion, and TMA connects asynchronous transfers to that state.</p>
 
 <h3 id="en-6-1">6.1 Cluster barrier</h3>
 
-<p>Aligns every thread of every CTA in the cluster:</p>
+<p>A cluster barrier is a synchronization operation covering all participating threads in the cluster. <code>cluster.sync()</code> waits for those threads to reach the same phase and establishes the documented memory visibility:</p>
 
 <pre class="code"><span class="kw">auto</span> cluster = cg::this_cluster();
 cluster.sync();                                   <span class="cm">// cluster-wide barrier</span>
 </pre>
 
-<p>Underneath it lowers to PTX's <code>barrier.cluster.arrive</code> + <code>barrier.cluster.wait</code>: a hardware fence on the SM-to-SM network, an order of magnitude cheaper than atomic-based cross-CTA sync through global.</p>
+<p>PTX ISA 8.5 provides the corresponding <a href="https://docs.nvidia.com/cuda/archive/12.6.3/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-barrier-cluster" target="_blank" rel="noopener"><code>barrier.cluster.arrive</code> / <code>barrier.cluster.wait</code></a> instructions. It defines participation and memory visibility, but neither a fixed latency nor a particular interconnect implementation.</p>
 
-<p>Common idiom: let every CTA finish phase 1 of a GEMM, then advance to phase 2 (the producer-to-consumer hand-off):</p>
+<p>In a staged GEMM, each CTA can finish loading its local tile before the cluster enters the cross-CTA consumption phase:</p>
 
 <pre class="code"><span class="cm">// Phase 1: each CTA stages its own A_tile / B_tile into local smem</span>
 load_tile_to_smem();
@@ -1257,7 +1007,7 @@ cluster.sync();                                   <span class="cm">// barrier ag
 
 <h3 id="en-6-2">6.2 Distributed Shared Memory (DSMEM)</h3>
 
-<p>A CTA can obtain a pointer to another in-cluster CTA's smem:</p>
+<p>DSMEM is an addressable space formed from the shared-memory allocations of CTAs in one cluster. Each allocation remains owned by its CTA, while peers obtain the corresponding address through rank mapping:</p>
 
 <pre class="code">__shared__ <span class="kw">float</span> local_buf[256];
 
@@ -1269,65 +1019,55 @@ cluster.sync();                                   <span class="cm">// barrier ag
 <span class="kw">float</span> v = peer_buf[threadIdx.x];                 <span class="cm">// cross-CTA smem read</span>
 </pre>
 
-<p>Semantics and access:</p>
+<p>Addressing and synchronization follow these rules:</p>
 
 <ul>
-  <li>At the language level it is a generic pointer; nvcc emits PTX with the <code>shared::cluster</code> address space (<code>ld.shared::cluster.b32</code>, <code>st.shared::cluster.b32</code>).</li>
-  <li>Latency is comparable to an L2 hit (~30 cycles), but the bandwidth is far higher than going through L2.</li>
+  <li>PTX uses <code>mapa.shared::cluster</code> to produce a cluster-scope address and provides load/store forms such as <code>ld.shared::cluster.b32</code> and <code>st.shared::cluster.b32</code>. Inspect the generated PTX/SASS for the toolchain in use.</li>
+  <li>The public guides do not define a fixed DSMEM latency or a bandwidth ratio relative to L2; those values must be measured on the target device.</li>
   <li>Synchronisation: before reading peer smem, the peer must have finished writing it. The canonical pattern is: peer writes → <code>cluster.sync()</code> → this CTA reads via <code>map_shared_rank</code>.</li>
 </ul>
 
 <h3 id="en-6-3">6.3 Cluster-scope mbarrier</h3>
 
-<p>An mbarrier (memory barrier) is a 64-bit smem object introduced in sm_80 that supports arrive/wait. Hopper extends its scope to the whole cluster:</p>
+<p>An mbarrier is an opaque, 8-byte-aligned 64-bit object in shared memory whose arrival count and transaction count represent asynchronous phase completion. PTX ISA 8.5 assigns local and remote operations according to owner and peer CTA roles:</p>
 
-<pre class="code"><span class="cm">// Put an mbarrier in some CTA's smem, e.g. rank=0</span>
-__shared__ <span class="kw">uint64_t</span> mbar;
+<pre class="code"><span class="cm">// PTX semantics: the owner CTA initializes the object in shared::cta</span>
+mbarrier.init.shared::cta.b64 [local_mbar], expected_arrivals;
+barrier.cluster.arrive;
+barrier.cluster.wait;
 
-<span class="kw">if</span> (cluster.block_rank() == 0 &amp;&amp; threadIdx.x == 0) {
-    asm <span class="kw">volatile</span>(<span class="cm">"mbarrier.init.shared::cluster.b64 [%0], %1;"</span>
-                 :: <span class="cm">"r"</span>(__cvta_generic_to_shared(&amp;mbar)),
-                    <span class="cm">"r"</span>(expected_arrivals));
-}
-cluster.sync();
+<span class="cm">// A peer maps the remote address and performs an arrive that returns no state</span>
+mapa.shared::cluster.u64 remote_mbar, local_mbar, owner_cta_rank;
+mbarrier.arrive.release.cluster.shared::cluster.b64 _, [remote_mbar];
 
-<span class="cm">// Other CTAs arrive on the mbarrier hosted by rank=0</span>
-<span class="kw">if</span> (threadIdx.x == 0) {
-    <span class="kw">uint64_t</span>* remote_mbar = cluster.map_shared_rank(&amp;mbar, 0);
-    asm <span class="kw">volatile</span>(<span class="cm">"mbarrier.arrive.shared::cluster.b64 _, [%0];"</span>
-                 :: <span class="cm">"r"</span>(__cvta_generic_to_shared(remote_mbar)));
-}
-
-<span class="cm">// rank=0 waits for expected_arrivals arrivals</span>
-<span class="kw">if</span> (cluster.block_rank() == 0 &amp;&amp; threadIdx.x == 0) {
-    asm <span class="kw">volatile</span>(<span class="cm">"mbarrier.try_wait.shared::cluster.b64 ...;"</span> : ...);
-}
+<span class="cm">// The owner waits through its local shared::cta address</span>
+mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 done, [local_mbar], phase;
 </pre>
 
-<p>Use case: park the pipeline state token on an mbarrier; the producer arrives at each stage boundary, the consumer waits until N arrivals are collected and then consumes. Hopper's TMA pipeline (including <code>cutlass::PipelineTmaAsync</code>) is built on this model.</p>
+<p>The <a href="https://docs.nvidia.com/cuda/archive/12.6.3/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-init" target="_blank" rel="noopener">PTX ISA 8.5 support table</a> allows <code>arrive</code>, <code>expect_tx</code>, and <code>complete_tx</code> on a remote <code>.shared::cluster</code> mbarrier. Initialization, waiting, and the remaining operations use the owner's local <code>.shared::cta</code> address. A staged protocol can combine arrival counts and tx-count with producers, consumers, and asynchronous copies, with the kernel defining their phase relationship.</p>
 
 <h3 id="en-6-4">6.4 TMA → <code>shared::cluster</code></h3>
 
-<p>The TMA (Tensor Memory Accelerator) is Hopper's bulk-async DMA engine. Its target smem can be the <strong>local CTA's smem</strong> or <strong>another CTA's smem in the same cluster</strong>:</p>
+<p>The <a href="https://docs.nvidia.com/cuda/archive/12.6.3/hopper-tuning-guide/index.html#tensor-memory-accelerator" target="_blank" rel="noopener">Hopper Tuning Guide</a> describes TMA (Tensor Memory Accelerator) as an asynchronous copy engine. Its destination may be the <strong>local CTA's shared memory</strong> or <strong>another CTA's shared memory in the same cluster</strong>:</p>
 
 <pre class="code"><span class="cm">// PTX (sketch): bulk-async copy a 2D tile to a peer CTA's smem in the cluster</span>
 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
     [dst_smem_ptr_in_peer_cta], [tensor_map], {coord_x, coord_y}, [mbar_in_peer_cta];
 </pre>
 
-<p>Key points:</p>
+<p>The transaction relationships are:</p>
 
 <ul>
-  <li>The destination smem address is <strong>another CTA's smem base plus offset</strong>. One CTA can issue a TMA copy whose destination is any peer CTA in the cluster.</li>
-  <li>The complete_tx signal lands on the <strong>peer CTA's mbarrier</strong>, so the peer can use <code>mbarrier.wait</code> to learn that "my smem has just been filled by some producer CTA."</li>
-  <li>This is the hardware basis of Hopper's "single TMA → multi-consumer" pattern: one producer CTA issues a TMA copy that fills N consumer CTAs' smem in parallel, and the N consumers run wgmma concurrently.</li>
+  <li>The destination is in <code>.shared::cluster</code> and may refer to another CTA's shared memory in the cluster.</li>
+  <li><code>mbarrier::complete_tx::bytes</code> updates the selected mbarrier's tx-count when the copy completes. The owning CTA performs the wait through its local address.</li>
+  <li>A normal copy has one destination address. Copying to multiple CTAs requires explicit <code>.multicast::cluster</code> and a CTA mask. PTX ISA 8.5 requires <code>sm_90</code> or newer for these instructions and advises targeting <code>sm_90a</code> for multicast performance.</li>
 </ul>
 
 <hr>
 
 <h2 id="en-7">7. CUDA C++ examples</h2>
 
-<p>All examples assume H100 (sm_90) plus CUDA 12.x. The four examples progress from a minimal hello-cluster to a cross-CTA TMA copy.</p>
+<p>The first two examples use public CUDA 12.6.3 interfaces and compile for Compute Capability 9.0. The mbarrier and TMA parts remain at PTX semantics and pinned source references rather than presenting unverified wrapper code as runnable.</p>
 
 <h3 id="en-7-1">7.1 Example 1: Hello cluster, synchronising with <code>cluster.sync()</code></h3>
 
@@ -1360,13 +1100,13 @@ __global__ <span class="kw">__cluster_dims__</span>(2, 2, 1)
 </pre>
 
 <p class="caption">Compile:</p>
-<pre class="code">nvcc -arch=sm_90a -std=c++17 -O3 hello_cluster.cu -o hello_cluster
+<pre class="code">nvcc -arch=sm_90 -std=c++17 -O3 hello_cluster.cu -o hello_cluster
 ./hello_cluster
 </pre>
 
 <p>Notes:</p>
 <ul>
-  <li><code>-arch=sm_90a</code> instead of <code>sm_90</code>: cluster + TMA primitives all require architecture-specific PTX (the <code>a</code> suffix). With <code>sm_90</code> only generic PTX is emitted and the cluster primitives become unusable.</li>
+  <li>PTX ISA 8.5 requires <code>sm_90</code> or newer for cluster, <code>.shared::cluster</code>, and TMA bulk-copy instructions. Architecture-specific features such as the recommended TMA multicast path need separate consideration of <code>sm_90a</code>.</li>
   <li>The kernel carries <code>__cluster_dims__(2, 2, 1)</code>, so the launch site is plain <code>&lt;&lt;&lt;dim3(4,4,1), 32&gt;&gt;&gt;</code>. gridDim is 4 × 4 = 16 CTAs = 4 clusters; 4 % 2 = 0 satisfies the divisibility constraint.</li>
 </ul>
 
@@ -1419,280 +1159,69 @@ __global__ <span class="kw">void</span> dsmem_demo(<span class="kw">int</span>* 
 </pre>
 
 <p class="caption">Compile:</p>
-<pre class="code">nvcc -arch=sm_90a -std=c++17 -O3 dsmem_read.cu -o dsmem_read
+<pre class="code">nvcc -arch=sm_90 -std=c++17 -O3 dsmem_read.cu -o dsmem_read
 ./dsmem_read
 </pre>
 
-<h3 id="en-7-3">7.3 Example 3: Cluster mbarrier producer-consumer sync</h3>
+<p>The first four blocks form one cluster and produce the following values. The second cluster follows the same rank rotation:</p>
 
-<p>Two CTAs per cluster, rank=0 as producer and rank=1 as consumer. The producer writes to the consumer's smem and signals it via a cluster-scope mbarrier:</p>
-
-<pre class="code"><span class="cm">// mbarrier_pc.cu</span>
-<span class="kw">#include</span> &lt;cstdio&gt;
-<span class="kw">#include</span> &lt;cooperative_groups.h&gt;
-<span class="kw">#include</span> &lt;cuda/barrier&gt;
-<span class="kw">namespace</span> cg = cooperative_groups;
-
-__global__ <span class="kw">__cluster_dims__</span>(2, 1, 1)
-<span class="kw">void</span> producer_consumer(<span class="kw">int</span>* out) {
-    __shared__ <span class="kw">int</span> shared_buf[32];
-    __shared__ cuda::barrier&lt;cuda::thread_scope_block&gt; mbar;     <span class="cm">// mbarrier wrapper</span>
-
-    <span class="kw">auto</span> cluster = cg::this_cluster();
-    <span class="kw">int</span> rank = cluster.block_rank();
-
-    <span class="cm">// Every CTA inits its own mbarrier instance; rank=1's instance is the one signaled remotely</span>
-    <span class="kw">if</span> (threadIdx.x == 0) {
-        init(&amp;mbar, 32 + 1);          <span class="cm">// 1 remote producer arrival + 32 local consumer arrivals</span>
-    }
-    cluster.sync();                  <span class="cm">// all mbarriers initialised</span>
-
-    <span class="kw">if</span> (rank == 0) {
-        <span class="cm">// Producer: write to the consumer's shared_buf, then remote-arrive its mbarrier</span>
-        <span class="kw">int</span>* peer_buf  = cluster.map_shared_rank(shared_buf, 1);
-        <span class="kw">auto</span>* peer_mbar = cluster.map_shared_rank(&amp;mbar, 1);
-        peer_buf[threadIdx.x] = threadIdx.x * 7;
-
-        __syncthreads();                                  <span class="cm">// local-CTA sync</span>
-        <span class="kw">if</span> (threadIdx.x == 0) {
-            peer_mbar-&gt;arrive();                          <span class="cm">// mbarrier.arrive.shared::cluster</span>
-        }
-    } <span class="kw">else</span> {
-        <span class="cm">// Consumer: every local thread also arrives once, then waits, then reads its own smem</span>
-        <span class="kw">auto</span> tok = mbar.arrive();
-        mbar.wait(std::move(tok));                        <span class="cm">// wait for 32+1 arrivals</span>
-        out[threadIdx.x] = shared_buf[threadIdx.x];
-    }
-}
-
-<span class="kw">int</span> main() {
-    <span class="kw">int</span>* d_out; cudaMalloc(&amp;d_out, 32 * <span class="kw">sizeof</span>(<span class="kw">int</span>));
-    producer_consumer&lt;&lt;&lt;dim3(2, 1, 1), 32&gt;&gt;&gt;(d_out);    <span class="cm">// 1 cluster, 2 CTAs</span>
-    cudaDeviceSynchronize();
-    <span class="kw">int</span> h[32]; cudaMemcpy(h, d_out, <span class="kw">sizeof</span> h, cudaMemcpyDeviceToHost);
-    <span class="kw">for</span> (<span class="kw">int</span> i = 0; i &lt; 32; ++i) printf(<span class="cm">"%d "</span>, h[i]);
-}
+<pre class="code">block 0 read peer = 142      <span class="cm"># rank 0 reads rank 1: 1*100+42</span>
+block 1 read peer = 242
+block 2 read peer = 342
+block 3 read peer = 42       <span class="cm"># rank 3 reads rank 0: 0*100+42</span>
+...
 </pre>
 
-<p class="caption">Compile:</p>
-<pre class="code">nvcc -arch=sm_90a -std=c++17 -O3 mbarrier_pc.cu -o mbarrier_pc
-./mbarrier_pc
-</pre>
+<h3 id="en-7-3">7.3 mbarrier: follow the PTX support table</h3>
 
-<p>Notes:</p>
-<ul>
-  <li><code>cuda::barrier&lt;cuda::thread_scope_block&gt;</code> from <code>&lt;cuda/barrier&gt;</code> is the C++ wrapper that compiles down to mbarrier PTX. <code>arrive()</code> / <code>wait()</code> emit <code>mbarrier.arrive</code> / <code>mbarrier.try_wait</code>.</li>
-  <li>The peer mbarrier pointer comes from <code>cluster.map_shared_rank(&amp;mbar, 1)</code>. When the producer arrives on that pointer, nvcc automatically picks the <code>mbarrier.arrive.shared::cluster</code> variant (the destination is non-local smem inside the same cluster).</li>
-</ul>
+<p>A remote mbarrier protocol distinguishes the owner CTA from peer CTAs that access it. Initialization and waiting use the owner's <code>.shared::cta</code> address. A peer maps a <code>.shared::cluster</code> address with <code>mapa</code> and issues the remote operations listed by the ISA. The complete operation set and memory semantics are defined by <a href="https://docs.nvidia.com/cuda/archive/12.6.3/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-init" target="_blank" rel="noopener">PTX ISA 8.5 mbarrier</a>.</p>
 
-<h3 id="en-7-4">7.4 Example 4: TMA lands global data into a peer CTA's smem</h3>
+<h3 id="en-7-4">7.4 TMA: start from PTX and pinned source</h3>
 
-<p>The closest model to Hopper GEMM: one CTA issues a TMA bulk copy that fills its own and other in-cluster CTAs' smem at once. A trimmed version:</p>
-
-<pre class="code"><span class="cm">// tma_to_cluster.cu — trimmed version showing cp.async.bulk into peer smem</span>
-<span class="kw">#include</span> &lt;cstdio&gt;
-<span class="kw">#include</span> &lt;cooperative_groups.h&gt;
-<span class="kw">#include</span> &lt;cuda/barrier&gt;
-<span class="kw">namespace</span> cg = cooperative_groups;
-
-__global__ <span class="kw">__cluster_dims__</span>(2, 1, 1)
-<span class="kw">void</span> tma_demo(<span class="kw">const</span> __grid_constant__ CUtensorMap tmap, <span class="kw">int</span>* out) {
-    __shared__ <span class="kw">alignas</span>(128) <span class="kw">float</span> tile[256];                 <span class="cm">// 16×16 tile</span>
-    __shared__ cuda::barrier&lt;cuda::thread_scope_block&gt; mbar;
-
-    <span class="kw">auto</span> cluster = cg::this_cluster();
-    <span class="kw">int</span> rank = cluster.block_rank();
-
-    <span class="kw">if</span> (threadIdx.x == 0) init(&amp;mbar, 1);
-    cluster.sync();
-
-    <span class="kw">if</span> (rank == 0 &amp;&amp; threadIdx.x == 0) {
-        <span class="cm">// Address of peer (rank=1) tile inside the cluster smem space</span>
-        <span class="kw">float</span>* peer_tile = cluster.map_shared_rank(tile, 1);
-        <span class="kw">auto</span>*  peer_mbar = cluster.map_shared_rank(&amp;mbar, 1);
-
-        cuda::memcpy_async(peer_tile,
-                           &amp;tmap,
-                           {0 /* x */, 0 /* y */},
-                           <span class="kw">sizeof</span>(<span class="kw">float</span>) * 256,
-                           *peer_mbar);                <span class="cm">// TMA → peer smem, signals peer mbar</span>
-    }
-
-    <span class="kw">if</span> (rank == 1) {
-        <span class="kw">auto</span> tok = mbar.arrive();
-        mbar.wait(std::move(tok));                    <span class="cm">// wait for TMA write to land</span>
-        <span class="kw">if</span> (threadIdx.x &lt; 16) out[threadIdx.x] = (<span class="kw">int</span>)tile[threadIdx.x];
-    }
-}
-
-<span class="cm">// On the host, build tmap with cuTensorMapEncodeTiled / cuTensorMapEncodeIm2col</span>
-<span class="cm">// and launch with cudaLaunchKernelEx (omitted; see the bulk_tensor CUDA sample).</span>
-</pre>
-
-<p class="caption">Compile (with the CUDA driver API):</p>
-<pre class="code">nvcc -arch=sm_90a -std=c++17 -O3 \
-     -lcuda \
-     tma_to_cluster.cu -o tma_to_cluster
-</pre>
-
-<p>Notes:</p>
-<ul>
-  <li><code>cuda::memcpy_async</code> combined with <code>CUtensorMap</code> emits <code>cp.async.bulk.tensor.*</code> PTX. When the destination smem comes from <code>map_shared_rank</code>, nvcc picks the <code>shared::cluster</code> variant.</li>
-  <li><code>CUtensorMap</code> is constructed on the host with <code>cuTensorMapEncodeTiled()</code> (driver API), then passed in as a <code>__grid_constant__</code> kernel argument. Every TMA example needs this step.</li>
-  <li>Compile with <code>-lcuda</code> to link the driver API (the <code>cuTensorMap*</code> entry points live in the driver lib, not the runtime lib).</li>
-</ul>
+<p><a href="https://docs.nvidia.com/cuda/archive/12.6.3/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-tensor" target="_blank" rel="noopener">PTX ISA 8.5 <code>cp.async.bulk.tensor</code></a> defines asynchronous tensor copies between global memory and <code>.shared::cluster</code>, mbarrier completion, and optional multicast. C++ wrapper arguments, tensor-map construction, and synchronization protocols can change with the toolchain. Runnable implementations should follow a CUDA sample or CUTLASS source pinned to the project's version.</p>
 
 <hr>
 
-<h2 id="en-8">8. CuTe DSL (Python) examples</h2>
+<h2 id="en-8">8. Pinned CUTLASS source map</h2>
 
-<p>CUTLASS 4.x's Python frontend (under the <code>cutlass.cute</code> namespace) exposes cluster / DSMEM / TMA primitives directly and JIT-compiles them down to the same SASS as the C++ counterparts. Below mirrors the §7 examples.</p>
+<p>All links below are pinned to CUTLASS commit <a href="https://github.com/NVIDIA/cutlass/tree/ffa119a1255d78998536107466cc7097ecefa393" target="_blank" rel="noopener"><code>ffa119a</code></a>, so moving interfaces on <code>main</code> are not presented as stable APIs.</p>
 
-<p class="callout">A few API names below I am not 100% certain about (CuTe DSL is still moving fast in 2025); these are flagged inline. Relevant modules: <code>cutlass.cute.arch</code> (low-level PTX wrappers), <code>cutlass.cute</code> (layouts / tensors), <code>cutlass.cute.kernel</code> (kernel decorator), <code>cutlass.runtime</code> (launch).</p>
+<table>
+  <thead><tr><th>Topic</th><th>Pinned source</th><th>What it establishes</th></tr></thead>
+  <tbody>
+    <tr><td>Cluster primitives</td><td><a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/include/cute/arch/cluster_sm90.hpp" target="_blank" rel="noopener"><code>cluster_sm90.hpp</code></a></td><td><code>cluster_arrive</code>, <code>cluster_wait</code>, rank queries, and the <code>mapa</code> wrapper in this revision</td></tr>
+    <tr><td>TMA wrappers</td><td><a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/include/cute/arch/copy_sm90_tma.hpp" target="_blank" rel="noopener"><code>copy_sm90_tma.hpp</code></a></td><td>The TMA copy types and PTX wrappers used by this revision</td></tr>
+    <tr><td>Cluster launch</td><td><a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/include/cutlass/cluster_launch.hpp" target="_blank" rel="noopener"><code>cluster_launch.hpp</code></a></td><td>Cluster attributes, non-portable opt-in, and the preferred/fallback launch helper</td></tr>
+    <tr><td>Hopper GEMM</td><td><a href="https://github.com/NVIDIA/cutlass/tree/ffa119a1255d78998536107466cc7097ecefa393/examples/48_hopper_warp_specialized_gemm" target="_blank" rel="noopener">Example 48</a></td><td>Cluster shape in a complete Hopper GEMM configuration</td></tr>
+  </tbody>
+</table>
 
-<h3>8.1 Specifying cluster shape at launch</h3>
-
-<pre class="code"><span class="kw">import</span> cutlass
-<span class="kw">import</span> cutlass.cute <span class="kw">as</span> cute
-<span class="kw">from</span> cutlass.cute.kernel <span class="kw">import</span> kernel
-<span class="kw">from</span> cutlass.cute.arch <span class="kw">import</span> cluster_sync, this_cluster_rank   <span class="cm"># exact names may differ</span>
-
-@kernel(cluster_shape=(2, 2, 1))                  <span class="cm"># equivalent to C++ __cluster_dims__</span>
-<span class="kw">def</span> hello_cluster():
-    rank = this_cluster_rank()
-    cute.printf(<span class="cm">"cluster rank=%d, blockIdx=(%d,%d)\n"</span>,
-                rank, cute.block_idx().x, cute.block_idx().y)
-    cluster_sync()
-    cute.printf(<span class="cm">"after cluster_sync from rank %d\n"</span>, rank)
-
-<span class="cm"># launch</span>
-hello_cluster.launch(grid=(4, 4, 1), block=(32, 1, 1))   <span class="cm"># gridDim 4×4 % cluster 2×2 == 0</span>
-</pre>
-
-<p>Notes:</p>
-<ul>
-  <li><code>@kernel(cluster_shape=...)</code> mirrors C++ <code>__cluster_dims__</code> and is a compile-time constant; the launch site only needs grid and block. To choose cluster shape at runtime, set <code>cluster_shape=None</code> on the decorator and pass it at <code>launch(cluster_shape=...)</code> (which routes through <code>cudaLaunchAttributeClusterDimension</code>).</li>
-  <li><code>cute.block_idx()</code> / <code>cute.thread_idx()</code> are layout-aware indices and match CUDA's <code>blockIdx</code> / <code>threadIdx</code>.</li>
-</ul>
-
-<h3>8.2 DSMEM cross-CTA read</h3>
-
-<pre class="code"><span class="kw">from</span> cutlass.cute.arch <span class="kw">import</span> dsmem_ptr, cluster_block_rank, cluster_num_blocks
-
-@kernel(cluster_shape=(4, 1, 1))
-<span class="kw">def</span> dsmem_demo(out: cute.Tensor):
-    local_buf = cute.shared_alloc(cute.Int32, 1)        <span class="cm"># __shared__ int local_buf[1]</span>
-    rank      = cluster_block_rank()
-    n_cta     = cluster_num_blocks()
-
-    <span class="kw">if</span> cute.thread_idx().x == 0:
-        local_buf[0] = rank * 100 + 42
-    cluster_sync()                                       <span class="cm"># wait for peer write</span>
-
-    peer_rank = (rank + 1) % n_cta
-    peer_buf  = dsmem_ptr(local_buf, peer_rank)          <span class="cm"># equivalent to cluster.map_shared_rank()</span>
-    <span class="kw">if</span> cute.thread_idx().x == 0:
-        out[cute.block_idx().x] = peer_buf[0]
-    cluster_sync()
-</pre>
-
-<p>The C++ concepts map almost one-to-one. <code>cute.shared_alloc</code> is the explicit smem allocator, and <code>dsmem_ptr</code> wraps <code>cluster_group::map_shared_rank</code>.</p>
-
-<h3>8.3 Cluster mbarrier sync</h3>
-
-<pre class="code"><span class="kw">from</span> cutlass.cute.arch <span class="kw">import</span> mbarrier_init, mbarrier_arrive, mbarrier_wait, dsmem_ptr
-
-@kernel(cluster_shape=(2, 1, 1))
-<span class="kw">def</span> pc_demo(out: cute.Tensor):
-    shared_buf = cute.shared_alloc(cute.Int32, 32)
-    mbar       = cute.shared_alloc(cute.Uint64, 1)              <span class="cm"># one 64-bit mbarrier slot</span>
-
-    rank = cluster_block_rank()
-    tid  = cute.thread_idx().x
-
-    <span class="kw">if</span> tid == 0:
-        mbarrier_init(mbar, expected_arrivals=32 + 1)
-    cluster_sync()
-
-    <span class="kw">if</span> rank == 0:
-        peer_buf  = dsmem_ptr(shared_buf, 1)
-        peer_mbar = dsmem_ptr(mbar, 1)
-        peer_buf[tid] = tid * 7
-        cute.syncthreads()
-        <span class="kw">if</span> tid == 0:
-            mbarrier_arrive(peer_mbar)                          <span class="cm"># scope=cluster auto-selected</span>
-    <span class="kw">else</span>:
-        mbarrier_arrive(mbar)                                   <span class="cm"># local arrival too</span>
-        mbarrier_wait(mbar, phase=0)                            <span class="cm"># wait for 33 arrivals</span>
-        out[tid] = shared_buf[tid]
-</pre>
-
-<p class="callout warn">Note: whether <code>mbarrier_arrive</code> (and the automatic <code>shared::cluster</code> variant selection when the target is a peer smem pointer) uses these exact names depends on the CUTLASS Python release. In recent versions the entry points are under <code>cutlass.cute.arch.mbarrier</code> / similar. Defer to the <code>cutlass.cute.arch</code> module of your installed version.</p>
-
-<h3>8.4 TMA bulk-async copy into a peer CTA's smem</h3>
-
-<pre class="code"><span class="kw">from</span> cutlass.cute.arch <span class="kw">import</span> cp_async_bulk_tensor_to_shared_cluster, mbarrier_init, mbarrier_wait
-
-@kernel(cluster_shape=(2, 1, 1))
-<span class="kw">def</span> tma_to_cluster(A_gmem: cute.Tensor, A_tma_desc: cute.TmaDescriptor, out: cute.Tensor):
-    A_smem = cute.shared_alloc(cute.Float32, (16, 16))
-    mbar   = cute.shared_alloc(cute.Uint64, 1)
-
-    rank = cluster_block_rank()
-    tid  = cute.thread_idx().x
-
-    <span class="kw">if</span> tid == 0:
-        mbarrier_init(mbar, expected_arrivals=1)
-    cluster_sync()
-
-    <span class="kw">if</span> rank == 0 <span class="kw">and</span> tid == 0:
-        peer_smem = dsmem_ptr(A_smem, 1)
-        peer_mbar = dsmem_ptr(mbar, 1)
-        cp_async_bulk_tensor_to_shared_cluster(
-            dst        = peer_smem,
-            tma_desc   = A_tma_desc,
-            coord      = (0, 0),
-            mbar       = peer_mbar,
-        )
-
-    <span class="kw">if</span> rank == 1:
-        mbarrier_wait(mbar, phase=0)
-        <span class="kw">if</span> tid &lt; 16:
-            out[tid] = cute.Int32(A_smem[tid, 0])
-
-<span class="cm"># Host side: build the TMA descriptor and launch</span>
-A_desc = cute.TmaDescriptor.encode_tiled(A_gmem, tile_shape=(16, 16))
-tma_to_cluster.launch(grid=(2, 1, 1), block=(32, 1, 1),
-                       A_gmem=A_gmem, A_tma_desc=A_desc, out=out)
-</pre>
-
-<p class="callout warn">Same caveat: <code>cp_async_bulk_tensor_to_shared_cluster</code> is a semantic placeholder. The actual entry points live under <code>cutlass.cute.nvgpu.cpasync</code> or <code>cutlass.cute.tma</code> in current releases; check <code>python/cutlass/cute/arch.py</code> in the version you installed.</p>
-
-<p>Overall feel: the CuTe DSL turns "configure cluster shape" into a <strong>decorator</strong>, "DSMEM" into <code>dsmem_ptr</code>, "TMA" into <code>cp_async_bulk_*</code>. The semantics map one-to-one onto the C++ side; only the host-side attribute boilerplate disappears.</p>
+<p>CUTLASS Python and C++ interfaces both change across revisions. Code and source links should therefore be pinned to the commit or release used by the project.</p>
 
 <hr>
 
-<h2 id="en-9">9. Pitfalls and boundaries</h2>
+<h2 id="en-9">9. Compatibility and usage boundaries</h2>
 
 <ol>
-  <li><strong><code>sm_90a</code> vs <code>sm_90</code></strong>: cluster, TMA and wgmma all need architecture-specific PTX. Always compile with <code>-arch=sm_90a</code>; the plain <code>sm_90</code> target only emits generic PTX and will either fail to assemble or produce an illegal instruction at runtime.</li>
-  <li><strong>gridDim divisibility</strong>: see §3.3. Always check on the host before launching dynamic shapes and prepare a fallback (e.g. drop to cluster=(1,1,1)).</li>
-  <li><strong>Cluster size vs occupancy trade-off</strong>: larger clusters mean fewer resident clusters. A H100 GPC has ~18 SMs, so cluster=8 caps the in-GPC concurrency at about 2 clusters, and the device-wide limit is ~16 clusters (8 GPCs × 2). Use <code>cudaOccupancyMaxActiveClusters</code> to query the real number.</li>
-  <li><strong>Clusters do not cross GPCs</strong>: a hardware constraint, not configurable. Even with <code>NonPortableClusterSizeAllowed</code> enabled, 16 CTAs still have to live on a single GPC, and on the smaller SKUs the launch will be rejected outright.</li>
-  <li><strong>DSMEM does not cross clusters</strong>: <code>map_shared_rank(ptr, k)</code> requires <code>k</code> to be inside the current cluster. Cross-cluster communication still has to go through global.</li>
-  <li><strong>Cluster mbarrier arrivals must use the cluster-scope variant</strong>: hitting a remote mbarrier with a vanilla <code>mbarrier.arrive</code> is <strong>undefined behaviour</strong> (it may even assemble but the signal will not cross the SM-to-SM network). The <code>cuda::barrier</code> wrapper selects the right variant based on pointer address space; when writing inline PTX, supply the <code>.shared::cluster</code> qualifier explicitly.</li>
-  <li><strong>Use <code>cluster.block_rank()</code>, not <code>blockIdx</code>, for the in-cluster rank</strong>. <code>blockIdx</code> is grid-wide and jumps across cluster boundaries.</li>
-  <li><strong>Dynamic cluster size in CUTLASS</strong>: <code>GemmUniversal::Arguments</code> takes a runtime cluster shape, but the <strong>set of feasible shapes</strong> is bounded by the <code>ClusterShape_MNK</code> template parameter (the collective builder picks the PipelineTmaAsync stage count and DSMEM routing based on it). At runtime you can only vary cluster shape <strong>without changing stage count</strong>.</li>
+  <li><strong><code>sm_90</code> and <code>sm_90a</code></strong>: PTX ISA 8.5 lists <code>sm_90</code> as the minimum target for clusters, <code>.shared::cluster</code>, and TMA bulk copies. It advises <code>sm_90a</code> for TMA multicast; check the Target ISA Notes separately for each WGMMA variant.</li>
+  <li><strong>Grid and cluster shapes</strong>: every grid dimension must be divisible by the matching cluster dimension. Dynamic problems need a validated launch configuration. Fallback is explicit application or library policy, not automatic CUDA behavior.</li>
+  <li><strong>Occupancy</strong>: a larger cluster may reduce the maximum number of active blocks, but concurrency cannot be calculated from an assumed SMs-per-GPC count. Query <code>cudaOccupancyMaxPotentialClusterSize()</code> and <code>cudaOccupancyMaxActiveClusters()</code>.</li>
+  <li><strong>Single-GPC guarantee</strong>: all blocks of one cluster are scheduled on one GPC. H100's non-portable 16-CTA cluster still requires opt-in, and actual support should be queried.</li>
+  <li><strong>DSMEM scope</strong>: the target rank of <code>map_shared_rank(ptr, rank)</code> must belong to the current cluster. The API does not create a shared-memory address across clusters.</li>
+  <li><strong>Remote mbarrier</strong>: the target must be a valid <code>.shared::cluster</code> address and the operation must appear in the PTX remote-support table. Remote wait is unsupported; the owner CTA waits through its local <code>.shared::cta</code> address.</li>
+  <li><strong>Cluster rank</strong>: use <code>cluster.block_rank()</code> for the logical rank within the cluster. <code>blockIdx</code> remains the block coordinate within the grid.</li>
+  <li><strong>CUTLASS preferred/fallback</strong>: the pinned helper accepts two shapes supplied by its caller. It does not establish that <code>GemmUniversal::Arguments</code> accepts an arbitrary cluster shape without a different kernel instantiation, nor that the library searches for an optimal fallback.</li>
 </ol>
 
 <hr>
 
 <h2 id="en-refs">References</h2>
 <ul>
-  <li><a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html" target="_blank" rel="noopener">CUDA C++ Programming Guide</a>: Thread Block Cluster, Distributed Shared Memory, cluster launch, and Cooperative Groups APIs.</li>
-  <li><a href="https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EXECUTION.html" target="_blank" rel="noopener">CUDA Runtime API: execution control</a>: <code>cudaLaunchKernelEx</code>, <code>cudaLaunchConfig_t</code>, and launch attributes.</li>
-  <li><a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html" target="_blank" rel="noopener">PTX ISA</a>: <code>barrier.cluster</code>, cluster-scope <code>mbarrier</code>, <code>.shared::cluster</code>, <code>mapa</code>, and cluster special registers.</li>
-  <li><a href="https://github.com/NVIDIA/cutlass" target="_blank" rel="noopener">NVIDIA CUTLASS / CuTe</a>: Hopper GEMM, TMA pipelines, cluster shapes, and CuTe DSL examples.</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/12.6.3/cuda-c-programming-guide/index.html#thread-block-clusters" target="_blank" rel="noopener">CUDA C++ Programming Guide 12.6.3: Thread Block Clusters</a>.</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/12.6.3/hopper-tuning-guide/index.html#thread-block-clusters" target="_blank" rel="noopener">Hopper Tuning Guide 12.6.3: Thread Block Clusters</a>.</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/12.6.3/cuda-runtime-api/group__CUDART__EXECUTION.html" target="_blank" rel="noopener">CUDA Runtime API 12.6.3: Execution Control</a>.</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/12.6.3/parallel-thread-execution/index.html" target="_blank" rel="noopener">PTX ISA 8.5</a>: <code>barrier.cluster</code>, mbarrier, <code>.shared::cluster</code>, <code>mapa</code>, and TMA.</li>
+  <li><a href="https://github.com/NVIDIA/cutlass/tree/ffa119a1255d78998536107466cc7097ecefa393" target="_blank" rel="noopener">NVIDIA CUTLASS commit <code>ffa119a</code></a>.</li>
 </ul>
 
 <hr>

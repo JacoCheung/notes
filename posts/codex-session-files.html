@@ -5,15 +5,15 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Codex 会话持久化机制：rollout JSONL 与 SQLite 状态库</title>
 <meta name="post:title"           content="Codex 会话持久化机制：rollout JSONL 与 SQLite 状态库">
-<meta name="post:title_en"        content="Codex session persistence: rollout JSONL and SQLite state">
+<meta name="post:title_en"        content="Codex Session Persistence: Rollout JSONL and SQLite State">
 <meta name="post:slug"            content="codex-session-files">
 <meta name="post:date"            content="2026-07-21">
 <meta name="post:tags"            content="Codex, Agentic Coding, Session, 工程实践">
 <meta name="post:tags_en"         content="Codex, Agentic Coding, Session, Engineering">
 <meta name="post:reading"         content="9 分钟">
 <meta name="post:reading_en"      content="9 min">
-<meta name="post:summary"         content="以一个 10 轮 Codex 会话为例,梳理 rollout JSONL、session_index、state_5.sqlite、logs、goals、memories 和 SQLite WAL 文件的职责边界。">
-<meta name="post:summary_en"      content="A 10-turn Codex session example for understanding rollout JSONL, session_index, state_5.sqlite, logs, goals, memories, and SQLite WAL files.">
+<meta name="post:summary"         content="Codex 分别持久化会话事件、可恢复状态、日志和 memory，因此 ~/.codex 同时包含 rollout JSONL、SQLite 与 WAL。公开接口只保证逻辑职责；state_5.sqlite 等文件名和 schema 属于版本实现，排障与披露应按数据职责判断。">
+<meta name="post:summary_en"      content="Codex persists conversation events, resumable state, diagnostics, and memory as separate concerns, so ~/.codex contains rollout JSONL, SQLite databases, and WAL support files. Public interfaces guarantee these logical responsibilities, not filenames or schemas such as state_5.sqlite; troubleshooting and disclosure decisions should follow data roles rather than extensions.">
 <meta name="post:series"          content="agentic-coding-practice">
 <meta name="post:series_title"    content="Agentic Coding Practice">
 <meta name="post:series_title_en" content="Agentic Coding Practice">
@@ -57,39 +57,54 @@
 <body>
 <div class="layout">
   <aside class="toc">
-    <div class="toc-title">目录</div>
+    <div class="toc-title">目录 · TOC</div>
+    <div class="lang-zh">
     <ul>
-      <li><a href="#scope">1. 存储边界</a></li>
-      <li><a href="#turns">2. 10 轮会话写入路径</a></li>
-      <li><a href="#files">3. 文件职责</a></li>
-      <li><a href="#examples">4. 内容示例</a></li>
-      <li><a href="#share">5. 敏感数据边界</a></li>
-      <li><a href="#refs">参考资料</a></li>
+      <li><a href="#zh-scope">1. 存储边界</a></li>
+      <li><a href="#zh-turns">2. 10 轮会话写入路径</a></li>
+      <li><a href="#zh-files">3. 文件职责</a></li>
+      <li><a href="#zh-examples">4. 内容示例</a></li>
+      <li><a href="#zh-share">5. 敏感数据边界</a></li>
+      <li><a href="#zh-refs">参考资料</a></li>
     </ul>
     <a class="toc-back-to-top" href="#">↑ 回到顶部</a>
+    </div>
+    <div class="lang-en">
+    <ul>
+      <li><a href="#en-scope">1. Storage boundary</a></li>
+      <li><a href="#en-turns">2. A ten-turn write path</a></li>
+      <li><a href="#en-files">3. File responsibilities</a></li>
+      <li><a href="#en-examples">4. Content examples</a></li>
+      <li><a href="#en-share">5. Sensitive-data boundary</a></li>
+      <li><a href="#en-refs">References</a></li>
+    </ul>
+    <a class="toc-back-to-top" href="#">↑ Back to top</a>
+    </div>
   </aside>
 
 <main class="content">
 
+<div class="lang-zh">
+
 <h1>Codex 会话持久化机制：rollout JSONL 与 SQLite 状态库</h1>
 
-<p>Codex 的本地状态不是一个单一数据库。会话正文、列表索引、运行时状态、诊断日志和 memory 任务被拆在不同文件里。这种拆分有明确的工程目的:resume 需要顺序重放事件,列表页需要快速查询,后台 agent/job 需要断点恢复,日志需要单独服务排错。</p>
+<p>一条 Codex 会话会持续产生多种状态：用户与 assistant 的消息构成会话历史，工具调用和命令输出记录执行过程，thread 标题与工作目录用于列表和恢复，日志服务于故障诊断，memory 则保存后续任务可能复用的摘要。Codex 将这些信息分开持久化，因此 <code>~/.codex</code> 中会同时出现 JSONL、SQLite 数据库以及 SQLite 的 WAL 辅助文件。</p>
 
-<p>看到 <code>state_5.sqlite</code>、<code>logs_2.sqlite</code>、<code>rollout-*.jsonl</code> 时,不要先假设它们都保存了一份完整对话。真正接近 transcript 的是 rollout JSONL。SQLite 文件更多是索引、运行状态、日志、目标进度和 summary 管线。</p>
+<p>公开接口给出了这套存储的逻辑边界：session transcript 和持久化 thread log 位于 <code>CODEX_HOME</code>，其中 thread log 使用 JSONL；<code>sqlite_home</code> 保存 agent jobs 与其他可恢复运行状态。<code>state_5.sqlite</code>、<code>logs_2.sqlite</code> 等文件名及其 schema 属于具体版本的实现形态。一个 10 轮会话足以把各类文件的职责、排障入口和敏感性串联起来。</p>
 
 <div class="callout">
-下文的 JSONL 和 SQL 表都是示意,用来说明数据形态和职责边界,不是稳定 schema。<code>state_5.sqlite</code> 里的 <code>_5</code> 或具体表名也不应被当成公开接口。
+<strong>证据范围：</strong>下文用 schematic record 表示具体 JSONL 字段、SQLite 文件名、表名和列名，不把它们作为稳定的磁盘 schema。公开且受支持的集成入口是 app-server protocol 与配置项；内部文件不具备 API 兼容性承诺。
 </div>
 
-<h2 id="scope">1. 存储边界</h2>
+<h2 id="zh-scope">1. 存储边界</h2>
 
-<p><code>CODEX_HOME</code> 默认是 <code>~/.codex</code>。官方文档说它放 config、auth、logs、sessions、skills 和 standalone package metadata。<code>CODEX_SQLITE_HOME</code> 控制 SQLite-backed state 的位置,默认也在 <code>CODEX_HOME</code> 下。</p>
+<p><code>CODEX_HOME</code> 默认指向 <code>~/.codex</code>，用于保存 config、auth、logs、sessions、skills 和 standalone package metadata。<code>CODEX_SQLITE_HOME</code> 决定 SQLite-backed state 的位置；未单独配置时，它也位于 <code>CODEX_HOME</code> 下。</p>
 
-<p>本文只讨论本地持久化。远端同步、账号权限和产品侧 retention policy 不在这里展开。另一个边界也要先记住:官方文档确认了 <code>CODEX_HOME</code>、<code>CODEX_SQLITE_HOME</code>、session transcripts、archived sessions、thread rollout、SQLite-backed state DB 这些概念,但没有承诺 <code>state_5.sqlite</code> 里的表名和字段会稳定。</p>
+<p>从持久化职责看，本地数据可以分成两层。事件层保存 thread 中依次发生的 turn 与 item，适合恢复会话正文和执行轨迹；状态层保存列表、索引、后台作业以及其他可恢复 metadata，适合快速查询当前状态。日志和 memory 分别面向诊断与跨会话复用。本文讨论这四类本地数据，范围不包括远端同步、账号权限和产品侧 retention policy。</p>
 
-<h2 id="turns">2. 10 轮会话写入路径</h2>
+<h2 id="zh-turns">2. 10 轮会话写入路径</h2>
 
-<p>假设有一条 thread,标题叫 <code>整理 FP8 note</code>,工作目录是 <code>/Users/me/projects/notes</code>。这段 10 轮会话的写入路径如下:</p>
+<p>文件之间的分工在会话推进过程中最容易看清。假设一条名为 <code>整理 FP8 note</code> 的 thread 运行在 <code>/Users/me/projects/notes</code>，下面用 10 个 turn 展开其逻辑写入路径：</p>
 
 <div class="table-scroll">
 <table class="note-table">
@@ -101,25 +116,25 @@
     </tr>
   </thead>
   <tbody>
-    <tr><td>1</td><td>用户提交 review 请求</td><td>rollout JSONL 追加用户消息; session_index / state 更新 preview 和时间</td></tr>
-    <tr><td>2</td><td>Codex 搜索文件并读取 HTML</td><td>rollout 记录 tool call 和结果片段; logs 可能记录命令事件</td></tr>
-    <tr><td>3</td><td>用户授权直接修改</td><td>rollout 追加新 turn; state 更新时间戳</td></tr>
-    <tr><td>4</td><td>Codex 调用 <code>apply_patch</code> 修改文章</td><td>rollout 记录 file change item; state 更新时间</td></tr>
-    <tr><td>5</td><td>Codex 执行 <code>python3 scripts/build-index.py</code></td><td>rollout 记录命令输出; logs 可能写入 INFO / WARN</td></tr>
-    <tr><td>6</td><td>用户要求压缩正文</td><td>rollout 追加用户消息; thread preview 可能更新</td></tr>
+    <tr><td>1</td><td>用户提交 review 请求</td><td>rollout JSONL 追加用户消息；session_index / state 更新 preview 和时间</td></tr>
+    <tr><td>2</td><td>Codex 搜索文件并读取 HTML</td><td>rollout 记录 tool call 和结果片段；logs 可能记录命令事件</td></tr>
+    <tr><td>3</td><td>用户授权直接修改</td><td>rollout 追加新 turn；state 更新时间戳</td></tr>
+    <tr><td>4</td><td>Codex 调用 <code>apply_patch</code> 修改文章</td><td>rollout 记录 file change item；state 更新时间</td></tr>
+    <tr><td>5</td><td>Codex 执行 <code>python3 scripts/build-index.py</code></td><td>rollout 记录命令输出；logs 可能写入 INFO / WARN</td></tr>
+    <tr><td>6</td><td>用户要求压缩正文</td><td>rollout 追加用户消息；thread preview 可能更新</td></tr>
     <tr><td>7</td><td>Codex 重写文章结构</td><td>rollout 记录 patch、assistant 消息和相关命令</td></tr>
     <tr><td>8</td><td>用户要求提交并推送</td><td>rollout 追加用户消息</td></tr>
-    <tr><td>9</td><td>Codex 执行 commit / push</td><td>rollout 记录 git 命令和输出片段; logs 可能记录诊断事件</td></tr>
-    <tr><td>10</td><td>用户询问本地 session 文件含义</td><td>rollout 继续追加; memories 后续可能基于这条 thread 生成摘要</td></tr>
+    <tr><td>9</td><td>Codex 执行 commit / push</td><td>rollout 记录 git 命令和输出片段；logs 可能记录诊断事件</td></tr>
+    <tr><td>10</td><td>用户询问本地 session 文件含义</td><td>rollout 继续追加；memories 后续可能基于这条 thread 生成摘要</td></tr>
   </tbody>
 </table>
 </div>
 
-<p>需要区分的是:10 轮会话不会平均分散到所有文件里。逐轮正文主要进 rollout。列表、状态库、日志库和 memory 库只保存各自需要的那部分信息。</p>
+<p>表中的“写入位置”表示 thread、turn 与 item 在逻辑上归入哪类持久化数据。实际磁盘写入可以批处理或延后，日志与 memory 也可能由后台任务异步生成；公开文档没有规定逐 turn 的文件写入时序。</p>
 
-<h2 id="files">3. 文件职责</h2>
+<h2 id="zh-files">3. 文件职责</h2>
 
-<p>下表按文件归纳存储内容。读它时可以先看两列:<code>是否接近正文</code> 和 <code>风险边界</code>。前者回答"能不能还原聊天",后者回答"分享前是否需要清理"。</p>
+<p>沿着这条逻辑路径回到磁盘，可以按“存储内容、主要用途、与会话正文的距离、分享风险”四个维度识别文件。与正文越接近，越可能保留 prompt、代码和工具输出；状态与索引虽然更精简，仍会暴露项目名称、路径或任务目标。</p>
 
 <div class="table-scroll">
 <table class="note-table wide-table">
@@ -135,56 +150,56 @@
   <tbody>
     <tr>
       <td><code>sessions/YYYY/MM/DD/rollout-*.jsonl</code></td>
-      <td>append-only 事件流:session metadata、用户消息、assistant 消息、tool call、命令输出片段、cwd、模型、turn/item 事件、rollback marker、context compaction item。</td>
-      <td>恢复 thread、继续会话、archive / unarchive、rollback。官方 app-server 文档里的 persisted thread log / thread rollout 主要指这类文件。</td>
-      <td>是。它最接近完整聊天记录。</td>
+      <td>公开文档保证 session transcript 与持久化 JSONL thread log 的存在；具体文件名模式和磁盘字段属于实现细节。app-server 对外公开 thread、turn、item、compaction 与 rollback 等逻辑对象。</td>
+      <td>供产品恢复、读取、归档和继续 thread。调用方应使用 app-server API，不应依赖 JSONL 的内部字段。</td>
+      <td>通常最接近会话正文，但“完整”程度及字段格式没有稳定 schema 保证。</td>
       <td>敏感级别最高。可能包含 prompt、代码、路径、命令输出和工具结果。</td>
     </tr>
     <tr>
       <td><code>session_index.jsonl</code></td>
-      <td>thread id、标题、preview、更新时间、cwd、rollout 路径。</td>
-      <td>聊天列表、快速定位、最近会话展示。Codex 不必每次扫描所有 rollout 文件。</td>
-      <td>否。它是索引,不是正文。</td>
+      <td>某些版本可观察到的本地索引文件；具体名称、字段与是否存在均未在公开文档中承诺。</td>
+      <td>可能服务 thread 列表或快速定位；这是实现推断，不是公开契约。</td>
+      <td>否。它是索引，不是正文。</td>
       <td>会暴露项目名、工作目录、thread 标题和会话预览。</td>
     </tr>
     <tr>
       <td><code>state_5.sqlite</code></td>
-      <td>thread 元信息、cwd、rollout path、archived / visible 状态、更新时间、spawn 关系、动态工具、agent jobs、remote control enrollment 等 runtime state。</td>
-      <td>thread 列表查询、状态恢复、子 agent 管理、动态工具恢复、后台 job 管理。官方把这类库称为 SQLite-backed state DB。</td>
-      <td>否。它保存状态和索引,不承担完整 transcript。</td>
+      <td>具体文件名和 schema 是版本相关观察。公开配置只保证 <code>sqlite_home</code> 存放 agent jobs 与其他 resumable runtime state；app-server 还公开了 SQLite-backed thread metadata 的概念。</td>
+      <td>可恢复运行状态与持久化 metadata。不能从公开文档推出某个表必然存在或由哪个界面读取。</td>
+      <td>否。它保存状态和索引，不承担完整 transcript。</td>
       <td>包含路径、标题、状态、工具配置和部分 preview。<code>_5</code> 更像内部 schema 版本,不要当稳定接口。</td>
     </tr>
     <tr>
       <td><code>logs_2.sqlite</code></td>
-      <td>结构化日志:timestamp、level、target、thread_id、file、line、message、错误、警告、部分命令或输出片段。</td>
-      <td>排查 app-server / CLI / tool execution 问题,也服务 feedback / diagnostics。</td>
+      <td>具体 SQLite 文件与列属于版本相关观察。公开 troubleshooting 文档只公布 app logs 与 session transcripts 的位置，并提醒分享前检查敏感信息。</td>
+      <td>若该版本存在，可用于诊断；其 schema 和内容覆盖范围不是公开 API。</td>
       <td>否。它是运行日志。</td>
-      <td>日志不是全文,但路径、命令、错误栈和输出片段经常足够还原上下文。</td>
+      <td>日志不是全文，但路径、命令、错误栈和输出片段经常足够还原上下文。</td>
     </tr>
     <tr>
       <td><code>goals_1.sqlite</code></td>
-      <td>goal objective、status、token budget、tokens used、elapsed time、continuation deferral。</td>
-      <td>恢复长期 goal、跟踪 continuation、记录预算和执行进度。</td>
+      <td>具体文件名和表结构未公开保证。app-server 公开了 thread goal 的 set/get/clear 与持久化 goal state。</td>
+      <td>goal 状态的产品实现；不应假定预算、用量或 continuation 一定按示例列存储。</td>
       <td>否。</td>
-      <td>可能暴露任务目标、预算和执行状态。没有使用 goal 时,这个库可能只有少量记录。</td>
+      <td>可能暴露任务目标、预算和执行状态。没有使用 goal 时，这个库可能只有少量记录。</td>
     </tr>
     <tr>
       <td><code>memories_1.sqlite</code></td>
-      <td>memory / summarization job、stage outputs、thread summary、从旧 chat 提取的偏好或项目上下文。</td>
-      <td>后台 memory 更新、thread 摘要生成、跨会话上下文恢复。真正可读的 memory 文件还可能在 <code>~/.codex/memories/</code> 下。</td>
-      <td>不是逐字正文,但可能是正文的压缩摘要。</td>
+      <td>具体 SQLite 文件名和 schema 未公开保证。官方只说明本地 memory 主文件位于 <code>CODEX_HOME/memories/</code>，包含 summary、durable entry、recent input 与 supporting evidence。</td>
+      <td>后台生成和使用 memory；是否另有 SQLite 作业库属于版本实现。</td>
+      <td>不是逐字正文，但可能是正文的压缩摘要。</td>
       <td>summary 可能比原文更集中地暴露工作偏好、项目、常用路径和习惯。</td>
     </tr>
     <tr>
       <td><code>*.sqlite-wal</code></td>
-      <td>SQLite write-ahead log。数据库写入先落到这里,之后再合并回主库。</td>
+      <td>SQLite write-ahead log。数据库写入先落到这里，之后再合并回主库。</td>
       <td>SQLite WAL 模式的写入机制。</td>
       <td>跟随主库。</td>
-      <td>不是独立业务库,但可能暂存尚未 checkpoint 回主库的数据。</td>
+      <td>不是独立业务库，但可能暂存尚未 checkpoint 回主库的数据。</td>
     </tr>
     <tr>
       <td><code>*.sqlite-shm</code></td>
-      <td>SQLite shared-memory 协调文件,用于 WAL 模式下的并发读写协调。</td>
+      <td>SQLite shared-memory 协调文件，用于 WAL 模式下的并发读写协调。</td>
       <td>SQLite 并发控制。</td>
       <td>否。</td>
       <td>不是业务数据入口。Codex 正在运行时看到它是正常现象。</td>
@@ -193,9 +208,9 @@
 </table>
 </div>
 
-<h2 id="examples">4. 内容示例</h2>
+<h2 id="zh-examples">4. 内容示例</h2>
 
-<p>上一节讲职责,这一节看数据形态。字段名仍然是示意,不能直接当作解析器依据;真正的内部 schema 会随 Codex 版本变化。</p>
+<p>职责表给出了分类，下面的 schematic record 沿用同一条 thread 展示各类数据的形态。需要编程集成时，应使用 app-server 为当前安装版本提供的 TypeScript 或 JSON Schema。</p>
 
 <h3>rollout JSONL 示例</h3>
 
@@ -218,14 +233,14 @@
 {"type":"assistant_message","turn_id":"turn_9","text":"已 push。"}
 {"type":"turn.completed","turn_id":"turn_9"}</pre>
 
-<p>如果某轮触发 compaction 或 rollback,同一个 rollout 里还可能追加 context compaction item 或 rollback marker。app-server 文档明确说 rollback 会把 marker persist 到 rollout log。也就是说,rollout 不是简单的"聊天消息数组",它是 thread 生命周期的事件账本。</p>
+<p>当某轮触发 compaction 或 rollback，同一个 rollout 还可能追加 context-compaction item 或 rollback marker。app-server 文档明确记录了 rollback marker 的持久化行为。由此可以把 rollout 定义为 thread 生命周期的追加式事件账本：聊天消息、工具活动和上下文状态变化都按事件进入同一条历史。</p>
 
 <h3>session_index.jsonl 示例</h3>
 
 <pre class="code">{"thread_id":"thr_fp8","name":"整理 FP8 note","preview":"帮我 review 这篇 note","cwd":"/Users/me/projects/notes","rollout_path":"sessions/2026/07/21/rollout-019f....jsonl","updated_at_ms":1784629000000}
 {"thread_id":"thr_layout","name":"torch linear 和 layout","preview":"我这个表格写得有问题吗?","cwd":"/Users/me/projects/notes","rollout_path":"sessions/2026/07/20/rollout-019e....jsonl","updated_at_ms":1784540000000}</pre>
 
-<p>这个文件看起来轻,但它仍然会泄漏项目名、工作目录、thread 标题和会话预览。</p>
+<p>当前版本若包含这类索引，其内容仍可能暴露项目名、工作目录、thread 标题和会话预览；字段集合以实际版本为准。</p>
 
 <h3>state_5.sqlite 示例</h3>
 
@@ -245,7 +260,7 @@ agent_jobs
 job_id | thread_id | kind             | status
 job_7  | thr_fp8   | subAgentReview   | completed</pre>
 
-<p>这类库解释了两个现象:Codex 打开聊天列表很快,删除 thread 时也不能只删一个 JSONL 文件。app-server 的 delete 文档说,删除 persisted thread 时会移除 rollout files 和 associated metadata。</p>
+<p>这组关系对应 thread metadata、派生关系、动态工具和后台作业；公开文档明确规定 <code>thread/delete</code> 会删除已有 rollout files 与 associated metadata。</p>
 
 <h3>logs_2.sqlite 示例</h3>
 
@@ -255,7 +270,7 @@ ts_ms         | level | thread_id | target          | message
 1784628112000 | WARN  | thr_fp8   | codex.tool.exec | command exited non-zero
 1784628113000 | ERROR | thr_fp8   | app_server      | failed to parse post metadata at posts/fp8-scaling-recipes.html</pre>
 
-<p>官方 troubleshooting 文档也提醒,分享日志前要先检查敏感信息。这条规则来自实际风险:路径、命令和错误输出经常足够还原上下文。</p>
+<p>官方 troubleshooting 文档也提醒，分享日志前要先检查敏感信息。路径、命令和错误输出往往已经足够还原任务上下文。</p>
 
 <h3>goals_1.sqlite 示例</h3>
 
@@ -267,7 +282,7 @@ thread_goal_continuation_deferrals
 thread_id | reason               | next_run_after_ms
 thr_fp8   | waiting for test run | 1784629000000</pre>
 
-<p>如果没有使用 goal 或 continuation,这个库可能只有几行。这不表示文件无效,只表示这条功能线当前没有多少状态。</p>
+<p>对外可依赖的是 persisted thread goal 的 app-server 操作。</p>
 
 <h3>memories_1.sqlite 示例</h3>
 
@@ -279,23 +294,23 @@ stage1_outputs
 source_thread_id | kind            | content
 thr_fp8          | rollout_summary | 用户在 notes repo 里维护 PyTorch/FP8 系列文章,偏好技术准确、少 AI 味、直接 commit/push...</pre>
 
-<p>memory 不一定马上生成。官方文档说 Codex 会等 chat idle 足够久,并且会在后台更新。它还会跳过 active 或 short-lived sessions。</p>
+<p>官方文档说明 memory 会在后台生成，可能跳过 active 或 short-lived session，并等待 chat 空闲。</p>
 
-<h2 id="share">5. 敏感数据边界</h2>
+<h2 id="zh-share">5. 敏感数据边界</h2>
 
-<p>从分享、打包、提交 issue 的角度看,这些文件可以按以下顺序处理:</p>
+<p>不同文件暴露的信息粒度不同。准备分享日志、打包目录或提交 issue 时，可以按敏感性从高到低处理：</p>
 
 <ol>
-  <li><code>auth.json</code>:当成密码。官方文档也这么说。</li>
-  <li><code>rollout-*.jsonl</code>:当成完整聊天记录。里面可能有 prompt、代码、命令输出、路径、tool result。</li>
-  <li><code>memories/</code> 和 <code>memories_1.sqlite</code>:当成压缩后的工作偏好和项目上下文。它不一定逐字保存原文,但 summary 可能暴露偏好和项目。</li>
-  <li><code>logs_2.sqlite</code>:当成诊断日志。它不是全文,但可能有足够多的片段。</li>
-  <li><code>state_5.sqlite</code> / <code>session_index.jsonl</code>:当成索引和元信息。不能因为"不是正文"就直接公开。</li>
+  <li><code>auth.json</code>：按密码处理，官方文档采用相同的安全级别。</li>
+  <li><code>rollout-*.jsonl</code>：按完整聊天记录处理，其中可能包含 prompt、代码、命令输出、路径和 tool result。</li>
+  <li><code>memories/</code> 和 <code>memories_1.sqlite</code>：按压缩后的工作偏好与项目上下文处理。Summary 可能集中呈现原文中的偏好和项目信息。</li>
+  <li><code>logs_2.sqlite</code>：按诊断日志处理，零散记录也可能提供足够多的任务线索。</li>
+  <li><code>state_5.sqlite</code> / <code>session_index.jsonl</code>：按索引与元信息处理，其中的路径、标题和 preview 同样需要脱敏。</li>
 </ol>
 
-<p>排查 resume 问题时,先看 rollout。排查列表展示问题时,看 session index 和 state DB。排查 Codex 运行错误时,看 logs。排查偏好和历史上下文来源时,看 memories。不要把这些文件打成一个包直接发出去:它们暴露的信息类型不同,清理方式也不同。</p>
+<p>文件职责也决定了排障入口：resume 问题对应 rollout，thread 列表问题对应 session index 与 state DB，运行错误对应 logs，历史偏好或上下文来源对应 memories。分享前应分别审查并脱敏，而不是把整个目录作为一份诊断包发布。</p>
 
-<h2 id="refs">参考资料</h2>
+<h2 id="zh-refs">参考资料</h2>
 
 <ul>
   <li><a href="https://developers.openai.com/codex/config-file/environment-variables" target="_blank" rel="noopener">Codex environment variables: <code>CODEX_HOME</code> / <code>CODEX_SQLITE_HOME</code></a></li>
@@ -305,6 +320,247 @@ thr_fp8          | rollout_summary | 用户在 notes repo 里维护 PyTorch/FP8 
   <li><a href="https://developers.openai.com/codex/memories" target="_blank" rel="noopener">Codex memories: local memory storage and background updates</a></li>
   <li><a href="https://developers.openai.com/codex/non-interactive-mode" target="_blank" rel="noopener">Codex non-interactive mode: JSONL event stream examples</a></li>
 </ul>
+
+</div>
+
+<div class="lang-en">
+
+<h1>Codex Session Persistence: Rollout JSONL and SQLite State</h1>
+
+<p>A Codex session produces several kinds of state. User and assistant messages form the conversation history; tool calls and command output record execution; thread titles and working directories support listing and resumption; logs serve diagnostics; and memory stores summaries that later tasks may reuse. Codex persists these concerns separately, which is why <code>~/.codex</code> can contain JSONL streams, SQLite databases, and SQLite WAL support files at the same time.</p>
+
+<p>The public interfaces define the logical boundary of this storage. Session transcripts and the persistent thread log live under <code>CODEX_HOME</code>, and the thread log uses JSONL. <code>sqlite_home</code> stores agent jobs and other resumable runtime state. Filenames such as <code>state_5.sqlite</code> and <code>logs_2.sqlite</code>, along with their schemas, belong to a particular implementation version. A ten-turn example below shows what category of information each file may carry and how that distinction affects troubleshooting and disclosure.</p>
+
+<div class="callout">
+<strong>Evidence boundary:</strong> The concrete JSONL fields, SQLite filenames, tables, and columns below are schematic records rather than a stable on-disk schema. The app-server protocol and documented configuration are the supported integration surfaces, while internal files carry no API compatibility guarantee.
+</div>
+
+<h2 id="en-scope">1. Storage Boundary</h2>
+
+<p><code>CODEX_HOME</code> defaults to <code>~/.codex</code> and contains configuration, authentication data, logs, sessions, skills, and standalone package metadata. <code>CODEX_SQLITE_HOME</code> selects the location of SQLite-backed state; unless configured separately, that location is also under <code>CODEX_HOME</code>.</p>
+
+<p>Local persistence has two primary layers. The event layer records the turns and items that occur in a thread, making it suitable for reconstructing conversation and execution history. The state layer stores listings, indexes, background jobs, and other resumable metadata for efficient lookup. Logs and memory then serve diagnostics and cross-session reuse, respectively. This article covers those four local categories; remote synchronization, account permissions, and product retention policies remain outside its scope.</p>
+
+<h2 id="en-turns">2. Write Path for a Ten-Turn Session</h2>
+
+<p>The division of responsibility becomes clearer as a session advances. Suppose a thread titled <code>整理 FP8 note</code> runs in <code>/Users/me/projects/notes</code>. The following ten turns illustrate its logical persistence path:</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr>
+      <th>Turn</th>
+      <th>Event</th>
+      <th>Possible write location</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>The user requests a review</td><td>Append the user message to rollout JSONL; update preview and timestamps in the session index or state</td></tr>
+    <tr><td>2</td><td>Codex searches for files and reads HTML</td><td>Record tool calls and result fragments in the rollout; logs may record command events</td></tr>
+    <tr><td>3</td><td>The user authorizes direct edits</td><td>Append a new turn to the rollout; update the state timestamp</td></tr>
+    <tr><td>4</td><td>Codex uses <code>apply_patch</code> to edit an article</td><td>Record a file-change item in the rollout; update state</td></tr>
+    <tr><td>5</td><td>Codex runs <code>python3 scripts/build-index.py</code></td><td>Record command output in the rollout; logs may contain INFO or WARN entries</td></tr>
+    <tr><td>6</td><td>The user asks for a shorter article</td><td>Append the user message to the rollout; the thread preview may change</td></tr>
+    <tr><td>7</td><td>Codex rewrites the article structure</td><td>Record patches, assistant messages, and related commands in the rollout</td></tr>
+    <tr><td>8</td><td>The user asks for a commit and push</td><td>Append the user message to the rollout</td></tr>
+    <tr><td>9</td><td>Codex commits and pushes</td><td>Record Git commands and output fragments in the rollout; logs may contain diagnostic events</td></tr>
+    <tr><td>10</td><td>The user asks what the local session files mean</td><td>Continue appending to the rollout; a later memory job may summarize the thread</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>The “possible write location” column assigns each thread, turn, and item to a logical storage category. Physical writes may be batched or delayed, and background jobs may generate logs or memory later. Public documentation does not specify per-turn disk-write ordering.</p>
+
+<h2 id="en-files">3. File Responsibilities</h2>
+
+<p>Mapping that logical path back to disk requires four dimensions: stored content, primary use, distance from the transcript, and disclosure risk. Files close to the transcript can preserve prompts, code, and tool output. Compact indexes and state databases may still disclose project names, paths, or task objectives.</p>
+
+<div class="table-scroll">
+<table class="note-table wide-table">
+  <thead>
+    <tr>
+      <th>File</th>
+      <th>Stored content</th>
+      <th>Primary use</th>
+      <th>How close to the transcript?</th>
+      <th>Risk boundary</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>sessions/YYYY/MM/DD/rollout-*.jsonl</code></td>
+      <td>Public documentation guarantees session transcripts and a persistent JSONL thread log. The exact filename pattern and on-disk fields are implementation details. The app-server publicly exposes logical objects such as threads, turns, items, compaction, and rollback.</td>
+      <td>Product features can resume, read, archive, and continue threads. Integrations should use the app-server API instead of depending on internal JSONL fields.</td>
+      <td>Usually the closest file to the conversation body, although neither completeness nor field format has a stable schema guarantee.</td>
+      <td>Highest sensitivity. It may contain prompts, code, paths, command output, and tool results.</td>
+    </tr>
+    <tr>
+      <td><code>session_index.jsonl</code></td>
+      <td>A local index file observed in some versions. Public documentation does not promise its name, fields, or continued existence.</td>
+      <td>It may support thread listings or fast lookup. That is an implementation inference, not a public contract.</td>
+      <td>No. It is an index rather than the transcript.</td>
+      <td>It can reveal project names, working directories, thread titles, and conversation previews.</td>
+    </tr>
+    <tr>
+      <td><code>state_5.sqlite</code></td>
+      <td>The concrete filename and schema are version-specific observations. Public configuration only guarantees that <code>sqlite_home</code> stores agent jobs and other resumable runtime state; the app-server also documents SQLite-backed thread metadata.</td>
+      <td>Resumable runtime state and persistent metadata. Public documentation does not establish that a particular table always exists or which interface reads it.</td>
+      <td>No. It stores state and indexes rather than the full transcript.</td>
+      <td>It may contain paths, titles, states, tool configuration, and previews. The <code>_5</code> suffix looks like an internal schema version and should not be treated as stable.</td>
+    </tr>
+    <tr>
+      <td><code>logs_2.sqlite</code></td>
+      <td>The SQLite file and its columns are version-specific observations. Public troubleshooting documentation identifies app logs and session transcripts and advises checking them for sensitive data before sharing.</td>
+      <td>It may support diagnostics in versions where it exists. Its schema and coverage are not public API.</td>
+      <td>No. It contains runtime logs.</td>
+      <td>Logs are not the complete conversation, but paths, commands, stack traces, and output fragments can reveal substantial context.</td>
+    </tr>
+    <tr>
+      <td><code>goals_1.sqlite</code></td>
+      <td>The filename and table layout are not publicly guaranteed. The app-server exposes operations to set, get, and clear thread goals and documents persistent goal state.</td>
+      <td>A product implementation of goal state. Budget, usage, and continuation details should not be assumed to use the sample columns below.</td>
+      <td>No.</td>
+      <td>It may expose task objectives, budgets, and execution state. When goals are unused, the database may contain little data.</td>
+    </tr>
+    <tr>
+      <td><code>memories_1.sqlite</code></td>
+      <td>The SQLite filename and schema are not publicly guaranteed. Official documentation only specifies local memory files under <code>CODEX_HOME/memories/</code>, including summaries, durable entries, recent input, and supporting evidence.</td>
+      <td>Background production and use of memory. A separate SQLite job database, if present, is a version-specific implementation detail.</td>
+      <td>Not a verbatim transcript, but it may contain a compressed summary of one.</td>
+      <td>A summary may expose work preferences, projects, common paths, and habits more compactly than the source conversation.</td>
+    </tr>
+    <tr>
+      <td><code>*.sqlite-wal</code></td>
+      <td>A SQLite write-ahead log. Database changes are first written here and later checkpointed into the main database.</td>
+      <td>The write path used by SQLite WAL mode.</td>
+      <td>It follows the associated database.</td>
+      <td>It is not a separate application database, but it may temporarily contain data not yet checkpointed into the main file.</td>
+    </tr>
+    <tr>
+      <td><code>*.sqlite-shm</code></td>
+      <td>A SQLite shared-memory coordination file used for concurrent access in WAL mode.</td>
+      <td>SQLite concurrency control.</td>
+      <td>No.</td>
+      <td>It is not an application-data entry point. Seeing it while Codex is running is normal.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="en-examples">4. Content Examples</h2>
+
+<p>The schematic records below follow the same thread through several storage forms. Programmatic integrations should use the TypeScript or JSON Schema generated by the app-server for the installed version.</p>
+
+<h3>Rollout JSONL Example</h3>
+
+<pre class="code">{"type":"session_metadata","thread_id":"thr_fp8","cwd":"/Users/me/projects/notes","model":"gpt-5-codex","created_at":"2026-07-21T10:00:00Z"}
+{"type":"turn.started","turn_id":"turn_1"}
+{"type":"user_message","turn_id":"turn_1","text":"Review this note"}
+{"type":"assistant_message","turn_id":"turn_1","text":"I will inspect the article structure and its series context first."}
+{"type":"item.started","turn_id":"turn_1","item":{"type":"command_execution","command":"rg --files posts"}}
+{"type":"item.completed","turn_id":"turn_1","item":{"type":"command_execution","exit_code":0,"output":"posts/fp8-scaling-recipes.html\nposts/pytorch-record-stream.html\n..."}}
+{"type":"turn.completed","turn_id":"turn_1","usage":{"input_tokens":12400,"output_tokens":820}}
+{"type":"turn.started","turn_id":"turn_4"}
+{"type":"user_message","turn_id":"turn_4","text":"Edit it directly"}
+{"type":"item.started","turn_id":"turn_4","item":{"type":"file_change","path":"posts/fp8-scaling-recipes.html"}}
+{"type":"item.completed","turn_id":"turn_4","item":{"type":"file_change","summary":"updated title and table section"}}
+{"type":"turn.completed","turn_id":"turn_4"}
+{"type":"turn.started","turn_id":"turn_9"}
+{"type":"user_message","turn_id":"turn_9","text":"push"}
+{"type":"item.started","turn_id":"turn_9","item":{"type":"command_execution","command":"git push origin main"}}
+{"type":"item.completed","turn_id":"turn_9","item":{"type":"command_execution","exit_code":0,"output":"main -&gt; main"}}
+{"type":"assistant_message","turn_id":"turn_9","text":"Pushed."}
+{"type":"turn.completed","turn_id":"turn_9"}</pre>
+
+<p>If a turn triggers compaction or rollback, the same rollout may also receive a context-compaction item or rollback marker. The app-server documentation explicitly records persistence of the rollback marker. A rollout can therefore be defined as an append-only event ledger for the thread lifecycle: messages, tool activity, and context-state changes enter one ordered history.</p>
+
+<h3><code>session_index.jsonl</code> Example</h3>
+
+<pre class="code">{"thread_id":"thr_fp8","name":"Polish the FP8 note","preview":"Review this note","cwd":"/Users/me/projects/notes","rollout_path":"sessions/2026/07/21/rollout-019f....jsonl","updated_at_ms":1784629000000}
+{"thread_id":"thr_layout","name":"Torch Linear layouts","preview":"Is this table correct?","cwd":"/Users/me/projects/notes","rollout_path":"sessions/2026/07/20/rollout-019e....jsonl","updated_at_ms":1784540000000}</pre>
+
+<p>If the installed version has such an index, it can still expose project names, working directories, thread titles, and conversation previews. The actual field set depends on the release.</p>
+
+<h3><code>state_5.sqlite</code> Example</h3>
+
+<pre class="code">threads
+thread_id | name          | cwd                       | rollout_path                         | archived | model       | updated_at_ms
+thr_fp8   | Polish FP8 note | /Users/me/projects/notes | sessions/2026/07/21/rollout-...jsonl | 0        | gpt-5-codex | 1784629000000
+
+thread_spawn_edges
+parent_thread_id | child_thread_id | status
+thr_fp8          | thr_fp8_review  | completed
+
+thread_dynamic_tools
+thread_id | tool_name | enabled_at_ms
+thr_fp8   | github    | 1784628300000
+
+agent_jobs
+job_id | thread_id | kind             | status
+job_7  | thr_fp8   | subAgentReview   | completed</pre>
+
+<p>These relationships cover thread metadata, spawn edges, dynamic tools, and background jobs. Public documentation specifies that <code>thread/delete</code> removes existing rollout files and associated metadata.</p>
+
+<h3><code>logs_2.sqlite</code> Example</h3>
+
+<pre class="code">logs
+ts_ms         | level | thread_id | target          | message
+1784628100000 | INFO  | thr_fp8   | codex.tool.exec | running command: python3 scripts/build-index.py
+1784628112000 | WARN  | thr_fp8   | codex.tool.exec | command exited non-zero
+1784628113000 | ERROR | thr_fp8   | app_server      | failed to parse post metadata at posts/fp8-scaling-recipes.html</pre>
+
+<p>Official troubleshooting documentation also advises checking logs for sensitive information before sharing. The warning reflects a practical risk: paths, commands, and error output often reveal enough context to reconstruct what happened.</p>
+
+<h3><code>goals_1.sqlite</code> Example</h3>
+
+<pre class="code">thread_goals
+thread_id | objective                       | status | token_budget | tokens_used | elapsed_ms
+thr_fp8   | review and polish all blog notes | active | 200000       | 87320       | 5400000
+
+thread_goal_continuation_deferrals
+thread_id | reason               | next_run_after_ms
+thr_fp8   | waiting for test run | 1784629000000</pre>
+
+<p>The supported contract is the app-server operation for a persisted thread goal.</p>
+
+<h3><code>memories_1.sqlite</code> Example</h3>
+
+<pre class="code">jobs
+job_id | kind             | source_thread_id | status
+mem_1  | summarize_thread | thr_fp8          | completed
+
+stage1_outputs
+source_thread_id | kind            | content
+thr_fp8          | rollout_summary | The user maintains PyTorch and FP8 notes and prefers precise technical prose...</pre>
+
+<p>Official documentation says memory is generated in the background, may skip active or short-lived sessions, and waits for the chat to become idle.</p>
+
+<h2 id="en-share">5. Sensitive-Data Boundary</h2>
+
+<p>Each file exposes a different granularity of information. When preparing logs, an archive, or an issue report, handle them in descending order of sensitivity:</p>
+
+<ol>
+  <li><code>auth.json</code>: treat it as a password. Official documentation uses the same guidance.</li>
+  <li><code>rollout-*.jsonl</code>: treat it as a complete conversation record. It may include prompts, code, command output, paths, and tool results.</li>
+  <li><code>memories/</code> and <code>memories_1.sqlite</code>: treat them as compressed work preferences and project context. They may not preserve the original text verbatim, but summaries can reveal preferences and project details.</li>
+  <li><code>logs_2.sqlite</code>: treat it as diagnostic logging. It is not the full transcript, but it may contain revealing fragments.</li>
+  <li><code>state_5.sqlite</code> and <code>session_index.jsonl</code>: treat them as indexes and metadata. Files do not become safe to publish merely because they are not the conversation body.</li>
+</ol>
+
+<p>The same responsibilities determine the troubleshooting entry point: resume failures map to the rollout, thread-list problems to the session index and state database, runtime errors to logs, and unexpected historical context to memory. Review and redact each category separately before disclosure instead of publishing the entire directory as one diagnostic bundle.</p>
+
+<h2 id="en-refs">References</h2>
+
+<ul>
+  <li><a href="https://developers.openai.com/codex/config-file/environment-variables" target="_blank" rel="noopener">Codex environment variables: <code>CODEX_HOME</code> and <code>CODEX_SQLITE_HOME</code></a></li>
+  <li><a href="https://developers.openai.com/codex/config-reference" target="_blank" rel="noopener">Codex configuration reference: <code>sqlite_home</code></a></li>
+  <li><a href="https://developers.openai.com/codex/app-server" target="_blank" rel="noopener">Codex app-server: thread listing, archival, deletion, restoration, and rollback</a></li>
+  <li><a href="https://developers.openai.com/codex/reference/troubleshooting" target="_blank" rel="noopener">Codex troubleshooting: feedback and logs</a></li>
+  <li><a href="https://developers.openai.com/codex/memories" target="_blank" rel="noopener">Codex memories: local memory storage and background updates</a></li>
+  <li><a href="https://developers.openai.com/codex/non-interactive-mode" target="_blank" rel="noopener">Codex non-interactive mode: JSONL event-stream examples</a></li>
+</ul>
+
+</div>
 
 </main>
 </div>
