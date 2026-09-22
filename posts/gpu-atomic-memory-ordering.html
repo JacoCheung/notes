@@ -1,0 +1,977 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NVIDIA GPU 原子内存顺序：CUDA C++ 语义与 PTX 映射</title>
+<meta name="post:title"           content="NVIDIA GPU 原子内存顺序：CUDA C++ 语义与 PTX 映射">
+<meta name="post:title_en"        content="NVIDIA GPU Atomic Memory Ordering: CUDA C++ Semantics and PTX Mappings">
+<meta name="post:slug"            content="gpu-atomic-memory-ordering">
+<meta name="post:date"            content="2026-09-03">
+<meta name="post:tags"            content="GPU, CUDA, Memory Ordering, libcu++, PTX, Atomic">
+<meta name="post:tags_en"         content="GPU, CUDA, Memory Ordering, libcu++, PTX, Atomics">
+<meta name="post:reading"         content="22 分钟">
+<meta name="post:reading_en"      content="22 min">
+<meta name="post:summary"         content="从普通 payload 与 atomic ready flag 的一次交接出发，用完整 CUDA C++ 示例证明 release/acquire 的 happens-before，检查 scope、初始化、复用与 forward progress，再对照 CUDA 13.2 atomic ABI 和 PTX 9.2；附录保留 libcu++、CAS 与 memory order 速查。">
+<meta name="post:summary_en"      content="A complete CUDA C++ publication example connects an ordinary payload to a ready flag through release/acquire. Follow the happens-before proof, scope and progress requirements, reuse boundaries, and CUDA 13.2 mappings to PTX 9.2, with libcu++, CAS, and memory-order references in the appendices.">
+<meta name="post:series"          content="gpu-programming-basics">
+<meta name="post:series_title"    content="GPU Programming Basics">
+<meta name="post:series_title_en" content="GPU Programming Basics">
+<meta name="post:series_order"    content="10">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(','\\)'], ['$','$']], displayMath: [['\\[','\\]'], ['$$','$$']] },
+    options: { skipHtmlTags: ['script', 'style', 'pre', 'code'] }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
+<script src="../lang-toggle.js" defer></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  .lead {
+    margin: -6px 0 30px;
+    color: var(--fg-muted);
+    font-size: 17px;
+    line-height: 1.8;
+  }
+  .table-scroll {
+    max-width: 100%;
+    margin: 18px 0 26px;
+    overflow-x: auto;
+  }
+  table.note-table {
+    width: 100%;
+    min-width: 700px;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  table.note-table th,
+  table.note-table td {
+    padding: 9px 12px;
+    text-align: left;
+    vertical-align: top;
+  }
+  .note-box {
+    margin: 18px 0 26px;
+    padding: 12px 16px;
+    border-left: 3px solid var(--accent);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    background: var(--accent-tint);
+  }
+  .note-box.warn {
+    border-left-color: #d97706;
+    background: rgba(217, 119, 6, 0.08);
+  }
+  .note-box p { margin: 6px 0; }
+  .diagram-frame {
+    max-width: 100%;
+    margin: 20px 0 30px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    box-sizing: border-box;
+  }
+  .diagram-title {
+    margin-bottom: 10px;
+    color: var(--fg-subtle);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  .diagram-svg {
+    display: block;
+    width: 100%;
+    min-width: 760px;
+    height: auto;
+  }
+  .diagram-svg text {
+    fill: var(--fg);
+    font-family: var(--font-sans);
+    letter-spacing: 0;
+  }
+  .diagram-svg .mono { font-family: var(--font-mono); }
+  .diagram-svg .muted { fill: var(--fg-muted); }
+  .diagram-svg .box { fill: var(--bg); stroke: var(--border-strong); stroke-width: 1.25; }
+  .diagram-svg .producer { fill: rgba(37, 99, 235, 0.09); stroke: #2563eb; }
+  .diagram-svg .atomic { fill: rgba(190, 24, 93, 0.09); stroke: #be185d; }
+  .diagram-svg .consumer { fill: rgba(5, 150, 105, 0.09); stroke: #059669; }
+  .diagram-svg .edge { fill: none; stroke: var(--fg-muted); stroke-width: 1.6; }
+  .diagram-svg .sync { fill: none; stroke: #be185d; stroke-width: 2; }
+  .diagram-svg .derived { fill: none; stroke: #d97706; stroke-width: 1.6; stroke-dasharray: 6 4; }
+  .reading-guide { margin: 20px 0 32px; padding: 14px 18px; border-left: 3px solid var(--accent); background: var(--accent-tint); font-size: 14px; }
+  .reading-guide ul { margin: 8px 0 0; padding-left: 20px; }
+  .reading-guide li { margin: 5px 0; }
+  .toc li ul { margin: 4px 0 8px; padding-left: 12px; }
+  .toc li ul a { font-size: 11px; }
+  @media (max-width: 720px) {
+    .lead { font-size: 16px; }
+    .diagram-frame { padding: 12px; }
+  }
+
+  .post-page main.content h2[id], .post-page main.content h3[id], .post-page main.content h4[id], .post-page main.content .legacy-anchor { scroll-margin-top: 80px; }
+  .article-toc > summary { display: none; }
+  .post-page aside.toc ul ul { padding-left: 12px; margin: 3px 0 6px; }
+  .post-page aside.toc ul ul a { font-size: 12px; }
+  .post-page main.content .reading-guide p { font-size: 15px; line-height: 1.75; }
+  @media (max-width: 1099px) {
+    .post-page main.content .article-toc { margin: 0 0 24px; }
+    .article-toc > summary { display: list-item; cursor: pointer; padding: 10px 0; color: var(--fg-muted); font-size: 15px; }
+    .article-toc > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+    .post-page .article-toc aside.toc { margin: 6px 0 0 !important; }
+    .post-page .article-toc aside.toc ul ul { columns: 1; }
+  }
+  @media (min-width: 1100px) { .diagram-svg { min-width: 0; } }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<main class="content">
+<details class="article-toc" open>
+<summary><span class="lang-zh">目录与系列</span><span class="lang-en">Contents and series</span></summary>
+<aside class="toc">
+<div class="toc-title"><span class="lang-zh">目录</span><span class="lang-en">Contents</span></div>
+<div class="lang-zh">
+<ul>
+<li><a href="#zh-definition">1. 原子 flag 为什么还不能交付普通数据</a>
+</li>
+<li><a href="#zh-example">2. 把一次发布写成完整程序</a>
+<ul>
+<li><a href="#zh-example-setup">2.1 单个 CTA、两个 warp、一份 payload</a></li>
+<li><a href="#zh-semantics">2.2 从 reads-from 推到 happens-before</a></li>
+<li><a href="#zh-order-changes">2.3 改动 order 会断开哪条关系</a></li>
+</ul>
+</li>
+<li><a href="#zh-guidance">3. 把协议扩大之前，先补齐通信条件</a>
+<ul>
+<li><a href="#zh-scope">3.1 Scope 必须覆盖实际参与者</a></li>
+<li><a href="#zh-progress">3.2 正确的顺序还需要能够推进的执行</a></li>
+<li><a href="#zh-reuse">3.3 从一次发布到循环使用的队列槽位</a></li>
+</ul>
+</li>
+<li><a href="#zh-implementation">4. 同一份证明如何映射到 PTX</a>
+<ul>
+<li><a href="#zh-ptx-pair">4.1 在指令上找到发布和接收</a></li>
+<li><a href="#zh-hardware-cost">4.2 从 PTX 继续向下看，需要目标架构</a></li>
+</ul>
+</li>
+<li><a href="#zh-selection">5. 根据交接的内容选择 order</a>
+</li>
+<li><a href="#zh-libcu">附录 A：libcu++ 接口与 storage 条件</a>
+<ul>
+<li><a href="#zh-api-types">A.1 Namespace、对象与 reference</a></li>
+<li><a href="#zh-api-cas">A.2 CAS、wait 与 fence</a></li>
+</ul>
+</li>
+<li><a href="#zh-appendix">附录 B：Memory order 与 PTX 速查</a>
+<ul>
+<li><a href="#zh-order-reference">B.1 Order 的方向和合法操作</a></li>
+<li><a href="#zh-cpp-consume">B.2 C++ 与 CUDA 的版本差异</a></li>
+<li><a href="#zh-ptx-reference">B.3 Atomic ABI 与 load/store qualifier</a></li>
+</ul>
+</li>
+<li><a href="#zh-refs">参考资料</a>
+</li>
+</ul>
+</div>
+<div class="lang-en">
+<ul>
+<li><a href="#en-definition">1. Why an atomic flag does not yet deliver ordinary data</a>
+</li>
+<li><a href="#en-example">2. A complete program for one publication</a>
+<ul>
+<li><a href="#en-example-setup">2.1 One CTA, two warps, one payload</a></li>
+<li><a href="#en-semantics">2.2 From reads-from to happens-before</a></li>
+<li><a href="#en-order-changes">2.3 Which relation changes when the order changes</a></li>
+</ul>
+</li>
+<li><a href="#en-guidance">3. Conditions to establish before expanding the protocol</a>
+<ul>
+<li><a href="#en-scope">3.1 Scope must cover the actual participants</a></li>
+<li><a href="#en-progress">3.2 Correct ordering also needs an execution that can progress</a></li>
+<li><a href="#en-reuse">3.3 From one publication to a reusable queue slot</a></li>
+</ul>
+</li>
+<li><a href="#en-implementation">4. How the same proof maps to PTX</a>
+<ul>
+<li><a href="#en-ptx-pair">4.1 Identify publication and reception in the instructions</a></li>
+<li><a href="#en-hardware-cost">4.2 Looking below PTX requires a target architecture</a></li>
+</ul>
+</li>
+<li><a href="#en-selection">5. Choose the order from what is being handed off</a>
+</li>
+<li><a href="#en-libcu">Appendix A: libcu++ interfaces and storage requirements</a>
+<ul>
+<li><a href="#en-api-types">A.1 Namespaces, objects, and references</a></li>
+<li><a href="#en-api-cas">A.2 CAS, wait, and fences</a></li>
+</ul>
+</li>
+<li><a href="#en-appendix">Appendix B: Memory-order and PTX reference</a>
+<ul>
+<li><a href="#en-order-reference">B.1 Ordering directions and legal operations</a></li>
+<li><a href="#en-cpp-consume">B.2 Version differences between C++ and CUDA</a></li>
+<li><a href="#en-ptx-reference">B.3 Atomic ABI and load/store qualifiers</a></li>
+</ul>
+</li>
+<li><a href="#en-refs">References</a>
+</li>
+</ul>
+</div>
+</aside>
+</details>
+<div class="lang-zh">
+<h1>NVIDIA GPU 原子内存顺序：CUDA C++ 语义与 PTX 映射</h1>
+
+<p class="lead">一个 thread 把结果写进 <code>data</code>，再把 <code>ready</code> 设为 1；另一个 thread 看到 1 后取走结果。这是 GPU 工作队列、任务完成标记和对象发布中常见的一步。难点在于：<code>ready</code> 的原子更新只直接约束这个标记，普通 <code>data</code> 的读写还需要一条跨 thread 的顺序关系。</p>
+
+<p>下面从这次数据交接出发，用一个完整的 CUDA C++ 程序推导 release/acquire 为什么成立，再看协议扩展到多个 CTA 时增加了哪些条件，以及这些条件如何落到 PTX。正文以 CUDA 13.2 的公开内存模型与 atomic ABI 为准；接口和 memory order 的完整对照放在附录。</p>
+
+<nav class="reading-guide" aria-label="快速索引">
+  <strong>快速索引</strong>
+  <ul>
+    <li><a href="#zh-example">查看可独立编译的发布程序</a></li>
+    <li><a href="#zh-semantics">沿 A → B → C → D 检查 happens-before</a></li>
+    <li><a href="#zh-guidance">检查跨 CTA 通信的 scope 与推进条件</a></li>
+    <li><a href="#zh-implementation">对照 release/acquire 的 PTX 形式</a></li>
+    <li><a href="#zh-appendix">查询合法 order、CAS 和 STL 差异</a></li>
+  </ul>
+</nav>
+
+<h2 id="zh-definition">1. 原子 flag 为什么还不能交付普通数据</h2>
+
+<p>设 <code>data</code> 和 <code>ready</code> 都已经初始化为 0。<code>data</code> 是普通整数，<code>ready</code> 是 scope 覆盖双方的 atomic 对象，只有一个 producer 写入一次结果。先考虑下面这个<strong>缺少同步的错误协议</strong>：</p>
+
+<pre class="code">// Producer
+data = 42;
+ready.store(1, relaxed);
+
+// Consumer
+if (ready.load(relaxed) == 1)
+    value = data;</pre>
+
+<p>Producer 的两行有本 thread 内的先后顺序，consumer 的两行也有。Atomic flag 还保证对自身的访问具有原子性。但这几条局部约束没有把 <code>data = 42</code> 与另一个 thread 的 <code>value = data</code> 连起来。Consumer 即使读到了 1，也尚未获得访问普通 payload 所需的同步。</p>
+
+<p>在 CUDA C++ 中，两个潜在并发、相互冲突的普通访问，如果至少一个是写入，又没有 happens-before 关系，就会形成 data race，行为未定义。因此上述程序的问题已经超出“偶尔读到旧值”的范围，不能给它列出一张只含 0 和 42 的合法结果表。判定依据是 <a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html#data-races" target="_blank" rel="noopener">CUDA 13.2 的 data-race 规则</a>。</p>
+
+<p><strong>Memory ordering</strong> 规定 memory operation 之间需要满足的顺序约束。对于这次交接，我们需要 producer 发布 <code>data</code> 的写入，并让 consumer 在确认这次发布之后读取它。Release store 和 acquire load 正好承担这两个角色。</p>
+
+<h2 id="zh-example">2. 把一次发布写成完整程序</h2>
+
+<h3 id="zh-example-setup">2.1 单个 CTA、两个 warp、一份 payload</h3>
+
+<p>下面只启动一个 64-thread CTA。Thread 0 生产，thread 32 消费，两者分别属于两个 warp；其余 thread 仅参加初始化 barrier。<code>data</code> 和 flag 都放在这个 CTA 的 shared memory 中，flag 使用 block scope。<code>atomic_ref</code> 为已有的整数提供原子访问，<code>FlagStorage</code> 则显式满足它的对齐要求。</p>
+
+<pre class="code">#include &lt;cassert&gt;
+#include &lt;cstdio&gt;
+#include &lt;cuda/atomic&gt;
+#include &lt;cuda_runtime.h&gt;
+
+using ReadyRef = cuda::atomic_ref&lt;int, cuda::thread_scope_block&gt;;
+
+struct alignas(ReadyRef::required_alignment) FlagStorage {
+    int value;
+};
+
+__global__ void message_passing() {
+    __shared__ int data;
+    __shared__ FlagStorage flag;
+
+    if (threadIdx.x == 0) {
+        data = 0;
+        flag.value = 0;
+    }
+    __syncthreads();
+
+    ReadyRef ready(flag.value);
+
+    if (threadIdx.x == 0) {
+        data = 42;                                    // A
+        ready.store(1, cuda::memory_order_release);    // B
+    }
+    if (threadIdx.x == 32) {
+        while (ready.load(cuda::memory_order_acquire) != 1) {
+        }                                             // C: load returns 1
+        assert(data == 42);                            // D
+    }
+}
+
+int main() {
+    message_passing&lt;&lt;&lt;1, 64&gt;&gt;&gt;();
+    cudaError_t status = cudaGetLastError();
+    if (status == cudaSuccess)
+        status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+        std::fprintf(stderr, "%s\n", cudaGetErrorString(status));
+        return 1;
+    }
+    return 0;
+}</pre>
+
+<p>可以保存为 <code>publication.cu</code>，在有 CUDA Toolkit 的环境中编译；例如面向 <code>sm_80</code> 使用 <code>nvcc -std=c++17 -arch=sm_80 publication.cu -o publication</code>。程序用 assertion 表达需要证明的结果，host 同时检查 launch 与执行错误。</p>
+
+<p>初始化发生在创建任何 <code>ReadyRef</code> 之前，所有 thread 都经过 <code>__syncthreads()</code> 后才进入协议。此后对 <code>flag.value</code> 的访问全部经过 atomic reference；shared storage 的生命周期覆盖这些 reference。初始化 barrier 只解决起始状态，A 发生在 barrier 之后，A 与 D 之间的交接仍由 B 和 C 完成。</p>
+
+<h3 id="zh-semantics">2.2 从 reads-from 推到 happens-before</h3>
+
+<p>把 consumer 最后一次返回 1 的 load 记为 C。本例只有 B 会写入 1，因此可以确定 C 读到的是 B 的值，这条值来源关系叫 <code>reads-from</code>。B 带 release，C 带 acquire，双方都使用覆盖两个 thread 的 block scope，于是 B 与 C 建立 <code>synchronizes-with</code>。</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">一次发布的顺序证明</div>
+  <svg class="diagram-svg" viewBox="0 0 760 354" role="img" aria-labelledby="zh-publication-title zh-publication-desc">
+    <title id="zh-publication-title">从普通写入到普通读取的 happens-before 路径</title>
+    <desc id="zh-publication-desc">Producer 先执行 A 写 data，再执行 B release store。Consumer 的 C acquire load 从 B 读到 1 后执行 D 读取 data。A 到 B 和 C 到 D 是线程内顺序，B 到 C 是同步关系，合成 A happens-before D。</desc>
+    <defs><marker id="zh-publication-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path></marker><marker id="zh-publication-sync" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#be185d"></path></marker></defs>
+    <text x="181" y="30" text-anchor="middle" font-size="16" font-weight="600">Producer：thread 0</text>
+    <text x="579" y="30" text-anchor="middle" font-size="16" font-weight="600">Consumer：thread 32</text>
+    <rect class="box producer" x="36" y="56" width="290" height="48" rx="4"></rect>
+    <text class="mono" x="181" y="86" text-anchor="middle" font-size="14">A: data = 42</text>
+    <path class="edge" d="M181 104V176" marker-end="url(#zh-publication-arrow)"></path>
+    <text class="muted" x="193" y="144" font-size="12">sequenced-before：本 thread 内</text>
+    <rect class="box atomic" x="36" y="180" width="290" height="48" rx="4"></rect>
+    <text class="mono" x="181" y="210" text-anchor="middle" font-size="13">B: ready.store(1, release)</text>
+    <path class="sync" d="M328 204H430" marker-end="url(#zh-publication-sync)"></path>
+    <text class="muted" x="380" y="177" text-anchor="middle" font-size="11">从 B 读到 1</text>
+    <text class="muted" x="380" y="249" text-anchor="middle" font-size="11">synchronizes-with</text>
+    <rect class="box atomic" x="434" y="180" width="290" height="48" rx="4"></rect>
+    <text class="mono" x="579" y="210" text-anchor="middle" font-size="13">C: ready.load(acquire) == 1</text>
+    <path class="edge" d="M579 228V290" marker-end="url(#zh-publication-arrow)"></path>
+    <text class="muted" x="567" y="271" text-anchor="end" font-size="12">sequenced-before：本 thread 内</text>
+    <rect class="box consumer" x="434" y="294" width="290" height="44" rx="4"></rect>
+    <text class="mono" x="579" y="322" text-anchor="middle" font-size="14">D: value = data</text>
+    <text x="181" y="305" text-anchor="middle" font-size="14" font-weight="600">合成结果：A happens-before D</text>
+    <text class="muted" x="181" y="329" text-anchor="middle" font-size="12">普通 payload 的访问因此有序</text>
+  </svg>
+</div>
+
+<p><code>sequenced-before</code> 表示同一 thread 内由语言规定的求值顺序。A 在 B 之前，C 在 D 之前，加上跨 thread 的 B → C，就得到：</p>
+
+<pre class="code">A --sequenced-before--&gt; B
+B --synchronizes-with-&gt; C
+C --sequenced-before--&gt; D
+
+A --happens-before--&gt; D</pre>
+
+<p><code>happens-before</code> 是这些顺序关系及其传递关系形成的约束。在这个一次写入的程序里，A 的写入有序地先于 D，期间也没有其他人改写 <code>data</code>，所以 D 必须得到 42。Payload 本身可以保持普通类型，因为它的访问已经由 flag 上的同步排好了顺序。</p>
+
+<p>Consumer 较早的 load 可能返回初始值 0；它们没有从 B 读取，因此尚未接收这次发布，循环会继续。Acquire 的保证以匹配的 observation 为条件。若一个可复用的 flag 曾被多次写成 1，单凭数值相等就无法认定读到了哪一代发布，后面还要为复用建立协议。</p>
+
+<h3 id="zh-order-changes">2.3 改动 order 会断开哪条关系</h3>
+
+<p>只改 B 或 C 的 order，其他条件保持不变，可以直接用上面的路径检查结果：</p>
+
+<div class="table-scroll"><table class="note-table">
+  <thead><tr><th>B：store</th><th>C：load</th><th>C 读到 B 的 1 之后</th></tr></thead>
+  <tbody>
+    <tr><td><code>release</code></td><td><code>acquire</code></td><td>B → C 建立同步，A happens-before D，读取 42。</td></tr>
+    <tr><td><code>seq_cst</code></td><td><code>acquire</code> 或 <code>seq_cst</code></td><td>Store 仍包含 release，协议成立。</td></tr>
+    <tr><td><code>release</code></td><td><code>seq_cst</code></td><td>Load 仍包含 acquire，协议成立。</td></tr>
+    <tr><td><code>release</code></td><td><code>relaxed</code></td><td>缺少接收语义，A 与 D 构成 data race，行为未定义。</td></tr>
+    <tr><td><code>relaxed</code></td><td><code>acquire</code> 或 <code>relaxed</code></td><td>缺少发布语义，A 与 D 构成 data race，行为未定义。</td></tr>
+  </tbody>
+</table></div>
+
+<p>Release/acquire 已经满足这次交接的证明。把两端改为 <code>seq_cst</code> 会增加 SC 顺序约束，但不会为这个单 flag、单次发布增加一个新的 payload 结果保证。<code>acq_rel</code> 同时具有接收和发布两个方向，适用于 RMW 或 fence，不能直接作为普通 load 或 store 的 order。</p>
+
+<h2 id="zh-guidance">3. 把协议扩大之前，先补齐通信条件</h2>
+
+<h3 id="zh-scope">3.1 Scope 必须覆盖实际参与者</h3>
+
+<p>示例使用 block scope，是因为两个 thread 在同一个 CTA。若把 producer 和 consumer 拆到不同 CTA，普通 shared memory 不再是双方都能访问的存储；payload 与 flag 通常要放到共同可访问的 global memory，atomic 的 scope 也要随之扩大。</p>
+
+<div class="table-scroll"><table class="note-table">
+  <thead><tr><th>通信范围</th><th>两端采用的 scope</th><th>存储与平台条件</th></tr></thead>
+  <tbody>
+    <tr><td>同一 CTA</td><td><code>thread_scope_block</code></td><td>双方访问同一对象；本文的 shared memory 满足要求。</td></tr>
+    <tr><td>同一 GPU、同一 memory synchronization domain，跨 CTA</td><td><code>thread_scope_device</code></td><td>使用双方可访问的存储，并另外满足下一节的调度条件。</td></tr>
+    <tr><td>CPU 或其他 GPU 参与</td><td><code>thread_scope_system</code></td><td>核对 allocation 类型、并发访问和对应操作的原子能力。</td></tr>
+  </tbody>
+</table></div>
+
+<p>只扩大 consumer 一侧不能补足 producer 的范围。例如跨 CTA 的 block-scope store 与 device-scope load 不满足双方的 scope 条件，连 flag 的竞争访问也会形成 data race。CUDA 的 <a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html#example-message-passing" target="_blank" rel="noopener">message-passing 示例</a>专门给出了这个反例。使用 <code>atomic_ref</code> 时，还应让同时引用同一对象的 reference 使用一致的 <code>Scope</code>。</p>
+
+<p>System scope 的适用性取决于内存和平台。例如 managed memory 的 CPU/GPU 并发原子访问需要核对 <code>concurrentManagedAccess</code>；mapped memory 和 GPU peer memory 则有各自的原子能力条件，见 <a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html#atomicity" target="_blank" rel="noopener">atomicity 条件</a>。如果应用主动将同一 GPU 的 kernel 分入不同 memory synchronization domain，跨 domain 的排序也需要 system-scope synchronization；默认 domain 内的通信仍可使用 device scope，见 <a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/04-special-topics/memory-sync-domains.html#isolating-traffic-with-domains" target="_blank" rel="noopener">domain 规则</a>。</p>
+
+<h3 id="zh-progress">3.2 正确的顺序还需要能够推进的执行</h3>
+
+<p>在主例中，producer 和 consumer 属于同一个 CTA，初始化 barrier 由全部 64 个 thread 执行，producer 写入后即可退出，不等待 consumer 先完成任何动作。这避免了两个参与者互相等待，以及 consumer 占据资源、producer CTA 却无法驻留的问题。</p>
+
+<p>这里用到的是独立于 memory order 的执行保证。<a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cuda-cpp-execution-model.html#device-threads" target="_blank" rel="noopener">CUDA 13.2 执行模型</a>规定，一个 device thread 开始推进后，同一 thread-block cluster 的 thread 也必须最终推进，其中包含同一 CTA。Consumer 轮询的是 shared storage 上的原子读取，producer 则执行有限的工作。例子的 host 最后进入同步 API 等待完成；它没有通过另一个 host 自旋循环等待 kernel 启动。</p>
+
+<p>普通 grid 不保证任意两个 CTA 同时或按指定次序运行。若已经驻留的 consumer CTA 都在自旋，等待尚未调度的 producer CTA，正确的 release/acquire 也不能消除这种资源等待。跨 CTA 协议需要合适的执行安排，例如具有相应保证的 cooperative launch，或把两个阶段拆成具有依赖关系的 kernel。Release/acquire 本身不提供调度公平性或完成时间上界。</p>
+
+<h3 id="zh-reuse">3.3 从一次发布到循环使用的队列槽位</h3>
+
+<p>主例在发布 42 后不再改写 payload。若 producer 马上开始写下一份数据，而 consumer 仍在读取上一份，第一次 B → C 的同步并没有排好这两次新访问的顺序，payload 仍可能产生 data race。</p>
+
+<p>复用需要反向交接所有权：consumer 完成读取后发布“槽位已空闲”，producer 接收这个确认之后才能覆盖。多轮协议还需要区分代数，避免把上一轮的 <code>ready == 1</code> 当成新一轮完成。Sequence number 或明确的状态机通常承担这个任务；它们的回绕、对象 lifetime 和多 producer 竞争需要各自的证明。主例提供的是其中一个方向的数据交接。</p>
+
+<h2 id="zh-implementation">4. 同一份证明如何映射到 PTX</h2>
+
+<h3 id="zh-ptx-pair">4.1 在指令上找到发布和接收</h3>
+
+<p>CUDA C++ 规定源程序的合法行为，编译器必须生成保持这些行为的指令。对于本文 shared-memory、block-scope 的协议，下面的 PTX 片段把 A 到 D 的角色直接写在指令上。地址和寄存器声明省略，这是按公开 ABI 写出的语义示意，并非某次 <code>nvcc</code> 编译的反汇编结果。</p>
+
+<pre class="code">// Producer
+st.shared.u32              [data], 42;       // A
+st.release.cta.shared.u32  [ready], 1;       // B
+
+// Consumer
+WAIT:
+ld.acquire.cta.shared.u32  %r0, [ready];     // C
+setp.ne.u32               %p0, %r0, 1;
+@%p0 bra                  WAIT;
+ld.shared.u32             %r1, [data];      // D</pre>
+
+<p><code>.release</code> 和 <code>.acquire</code> 标记排序语义，<code>.cta</code> 标记同步范围，<code>.shared</code> 标记地址空间。若协议经前述条件检查后改为 global-memory、device-scope 交接，相关形式是 <code>st.release.gpu.global</code> 和 <code>ld.acquire.gpu.global</code>。改变的是 scope 和地址空间，A → B → C → D 的证明结构保持相同。</p>
+
+<p><a href="https://docs.nvidia.com/cuda/archive/13.2.0/ptx-writers-guide-to-interoperability/index.html#atomics-application-binary-interface" target="_blank" rel="noopener">PTX Interoperability 13.2 的 atomic ABI</a>也允许用 relaxed operation 配合 fence 表达同一契约：</p>
+
+<p>下面独立的 <code>fence.release</code>/<code>fence.acquire</code> 从 PTX 8.6 引入，要求 <code>sm_90</code> 或更高；面向前例的 <code>sm_80</code> 时，可以将它们各自加强为 <code>fence.acq_rel.cta</code>。这个目标限制属于独立 fence 的 qualifier，不影响 C++ release/acquire 接口，见 <a href="https://docs.nvidia.com/cuda/archive/13.2.0/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-membar" target="_blank" rel="noopener">PTX fence 的 ISA 与 Target Notes</a>。</p>
+
+<pre class="code">// Alternative B, after A
+fence.release.cta;
+st.relaxed.cta.shared.u32  [ready], 1;
+
+// Alternative C, before D
+WAIT_RELAXED:
+ld.relaxed.cta.shared.u32  %r0, [ready];
+setp.ne.u32               %p0, %r0, 1;
+@%p0 bra                  WAIT_RELAXED;
+fence.acquire.cta;</pre>
+
+<p>Producer 的 payload 写入在 release fence 之前，consumer 的 payload 读取在 acquire fence 之后，退出循环的 atomic load 仍从发布方的 store 取值。这正是 <a href="https://docs.nvidia.com/cuda/archive/13.2.0/parallel-thread-execution/index.html#release-acquire-patterns" target="_blank" rel="noopener">PTX 9.2 的 release/acquire pattern</a>。只在两侧各放一条 fence，而没有中间的通信关系，无法得到这个证明。</p>
+
+<h3 id="zh-hardware-cost">4.2 从 PTX 继续向下看，需要目标架构</h3>
+
+<p>ABI 允许合规映射混用，也允许加强 order。因此一份源码里的 release/acquire 可能表现为带语义的访存，也可能出现单独 fence。再往下到 SASS，必须指定目标架构和编译器版本后查看实际输出，不能把某一份输出当成所有 GPU 的固定序列。</p>
+
+<p>排序可能有执行成本。CUDA 的 <a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/04-special-topics/memory-sync-domains.html#memory-fence-interference" target="_blank" rel="noopener">memory fence interference</a> 说明，fence/flush 有时会等待超出源程序同步所需范围的 in-flight transaction。这个公开现象解释了缩小通信范围、减少不必要同步为何可能有价值，但它没有规定 release 必须把所有 cache line 写回 DRAM，也没有规定 acquire 必须清空整级 cache。</p>
+
+<p>查看 <code>ld</code>/<code>st</code> 时也要区分 cache hint 与排序语义。PTX 的 cache operator 用于性能提示，不改变程序的 memory consistency；<code>.volatile</code> 也没有 acquire/release 的发布语义。完整 qualifier 与 atomic ABI 速查放在附录，避免把代码生成细节混进源码的正确性证明。</p>
+
+<h2 id="zh-selection">5. 根据交接的内容选择 order</h2>
+
+<p>回到起点：<code>ready</code> 的职责是交付另一个地址上的普通 payload，因此需要发布方 release 和接收方 acquire。若 atomic 只分配独立编号，正确性所依赖的关系会少一些。下面的 device-scope atomic 自己拥有存储；每个 thread 将取得的编号写到独占的输出元素：</p>
+
+<pre class="code">#include &lt;cuda/atomic&gt;
+
+__device__ cuda::atomic&lt;unsigned, cuda::thread_scope_device&gt; ticket{0};
+
+__global__ void allocate_ticket(unsigned* out) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    out[i] = ticket.fetch_add(1, cuda::memory_order_relaxed);
+}</pre>
+
+<p>这里假定一维 launch，<code>out</code> 为每个 thread 分配了一个元素，索引与计数器都没有回绕，所有访问处于同一 device scope。Atomic RMW 的不可分割更新以及同一对象的 <code>modification order</code> 足以分配互不重复的编号；编号大小不承诺 thread 的完成顺序。Host 在 kernel 完成后读取输出。若其他 GPU thread 要根据 ticket 的数值判断某个 <code>out[i]</code> 已写好，就增加了新的 publication 要求，当前代码并未提供它。</p>
+
+<div class="table-scroll"><table class="note-table">
+  <thead><tr><th>Atomic 承担的职责</th><th>所需关系</th><th>常用 order</th></tr></thead>
+  <tbody>
+    <tr><td>只计数或分配编号</td><td>仅依赖当前对象的原子更新</td><td><code>relaxed</code></td></tr>
+    <tr><td>写完 payload 后交付状态</td><td>先前访问进入发布关系</td><td><code>release</code> store</td></tr>
+    <tr><td>接收状态后访问 payload</td><td>从对应发布接收先行访问</td><td><code>acquire</code> load</td></tr>
+    <tr><td>一次状态更新同时接收旧阶段、交付新阶段</td><td>RMW 需要接收和发布两个方向</td><td><code>acq_rel</code></td></tr>
+    <tr><td>证明依赖多个 atomic object 的 SC 顺序</td><td>在适用的 scope 内增加 SC 全序约束</td><td><code>seq_cst</code></td></tr>
+  </tbody>
+</table></div>
+
+<p>选择 order 前，先把普通数据的生产、交付、消费和回收画出来，就能看出哪些访问必须排成 happens-before。随后选择覆盖参与者的 scope，检查实际 launch 能否推进。对于整组 thread 的阶段性交接，barrier 往往能更直接地表达意图；对于独立 producer/consumer，flag 的 release/acquire 让交接发生在具体数据就绪的位置。性能优化应从这些已成立的关系出发，再比较 kernel 时间，不能通过删掉证明中必需的一条边换取更短的指令序列。</p>
+
+<h2 id="zh-libcu">附录 A：libcu++ 接口与 storage 条件</h2>
+
+<h3 id="zh-api-types">A.1 Namespace、对象与 reference</h3>
+
+<div class="table-scroll"><table class="note-table">
+  <thead><tr><th>Header 与类型</th><th>使用位置</th><th>Scope 与存储</th></tr></thead>
+  <tbody>
+    <tr><td><code>&lt;atomic&gt;</code> / <code>std::atomic&lt;T&gt;</code></td><td>通常使用 host 标准库</td><td>标准 C++ 接口，不显式表达 CUDA scope。</td></tr>
+    <tr><td><code>&lt;cuda/std/atomic&gt;</code> / <code>cuda::std::atomic&lt;T&gt;</code></td><td>Host 与 device</td><td>标准形态，CUDA 内存模型中对应 system-scope 行为。</td></tr>
+    <tr><td><code>&lt;cuda/atomic&gt;</code> / <code>cuda::atomic&lt;T, Scope&gt;</code></td><td>Host 与 device</td><td>自带存储，模板参数指定 scope，默认 system。</td></tr>
+    <tr><td><code>&lt;cuda/atomic&gt;</code> / <code>cuda::atomic_ref&lt;T, Scope&gt;</code></td><td>Host 与 device</td><td>原子访问已有对象，模板参数指定 scope，默认 system。</td></tr>
+  </tbody>
+</table></div>
+
+<p>libcu++ 保留标准 atomic 的成员接口，并扩展了 thread scope。<code>cuda::atomic_ref</code> 的 scope 参数与 <code>required_alignment</code> 可见 <a href="https://github.com/NVIDIA/cccl/blob/v3.1.0/libcudacxx/include/cuda/__atomic/atomic.h" target="_blank" rel="noopener">CCCL v3.1.0 的公开定义</a>；该版本将 required alignment 设为 <code>sizeof(T)</code>。写通用代码时应查询类型暴露的常量，主例因此使用 <code>ReadyRef::required_alignment</code>。</p>
+
+<p><a href="https://eel.is/c++draft/atomics.ref.generic" target="_blank" rel="noopener">Atomic reference 的对象约束</a>包括：底层类型满足接口要求，storage 正确对齐，底层对象存活得比所有 reference 更久，并且在 reference 存在期间只通过这些 reference 访问该对象。CUDA 还要求同时引用同一对象的 reference 不混用不同的 <code>Scope</code>，见 <a href="https://nvidia.github.io/cccl/unstable/libcudacxx/extended_api/synchronization_primitives/atomic_ref.html#limitations" target="_blank" rel="noopener">libcu++ 限制</a>。主例把普通初始化放在 reference 创建之前，并通过 barrier 完成阶段交接。</p>
+
+<h3 id="zh-api-cas">A.2 CAS、wait 与 fence</h3>
+
+<p><code>load</code>、<code>store</code>、<code>exchange</code>、<code>fetch_add/sub/and/or/xor</code> 和 compare-exchange 使用标准 atomic 的参数习惯，省略 order 时通常采用 <code>seq_cst</code>。Compare-exchange 的成功路径是 read-modify-write，失败路径只是读取，因此分别接收两个 order。下面是一段状态转换的 API 片段，其中 <code>phase</code> 是已初始化、scope 合适的 atomic 整数：</p>
+
+<pre class="code">int expected = 0;
+bool changed = phase.compare_exchange_weak(
+    expected, 1,
+    cuda::memory_order_acq_rel,  // success: read and write
+    cuda::memory_order_acquire  // failure: read only
+);</pre>
+
+<p>失败时 <code>expected</code> 会取得观察到的值；weak CAS 允许偶发失败。需要最终完成状态转换的算法要按自身状态机处理重试，不能把一次返回 false 当成已完成获取。这个片段只展示两条路径的 order，没有构成一个完整 mutex。</p>
+
+<p><code>wait</code> 使用 load-side order，<code>notify_one/all</code> 用于通知等待者重新检查状态。Payload 的交接仍取决于相关 store、load 或 fence 的 order。Fence 接口是 <code>cuda::atomic_thread_fence(order, scope)</code>，它没有自己的 atomic object，需要参与协议的 atomic 访问连接双方。</p>
+
+<p>例如保留主例 producer 的 release store，consumer 可以改成下面的形式。退出循环的 relaxed load 必须从 B 读取，load 与 fence 的 scope 都覆盖 producer，D 必须放在 fence 后面。这满足 <a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html#data-races" target="_blank" rel="noopener">CUDA 对 atomic-to-fence 同步的规定</a>：</p>
+
+<pre class="code">while (ready.load(cuda::memory_order_relaxed) != 1) {
+}
+cuda::atomic_thread_fence(
+    cuda::memory_order_acquire, cuda::thread_scope_block);
+int value = data;</pre>
+
+<h2 id="zh-appendix">附录 B：Memory order 与 PTX 速查</h2>
+
+<h3 id="zh-order-reference">B.1 Order 的方向和合法操作</h3>
+
+<div class="table-scroll"><table class="note-table">
+  <thead><tr><th>Order</th><th>承担的排序角色</th><th>常见操作</th></tr></thead>
+  <tbody>
+    <tr><td><code>relaxed</code></td><td>保留对象本身的原子性及 modification order，不单独发布其他地址的数据。</td><td>Load、store、RMW；relaxed fence 不增加排序。</td></tr>
+    <tr><td><code>acquire</code></td><td>通过匹配 observation 接收发布，使其作用于后续访问。</td><td>Load、RMW、fence。</td></tr>
+    <tr><td><code>release</code></td><td>将先行访问纳入其他 thread 可接收的发布关系。</td><td>Store、RMW、fence。</td></tr>
+    <tr><td><code>acq_rel</code></td><td>同一操作包含两个方向。</td><td>RMW、fence。</td></tr>
+    <tr><td><code>seq_cst</code></td><td>包含适合该操作的 acquire/release 语义，并加入 SC 顺序约束。</td><td>Load、store、RMW、fence。</td></tr>
+    <tr><td><code>consume</code></td><td>历史上针对数据依赖的接收语义；CUDA 文档中的当前实现加强为 acquire。</td><td>可用于 load-side 操作；新代码通常直接写 acquire。</td></tr>
+  </tbody>
+</table></div>
+
+<p>Acquire 和 release 约束不同方向，不能排成一条统一的强弱直线。忽略 consume 的历史差异后，可以按操作种类读下面的偏序；箭头仅表示排序约束加强，不表示运行时间：</p>
+
+<pre class="code">load:   relaxed &lt; acquire &lt; seq_cst
+store:  relaxed &lt; release &lt; seq_cst
+
+RMW:                 acquire
+                    /       \
+       relaxed ----           ---- acq_rel ---- seq_cst
+                    \       /
+                     release</pre>
+
+<p>普通 load 不接受 <code>release</code>/<code>acq_rel</code>，普通 store 不接受 <code>consume</code>/<code>acquire</code>/<code>acq_rel</code>。Compare-exchange 的 failure order 也只能使用 load-side 语义，不能含 release。Acquire 在一般协议中可以从 release sequence 接收发布；本文为使值来源清楚，使用直接从单个 release store 读取的情形。</p>
+
+<h3 id="zh-cpp-consume">B.2 C++ 与 CUDA 的版本差异</h3>
+
+<p>C++11 至 C++23 的接口包含六个 order 名称。当前 C++ 工作草案的 <a href="https://eel.is/c++draft/depr.atomics.order" target="_blank" rel="noopener">兼容性附录</a>保留 <code>consume</code>，并将其含义定义为 acquire。CUDA 13.2 的 <a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cpp-language-extensions.html#built-in-atomic-functions" target="_blank" rel="noopener">compiler atomic built-in 文档</a>仍列六个名字，并明确把 <code>__NV_ATOMIC_CONSUME</code> 加强为 <code>__NV_ATOMIC_ACQUIRE</code>。这些版本差异不影响主例直接使用 release/acquire。</p>
+
+<p>移植 CPU 的 <code>std::atomic</code> 算法时，可以复用数据交接的证明思路；CUDA 还需要补上 scope、内存能力和 GPU 执行条件。采用 <code>cuda::std::atomic</code> 并不会自动消除这些前置条件。也不要把 CPU 上某个 order “没有额外指令”的经验直接套到 GPU，代码生成与成本都需要在目标环境中确认。</p>
+
+<h3 id="zh-ptx-reference">B.3 Atomic ABI 与 load/store qualifier</h3>
+
+<p>下表摘取 PTX Interoperability 13.2 的常用映射，省略数据类型、地址空间与操作数；<code>&lt;scope&gt;</code> 代表相应 PTX scope。带 fence 的替代形式仍须满足同一协议的顺序关系。独立 <code>fence.acquire</code>/<code>fence.release</code> 的 <code>sm_90+</code> 要求及 <code>sm_80</code> 的加强形式见<a href="#zh-ptx-pair">第 4.1 节</a>。</p>
+
+<div class="table-scroll"><table class="note-table">
+  <thead><tr><th>CUDA C++ 操作</th><th>PTX 形式</th><th>允许的替代形式</th></tr></thead>
+  <tbody>
+    <tr><td>Relaxed load/store</td><td><code>ld.relaxed.&lt;scope&gt;</code> / <code>st.relaxed.&lt;scope&gt;</code></td><td>不需额外 fence。</td></tr>
+    <tr><td>Acquire load</td><td><code>ld.acquire.&lt;scope&gt;</code></td><td><code>ld.relaxed; fence.acquire</code></td></tr>
+    <tr><td>Release store</td><td><code>st.release.&lt;scope&gt;</code></td><td><code>fence.release; st.relaxed</code></td></tr>
+    <tr><td>Acq_rel RMW</td><td><code>atom.acq_rel.&lt;scope&gt;.&lt;op&gt;</code></td><td><code>fence.release; atom.relaxed; fence.acquire</code></td></tr>
+    <tr><td>Seq_cst load</td><td><code>fence.sc.&lt;scope&gt;; ld.acquire.&lt;scope&gt;</code></td><td><code>fence.sc; ld.relaxed; fence.acquire</code></td></tr>
+    <tr><td>Seq_cst store</td><td><code>fence.sc.&lt;scope&gt;; st.relaxed.&lt;scope&gt;</code></td><td>ABI 允许加强 operation 的 order。</td></tr>
+  </tbody>
+</table></div>
+
+<p>PTX 9.2 对 <a href="https://docs.nvidia.com/cuda/archive/13.2.0/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-ld" target="_blank" rel="noopener"><code>ld</code></a> 的主要 semantic 区分为 <code>.weak</code>、<code>.volatile</code>、<code>.relaxed</code>、<code>.acquire</code>；<a href="https://docs.nvidia.com/cuda/archive/13.2.0/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-st" target="_blank" rel="noopener"><code>st</code></a> 对应 <code>.weak</code>、<code>.volatile</code>、<code>.relaxed</code>、<code>.release</code>。每组互斥，省略时默认为 weak。Weak operation 依靠其他同步机制排序；scoped relaxed 是 strong operation，但单独使用没有发布或接收其他地址的语义。</p>
+
+<p><code>.volatile</code> 在 PTX 内存模型中具有 system-scope relaxed 语义及额外指令执行约束，不等于 acquire/release。MMIO 使用专门的 <code>.mmio</code> 规则，不能从 volatile 推导出来。Address space、scope 和 cache qualifier 的组合仍以具体指令语法为准。</p>
+
+<h2 id="zh-refs">参考资料</h2>
+
+<ul>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html" target="_blank" rel="noopener">CUDA Programming Guide 13.2：CUDA C++ Memory Model</a>，scope、data race、message passing 和 fence 同步条件。</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cuda-cpp-execution-model.html" target="_blank" rel="noopener">CUDA Programming Guide 13.2：CUDA C++ Execution Model</a>，device thread 与 CUDA API 的推进保证。</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.2.0/ptx-writers-guide-to-interoperability/index.html#atomics-application-binary-interface" target="_blank" rel="noopener">PTX Interoperability 13.2：Atomics ABI</a>，source order 到 PTX 的合规映射。</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.2.0/parallel-thread-execution/index.html#memory-consistency-model" target="_blank" rel="noopener">PTX ISA 9.2：Memory Consistency Model</a>，release/acquire pattern、scope 与 operation 类型。</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/04-special-topics/memory-sync-domains.html" target="_blank" rel="noopener">CUDA Programming Guide 13.2：Memory Synchronization Domains</a>，fence interference 与跨 domain 同步。</li>
+  <li><a href="https://github.com/NVIDIA/cccl/blob/v3.1.0/libcudacxx/include/cuda/__atomic/atomic.h" target="_blank" rel="noopener">CCCL v3.1.0：cuda atomic 类型定义</a>；<a href="https://nvidia.github.io/cccl/unstable/libcudacxx/extended_api/synchronization_primitives/atomic_ref.html" target="_blank" rel="noopener">libcu++ atomic_ref 文档</a>。</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cpp-language-extensions.html#built-in-atomic-functions" target="_blank" rel="noopener">CUDA Programming Guide 13.2：Built-in Atomic Functions</a>，order 名称及当前 consume 映射。</li>
+  <li><a href="https://eel.is/c++draft/atomics.order" target="_blank" rel="noopener">C++ 工作草案：Order and Consistency</a>；<a href="https://eel.is/c++draft/atomics.ref.generic" target="_blank" rel="noopener">atomic_ref</a>；<a href="https://eel.is/c++draft/depr.atomics.order" target="_blank" rel="noopener">consume 兼容性语义</a>。</li>
+</ul>
+
+</div>
+<div class="lang-en">
+<h1>NVIDIA GPU Atomic Memory Ordering: CUDA C++ Semantics and PTX Mappings</h1>
+
+<p class="lead">One thread writes a result to <code>data</code>, then sets <code>ready</code> to 1. Another thread sees 1 and retrieves the result. GPU work queues, completion flags, and object publication often contain this handoff. The difficulty is that an atomic update to <code>ready</code> directly protects the flag; the ordinary reads and writes of <code>data</code> still need an ordering relation between the threads.</p>
+
+<p>This article follows that handoff through a complete CUDA C++ program, derives why release/acquire makes it valid, and examines the additional conditions needed across CTAs. It then connects the proof to PTX. The discussion uses the public CUDA 13.2 memory model and atomic ABI; the full interface and memory-order comparisons are in the appendices.</p>
+
+<nav class="reading-guide" aria-label="Quick index">
+  <strong>Quick index</strong>
+  <ul>
+    <li><a href="#en-example">Find the self-contained publication program</a></li>
+    <li><a href="#en-semantics">Check happens-before along A → B → C → D</a></li>
+    <li><a href="#en-guidance">Check scope and progress across CTAs</a></li>
+    <li><a href="#en-implementation">Compare the PTX release/acquire forms</a></li>
+    <li><a href="#en-appendix">Look up legal orders, CAS, and Standard Library differences</a></li>
+  </ul>
+</nav>
+
+<h2 id="en-definition">1. Why an atomic flag does not yet deliver ordinary data</h2>
+
+<p>Suppose <code>data</code> and <code>ready</code> have both been initialized to 0. The payload is an ordinary integer, the flag is atomic at a scope covering both threads, and a single producer writes one result. Consider this <strong>incorrect protocol, which lacks synchronization</strong>:</p>
+
+<pre class="code">// Producer
+data = 42;
+ready.store(1, relaxed);
+
+// Consumer
+if (ready.load(relaxed) == 1)
+    value = data;</pre>
+
+<p>The producer's two statements have an order within its thread, as do the consumer's statements. The atomic flag also provides atomicity for its own accesses. Those local constraints do not connect <code>data = 42</code> to <code>value = data</code> in the other thread. Observing 1 has not established the synchronization needed to read the ordinary payload.</p>
+
+<p>In CUDA C++, potentially concurrent conflicting ordinary accesses, at least one of which writes, form a data race when neither happens before the other. The behavior is undefined. The problem therefore goes beyond occasionally obtaining an old value: a table listing only 0 and 42 would not describe this program's allowed outcomes. The relevant criterion is the <a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html#data-races" target="_blank" rel="noopener">CUDA 13.2 data-race rule</a>.</p>
+
+<p><strong>Memory ordering</strong> specifies the ordering constraints that memory operations must satisfy. For this handoff, the producer must publish its write to <code>data</code>, and the consumer must read the payload after receiving that publication. A release store and an acquire load provide those two roles.</p>
+
+<h2 id="en-example">2. A complete program for one publication</h2>
+
+<h3 id="en-example-setup">2.1 One CTA, two warps, one payload</h3>
+
+<p>The program launches one CTA with 64 threads. Thread 0 produces the result and thread 32 consumes it, placing them in separate warps. The remaining threads participate only in the initialization barrier. Both <code>data</code> and the flag reside in the CTA's shared memory, and the flag uses block scope. An <code>atomic_ref</code> provides atomic access to the existing integer; <code>FlagStorage</code> explicitly satisfies its alignment requirement.</p>
+
+<pre class="code">#include &lt;cassert&gt;
+#include &lt;cstdio&gt;
+#include &lt;cuda/atomic&gt;
+#include &lt;cuda_runtime.h&gt;
+
+using ReadyRef = cuda::atomic_ref&lt;int, cuda::thread_scope_block&gt;;
+
+struct alignas(ReadyRef::required_alignment) FlagStorage {
+    int value;
+};
+
+__global__ void message_passing() {
+    __shared__ int data;
+    __shared__ FlagStorage flag;
+
+    if (threadIdx.x == 0) {
+        data = 0;
+        flag.value = 0;
+    }
+    __syncthreads();
+
+    ReadyRef ready(flag.value);
+
+    if (threadIdx.x == 0) {
+        data = 42;                                    // A
+        ready.store(1, cuda::memory_order_release);    // B
+    }
+    if (threadIdx.x == 32) {
+        while (ready.load(cuda::memory_order_acquire) != 1) {
+        }                                             // C: load returns 1
+        assert(data == 42);                            // D
+    }
+}
+
+int main() {
+    message_passing&lt;&lt;&lt;1, 64&gt;&gt;&gt;();
+    cudaError_t status = cudaGetLastError();
+    if (status == cudaSuccess)
+        status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+        std::fprintf(stderr, "%s\n", cudaGetErrorString(status));
+        return 1;
+    }
+    return 0;
+}</pre>
+
+<p>Save it as <code>publication.cu</code> and compile in an environment with the CUDA Toolkit. For example, <code>nvcc -std=c++17 -arch=sm_80 publication.cu -o publication</code> targets <code>sm_80</code>. The assertion states the result to be proved, and the host checks launch and execution errors.</p>
+
+<p>Initialization occurs before any <code>ReadyRef</code> is constructed. Every thread passes through <code>__syncthreads()</code> before entering the protocol. All subsequent accesses to <code>flag.value</code> use atomic references, and the shared storage outlives them. The initialization barrier establishes the starting state. Since A occurs after that barrier, B and C still provide the handoff between A and D.</p>
+
+<h3 id="en-semantics">2.2 From reads-from to happens-before</h3>
+
+<p>Call the consumer's final load, which returns 1, C. Only B writes 1 in this program, so C obtains its value from B. This value-source relation is called <code>reads-from</code>. B has release semantics, C has acquire semantics, and both use block scope covering the two threads. B and C therefore establish <code>synchronizes-with</code>.</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">The ordering proof for one publication</div>
+  <svg class="diagram-svg" viewBox="0 0 760 354" role="img" aria-labelledby="en-publication-title en-publication-desc">
+    <title id="en-publication-title">The happens-before path from an ordinary write to an ordinary read</title>
+    <desc id="en-publication-desc">The producer performs A, a write to data, then B, a release store. The consumer's acquire load C reads 1 from B before D reads data. A to B and C to D are sequenced-before relations; B to C is synchronizes-with. Together they give A happens-before D.</desc>
+    <defs><marker id="en-publication-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--fg-muted)"></path></marker><marker id="en-publication-sync" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#be185d"></path></marker></defs>
+    <text x="181" y="30" text-anchor="middle" font-size="16" font-weight="600">Producer: thread 0</text>
+    <text x="579" y="30" text-anchor="middle" font-size="16" font-weight="600">Consumer: thread 32</text>
+    <rect class="box producer" x="36" y="56" width="290" height="48" rx="4"></rect>
+    <text class="mono" x="181" y="86" text-anchor="middle" font-size="14">A: data = 42</text>
+    <path class="edge" d="M181 104V176" marker-end="url(#en-publication-arrow)"></path>
+    <text class="muted" x="193" y="144" font-size="12">sequenced-before: within a thread</text>
+    <rect class="box atomic" x="36" y="180" width="290" height="48" rx="4"></rect>
+    <text class="mono" x="181" y="210" text-anchor="middle" font-size="13">B: ready.store(1, release)</text>
+    <path class="sync" d="M328 204H430" marker-end="url(#en-publication-sync)"></path>
+    <text class="muted" x="380" y="177" text-anchor="middle" font-size="11">reads 1 from B</text>
+    <text class="muted" x="380" y="249" text-anchor="middle" font-size="11">synchronizes-with</text>
+    <rect class="box atomic" x="434" y="180" width="290" height="48" rx="4"></rect>
+    <text class="mono" x="579" y="210" text-anchor="middle" font-size="13">C: ready.load(acquire) == 1</text>
+    <path class="edge" d="M579 228V290" marker-end="url(#en-publication-arrow)"></path>
+    <text class="muted" x="567" y="271" text-anchor="end" font-size="12">sequenced-before: within a thread</text>
+    <rect class="box consumer" x="434" y="294" width="290" height="44" rx="4"></rect>
+    <text class="mono" x="579" y="322" text-anchor="middle" font-size="14">D: value = data</text>
+    <text x="181" y="305" text-anchor="middle" font-size="14" font-weight="600">Result: A happens-before D</text>
+    <text class="muted" x="181" y="329" text-anchor="middle" font-size="12">The ordinary payload accesses are ordered</text>
+  </svg>
+</div>
+
+<p><code>Sequenced-before</code> describes the language-defined evaluation order within a thread. A precedes B, and C precedes D. Adding the cross-thread edge from B to C gives:</p>
+
+<pre class="code">A --sequenced-before--&gt; B
+B --synchronizes-with-&gt; C
+C --sequenced-before--&gt; D
+
+A --happens-before--&gt; D</pre>
+
+<p><code>Happens-before</code> combines these ordering relations and their transitive relationships. In this program, which publishes once, A's write is ordered before D and no other thread overwrites <code>data</code> in between. D must therefore obtain 42. The payload can remain an ordinary object because synchronization on the flag has ordered its accesses.</p>
+
+<p>Earlier consumer loads may return the initial value 0. Those loads do not read from B, so they have not received this publication and the loop continues. The acquire guarantee depends on a matching observation. If a reusable flag has been set to 1 several times, equality of the value alone no longer identifies the publication generation; reuse needs an additional protocol.</p>
+
+<h3 id="en-order-changes">2.3 Which relation changes when the order changes</h3>
+
+<p>Change only the order of B or C, retaining all other conditions, and the path above gives the result:</p>
+
+<div class="table-scroll"><table class="note-table">
+  <thead><tr><th>B: store</th><th>C: load</th><th>After C reads B's value 1</th></tr></thead>
+  <tbody>
+    <tr><td><code>release</code></td><td><code>acquire</code></td><td>B synchronizes with C, A happens before D, and D reads 42.</td></tr>
+    <tr><td><code>seq_cst</code></td><td><code>acquire</code> or <code>seq_cst</code></td><td>The store still includes release semantics, so the protocol is valid.</td></tr>
+    <tr><td><code>release</code></td><td><code>seq_cst</code></td><td>The load still includes acquire semantics, so the protocol is valid.</td></tr>
+    <tr><td><code>release</code></td><td><code>relaxed</code></td><td>The receiving semantic is absent. A and D race, giving undefined behavior.</td></tr>
+    <tr><td><code>relaxed</code></td><td><code>acquire</code> or <code>relaxed</code></td><td>The publishing semantic is absent. A and D race, giving undefined behavior.</td></tr>
+  </tbody>
+</table></div>
+
+<p>Release/acquire already satisfies this handoff's proof. Using <code>seq_cst</code> at both ends adds SC ordering constraints, but gives this single-flag, single-publication program no additional guarantee about the payload result. <code>acq_rel</code> combines reception and publication; it applies to RMW operations or fences and is not a valid order for a plain load or store.</p>
+
+<h2 id="en-guidance">3. Conditions to establish before expanding the protocol</h2>
+
+<h3 id="en-scope">3.1 Scope must cover the actual participants</h3>
+
+<p>The example uses block scope because the two threads belong to one CTA. Moving the producer and consumer to different CTAs changes that assumption. Ordinary shared memory is no longer common storage for both participants; the payload and flag usually move to accessible global memory, and the atomic scope must expand with the communication range.</p>
+
+<div class="table-scroll"><table class="note-table">
+  <thead><tr><th>Communication range</th><th>Scope at both ends</th><th>Storage and platform conditions</th></tr></thead>
+  <tbody>
+    <tr><td>Within one CTA</td><td><code>thread_scope_block</code></td><td>Both threads access the same object; the example's shared memory qualifies.</td></tr>
+    <tr><td>Across CTAs on one GPU, within one memory synchronization domain</td><td><code>thread_scope_device</code></td><td>Use accessible storage and establish the scheduling conditions in the next section.</td></tr>
+    <tr><td>A CPU or another GPU participates</td><td><code>thread_scope_system</code></td><td>Check the allocation type, concurrent access support, and atomic capability for the operation.</td></tr>
+  </tbody>
+</table></div>
+
+<p>Widening only the consumer's scope does not repair the producer's range. A block-scope store paired with a device-scope load in another CTA fails the mutual scope requirement; the competing flag accesses themselves race. CUDA's <a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html#example-message-passing" target="_blank" rel="noopener">message-passing example</a> gives this counterexample. When using <code>atomic_ref</code>, references concurrently naming the same object must also use a consistent <code>Scope</code>.</p>
+
+<p>System scope depends on the memory and platform. For example, concurrent CPU/GPU atomic access to managed memory requires checking <code>concurrentManagedAccess</code>. Mapped memory and GPU peer memory have their own conditions; see the <a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html#atomicity" target="_blank" rel="noopener">atomicity requirements</a>. If an application places kernels on the same GPU in separate memory synchronization domains, ordering across those domains also needs system-scope synchronization. Device scope remains sufficient within the default domain; see the <a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/04-special-topics/memory-sync-domains.html#isolating-traffic-with-domains" target="_blank" rel="noopener">domain rules</a>.</p>
+
+<h3 id="en-progress">3.2 Correct ordering also needs an execution that can progress</h3>
+
+<p>In the main example, the producer and consumer belong to one CTA, all 64 threads reach the initialization barrier, and the producer can finish its store and exit without waiting for the consumer. This avoids both circular waiting and a consumer occupying resources while its producer CTA cannot become resident.</p>
+
+<p>The execution guarantee is separate from memory order. The <a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cuda-cpp-execution-model.html#device-threads" target="_blank" rel="noopener">CUDA 13.2 execution model</a> states that once a device thread makes progress, the threads in its thread-block cluster must eventually make progress, including those in the same CTA. The consumer polls an atomic read of shared storage, and the producer performs finite work. The host enters a synchronization API to wait for completion; it does not wait for the kernel to start through a separate host spin loop.</p>
+
+<p>An ordinary grid does not guarantee that arbitrary CTAs execute concurrently or in a chosen order. If resident consumer CTAs spin while their producer CTAs have not been scheduled, correct release/acquire semantics do not remove the resource dependency. Communication across CTAs needs an appropriate execution arrangement, such as a cooperative launch with the required guarantees, or separate kernels connected by a dependency. Release/acquire itself provides neither scheduling fairness nor a bound on completion time.</p>
+
+<h3 id="en-reuse">3.3 From one publication to a reusable queue slot</h3>
+
+<p>The main example never overwrites the payload after publishing 42. If the producer immediately starts writing the next payload while the consumer is still reading the previous one, the first B-to-C synchronization has not ordered those new accesses. The payload can race again.</p>
+
+<p>Reuse requires a handoff of ownership in the reverse direction: the consumer publishes that the slot is free after finishing its read, and the producer receives that acknowledgment before overwriting it. A repeated protocol also needs to distinguish generations, so a previous <code>ready == 1</code> cannot be mistaken for a new completion. Sequence numbers or an explicit state machine usually serve that purpose. Their wraparound, object lifetime, and competition among producers need their own proofs. The main example supplies one direction of the data handoff.</p>
+
+<h2 id="en-implementation">4. How the same proof maps to PTX</h2>
+
+<h3 id="en-ptx-pair">4.1 Identify publication and reception in the instructions</h3>
+
+<p>CUDA C++ specifies the source program's allowed behavior, and the compiler must generate instructions that preserve it. For the shared-memory, block-scope protocol, the following PTX fragment places the roles of A through D directly on the instructions. Address and register declarations are omitted. This is a semantic illustration based on the public ABI, rather than disassembly from a particular <code>nvcc</code> run.</p>
+
+<pre class="code">// Producer
+st.shared.u32              [data], 42;       // A
+st.release.cta.shared.u32  [ready], 1;       // B
+
+// Consumer
+WAIT:
+ld.acquire.cta.shared.u32  %r0, [ready];     // C
+setp.ne.u32               %p0, %r0, 1;
+@%p0 bra                  WAIT;
+ld.shared.u32             %r1, [data];      // D</pre>
+
+<p><code>.release</code> and <code>.acquire</code> identify ordering semantics, <code>.cta</code> identifies the synchronization scope, and <code>.shared</code> identifies the address space. After establishing the conditions for a global-memory, device-scope handoff, the corresponding forms are <code>st.release.gpu.global</code> and <code>ld.acquire.gpu.global</code>. The scope and address space change, while the A → B → C → D proof retains its structure.</p>
+
+<p>The <a href="https://docs.nvidia.com/cuda/archive/13.2.0/ptx-writers-guide-to-interoperability/index.html#atomics-application-binary-interface" target="_blank" rel="noopener">PTX Interoperability 13.2 atomic ABI</a> also permits relaxed operations combined with fences to express the same contract:</p>
+
+<p>The standalone <code>fence.release</code>/<code>fence.acquire</code> forms below were introduced in PTX 8.6 and require <code>sm_90</code> or newer. For the earlier example's <code>sm_80</code> target, each can be strengthened to <code>fence.acq_rel.cta</code>. This target restriction applies to the standalone fence qualifiers and does not restrict the C++ release/acquire interface; see the <a href="https://docs.nvidia.com/cuda/archive/13.2.0/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-membar" target="_blank" rel="noopener">PTX fence ISA and Target Notes</a>.</p>
+
+<pre class="code">// Alternative B, after A
+fence.release.cta;
+st.relaxed.cta.shared.u32  [ready], 1;
+
+// Alternative C, before D
+WAIT_RELAXED:
+ld.relaxed.cta.shared.u32  %r0, [ready];
+setp.ne.u32               %p0, %r0, 1;
+@%p0 bra                  WAIT_RELAXED;
+fence.acquire.cta;</pre>
+
+<p>The producer's payload write precedes the release fence, the consumer's payload read follows the acquire fence, and the load that exits the loop still reads from the publishing store. This forms a <a href="https://docs.nvidia.com/cuda/archive/13.2.0/parallel-thread-execution/index.html#release-acquire-patterns" target="_blank" rel="noopener">PTX 9.2 release/acquire pattern</a>. A fence on each side without the intervening communication relation does not establish this proof.</p>
+
+<h3 id="en-hardware-cost">4.2 Looking below PTX requires a target architecture</h3>
+
+<p>The ABI permits conforming mappings to be mixed and orders to be strengthened. Release/acquire in source code can therefore appear as memory instructions carrying semantics or as separate fences. To continue to SASS, specify the target architecture and compiler version and inspect their output. One compilation does not define a fixed sequence for every GPU.</p>
+
+<p>Ordering can carry an execution cost. CUDA's discussion of <a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/04-special-topics/memory-sync-domains.html#memory-fence-interference" target="_blank" rel="noopener">memory fence interference</a> explains that fence and flush operations sometimes wait on in-flight transactions beyond those required by source-level synchronization. This public observation explains why a narrower communication range or fewer unnecessary synchronization operations can matter. It does not specify that release must write every cache line to DRAM or that acquire must empty an entire cache.</p>
+
+<p>When reading <code>ld</code>/<code>st</code>, distinguish cache hints from ordering semantics. PTX cache operators are performance hints and do not change memory consistency; <code>.volatile</code> also lacks acquire/release publication semantics. The appendix collects the qualifier and atomic ABI reference, keeping code-generation details separate from the source program's correctness proof.</p>
+
+<h2 id="en-selection">5. Choose the order from what is being handed off</h2>
+
+<p>The original <code>ready</code> flag delivers an ordinary payload at another address, so the producer needs release and the receiver needs acquire. An atomic that only allocates independent numbers relies on fewer relations. The following device-scope atomic owns its storage, and each thread writes the number it receives to an exclusive output element:</p>
+
+<pre class="code">#include &lt;cuda/atomic&gt;
+
+__device__ cuda::atomic&lt;unsigned, cuda::thread_scope_device&gt; ticket{0};
+
+__global__ void allocate_ticket(unsigned* out) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    out[i] = ticket.fetch_add(1, cuda::memory_order_relaxed);
+}</pre>
+
+<p>This assumes a one-dimensional launch, one allocated output element per thread, no index or counter wraparound, and accesses within one device scope. Indivisible RMW updates and the atomic object's <code>modification order</code> suffice to assign distinct numbers. The numbers do not promise thread completion order. The host reads the output after kernel completion. If other GPU threads use the ticket value to decide that an <code>out[i]</code> has been written, that adds a publication requirement which this code does not provide.</p>
+
+<div class="table-scroll"><table class="note-table">
+  <thead><tr><th>Role of the atomic</th><th>Required relation</th><th>Usual order</th></tr></thead>
+  <tbody>
+    <tr><td>Only count or allocate numbers</td><td>Depend only on this object's atomic update</td><td><code>relaxed</code></td></tr>
+    <tr><td>Deliver state after writing a payload</td><td>Include earlier accesses in publication</td><td><code>release</code> store</td></tr>
+    <tr><td>Access a payload after receiving state</td><td>Receive earlier accesses from the corresponding publication</td><td><code>acquire</code> load</td></tr>
+    <tr><td>Receive an old phase and deliver a new phase in one update</td><td>The RMW needs both directions</td><td><code>acq_rel</code></td></tr>
+    <tr><td>Depend on SC ordering across several atomic objects</td><td>Add SC total-order constraints within the applicable scopes</td><td><code>seq_cst</code></td></tr>
+  </tbody>
+</table></div>
+
+<p>Before choosing an order, trace how ordinary data is produced, handed off, consumed, and reclaimed. That identifies the accesses which must form happens-before. Then choose a scope covering the participants and check whether the launch can make progress. A barrier often expresses a handoff between phases of a thread group more directly; a release/acquire flag lets independent producers and consumers hand off individual results when they become ready. Performance tuning can then compare kernel time while preserving those established relations. Removing an edge required by the proof is not a valid way to shorten the instruction sequence.</p>
+
+<h2 id="en-libcu">Appendix A: libcu++ interfaces and storage requirements</h2>
+
+<h3 id="en-api-types">A.1 Namespaces, objects, and references</h3>
+
+<div class="table-scroll"><table class="note-table">
+  <thead><tr><th>Header and type</th><th>Execution location</th><th>Scope and storage</th></tr></thead>
+  <tbody>
+    <tr><td><code>&lt;atomic&gt;</code> / <code>std::atomic&lt;T&gt;</code></td><td>Usually the host Standard Library</td><td>Standard C++ interface; no explicit CUDA scope.</td></tr>
+    <tr><td><code>&lt;cuda/std/atomic&gt;</code> / <code>cuda::std::atomic&lt;T&gt;</code></td><td>Host and device</td><td>Standard interface shape; system-scope behavior in the CUDA memory model.</td></tr>
+    <tr><td><code>&lt;cuda/atomic&gt;</code> / <code>cuda::atomic&lt;T, Scope&gt;</code></td><td>Host and device</td><td>Owns its storage. The scope template parameter defaults to system.</td></tr>
+    <tr><td><code>&lt;cuda/atomic&gt;</code> / <code>cuda::atomic_ref&lt;T, Scope&gt;</code></td><td>Host and device</td><td>Provides atomic access to an existing object. Scope defaults to system.</td></tr>
+  </tbody>
+</table></div>
+
+<p>libcu++ retains the standard atomic member interface and extends it with thread scope. The scope parameter and <code>required_alignment</code> of <code>cuda::atomic_ref</code> can be seen in the <a href="https://github.com/NVIDIA/cccl/blob/v3.1.0/libcudacxx/include/cuda/__atomic/atomic.h" target="_blank" rel="noopener">public CCCL v3.1.0 definition</a>, where required alignment is <code>sizeof(T)</code>. Generic code should query the exposed constant, as the main example does through <code>ReadyRef::required_alignment</code>.</p>
+
+<p>The <a href="https://eel.is/c++draft/atomics.ref.generic" target="_blank" rel="noopener">atomic reference contract</a> requires a supported underlying type, suitably aligned storage, a referenced object that outlives all its references, and access exclusively through those references while they exist. CUDA additionally prohibits concurrent references to the same object with different <code>Scope</code> parameters; see the <a href="https://nvidia.github.io/cccl/unstable/libcudacxx/extended_api/synchronization_primitives/atomic_ref.html#limitations" target="_blank" rel="noopener">libcu++ limitations</a>. The main example places ordinary initialization before reference construction and uses the barrier to complete that phase.</p>
+
+<h3 id="en-api-cas">A.2 CAS, wait, and fences</h3>
+
+<p><code>load</code>, <code>store</code>, <code>exchange</code>, <code>fetch_add/sub/and/or/xor</code>, and compare-exchange follow standard atomic parameter conventions. Omitting the order normally selects <code>seq_cst</code>. A successful compare-exchange is a read-modify-write operation, while failure performs only a read, so the two paths accept separate orders. The following API fragment operates on an initialized atomic integer <code>phase</code> with a suitable scope:</p>
+
+<pre class="code">int expected = 0;
+bool changed = phase.compare_exchange_weak(
+    expected, 1,
+    cuda::memory_order_acq_rel,  // success: read and write
+    cuda::memory_order_acquire  // failure: read only
+);</pre>
+
+<p>On failure, <code>expected</code> receives the observed value, and weak CAS permits spurious failure. An algorithm that requires the transition to complete must handle retries according to its state machine; a false return does not complete an acquisition. This fragment illustrates the orders on the two paths and does not constitute a complete mutex.</p>
+
+<p><code>wait</code> takes a load-side order; <code>notify_one/all</code> asks waiting threads to check the state again. Payload handoff still depends on the associated store, load, or fence orders. The fence interface is <code>cuda::atomic_thread_fence(order, scope)</code>. A fence has no atomic object of its own, so atomic accesses in the protocol must connect the participants.</p>
+
+<p>For example, retain the main example's producer release store and replace the consumer with the following. The relaxed load that exits the loop must read from B, both the load and fence scopes must cover the producer, and D must follow the fence. This meets the <a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html#data-races" target="_blank" rel="noopener">CUDA atomic-to-fence synchronization rule</a>:</p>
+
+<pre class="code">while (ready.load(cuda::memory_order_relaxed) != 1) {
+}
+cuda::atomic_thread_fence(
+    cuda::memory_order_acquire, cuda::thread_scope_block);
+int value = data;</pre>
+
+<h2 id="en-appendix">Appendix B: Memory-order and PTX reference</h2>
+
+<h3 id="en-order-reference">B.1 Ordering directions and legal operations</h3>
+
+<div class="table-scroll"><table class="note-table">
+  <thead><tr><th>Order</th><th>Ordering role</th><th>Common operations</th></tr></thead>
+  <tbody>
+    <tr><td><code>relaxed</code></td><td>Preserves the object's atomicity and modification order; does not by itself publish data at other addresses.</td><td>Load, store, RMW; a relaxed fence adds no ordering.</td></tr>
+    <tr><td><code>acquire</code></td><td>Receives publication through a matching observation, affecting subsequent accesses.</td><td>Load, RMW, fence.</td></tr>
+    <tr><td><code>release</code></td><td>Includes earlier accesses in publication that another thread can receive.</td><td>Store, RMW, fence.</td></tr>
+    <tr><td><code>acq_rel</code></td><td>Combines the two directions in one operation.</td><td>RMW, fence.</td></tr>
+    <tr><td><code>seq_cst</code></td><td>Includes acquire/release semantics appropriate to the operation and adds SC ordering constraints.</td><td>Load, store, RMW, fence.</td></tr>
+    <tr><td><code>consume</code></td><td>Historically receives ordering through data dependencies; the implementation described by CUDA strengthens it to acquire.</td><td>Load-side operations; new code usually spells acquire directly.</td></tr>
+  </tbody>
+</table></div>
+
+<p>Acquire and release constrain different directions, so there is no single strength ranking for all operations. Setting aside consume's historical distinction gives the following partial orders by operation type. The arrows describe stronger ordering constraints, not execution time:</p>
+
+<pre class="code">load:   relaxed &lt; acquire &lt; seq_cst
+store:  relaxed &lt; release &lt; seq_cst
+
+RMW:                 acquire
+                    /       \
+       relaxed ----           ---- acq_rel ---- seq_cst
+                    \       /
+                     release</pre>
+
+<p>A plain load cannot use <code>release</code> or <code>acq_rel</code>; a plain store cannot use <code>consume</code>, <code>acquire</code>, or <code>acq_rel</code>. Compare-exchange failure also accepts only load-side semantics, without release. In a general protocol, acquire can receive publication through a release sequence. This article uses a direct read from one release store to keep the value source explicit.</p>
+
+<h3 id="en-cpp-consume">B.2 Version differences between C++ and CUDA</h3>
+
+<p>C++11 through C++23 expose six order names. The current C++ working draft retains <code>consume</code> in its <a href="https://eel.is/c++draft/depr.atomics.order" target="_blank" rel="noopener">compatibility annex</a> and defines its meaning as acquire. CUDA 13.2's <a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cpp-language-extensions.html#built-in-atomic-functions" target="_blank" rel="noopener">compiler atomic built-in documentation</a> still lists six names and explicitly strengthens <code>__NV_ATOMIC_CONSUME</code> to <code>__NV_ATOMIC_ACQUIRE</code>. These differences do not affect the main example's explicit release/acquire operations.</p>
+
+<p>When porting a CPU algorithm using <code>std::atomic</code>, its data-handoff proof remains a useful starting point. CUDA additionally needs scope, memory capability, and GPU execution conditions. Choosing <code>cuda::std::atomic</code> does not remove those preconditions. Nor does a CPU observation that an order costs no extra instructions transfer directly to a GPU: code generation and cost must be checked in the target environment.</p>
+
+<h3 id="en-ptx-reference">B.3 Atomic ABI and load/store qualifiers</h3>
+
+<p>This table collects common PTX Interoperability 13.2 mappings, omitting data types, address spaces, and operands. <code>&lt;scope&gt;</code> denotes the relevant PTX scope. Alternatives containing fences must preserve the same protocol's ordering relations. See <a href="#en-ptx-pair">Section 4.1</a> for the <code>sm_90+</code> requirement of standalone <code>fence.acquire</code>/<code>fence.release</code> and their strengthened form on <code>sm_80</code>.</p>
+
+<div class="table-scroll"><table class="note-table">
+  <thead><tr><th>CUDA C++ operation</th><th>PTX form</th><th>Permitted alternative</th></tr></thead>
+  <tbody>
+    <tr><td>Relaxed load/store</td><td><code>ld.relaxed.&lt;scope&gt;</code> / <code>st.relaxed.&lt;scope&gt;</code></td><td>No additional fence is needed.</td></tr>
+    <tr><td>Acquire load</td><td><code>ld.acquire.&lt;scope&gt;</code></td><td><code>ld.relaxed; fence.acquire</code></td></tr>
+    <tr><td>Release store</td><td><code>st.release.&lt;scope&gt;</code></td><td><code>fence.release; st.relaxed</code></td></tr>
+    <tr><td>Acq_rel RMW</td><td><code>atom.acq_rel.&lt;scope&gt;.&lt;op&gt;</code></td><td><code>fence.release; atom.relaxed; fence.acquire</code></td></tr>
+    <tr><td>Seq_cst load</td><td><code>fence.sc.&lt;scope&gt;; ld.acquire.&lt;scope&gt;</code></td><td><code>fence.sc; ld.relaxed; fence.acquire</code></td></tr>
+    <tr><td>Seq_cst store</td><td><code>fence.sc.&lt;scope&gt;; st.relaxed.&lt;scope&gt;</code></td><td>The ABI permits strengthening the operation's order.</td></tr>
+  </tbody>
+</table></div>
+
+<p>PTX 9.2 distinguishes the primary semantics <code>.weak</code>, <code>.volatile</code>, <code>.relaxed</code>, and <code>.acquire</code> for <a href="https://docs.nvidia.com/cuda/archive/13.2.0/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-ld" target="_blank" rel="noopener"><code>ld</code></a>. The corresponding set for <a href="https://docs.nvidia.com/cuda/archive/13.2.0/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-st" target="_blank" rel="noopener"><code>st</code></a> is <code>.weak</code>, <code>.volatile</code>, <code>.relaxed</code>, and <code>.release</code>. Each set is mutually exclusive, with weak as the default. Weak operations depend on other mechanisms for synchronization; scoped relaxed operations are strong operations but do not alone publish or receive data at other addresses.</p>
+
+<p>In the PTX memory model, <code>.volatile</code> has system-scope relaxed semantics plus additional instruction-execution constraints. It is not acquire/release. MMIO has dedicated <code>.mmio</code> rules that cannot be inferred from volatile. The permitted combinations of address space, scope, and cache qualifiers remain subject to each instruction's syntax.</p>
+
+<h2 id="en-refs">References</h2>
+
+<ul>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html" target="_blank" rel="noopener">CUDA Programming Guide 13.2: CUDA C++ Memory Model</a>, covering scopes, data races, message passing, and fence synchronization.</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cuda-cpp-execution-model.html" target="_blank" rel="noopener">CUDA Programming Guide 13.2: CUDA C++ Execution Model</a>, covering progress guarantees for device threads and CUDA APIs.</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.2.0/ptx-writers-guide-to-interoperability/index.html#atomics-application-binary-interface" target="_blank" rel="noopener">PTX Interoperability 13.2: Atomics ABI</a>, defining conforming mappings from source orders to PTX.</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.2.0/parallel-thread-execution/index.html#memory-consistency-model" target="_blank" rel="noopener">PTX ISA 9.2: Memory Consistency Model</a>, including release/acquire patterns, scopes, and operation types.</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/04-special-topics/memory-sync-domains.html" target="_blank" rel="noopener">CUDA Programming Guide 13.2: Memory Synchronization Domains</a>, covering fence interference and synchronization across domains.</li>
+  <li><a href="https://github.com/NVIDIA/cccl/blob/v3.1.0/libcudacxx/include/cuda/__atomic/atomic.h" target="_blank" rel="noopener">CCCL v3.1.0: CUDA atomic type definitions</a>; <a href="https://nvidia.github.io/cccl/unstable/libcudacxx/extended_api/synchronization_primitives/atomic_ref.html" target="_blank" rel="noopener">libcu++ atomic_ref documentation</a>.</li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-programming-guide/05-appendices/cpp-language-extensions.html#built-in-atomic-functions" target="_blank" rel="noopener">CUDA Programming Guide 13.2: Built-in Atomic Functions</a>, listing order names and the current consume mapping.</li>
+  <li><a href="https://eel.is/c++draft/atomics.order" target="_blank" rel="noopener">C++ working draft: Order and Consistency</a>; <a href="https://eel.is/c++draft/atomics.ref.generic" target="_blank" rel="noopener">atomic_ref</a>; <a href="https://eel.is/c++draft/depr.atomics.order" target="_blank" rel="noopener">consume compatibility semantics</a>.</li>
+</ul>
+
+</div>
+</main>
+</div>
+<script>
+(function () {
+  const contents = document.querySelector('.article-toc');
+  const compact = window.matchMedia('(max-width: 1099px)');
+  function fitContents() { contents.open = !compact.matches; }
+  fitContents();
+  compact.addEventListener('change', fitContents);
+  contents.addEventListener('click', function (event) {
+    if (compact.matches && event.target.closest('a[href^="#"]')) contents.open = false;
+  });
+})();
+</script>
+</body>
+</html>

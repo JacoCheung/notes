@@ -1,0 +1,1644 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>QuACK CuTeDSL RMSNorm 前向 Kernel：线程映射、规约与逐行注释</title>
+<meta name="post:title" content="QuACK CuTeDSL RMSNorm 前向 Kernel：线程映射、规约与逐行注释">
+<meta name="post:title_en" content="QuACK CuTeDSL RMSNorm Forward Kernel: Thread Mapping, Reduction, and Line-by-Line Commentary">
+<meta name="post:slug" content="quack-rmsnorm-cutedsl-annotated">
+<meta name="post:date" content="2026-08-31">
+<meta name="post:tags" content="GPU, CUDA, CuTe DSL, QuACK, RMSNorm, 源码分析">
+<meta name="post:tags_en" content="GPU, CUDA, CuTe DSL, QuACK, RMSNorm, Source Analysis">
+<meta name="post:reading" content="35 分钟">
+<meta name="post:reading_en" content="35 min">
+<meta name="post:summary" content="以 QuACK commit 14b0b71 为边界，逐行解释 RMSNorm/LayerNorm 共用前向 kernel 从装饰器开始的 213 行源码，建立从 CuTe layout、线程分片、cp.async staging、跨 warp/CTA 行规约到融合 affine epilogue 的完整执行模型。">
+<meta name="post:summary_en" content="A line-by-line reading of the 213-line unified RMSNorm/LayerNorm forward kernel from its decorator at QuACK commit 14b0b71, covering CuTe layouts, thread partitions, cp.async staging, row reduction across warps and CTA clusters, and the fused affine epilogue.">
+<meta name="post:series" content="kernel-dsl">
+<meta name="post:series_title" content="Kernel DSL">
+<meta name="post:series_title_en" content="Kernel DSL">
+<meta name="post:series_order" content="2">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(', '\\)'], ['$', '$']], displayMath: [['\\[', '\\]'], ['$$', '$$']] },
+    options: { skipHtmlTags: ['script', 'style', 'pre', 'code'] }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
+<script src="../lang-toggle.js" defer></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Geist+Mono:wght@400;500&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  main.content { max-width: 1120px; min-width: 0; padding: 56px 32px 96px; letter-spacing: 0; }
+  main.content h1,
+  main.content h2,
+  main.content h3 { letter-spacing: 0; }
+  @media (max-width: 960px) {
+    main.content { width: 100%; max-width: 100%; padding: 48px 18px 80px; }
+  }
+  .lead {
+    max-width: 88ch;
+    margin: -6px 0 30px;
+    color: var(--fg-muted);
+    font-size: 17px;
+    line-height: 1.8;
+  }
+  .note-box {
+    margin: 18px 0 26px;
+    padding: 12px 16px;
+    border-left: 3px solid var(--accent);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    background: var(--accent-tint);
+  }
+  .note-box.warn {
+    border-left-color: #d97706;
+    background: rgba(217, 119, 6, 0.09);
+  }
+  .note-box p { margin: 6px 0; }
+  .table-scroll {
+    max-width: 100%;
+    margin: 18px 0 28px;
+    overflow-x: auto;
+  }
+  table.note-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  table.note-table { min-width: 760px; }
+  table.note-table th,
+  table.note-table td {
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    text-align: left;
+    vertical-align: top;
+  }
+  table.note-table th {
+    background: var(--bg-elevated);
+    font-weight: 600;
+  }
+  pre.annotated-code {
+    max-width: 100%;
+    margin: 14px 0 30px;
+    padding: 18px 0;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+  }
+  pre.annotated-code code {
+    display: block;
+    width: max-content;
+    min-width: 100%;
+    padding: 0 20px;
+    box-sizing: border-box;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.62;
+    white-space: pre;
+  }
+  pre.annotated-code .annotation {
+    color: color-mix(in srgb, var(--accent) 72%, var(--fg-muted));
+    font-style: normal;
+  }
+  @media (max-width: 560px) {
+    pre.annotated-code { margin-inline: -8px; }
+    pre.annotated-code code { padding: 0 14px; font-size: 11.5px; }
+  }
+  .source-range {
+    margin: -8px 0 14px;
+    color: var(--fg-subtle);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  .source-range a { color: var(--accent); }
+  .diagram-frame {
+    max-width: 100%;
+    margin: 20px 0 30px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    box-sizing: border-box;
+  }
+  .diagram-title {
+    margin-bottom: 10px;
+    color: var(--fg-subtle);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  .diagram-svg {
+    display: block;
+    width: 100%;
+    min-width: 720px;
+    height: auto;
+  }
+  .diagram-svg text { fill: var(--fg); font-family: var(--font-sans); }
+  .diagram-svg .mono { font-family: var(--font-mono); }
+  .diagram-svg .muted { fill: var(--fg-muted); }
+  .diagram-svg .box { fill: var(--bg); stroke: var(--border-strong); stroke-width: 1.4; }
+  .diagram-svg .gmem { fill: rgba(37, 99, 235, 0.10); stroke: #2563eb; stroke-width: 1.4; }
+  .diagram-svg .smem { fill: rgba(217, 119, 6, 0.10); stroke: #d97706; stroke-width: 1.4; }
+  .diagram-svg .rmem { fill: rgba(5, 150, 105, 0.10); stroke: #059669; stroke-width: 1.4; }
+  .diagram-svg .reduce { fill: rgba(190, 24, 93, 0.09); stroke: #be185d; stroke-width: 1.4; }
+  .diagram-svg .arrow { fill: none; stroke: var(--fg-muted); stroke-width: 1.6; }
+  .diagram-svg .cluster { fill: none; stroke: var(--fg-subtle); stroke-width: 1.2; stroke-dasharray: 6 5; }
+  main.content mjx-container[display="true"] {
+    max-width: 100%;
+    padding-bottom: 2px;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录 · TOC</div>
+    <div class="lang-zh">
+    <ul>
+      <li><a href="#zh-naming">变量命名图例</a></li>
+      <li><a href="#zh-scope">0. 源码边界与调用位置</a></li>
+      <li><a href="#zh-model">1. 数学与执行模型</a></li>
+      <li><a href="#zh-example">2. N=760 的 tile 实例</a></li>
+      <li><a href="#zh-signature">3.1 入口与线程坐标</a></li>
+      <li><a href="#zh-tiles">3.2 Shared memory 与 CTA tile</a></li>
+      <li><a href="#zh-partitions">3.3 线程分片与寄存器 fragment</a></li>
+      <li><a href="#zh-load">3.4 异步搬运与 residual</a></li>
+      <li><a href="#zh-layernorm">3.5 LayerNorm 特化分支</a></li>
+      <li><a href="#zh-rmsnorm">3.6 RMSNorm 规约与统计量</a></li>
+      <li><a href="#zh-epilogue">3.7 Reload 与 affine epilogue</a></li>
+      <li><a href="#zh-reading">4. 阅读结论</a></li>
+      <li><a href="#zh-refs">参考资料</a></li>
+    </ul>
+    </div>
+    <div class="lang-en">
+    <ul>
+      <li><a href="#en-naming">Variable naming legend</a></li>
+      <li><a href="#en-scope">0. Source boundary and call path</a></li>
+      <li><a href="#en-model">1. Mathematical and execution model</a></li>
+      <li><a href="#en-example">2. A tile instance for N=760</a></li>
+      <li><a href="#en-signature">3.1 Entry and thread coordinates</a></li>
+      <li><a href="#en-tiles">3.2 Shared memory and CTA tiles</a></li>
+      <li><a href="#en-partitions">3.3 Thread partitions and register fragments</a></li>
+      <li><a href="#en-load">3.4 Asynchronous loads and residual fusion</a></li>
+      <li><a href="#en-layernorm">3.5 LayerNorm specialization branch</a></li>
+      <li><a href="#en-rmsnorm">3.6 RMSNorm reduction and statistics</a></li>
+      <li><a href="#en-epilogue">3.7 Reload and affine epilogue</a></li>
+      <li><a href="#en-reading">4. Reading conclusions</a></li>
+      <li><a href="#en-refs">References</a></li>
+    </ul>
+    </div>
+  </aside>
+
+<main class="content">
+
+<div class="lang-zh">
+
+<h1>QuACK CuTeDSL RMSNorm 前向 Kernel：线程映射、规约与逐行注释</h1>
+
+<p class="lead">QuACK 的公开 <code>rmsnorm()</code> 先把 batch 维压成行，再把每行 hidden features 交给一个 CuTeDSL reduction kernel。这个 kernel 还可以融合 residual、保存 prenorm 结果、应用 weight 与 bias，并在宽行上让一个 CTA cluster 分担 feature 维。RMSNorm 本身只需要平方和与一次缩放；源码的主要篇幅在描述数据由哪个 CTA、warp 和 thread 持有，以及它在 global memory、shared memory 与 registers 之间何时移动。读这 213 行时，应先固定 tile 所有权，再沿数据流追踪一次完整的行规约。</p>
+
+<h2 id="zh-naming">变量命名图例</h2>
+
+<p>这些前缀描述 tensor 的作用域、存储层级或用途。NVIDIA 的 <a href="https://docs.nvidia.com/cutlass/4.7.0/media/docs/cpp/cute/0x_gemm_tutorial.html">CuTe GEMM tutorial</a> 先用 <code>mA/mB/mC</code> 表示完整 tensor，再把 CTA tile 命名为 <code>gA/gB/gC</code>；QuACK 延续了这套习惯。参数是输入还是输出，以函数签名中的 <code>[输入]</code>、<code>[输出]</code> 和 <code>[配置]</code> 标记为准。</p>
+
+<div class="table-scroll">
+<table class="note-table naming-table">
+  <thead><tr><th>记号</th><th>含义</th><th>作用域或存储层级</th><th>本文示例</th></tr></thead>
+  <tbody>
+    <tr><td><code>m...</code></td><td>完整 tensor</td><td>kernel 边界处、按 CTA 切分之前的完整视图；既可以是输入，也可以是由 kernel 写入的输出。</td><td><code>mX</code>、<code>mW</code>、<code>mO</code>、<code>mRstd</code></td></tr>
+    <tr><td><code>g...</code></td><td>global-memory tile</td><td>从 <code>m...</code> 切出的当前 CTA global-memory 视图。</td><td><code>gX</code>、<code>gRes</code>、<code>gW</code>、<code>gO</code></td></tr>
+    <tr><td><code>s...</code></td><td>shared-memory tile</td><td>CTA 共享的 shared-memory staging 区。</td><td><code>sX</code>、<code>sRes</code></td></tr>
+    <tr><td><code>...r...</code></td><td>register fragment</td><td>通常表示当前 thread 私有的 register storage。</td><td><code>tXrX</code>、<code>tXrW</code>、<code>tXrO</code></td></tr>
+    <tr><td><code>c...</code></td><td>coordinate tensor</td><td>描述逻辑坐标，不保存输入或输出数据。</td><td><code>cX</code>、<code>tXcX</code></td></tr>
+    <tr><td><code>...p...</code></td><td>predicate</td><td>由坐标生成的布尔 mask，用于屏蔽 feature 维越界元素。</td><td><code>tXpX</code></td></tr>
+    <tr><td><code>tX...</code></td><td>thread partition</td><td>当前 thread 按 tiled copy <code>X</code> 获得的 partition；后面的 <code>g/s/r</code> 再指出被分片 tensor 的存储层级。</td><td><code>tXgW</code>、<code>tXsX</code>、<code>tXrX</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p><code>tXgW</code> 可以读作 partitioning pattern <code>tX</code> 作用于 global-memory tensor <code>gW</code>。名称尾部表示数据角色：<code>X</code> 是 input，<code>Res</code> 是 residual，<code>W</code> 是 weight，<code>B</code> 是 bias，<code>O</code> 是 output。<code>Rstd</code> 与 <code>Mean</code> 分别表示 reciprocal standard deviation 和 row mean。<code>tXrRstd</code> 与 <code>tXrMean</code> 是例外：它们由 <code>partition_D(gRstd/gMean)</code> 得到，实际是 global destination partitions，并非同名 register fragments。</p>
+
+<h2 id="zh-scope">0. 源码边界与调用位置</h2>
+
+<p>本文只分析 <a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L150-L362">QuACK commit <code>14b0b71</code> 的 <code>RMSNorm.kernel</code> 第 150 至 362 行</a>。该 revision 声明依赖 <code>nvidia-cutlass-dsl&gt;=4.7</code>；API 语义以 CuTe DSL 4.7.0 文档辅助解释。QuACK 后续 revision 可以调整 layout、heuristic 或 API 拼写，因此本文的逐行结论不是跨版本接口承诺。</p>
+
+<p>公开入口到 device kernel 的调用顺序如下：</p>
+
+<ol>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L1666-L1706"><code>rmsnorm()</code></a> 判断普通模式或 per-head 模式，把 batch 维 reshape 为 <code>[M, N]</code> 或 <code>[M, H, N]</code>。</li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L1598-L1663"><code>RMSNormFunction</code></a> 处理 contiguous、autograd 保存项和可选 prenorm 输出。</li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L365-L470"><code>_rmsnorm_fwd</code> 与 <code>_compile_rmsnorm_fwd</code></a> 选择 dtype、可选参数和 JIT specialization。</li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L107-L148"><code>RMSNorm.__call__</code></a> 计算 vector width、tile、block、grid 与 cluster shape，然后 launch 本文的 kernel。</li>
+</ol>
+
+<div class="note-box">
+  <p><code>is_layernorm</code>、可选 tensor 是否存在、<code>reload_from</code>、<code>delay_w_load</code> 与 <code>weight_offset</code> 都参与 compile-time specialization。对普通 RMSNorm，<code>is_layernorm=False</code>，第 263 至 312 行的 LayerNorm 分支不会保留为运行时分支；第 313 至 324 行才是平方和路径。</p>
+</div>
+
+<h2 id="zh-model">1. 数学与执行模型</h2>
+
+<p>对一行长度为 (N) 的输入，先定义可选 residual 融合后的 FP32 值：</p>
+
+<p>\[
+z_j = \operatorname{fp32}(x_j) +
+\begin{cases}
+\operatorname{fp32}(r_j), &amp; \text{存在 residual},\\
+0, &amp; \text{否则}.
+\end{cases}
+\]</p>
+
+<p>RMSNorm 统计量和输出为：</p>
+
+<p>\[
+\operatorname{rstd}
+=
+\left(\frac{1}{N}\sum_{j=0}^{N-1} z_j^2 + \varepsilon\right)^{-1/2},
+\qquad
+y_j = (z_j\operatorname{rstd})(w_j+\delta)+b_j.
+\]</p>
+
+<p>(w_j)、(b_j) 和 weight offset (delta) 都是可选项。加法、平方、规约、归一化、weight offset 和 affine 运算在 FP32 中完成；<code>residual_out</code> 与最终 <code>mO</code> 在写出前各自转换到目标 storage dtype。<a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L563-L575">PyTorch reference</a> 给出了同一数值定义。</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">一行数据在 kernel 中的存储位置与依赖</div>
+  <svg class="diagram-svg" viewBox="0 0 1120 430" role="img" aria-labelledby="zh-rms-flow-title zh-rms-flow-desc">
+    <title id="zh-rms-flow-title">QuACK RMSNorm 前向 kernel 数据流</title>
+    <desc id="zh-rms-flow-desc">输入和 residual 从 global memory 异步搬到 shared memory，再进入寄存器，以 FP32 完成行规约与 affine epilogue，最后写回 global memory。宽行可以沿 feature 维拆给 cluster 中多个 CTA。</desc>
+    <rect class="cluster" x="22" y="34" width="1074" height="350" rx="12"></rect>
+    <text x="42" y="62" class="mono muted" font-size="13">CTA 或沿 N 维协作的 CTA cluster</text>
+    <rect class="gmem" x="52" y="102" width="180" height="82" rx="8"></rect>
+    <text x="142" y="132" text-anchor="middle" class="mono" font-size="14">gX / gRes</text>
+    <text x="142" y="158" text-anchor="middle" class="muted" font-size="12">global-memory tile</text>
+    <path class="arrow" d="M232 143 H302"></path>
+    <text x="267" y="130" text-anchor="middle" class="mono muted" font-size="11">cp.async</text>
+    <rect class="smem" x="302" y="102" width="180" height="82" rx="8"></rect>
+    <text x="392" y="132" text-anchor="middle" class="mono" font-size="14">sX / sRes</text>
+    <text x="392" y="158" text-anchor="middle" class="muted" font-size="12">shared-memory tile</text>
+    <path class="arrow" d="M482 143 H552"></path>
+    <text x="517" y="130" text-anchor="middle" class="mono muted" font-size="11">autovec</text>
+    <rect class="rmem" x="552" y="102" width="180" height="82" rx="8"></rect>
+    <text x="642" y="132" text-anchor="middle" class="mono" font-size="14">tXrX / x</text>
+    <text x="642" y="158" text-anchor="middle" class="muted" font-size="12">register fragment, FP32</text>
+    <path class="arrow" d="M732 143 H802"></path>
+    <rect class="reduce" x="802" y="92" width="244" height="102" rx="8"></rect>
+    <text x="924" y="126" text-anchor="middle" class="mono" font-size="14">row_reduce(x * x)</text>
+    <text x="924" y="151" text-anchor="middle" class="muted" font-size="12">thread, warp, block, optional cluster</text>
+    <text x="924" y="174" text-anchor="middle" class="mono muted" font-size="12">rstd = rsqrt(sum / N + eps)</text>
+    <rect class="gmem" x="52" y="258" width="180" height="82" rx="8"></rect>
+    <text x="142" y="288" text-anchor="middle" class="mono" font-size="14">gW / gB</text>
+    <text x="142" y="314" text-anchor="middle" class="muted" font-size="12">direct global to register load</text>
+    <path class="arrow" d="M232 299 H552"></path>
+    <path class="arrow" d="M642 184 V268"></path>
+    <path class="arrow" d="M924 194 V268 H732"></path>
+    <rect class="rmem" x="552" y="258" width="180" height="82" rx="8"></rect>
+    <text x="642" y="288" text-anchor="middle" class="mono" font-size="14">x_hat, y</text>
+    <text x="642" y="314" text-anchor="middle" class="muted" font-size="12">FP32 affine epilogue</text>
+    <path class="arrow" d="M732 299 H802"></path>
+    <rect class="gmem" x="802" y="258" width="244" height="82" rx="8"></rect>
+    <text x="924" y="288" text-anchor="middle" class="mono" font-size="14">gO / gResO / gRstd</text>
+    <text x="924" y="314" text-anchor="middle" class="muted" font-size="12">predicated global stores</text>
+  </svg>
+</div>
+
+<h2 id="zh-example">2. <code>N=760</code> 的 tile 实例</h2>
+
+<p>取 <code>x.dtype=bf16</code>、<code>weight.dtype=fp32</code>、普通 RMSNorm、无 cluster。<a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm_config.py#L47-L91">默认 heuristic</a> 选择 128 threads 和 32 threads per row。最宽 dtype 为 32 bit，因此 <code>vecsize=gcd(760, 128/32)=4</code>。令 (B_N) 表示 feature 方向的 vector-block 组数，<a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/reduction_base.py#L42-L50"><code>_get_tiled_copy()</code></a> 随后得到：</p>
+
+<p>\[
+B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
+\qquad
+\operatorname{tiler}_{MN}=(128/32,\;4\times6\times32)=(4,768).
+\]</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead><tr><th>量</th><th>值</th><th>解释</th></tr></thead>
+  <tbody>
+    <tr><td>CTA rows</td><td>4</td><td>128 threads 被分成 4 个 32-thread row groups，每组处理一行。</td></tr>
+    <tr><td>逻辑 columns</td><td>768</td><td>每行比真实 <code>N=760</code> 多 8 个位置，尾部由 <code>tXpX</code> 屏蔽。</td></tr>
+    <tr><td>每 thread 的值</td><td>6 组乘 4 个</td><td>同一 row group 的 32 threads 覆盖 32 个 vector，每个 thread 在 6 次 rest-k 迭代中各持有一个 4-element vector。</td></tr>
+    <tr><td><code>sX</code></td><td>4 × 768 bf16</td><td>输入 tile 占 6144 bytes，并按 feature 维连续布局。</td></tr>
+    <tr><td>规约层级</td><td>单 warp</td><td>32 threads per row 正好是一个 warp；本例不需要跨 warp 或跨 CTA 合并。</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>3. 第 150 至 362 行逐行注释</h2>
+
+<p>下面采用<a href="https://mirror.math.princeton.edu/pub/oldlinux/download/clk011c-1.9.6pre.pdf">《Linux 内核完全注释》</a>的源码阅读编排：保留固定 commit 的完整代码与原有英文注释，不改动也不省略；新增解释直接插在相关语句之前，并以 <code># L行号:</code> 开头。这样可以沿连续控制流阅读，同时随时回到原仓库核对对应行。</p>
+
+<h3 id="zh-signature">3.1 入口与线程坐标</h3>
+<p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L150-L170">source L150-L170</a></p>
+
+<pre class="annotated-code" data-source-start="150" data-source-end="170"><code>
+<span class="annotation">    # 变量命名图例，前缀描述 tensor 的作用域或存储层级，不表示输入/输出方向：</span>
+<span class="annotation">    #   m*: kernel 边界处的完整 tensor，沿用 CuTe mA/mB/mC 的 full-tensor 命名；</span>
+<span class="annotation">    #   g*: 从 m* 切出的当前 CTA global-memory tile；</span>
+<span class="annotation">    #   s*: shared-memory tile；r*: register fragment；c*: coordinate；p*: predicate。</span>
+<span class="annotation">    #   tX*: 当前 thread 按 tiled_copy X 得到的 partition。其后的 g/s/r 表示</span>
+<span class="annotation">    #        global/shared/register，例如 tXgW、tXsX、tXrX。</span>
+<span class="annotation">    #   例外：tXrRstd 与 tXrMean 实际是 global destination partitions。</span>
+<span class="annotation">    # 参数方向在签名中标为 [输入]、[输出] 或 [配置]。kernel 原地写入输出 tensor，</span>
+<span class="annotation">    # 这个 device kernel 本身没有返回值。</span>
+<span class="annotation">    # L150: @cute.kernel 把下面的 Python 函数声明为 device kernel。JIT 编译时，CuTeDSL</span>
+<span class="annotation">    #       会把函数体 lowering 为 GPU kernel，而不是在 host 上直接执行它。</span>
+    @cute.kernel
+<span class="annotation">    # L151: 定义 kernel 的参数表与 device-side 函数体。</span>
+    def kernel(
+<span class="annotation">        # L152 [配置]: self 携带已经固定的 dtype、N、is_layernorm 与 launch config；这些字段可参与</span>
+<span class="annotation">        #       compile-time specialization。</span>
+        self,
+<span class="annotation">        # L153 [输入]: mX 是完整输入 tensor。普通模式是 [M,N]，per-head 模式是 [M,H,N]。</span>
+        mX: cute.Tensor,
+<span class="annotation">        # L154 [可选输入]: mW 是完整 weight tensor，形状为 [N] 或 [H,N]。</span>
+<span class="annotation">        #       是否为 None 会生成不同的 specialization。</span>
+        mW: Optional[cute.Tensor],
+<span class="annotation">        # L155 [可选输入]: mB 是完整 bias tensor，广播方式与 weight 相同。</span>
+        mB: Optional[cute.Tensor],
+<span class="annotation">        # L156 [可选输入]: mRes 是完整 residual tensor，形状与 mX 相同。</span>
+        mRes: Optional[cute.Tensor],
+<span class="annotation">        # L157 [输出]: mO 是调用者预先分配的完整输出 tensor；kernel 将最终结果写入它。</span>
+        mO: cute.Tensor,
+<span class="annotation">        # L158 [可选输出]: mResO 保存 FP32 相加后再转换到指定 storage dtype 的</span>
+<span class="annotation">        #       (x+residual)。</span>
+        mResO: Optional[cute.Tensor],
+<span class="annotation">        # L159 [可选输出]: mRstd 保存逐行 reciprocal standard deviation，storage dtype</span>
+<span class="annotation">        #       固定为 FP32。</span>
+        mRstd: Optional[cute.Tensor],
+<span class="annotation">        # L160 [可选输出]: mMean 保存逐行均值，只在 LayerNorm specialization 中有数值意义。</span>
+        mMean: Optional[cute.Tensor],
+<span class="annotation">        # L161 [输入]: eps 是运行时 FP32 标量，所以改变 epsilon 不需要重新选择源码分支。</span>
+        eps: Float32,
+<span class="annotation">        # L162 [配置]: tiler_mn 描述一个 CTA 负责的 (rows, columns) 逻辑 tile。</span>
+        tiler_mn: cute.Shape,
+<span class="annotation">        # L163 [配置]: tiled_copy 同时编码 copy atom、thread layout 与每个 thread 的 value</span>
+<span class="annotation">        #       layout，是后续所有 partition_S/D 的共同所有权规则。</span>
+        tiled_copy: cute.TiledCopy,
+<span class="annotation">        # L164 [配置]: threads_per_row 是 compile-time integer，决定一个 row reduction</span>
+<span class="annotation">        #       先覆盖多少 threads。</span>
+        threads_per_row: cutlass.Constexpr[int],
+    ):
+<span class="annotation">        # L166: 读取 CTA 内 thread index，只保留 x 维 tidx；block 是一维 thread block。</span>
+        tidx, _, _ = cute.arch.thread_idx()
+<span class="annotation">        # L167: 读取 grid 坐标，bidx 选择 row tile，bidz 选择 head；中间的 y 坐标另行处理。</span>
+        bidx, _, bidz = cute.arch.block_idx()
+<span class="annotation">        # L168: 若 cluster_n==1，编译期把 feature-tile 坐标固定为 0；否则读取 block y 作为</span>
+<span class="annotation">        #       cluster 内沿 N 维的 CTA 坐标。</span>
+        cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
+<span class="annotation">        # L169: 取得 tiled copy 的 thread-value layout。Reduction buffer</span>
+<span class="annotation">        #       用它推导每行有多少 warps，以及 cluster reduction buffer 的 shape。</span>
+        tv_layout = tiled_copy.layout_tv_tiled
+
+</code></pre>
+<h3 id="zh-tiles">3.2 Shared memory、head slicing 与 CTA tile</h3>
+<p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L171-L201">source L171-L201</a></p>
+
+<pre class="annotated-code" data-source-start="171" data-source-end="201"><code>
+<span class="annotation">        # L171: 创建 shared-memory allocator。CuTeDSL 根据后续 allocation 自动计算</span>
+<span class="annotation">        #       kernel 的动态 shared-memory 用量与对象偏移。</span>
+        smem = cutlass.utils.SmemAllocator()
+<span class="annotation">        # L172: 开始分配输入 tile sX。</span>
+        sX = smem.allocate_tensor(
+<span class="annotation">            # L173: sX 使用输入 element type，shape 等于 tiler_mn；order=(1,0) 让</span>
+<span class="annotation">            #       feature mode 连续，16-byte alignment 适配向量 copy。</span>
+            mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
+        )
+<span class="annotation">        # L175: 只有 residual tensor 存在时才编译 residual shared-memory 分支；普通无</span>
+<span class="annotation">        #       residual kernel 不预留这块空间。</span>
+        if const_expr(mRes is not None):
+<span class="annotation">            # L176: 开始分配 sRes。</span>
+            sRes = smem.allocate_tensor(
+<span class="annotation">                # L177: sRes 保留 residual 自己的 storage dtype，它可以与输入 dtype 不同。</span>
+                mRes.element_type,
+<span class="annotation">                # L178: residual tile 使用与 sX 相同的 row-major-by-feature 逻辑</span>
+<span class="annotation">                #       layout。</span>
+                cute.make_ordered_layout(tiler_mn, order=(1, 0)),
+<span class="annotation">                # L179: 同样要求 16-byte alignment。</span>
+                byte_alignment=16,
+            )
+<span class="annotation">        # L181: 分配行规约的 shared buffer；当 cluster_n&gt;1 时还分配每个 reduction stage</span>
+<span class="annotation">        #       使用的 mbarrier array，单 CTA 时返回 mbar_ptr=None。</span>
+        reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
+
+<span class="annotation">        # L183: 下面按 head 对所有相关 tensor 做切片。</span>
+        # Slice per head
+<span class="annotation">        # L184: 输入 rank 为 3 时进入 per-head 分支；rank 是 JIT 已知属性，所以该分支在编译期确定。</span>
+        if const_expr(cute.rank(mX) == 3):
+<span class="annotation">            # L185: 并行重绑定所有与 head 相关的 tensor，使后续主体只处理一个二维 [M,N] view。</span>
+            mX, mW, mB, mRes, mO, mResO, mRstd, mMean = [
+<span class="annotation">                # L186: 对存在的 tensor 固定中间 head mode 为 bidz，保留 row 与 feature</span>
+<span class="annotation">                #       modes；缺失的 optional tensor 继续保持 None。</span>
+                mT[None, bidz, None] if const_expr(mT is not None) else None
+<span class="annotation">                # L187: 列出必须使用同一 head 坐标切片的输入、参数、输出与统计量 tensors。</span>
+                for mT in (mX, mW, mB, mRes, mO, mResO, mRstd, mMean)
+            ]
+
+<span class="annotation">        # L190: 从切片后的 mX 读取真实二维 shape (M,N)。后续 row bounds、tail predicate</span>
+<span class="annotation">        #       和统计除数都使用它。</span>
+        shape = (cute.size(mX, mode=[0]), cute.size(mX, mode=[1]))
+<span class="annotation">        # L191: 创建与输入 shape 相同的 identity tensor。它不分配数据，而是让同一 layout</span>
+<span class="annotation">        #       运算返回每个逻辑元素的 (row,column) 坐标。</span>
+        idX = cute.make_identity_tensor(shape)
+<span class="annotation">        # L192: 下面把完整 tensor 切成当前 CTA 负责的 tile。</span>
+        # Slice for CTAs
+<span class="annotation">        # L193: 准备同时生成数据 tiles 与 coordinate tile。</span>
+        gX, gRes, gO, gResO, gRstd, gMean, cX = [
+<span class="annotation">            # L194: local_tile 用 tiler_mn 分割 tensor，并选择坐标</span>
+<span class="annotation">            #       (bidx,cluster_y)；缺失 tensor 不参与 tiling。</span>
+            cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) if mT is not None else None
+<span class="annotation">            # L195: 同一 tile 坐标应用到输入、residual、输出、side outputs 与 identity</span>
+<span class="annotation">            #       tensor，保证数据 partition 和坐标 partition 同构。</span>
+            for mT in (mX, mRes, mO, mResO, mRstd, mMean, idX)
+        ]
+<span class="annotation">        # L197: 单独开始 weight 与 bias 的 tiling。</span>
+        gW, gB = [
+<span class="annotation">            # L198: weight/bias 在 __call__ 中沿 row mode 做了 stride-0 expand，所以</span>
+<span class="annotation">            #       row tile 固定选 0；cluster_y 仍选择各 CTA 负责的 feature slice。</span>
+            cute.local_tile(mT, tiler_mn, (0, cluster_y)) if const_expr(mT is not None) else None
+<span class="annotation">            # L199: 对 weight 与 bias 应用相同操作，不存在的参数保持 None。</span>
+            for mT in (mW, mB)
+        ]
+
+</code></pre>
+
+<h3 id="zh-partitions">3.3 线程分片、register fragments 与尾部 predicate</h3>
+<p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L202-L236">source L202-L236</a></p>
+
+<pre class="annotated-code" data-source-start="202" data-source-end="236"><code>
+<span class="annotation">        # L202: 从 CTA-wide tiled_copy 取出当前 tidx 的 ThrCopy slice。此后所有</span>
+<span class="annotation">        #       partition 都属于同一个 thread。</span>
+        thr_copy_X = tiled_copy.get_slice(tidx)
+
+<span class="annotation">        # L204: 若 weight 存在，用 source partition 规则取得当前 thread 在 gW 中负责的元素。</span>
+        tXgW = thr_copy_X.partition_S(gW) if const_expr(mW is not None) else None
+<span class="annotation">        # L205: 用相同 source partition 规则切分 bias。</span>
+        tXgB = thr_copy_X.partition_S(gB) if const_expr(mB is not None) else None
+<span class="annotation">        # L206: tXgX 是当前 thread 的 global-input source partition。</span>
+        tXgX = thr_copy_X.partition_S(gX)
+<span class="annotation">        # L207: tXsX 是同一 copy 映射下的 shared-memory destination partition；它与</span>
+<span class="annotation">        #       tXgX 的值坐标逐项对应。</span>
+        tXsX = thr_copy_X.partition_D(sX)
+<span class="annotation">        # L208: residual 存在时编译它的 partition body。</span>
+        if const_expr(mRes is not None):
+<span class="annotation">            # L209: 取得 residual global source partition。</span>
+            tXgRes = thr_copy_X.partition_S(gRes)
+<span class="annotation">            # L210: 取得 residual shared destination partition。</span>
+            tXsRes = thr_copy_X.partition_D(sRes)
+<span class="annotation">        # L211: tXgO 是最终 global output 的 destination partition。</span>
+        tXgO = thr_copy_X.partition_D(gO)
+<span class="annotation">        # L212: 只有请求 residual_out 时才编译对应 partition。</span>
+        if const_expr(mResO is not None):
+<span class="annotation">            # L213: 取得 prenorm global output 的 destination partition。</span>
+            tXgResO = thr_copy_X.partition_D(gResO)
+<span class="annotation">        # L214: 若请求 rstd，取得扩展后统计量 tile 的 destination partition。变量名带</span>
+<span class="annotation">        #       r，但这里没有创建 rmem tensor。</span>
+        tXrRstd = thr_copy_X.partition_D(gRstd) if const_expr(mRstd is not None) else None
+<span class="annotation">        # L215: 对可选 mean output 建立同构 destination partition。</span>
+        tXrMean = thr_copy_X.partition_D(gMean) if const_expr(mMean is not None) else None
+<span class="annotation">        # L216: 用同一 source partition 切分 identity tensor，再选 copy vector</span>
+<span class="annotation">        #       的第一个元素；tXcX 因而给出当前 thread 所属行和各 value-iteration 的列坐标。</span>
+        tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
+
+<span class="annotation">        # L218: 下面为 global-memory 到 register-memory 的 copy 创建 register</span>
+<span class="annotation">        #       fragments。</span>
+        # allocate fragments for gmem-&gt;rmem
+<span class="annotation">        # L219: 若 weight 存在，创建 shape/layout 与 tXgW 对应的 register</span>
+<span class="annotation">        #       fragment，element type 默认跟随 weight。</span>
+        tXrW = cute.make_rmem_tensor_like(tXgW) if const_expr(mW is not None) else None
+<span class="annotation">        # L220: 为 bias 创建对应 register fragment。</span>
+        tXrB = cute.make_rmem_tensor_like(tXgB) if const_expr(mB is not None) else None
+<span class="annotation">        # L221: 一次创建输入 fragment tXrX 和输出 fragment tXrO；后者跟随输出 storage</span>
+<span class="annotation">        #       dtype，而不是强制等于输入 dtype。</span>
+        tXrX, tXrO = [cute.make_rmem_tensor_like(t) for t in (tXgX, tXgO)]
+<span class="annotation">        # L222: residual 存在时才需要 residual register fragment。</span>
+        if const_expr(mRes is not None):
+<span class="annotation">            # L223: 创建与 residual global partition 同 shape/layout、同 element</span>
+<span class="annotation">            #       type 的 tXrRes。</span>
+            tXrRes = cute.make_rmem_tensor_like(tXgRes)
+
+<span class="annotation">        # L225: 用 tiled-copy 覆盖的 thread 数除以 warp size 得到 CTA warp 数。当前</span>
+<span class="annotation">        #       revision 把它传给初始化 helper，但 helper 本身没有使用该形参。</span>
+        num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
+<span class="annotation">        # L226: 若使用 cluster，前几个 threads 初始化各 reduction stage 的 mbarrier，执行</span>
+<span class="annotation">        #       init fence，再让 cluster 中 CTA 到达初始化 rendezvous；单 CTA</span>
+<span class="annotation">        #       specialization 中该 helper 为空操作。</span>
+        self._initialize_cluster(tidx, mbar_ptr, num_warps)
+
+<span class="annotation">        # L228: 编译期判断所有 CTA 的 feature tiles 是否恰好覆盖真实 N。相等时不需要逐元素 tail</span>
+<span class="annotation">        #       predicate。</span>
+        is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
+<span class="annotation">        # L229: 开始构造可选 predicate tensor。</span>
+        tXpX = (
+<span class="annotation">            # L230: 覆盖不整齐时，对 identity partition 的 feature 坐标检查 column&lt;N，生成当前</span>
+<span class="annotation">            #       thread 可复用的布尔 predicate。</span>
+            copy_utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+<span class="annotation">            # L231: 这是上一行表达式的条件分支：只有 is_even_N 为假才调用 predicate helper。</span>
+            if not is_even_N
+<span class="annotation">            # L232: 整齐覆盖时以 None 表示 copy 无需 predicate。</span>
+            else None
+        )
+<span class="annotation">        # L234: 后续所有 copy 共用同一个 feature-tail predicate。</span>
+        # Each copy will use the same predicate
+<span class="annotation">        # L235: 用 partial 把 pred=tXpX 固定到 QuACK copy helper，后续调用只传</span>
+<span class="annotation">        #       source、destination 与 async 选择。</span>
+        copy = partial(copy_utils.copy, pred=tXpX)
+
+</code></pre>
+
+<p>当 <code>N</code> 变宽，<code>threads_per_row</code> 可以大于 32，<code>row_reduce</code> 会增加 shared-memory block reduction；当 <code>cluster_n&gt;1</code>，同一行的 feature tile 还会拆给多个 CTA，通过 remote shared-memory store 与 mbarrier 合并。<a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/reduce.py#L202-L267"><code>row_reduce</code></a> 把这三层差异封装在同一个调用中。</p>
+
+<h3 id="zh-load">3.4 <code>cp.async</code> staging、weight load 与 residual 融合</h3>
+<p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L237-L261">source L237-L261</a></p>
+
+<pre class="annotated-code" data-source-start="237" data-source-end="261"><code>
+<span class="annotation">        # L237: 从 coordinate partition 读取当前 thread 所属的逻辑 row。一个 row group 中的</span>
+<span class="annotation">        #       threads 得到同一个 row 值。</span>
+        row = tXcX[0][0]
+<span class="annotation">        # L238: 运行时检查 row 是否小于真实 M，屏蔽最后一个 CTA 中超出 batch 的 row groups。</span>
+        if row &lt; shape[0]:
+<span class="annotation">            # L239: 对有效行发出 input global-to-shared async copy。QuACK helper</span>
+<span class="annotation">            #       为该调用选择 cp.async copy atom，并应用 feature predicate。</span>
+            copy(tXgX, tXsX, is_async=True)
+<span class="annotation">            # L240: residual 存在时编译第二条 async load 路径。</span>
+            if const_expr(mRes is not None):
+<span class="annotation">                # L241: 把当前 thread 的 residual partition 异步搬到 sRes，使用与 input</span>
+<span class="annotation">                #       相同的列 predicate。</span>
+                copy(tXgRes, tXsRes, is_async=True)
+<span class="annotation">        # L242: 提交当前 thread 已发出的 cp.async 操作为一个 group。该调用位于 row guard 外，使所有</span>
+<span class="annotation">        #       threads 沿一致的 group 协议前进；无有效 copy 的 thread 提交空 group。</span>
+        cute.arch.cp_async_commit_group()
+
+<span class="annotation">        # L244: 若 config 没有要求延迟 weight/bias load，就在等待 async input 期间执行</span>
+<span class="annotation">        #       parameter loads，以重叠一部分延迟。</span>
+        if const_expr(not self.delay_w_load):
+<span class="annotation">            # L245: weight optional specialization guard。</span>
+            if const_expr(mW is not None):
+<span class="annotation">                # L246: 把 weight 从 global partition 同步 copy 到 register</span>
+<span class="annotation">                #       fragment；copy atom 按 weight 自身 dtype 和 vector width</span>
+<span class="annotation">                #       构造。</span>
+                copy(tXgW, tXrW)
+<span class="annotation">            # L247: bias optional specialization guard。</span>
+            if const_expr(mB is not None):
+<span class="annotation">                # L248: 把 bias 从 global memory 载入 register fragment。</span>
+                copy(tXgB, tXrB)
+
+<span class="annotation">        # L250: 等待所有先前提交的 async groups 完成。参数 0 表示不允许未完成的旧 group 留在队列中。</span>
+        cute.arch.cp_async_wait_group(0)
+<span class="annotation">        # L251: 把当前 thread 在 sX 中的元素向量化 copy 到 tXrX。每个 thread 只读取自己先前写入的</span>
+<span class="annotation">        #       shared partition，因此这里不需要全 CTA barrier。</span>
+        cute.autovec_copy(tXsX, tXrX)
+<span class="annotation">        # L252: 从 register tensor 载入 TensorSSA，并立即转换为 FP32；后面的相加、平方与规约都以</span>
+<span class="annotation">        #       FP32 进行。</span>
+        x = tXrX.load().to(cute.Float32)
+<span class="annotation">        # L253: residual 存在时进入 compile-time body。</span>
+        if const_expr(mRes is not None):
+<span class="annotation">            # L254: 把 sRes 的当前 thread partition 搬到 residual register</span>
+<span class="annotation">            #       fragment。</span>
+            cute.autovec_copy(tXsRes, tXrRes)
+<span class="annotation">            # L255: 载入 residual、转换为 FP32，并与 input 的 FP32 TensorSSA 相加；变量 x</span>
+<span class="annotation">            #       从这里开始表示 (z=x+residual)。</span>
+            x += tXrRes.load().to(cute.Float32)
+<span class="annotation">        # L256: 若调用方请求 prenorm side output，编译写出 (z) 的路径。</span>
+        if const_expr(mResO is not None):
+<span class="annotation">            # L257: 创建与 global residual-output partition 同 shape/layout 和</span>
+<span class="annotation">            #       element type 的临时 register fragment。</span>
+            tXrResO = cute.make_rmem_tensor_like(tXgResO)
+<span class="annotation">            # L258: 把 FP32 的 x 转为 residual_out storage dtype，再存入临时</span>
+<span class="annotation">            #       fragment。若目标为 FP32，此处保留完整相加结果。</span>
+            tXrResO.store(x.to(tXrResO.element_type))
+<span class="annotation">            # L259: 只有真实 row 才执行 global store。</span>
+            if row &lt; shape[0]:
+<span class="annotation">                # L260: 把 prenorm fragment copy 到 global destination；绑定的</span>
+<span class="annotation">                #       tXpX 同时屏蔽尾部 columns。</span>
+                copy(tXrResO, tXgResO)
+
+</code></pre>
+
+<h3 id="zh-layernorm">3.5 LayerNorm compile-time 分支</h3>
+<p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L262-L312">source L262-L312</a></p>
+
+<p>这一节仍逐行解释，但普通 RMSNorm specialization 会删除第 263 至 311 行的 body，只保留第 312 行的 <code>else</code> 所属路径。共用实现需要两个 reduction slots：LayerNorm 先规约均值，再规约 centered square；RMSNorm 只用 slot 0。</p>
+
+<pre class="annotated-code" data-source-start="262" data-source-end="312"><code>
+<span class="annotation">        # L262: 先把 mean 与 rstd 绑定为 None，满足 DSL 对控制流外变量可见性和类型确定性的要求；两个</span>
+<span class="annotation">        #       compile-time 分支随后都会重新赋值。</span>
+        mean, rstd = None, None
+<span class="annotation">        # L263: 按 self.is_layernorm 做 compile-time 分支。LayerNorm 版本进入</span>
+<span class="annotation">        #       body，RMSNorm 版本在编译时删除 body。</span>
+        if const_expr(self.is_layernorm):
+<span class="annotation">            # L264: LayerNorm 先规约均值，再规约中心化后的平方和。</span>
+            # LayerNorm: compute mean first, then variance
+<span class="annotation">            # L265: 开始第一次 row_reduce，目标是求整行元素和。</span>
+            sum_x = row_reduce(
+<span class="annotation">                # L266: 把当前 thread 的 FP32 TensorSSA fragment x 交给 reduction</span>
+<span class="annotation">                #       helper；helper 先在 fragment 内求和。</span>
+                x,
+<span class="annotation">                # L267: 选择加法规约。</span>
+                cute.ReductionOp.ADD,
+<span class="annotation">                # L268: 指定一个 row group 包含的 threads 数。helper 先在不超过 32 lanes 的</span>
+<span class="annotation">                #       aligned subgroup 内做 warp reduction。</span>
+                threads_per_row,
+<span class="annotation">                # L269: 选择 shared reduction buffer 的 stage 0。多 warp row 会把</span>
+<span class="annotation">                #       warp partial 写入这里。</span>
+                reduction_buffer[None, None, 0],
+<span class="annotation">                # L270: cluster 模式传入第 0 个 mbarrier，单 CTA 模式传 None 并走 block</span>
+<span class="annotation">                #       reduction。</span>
+                mbar_ptr + 0 if const_expr(self.cluster_n &gt; 1) else None,
+<span class="annotation">                # L271: 加法规约的 identity 为 FP32 零。</span>
+                init_val=0.0,
+<span class="annotation">                # L272: cluster 模式在 warp-local partial 得到后先执行</span>
+<span class="annotation">                #       cluster_wait。它与初始化阶段的 cluster_arrive_relaxed 配对，确保所有</span>
+<span class="annotation">                #       peer CTA 已完成 mbarrier 初始化，再开始 remote shared-memory</span>
+<span class="annotation">                #       reduction。</span>
+                hook_fn=cute.arch.cluster_wait if const_expr(self.cluster_n &gt; 1) else None,
+            )
+<span class="annotation">            # L274: 除以真实 N 得到均值，padding columns 不进入除数。</span>
+            mean = sum_x / shape[1]
+<span class="annotation">            # L275: 只有调用方请求 mean side output 时才编译 store body。</span>
+            if const_expr(mMean is not None):
+<span class="annotation">                # L276: 每行只允许持有 column 0 的 thread 把 mean 写回 global memory。</span>
+                # Only the thread corresponding to column 0 writes out the mean to gmem
+<span class="annotation">                # L277: 开始运行时 owner 条件。</span>
+                if (
+<span class="annotation">                    # L278: 当前 thread 的首个逻辑 column 必须为 0。这把同一 CTA 中重复持有 mean</span>
+<span class="annotation">                    #       的 threads 收敛为一个 writer。</span>
+                    tXcX[0][1] == 0
+<span class="annotation">                    # L279: 排除最后一个 row tile 中越界的 row。</span>
+                    and row &lt; shape[0]
+<span class="annotation">                    # L280: 单 CTA 直接允许写；cluster 模式只允许 linear cluster rank 0</span>
+<span class="annotation">                    #       写，避免同一行的 peer CTAs 重复写统计量。</span>
+                    and (self.cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0)
+                ):
+<span class="annotation">                    # L282: 把 FP32 mean 写到 destination partition 的第一个元素。这里是</span>
+<span class="annotation">                    #       global store，不是把 mean 长期保存在名为 tXrMean 的 rmem</span>
+<span class="annotation">                    #       fragment。</span>
+                    tXrMean[0] = mean
+<span class="annotation">            # L283: 若 config 选择 reload_from="smem"，均值规约后重新装载 input，以缩短原始 x</span>
+<span class="annotation">            #       fragment 跨规约的 live range。</span>
+            if const_expr(self.reload_from == "smem"):
+<span class="annotation">                # L284: 从仍保留初始数据的 sX 重新 copy 到 input fragment。</span>
+                cute.autovec_copy(tXsX, tXrX)
+<span class="annotation">                # L285: 重新载入并转换为 FP32。</span>
+                x = tXrX.load().to(cute.Float32)
+<span class="annotation">                # L286: residual specialization 也必须恢复 residual。</span>
+                if const_expr(mRes is not None):
+<span class="annotation">                    # L287: 从 sRes 重新填充 residual fragment。</span>
+                    cute.autovec_copy(tXsRes, tXrRes)
+<span class="annotation">                    # L288: 再次以 FP32 形成 (x+residual)。</span>
+                    x += tXrRes.load().to(cute.Float32)
+<span class="annotation">            # L289: 若 config 选择 reload_from="gmem"，改走 global reload；该选择与</span>
+<span class="annotation">            #       smem reload 互斥且在编译期固定。</span>
+            elif const_expr(self.reload_from == "gmem"):
+<span class="annotation">                # L290: 同步从 gX 重新装载 input 到 register fragment，仍使用 feature</span>
+<span class="annotation">                #       predicate。</span>
+                copy(tXgX, tXrX)
+<span class="annotation">                # L291: 载入 reload 后的 input 并转换为 FP32。</span>
+                x = tXrX.load().to(cute.Float32)
+<span class="annotation">                # L292: residual specialization guard。</span>
+                if const_expr(mRes is not None):
+<span class="annotation">                    # L293: 从 gRes 同步重新装载 residual。</span>
+                    copy(tXgRes, tXrRes)
+<span class="annotation">                    # L294: 以 FP32 恢复 fused input。</span>
+                    x += tXrRes.load().to(cute.Float32)
+<span class="annotation">            # L295: 对每个 register 元素减去 row mean，得到 centered values。</span>
+            x_centered = x - mean
+<span class="annotation">            # L296: 若 tile 在 feature 维有 padding，编译尾部清零修正。</span>
+            if const_expr(not is_even_N):
+<span class="annotation">                # L297: mean pass 已把越界 lane 填成 0，但 variance pass 还要单独处理。</span>
+                # OOB lanes are zero-filled for the mean pass, but they must contribute zero
+<span class="annotation">                # L298: 否则越界 lane 会从 (0 - mean)^2 错误贡献 mean^2。</span>
+                # to the variance pass (not mean^2 from (0 - mean)^2).
+<span class="annotation">                # L299: 创建与 input fragment 同 layout 的 FP32 register</span>
+<span class="annotation">                #       tensor，专门承载修正后的 centered values。</span>
+                tXrX_centered = cute.make_rmem_tensor_like(tXrX, Float32)
+<span class="annotation">                # L300: 先把所有 centered values 存入该 fragment。</span>
+                tXrX_centered.store(x_centered)
+<span class="annotation">                # L301: 根据 tXpX 把越界 fragment 元素改成 FP32 零，使它们对平方和无贡献。</span>
+                utils.fill_oob(tXrX_centered, tXpX, fill_value=Float32.zero)
+<span class="annotation">                # L302: 重新载入修正后的 TensorSSA，覆盖原 x_centered 绑定。</span>
+                x_centered = tXrX_centered.load()
+<span class="annotation">            # L303: 开始第二次 row reduction，求 centered square sum。</span>
+            sum_sq_x_sub_mean = row_reduce(
+<span class="annotation">                # L304: 在 FP32 TensorSSA 上逐元素平方，作为规约输入。</span>
+                x_centered * x_centered,
+<span class="annotation">                # L305: 仍使用加法规约。</span>
+                cute.ReductionOp.ADD,
+<span class="annotation">                # L306: 复用同一个 threads_per_row mapping。</span>
+                threads_per_row,
+<span class="annotation">                # L307: 选择 reduction buffer stage 1，避免与 mean pass 的 stage 0</span>
+<span class="annotation">                #       状态混淆。</span>
+                reduction_buffer[None, None, 1],
+<span class="annotation">                # L308: cluster 模式选择第二个 mbarrier；单 CTA 模式仍传 None。</span>
+                mbar_ptr + 1 if const_expr(self.cluster_n &gt; 1) else None,
+<span class="annotation">                # L309: 平方和的 identity 为 FP32 零。</span>
+                init_val=0.0,
+            )
+<span class="annotation">            # L311: 以真实 N 计算 population variance，加 eps，再请求 fast-math</span>
+<span class="annotation">            #       reciprocal square root，得到 rstd。</span>
+            rstd = cute.math.rsqrt(sum_sq_x_sub_mean / shape[1] + eps, fastmath=True)
+<span class="annotation">        # L312: 开始 is_layernorm=False 的 compile-time else。普通 RMSNorm</span>
+<span class="annotation">        #       specialization 从这里进入自己的统计量路径。</span>
+        else:
+</code></pre>
+
+<h3 id="zh-rmsnorm">3.6 RMSNorm 平方和规约、<code>rstd</code> 与延迟参数加载</h3>
+<p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L313-L337">source L313-L337</a></p>
+
+<pre class="annotated-code" data-source-start="313" data-source-end="337"><code>
+<span class="annotation">            # L313: RMSNorm 不减均值，直接规约输入的平方和。</span>
+            # RMSNorm: compute sum of squares directly
+<span class="annotation">            # L314: 把 mean 设为 compile-time FP32 零，为共用 epilogue</span>
+<span class="annotation">            #       提供确定绑定。RMSNorm 的第 350 行实际选择 x*rstd，不会执行减 mean。</span>
+            mean = const_expr(0.0)
+<span class="annotation">            # L315: 开始 RMSNorm 唯一一次 row_reduce。</span>
+            sum_sq_x = row_reduce(
+<span class="annotation">                # L316: 逐元素计算 FP32 的 x*x。若 residual 存在，这里的 x 已经是 FP32 的</span>
+<span class="annotation">                #       fused (x+residual)。</span>
+                x * x,
+<span class="annotation">                # L317: 选择加法规约。</span>
+                cute.ReductionOp.ADD,
+<span class="annotation">                # L318: 沿配置给出的 thread row group 合并 fragment partials。</span>
+                threads_per_row,
+<span class="annotation">                # L319: 使用 reduction buffer stage 0。RMSNorm 构造 ReductionBase</span>
+<span class="annotation">                #       时 stage=1，因此只分配这一格。</span>
+                reduction_buffer[None, None, 0],
+<span class="annotation">                # L320: 直接传 mbar_ptr：cluster specialization 中它指向唯一</span>
+<span class="annotation">                #       mbarrier，单 CTA specialization 中为 None。</span>
+                mbar_ptr,
+<span class="annotation">                # L321: 平方和从 FP32 零开始。</span>
+                init_val=0.0,
+<span class="annotation">                # L322: cluster 模式在 remote shared-memory reduction 前完成初始化</span>
+<span class="annotation">                #       rendezvous；单 CTA 不注入 hook。</span>
+                hook_fn=cute.arch.cluster_wait if const_expr(self.cluster_n &gt; 1) else None,
+            )
+<span class="annotation">            # L324: 除以真实 N 得到 mean square，加 epsilon 后计算 fast-math reciprocal</span>
+<span class="annotation">            #       square root，即 RMSNorm 的 rstd。</span>
+            rstd = cute.math.rsqrt(sum_sq_x / shape[1] + eps, fastmath=True)
+<span class="annotation">        # L325: 若 backward 或调用方需要保存 rstd，才编译 side-output store。</span>
+        if const_expr(mRstd is not None):
+<span class="annotation">            # L326: 每行只允许持有 column 0 的 thread 把 rstd 写回 global memory。</span>
+            # Only the thread corresponding to column 0 writes out the rstd to gmem
+<span class="annotation">            # L327: 开始 writer election 条件。</span>
+            if (
+<span class="annotation">                # L328: 要求当前 thread 对应逻辑 column 0。</span>
+                tXcX[0][1] == 0
+<span class="annotation">                # L329: 要求 row 未越过真实 M。</span>
+                and row &lt; shape[0]
+<span class="annotation">                # L330: cluster 模式还要求 linear cluster rank 为 0；单 CTA 模式自动满足。</span>
+                and (self.cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0)
+            ):
+<span class="annotation">                # L332: 把 FP32 rstd 写入本行统计量 destination。规约结果存在于所有参与</span>
+<span class="annotation">                #       threads，但只有一个 writer 产生 global store。</span>
+                tXrRstd[0] = rstd
+<span class="annotation">        # L333: 若 config 要求延迟 parameter load，规约完成后才进入 weight/bias load</span>
+<span class="annotation">        #       body，以缩短 parameter fragment 的 register live range。</span>
+        if const_expr(self.delay_w_load):
+<span class="annotation">            # L334: weight optional specialization guard。</span>
+            if const_expr(mW is not None):
+<span class="annotation">                # L335: 把 weight 从 global partition copy 到 register</span>
+<span class="annotation">                #       fragment，应用同一 feature-tail predicate。</span>
+                copy(tXgW, tXrW)
+<span class="annotation">            # L336: bias optional specialization guard。</span>
+            if const_expr(mB is not None):
+<span class="annotation">                # L337: 把 bias 从 global memory 载入 register fragment。</span>
+                copy(tXgB, tXrB)
+</code></pre>
+
+<h3 id="zh-epilogue">3.7 Input reload、归一化与 affine epilogue</h3>
+<p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L338-L362">source L338-L362</a></p>
+
+<pre class="annotated-code" data-source-start="338" data-source-end="362"><code>
+<span class="annotation">        # L338: 如果 config 选择任一 reload source，规约后重新构造 input fragment。该 reload</span>
+<span class="annotation">        #       保持数值不变，用于缩短宽行原始 input fragment 跨规约的 live range，从而控制 register</span>
+<span class="annotation">        #       pressure。</span>
+        if const_expr(self.reload_from == "smem" or self.reload_from == "gmem"):
+<span class="annotation">            # L339: compile-time 选择 shared-memory reload。</span>
+            if const_expr(self.reload_from == "smem"):
+<span class="annotation">                # L340: 从最初的 sX 重新填充 input register fragment。</span>
+                cute.autovec_copy(tXsX, tXrX)
+<span class="annotation">                # L341: residual specialization 也需要 reload。</span>
+                if const_expr(mRes is not None):
+<span class="annotation">                    # L342: 从 sRes 重新填充 residual register fragment。</span>
+                    cute.autovec_copy(tXsRes, tXrRes)
+<span class="annotation">            # L343: 外层条件已经限制取值只能是 smem 或 gmem，所以这个 else 明确表示 global-memory</span>
+<span class="annotation">            #       reload。</span>
+            else:
+<span class="annotation">                # L344: 同步从 gX copy input，复用 tail predicate。</span>
+                copy(tXgX, tXrX)
+<span class="annotation">                # L345: residual specialization guard。</span>
+                if const_expr(mRes is not None):
+<span class="annotation">                    # L346: 同步从 gRes copy residual。</span>
+                    copy(tXgRes, tXrRes)
+<span class="annotation">            # L347: 无论 reload source 是什么，都重新载入 input TensorSSA 并转换为 FP32。</span>
+            x = tXrX.load().to(cute.Float32)
+<span class="annotation">            # L348: residual specialization guard。</span>
+            if const_expr(mRes is not None):
+<span class="annotation">                # L349: 载入 residual、转换为 FP32，再次恢复 fused (x+residual)。</span>
+                x += tXrRes.load().to(cute.Float32)
+<span class="annotation">        # L350: compile-time 选择归一化公式：LayerNorm 用 (x-mean)*rstd，RMSNorm 用</span>
+<span class="annotation">        #       x*rstd。生成的 specialization 没有运行时 mode 判断。</span>
+        x_hat = (x - mean) * rstd if const_expr(self.is_layernorm) else x * rstd
+<span class="annotation">        # L351: 把 x_hat 绑定给 epilogue accumulator y，后续可原地融合 affine 操作。</span>
+        y = x_hat
+<span class="annotation">        # L352: weight 存在时编译 scale body。</span>
+        if const_expr(mW is not None):
+<span class="annotation">            # L353: 从 weight register fragment 载入 TensorSSA 并转换为 FP32。</span>
+            w = tXrW.load().to(cute.Float32)
+<span class="annotation">            # L354: 只有非零 compile-time weight_offset 才保留 offset 加法，常规 RMSNorm</span>
+<span class="annotation">            #       的零 offset 不生成它。</span>
+            if const_expr(self.weight_offset != 0.0):
+<span class="annotation">                # L355: offset 在 FP32 中相加，避免 (1 + w) 先舍入到 weight 的低精度 dtype。</span>
+                # fp32 add so e.g. (1 + w) doesn't round through the weight dtype
+<span class="annotation">                # L356: 把 Python specialization 中固定的 offset 转为 FP32 并加到</span>
+<span class="annotation">                #       weight。</span>
+                w += Float32(self.weight_offset)
+<span class="annotation">            # L357: 以 FP32 执行逐元素 y*=w。</span>
+            y *= w
+<span class="annotation">        # L358: bias 存在时编译加法 body。</span>
+        if const_expr(mB is not None):
+<span class="annotation">            # L359: 载入 bias fragment、转换为 FP32，并加到 y。</span>
+            y += tXrB.load().to(cute.Float32)
+<span class="annotation">        # L360: 把 FP32 epilogue 结果转换为 mO 的 storage dtype，并存入 output register</span>
+<span class="annotation">        #       fragment。</span>
+        tXrO.store(y.to(tXrO.element_type))
+<span class="annotation">        # L361: 只允许真实 row 执行最终 global store。</span>
+        if row &lt; shape[0]:
+<span class="annotation">            # L362: 把 output fragment copy 到 gO；绑定的 tXpX 屏蔽 feature tail。至此</span>
+<span class="annotation">            #       kernel 完成，没有额外返回值。</span>
+            copy(tXrO, tXgO)
+</code></pre>
+
+<h2 id="zh-reading">4. 阅读结论</h2>
+
+<p>这段 kernel 可以压缩成四个所有权转换。<code>local_tile</code> 先把完整 tensor 分给 CTA，<code>ThrCopy.partition_S/D</code> 再把 CTA tile 分给 threads，<code>make_rmem_tensor_like</code> 为每个 thread 建立同构 register storage，<code>row_reduce</code> 最后沿同一 row group 把分散值合并。CuTe layout 只描述映射，数据移动发生在 copy、load、store 与 reduction helper 内。</p>
+
+<p>对 RMSNorm specialization，数值主路径是第 237 至 255 行的 input staging、第 315 至 324 行的平方和规约，以及第 338 至 362 行的 reload 与 epilogue。其余代码负责可选输出、per-head、residual、tail、LayerNorm 复用和 cluster 扩展。阅读生成代码或做性能实验时，应按实际 dtype、<code>N</code> 和 config 先确定 specialization，再讨论 register lifetime、shared-memory traffic 或 cluster 开销；仅从完整 Python 源码无法推断某个 specialization 最终包含哪些指令。</p>
+
+<h2 id="zh-refs">参考资料</h2>
+
+<ul>
+  <li><a href="https://mirror.math.princeton.edu/pub/oldlinux/download/clk011c-1.9.6pre.pdf">赵炯，《Linux 内核完全注释》：完整源码内嵌注释的编排参考</a></li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L150-L362">QuACK <code>RMSNorm.kernel</code>, commit <code>14b0b71</code></a></li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/reduction_base.py#L12-L94">QuACK <code>ReductionBase</code>: tile 与 reduction storage</a></li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/reduce.py#L92-L267">QuACK <code>row_reduce</code>: warp、block 与 cluster reduction</a></li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/copy_utils.py#L307-L396">QuACK copy atom、2D tiled copy 与 feature predicate</a></li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm_config.py#L16-L91">QuACK RMSNorm forward launch config</a></li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/tests/test_rmsnorm.py#L29-L144">QuACK RMSNorm correctness tests</a></li>
+  <li><a href="https://docs.nvidia.com/cutlass/4.7.0/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html">NVIDIA CuTe DSL 4.7.0 Introduction</a></li>
+  <li><a href="https://docs.nvidia.com/cutlass/4.7.0/media/docs/pythonDSL/cute_dsl_general/dsl_control_flow.html">NVIDIA CuTe DSL 4.7.0 Control Flow</a></li>
+  <li><a href="https://docs.nvidia.com/cutlass/4.7.0/media/docs/pythonDSL/cute_dsl_api/cute.html">NVIDIA CuTe DSL 4.7.0 <code>cute</code> API</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async">PTX ISA: <code>cp.async</code></a></li>
+</ul>
+
+</div>
+
+<div class="lang-en">
+
+<h1>QuACK CuTeDSL RMSNorm Forward Kernel: Thread Mapping, Reduction, and Line-by-Line Commentary</h1>
+
+<p class="lead">QuACK's public <code>rmsnorm()</code> flattens the batch dimensions into rows and sends the hidden features of each row to a CuTeDSL reduction kernel. The kernel can also fuse a residual, preserve a prenorm result, apply weight and bias, and split a wide feature dimension across a CTA cluster. RMSNorm itself requires only a sum of squares and a scale. Most of the 213 source lines describe which CTA, warp, and thread owns each value, along with when that value moves through global memory, shared memory, and registers. The useful entry point is therefore tile ownership, followed by one complete row-reduction data path.</p>
+
+<h2 id="en-naming">Variable naming legend</h2>
+
+<p>These prefixes describe a tensor's scope, storage level, or purpose. NVIDIA's <a href="https://docs.nvidia.com/cutlass/4.7.0/media/docs/cpp/cute/0x_gemm_tutorial.html">CuTe GEMM tutorial</a> uses <code>mA/mB/mC</code> for complete tensors, then names their CTA tiles <code>gA/gB/gC</code>. QuACK follows the same convention. The <code>[input]</code>, <code>[output]</code>, and <code>[configuration]</code> labels in the function signature determine parameter direction.</p>
+
+<div class="table-scroll">
+<table class="note-table naming-table">
+  <thead><tr><th>Pattern</th><th>Meaning</th><th>Scope or storage level</th><th>Examples in this article</th></tr></thead>
+  <tbody>
+    <tr><td><code>m...</code></td><td>Complete tensor</td><td>The complete view at the kernel boundary, before CTA partitioning. It may be an input or an output written by the kernel.</td><td><code>mX</code>, <code>mW</code>, <code>mO</code>, <code>mRstd</code></td></tr>
+    <tr><td><code>g...</code></td><td>Global-memory tile</td><td>The current CTA's global-memory view, cut from an <code>m...</code> tensor.</td><td><code>gX</code>, <code>gRes</code>, <code>gW</code>, <code>gO</code></td></tr>
+    <tr><td><code>s...</code></td><td>Shared-memory tile</td><td>Shared-memory staging storage visible to the CTA.</td><td><code>sX</code>, <code>sRes</code></td></tr>
+    <tr><td><code>...r...</code></td><td>Register fragment</td><td>Usually thread-private register storage.</td><td><code>tXrX</code>, <code>tXrW</code>, <code>tXrO</code></td></tr>
+    <tr><td><code>c...</code></td><td>Coordinate tensor</td><td>Logical coordinates rather than input or output data.</td><td><code>cX</code>, <code>tXcX</code></td></tr>
+    <tr><td><code>...p...</code></td><td>Predicate</td><td>A Boolean mask derived from coordinates to suppress out-of-range feature elements.</td><td><code>tXpX</code></td></tr>
+    <tr><td><code>tX...</code></td><td>Thread partition</td><td>The current thread's partition under tiled copy <code>X</code>. A following <code>g/s/r</code> identifies the partitioned tensor's storage level.</td><td><code>tXgW</code>, <code>tXsX</code>, <code>tXrX</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p><code>tXgW</code> reads as partitioning pattern <code>tX</code> applied to global-memory tensor <code>gW</code>. Name suffixes identify data roles: <code>X</code> is the input, <code>Res</code> the residual, <code>W</code> the weight, <code>B</code> the bias, and <code>O</code> the output. <code>Rstd</code> and <code>Mean</code> denote reciprocal standard deviation and row mean. <code>tXrRstd</code> and <code>tXrMean</code> are exceptions: they come from <code>partition_D(gRstd/gMean)</code> and are global destination partitions, not same-named register fragments.</p>
+
+<h2 id="en-scope">0. Source boundary and call path</h2>
+
+<p>This article analyzes only <a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L150-L362"><code>RMSNorm.kernel</code>, lines 150 through 362, at QuACK commit <code>14b0b71</code></a>. That revision declares <code>nvidia-cutlass-dsl&gt;=4.7</code>; CuTe DSL 4.7.0 documentation supplies supporting API semantics. A later QuACK revision may change layouts, heuristics, or API spellings, so the commentary is not a cross-version interface contract.</p>
+
+<p>The public entry reaches the device kernel through this path:</p>
+
+<ol>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L1666-L1706"><code>rmsnorm()</code></a> selects regular or per-head mode, then reshapes the batch dimensions into <code>[M,N]</code> or <code>[M,H,N]</code>.</li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L1598-L1663"><code>RMSNormFunction</code></a> handles contiguity, saved autograd values, and the optional prenorm output.</li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L365-L470"><code>_rmsnorm_fwd</code> and <code>_compile_rmsnorm_fwd</code></a> select dtypes, optional arguments, and the JIT specialization.</li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L107-L148"><code>RMSNorm.__call__</code></a> computes vector width, tile, block, grid, and cluster shapes, then launches the kernel discussed here.</li>
+</ol>
+
+<div class="note-box">
+  <p><code>is_layernorm</code>, optional-tensor presence, <code>reload_from</code>, <code>delay_w_load</code>, and <code>weight_offset</code> all participate in compile-time specialization. In an ordinary RMSNorm build, <code>is_layernorm=False</code>. Lines 263 through 312 do not remain as a runtime LayerNorm branch; lines 313 through 324 provide the selected sum-of-squares path.</p>
+</div>
+
+<h2 id="en-model">1. Mathematical and execution model</h2>
+
+<p>For an input row of length (N), define the FP32 value after optional residual fusion as:</p>
+
+<p>\[
+z_j = \operatorname{fp32}(x_j) +
+\begin{cases}
+\operatorname{fp32}(r_j), &amp; \text{if a residual is present},\\
+0, &amp; \text{otherwise}.
+\end{cases}
+\]</p>
+
+<p>The RMSNorm statistic and output are:</p>
+
+<p>\[
+\operatorname{rstd}
+=
+\left(\frac{1}{N}\sum_{j=0}^{N-1} z_j^2 + \varepsilon\right)^{-1/2},
+\qquad
+y_j = (z_j\operatorname{rstd})(w_j+\delta)+b_j.
+\]</p>
+
+<p>The weight (w_j), bias (b_j), and weight offset (delta) are optional. Addition, squaring, reduction, normalization, weight-offset addition, and affine arithmetic use FP32. The kernel converts <code>residual_out</code> and final <code>mO</code> independently to their requested storage dtypes before writing. The <a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L563-L575">PyTorch reference</a> states the same numerical definition.</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">Storage locations and dependencies for one row</div>
+  <svg class="diagram-svg" viewBox="0 0 1120 430" role="img" aria-labelledby="en-rms-flow-title en-rms-flow-desc">
+    <title id="en-rms-flow-title">QuACK RMSNorm forward-kernel data flow</title>
+    <desc id="en-rms-flow-desc">Input and residual values move asynchronously from global memory to shared memory, then enter registers. The kernel performs an FP32 row reduction and affine epilogue before writing global outputs. A wide row may be divided along the feature dimension among CTAs in a cluster.</desc>
+    <rect class="cluster" x="22" y="34" width="1074" height="350" rx="12"></rect>
+    <text x="42" y="62" class="mono muted" font-size="13">CTA or CTA cluster cooperating along N</text>
+    <rect class="gmem" x="52" y="102" width="180" height="82" rx="8"></rect>
+    <text x="142" y="132" text-anchor="middle" class="mono" font-size="14">gX / gRes</text>
+    <text x="142" y="158" text-anchor="middle" class="muted" font-size="12">global-memory tile</text>
+    <path class="arrow" d="M232 143 H302"></path>
+    <text x="267" y="130" text-anchor="middle" class="mono muted" font-size="11">cp.async</text>
+    <rect class="smem" x="302" y="102" width="180" height="82" rx="8"></rect>
+    <text x="392" y="132" text-anchor="middle" class="mono" font-size="14">sX / sRes</text>
+    <text x="392" y="158" text-anchor="middle" class="muted" font-size="12">shared-memory tile</text>
+    <path class="arrow" d="M482 143 H552"></path>
+    <text x="517" y="130" text-anchor="middle" class="mono muted" font-size="11">autovec</text>
+    <rect class="rmem" x="552" y="102" width="180" height="82" rx="8"></rect>
+    <text x="642" y="132" text-anchor="middle" class="mono" font-size="14">tXrX / x</text>
+    <text x="642" y="158" text-anchor="middle" class="muted" font-size="12">register fragment, FP32</text>
+    <path class="arrow" d="M732 143 H802"></path>
+    <rect class="reduce" x="802" y="92" width="244" height="102" rx="8"></rect>
+    <text x="924" y="126" text-anchor="middle" class="mono" font-size="14">row_reduce(x * x)</text>
+    <text x="924" y="151" text-anchor="middle" class="muted" font-size="12">thread, warp, block, optional cluster</text>
+    <text x="924" y="174" text-anchor="middle" class="mono muted" font-size="12">rstd = rsqrt(sum / N + eps)</text>
+    <rect class="gmem" x="52" y="258" width="180" height="82" rx="8"></rect>
+    <text x="142" y="288" text-anchor="middle" class="mono" font-size="14">gW / gB</text>
+    <text x="142" y="314" text-anchor="middle" class="muted" font-size="12">direct global-to-register load</text>
+    <path class="arrow" d="M232 299 H552"></path>
+    <path class="arrow" d="M642 184 V268"></path>
+    <path class="arrow" d="M924 194 V268 H732"></path>
+    <rect class="rmem" x="552" y="258" width="180" height="82" rx="8"></rect>
+    <text x="642" y="288" text-anchor="middle" class="mono" font-size="14">x_hat, y</text>
+    <text x="642" y="314" text-anchor="middle" class="muted" font-size="12">FP32 affine epilogue</text>
+    <path class="arrow" d="M732 299 H802"></path>
+    <rect class="gmem" x="802" y="258" width="244" height="82" rx="8"></rect>
+    <text x="924" y="288" text-anchor="middle" class="mono" font-size="14">gO / gResO / gRstd</text>
+    <text x="924" y="314" text-anchor="middle" class="muted" font-size="12">predicated global stores</text>
+  </svg>
+</div>
+
+<h2 id="en-example">2. A tile instance for <code>N=760</code></h2>
+
+<p>Consider <code>x.dtype=bf16</code>, <code>weight.dtype=fp32</code>, ordinary RMSNorm, and no cluster. The <a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm_config.py#L47-L91">default heuristic</a> selects 128 threads and 32 threads per row. The widest dtype is 32 bits, so <code>vecsize=gcd(760, 128/32)=4</code>. Let (B_N) denote the number of vector-block groups along the feature dimension. The <a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/reduction_base.py#L42-L50"><code>_get_tiled_copy()</code></a> calculation is:</p>
+
+<p>\[
+B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
+\qquad
+\operatorname{tiler}_{MN}=(128/32,\;4\times6\times32)=(4,768).
+\]</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead><tr><th>Quantity</th><th>Value</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>CTA rows</td><td>4</td><td>The 128 threads form four 32-thread row groups, one per row.</td></tr>
+    <tr><td>Logical columns</td><td>768</td><td>Each row has eight positions beyond the real <code>N=760</code>; <code>tXpX</code> masks that tail.</td></tr>
+    <tr><td>Values per thread</td><td>6 groups of 4</td><td>The 32 threads in a row group cover 32 vectors, and each thread owns one four-element vector in each of six rest-k iterations.</td></tr>
+    <tr><td><code>sX</code></td><td>4 by 768 bf16</td><td>The input tile occupies 6144 bytes and is contiguous along the feature mode.</td></tr>
+    <tr><td>Reduction level</td><td>One warp</td><td>Thirty-two threads per row is exactly one warp, so this instance requires neither cross-warp nor cross-CTA combining.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>As <code>N</code> grows, <code>threads_per_row</code> can exceed 32 and <code>row_reduce</code> adds a shared-memory block reduction. When <code>cluster_n&gt;1</code>, peer CTAs receive separate feature tiles of the same row and combine them through remote shared-memory stores and an mbarrier. The <a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/reduce.py#L202-L267"><code>row_reduce</code></a> interface hides those three cases behind one call site.</p>
+
+<h2>3. Commentary for every line from 150 through 362</h2>
+
+<p>The listing below follows the source-reading format used by Zhao Jiong's <a href="https://mirror.math.princeton.edu/pub/oldlinux/download/clk011c-1.9.6pre.pdf"><cite>Fully Annotated Linux Kernel</cite></a>. It preserves every line and original comment from the fixed commit, then inserts commentary immediately before the relevant statement with a <code># Lline:</code> prefix. The control flow therefore remains continuous and directly comparable with the upstream file.</p>
+
+<h3 id="en-signature">3.1 Entry and thread coordinates</h3>
+<p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L150-L170">source L150-L170</a></p>
+
+<pre class="annotated-code" data-source-start="150" data-source-end="170"><code>
+<span class="annotation">    # Naming legend. Prefixes describe tensor scope or storage level, not input/output direction:</span>
+<span class="annotation">    #   m*: complete tensor at the kernel boundary, following CuTe's mA/mB/mC convention;</span>
+<span class="annotation">    #   g*: current CTA's global-memory tile cut from an m* tensor;</span>
+<span class="annotation">    #   s*: shared-memory tile; r*: register fragment; c*: coordinate; p*: predicate.</span>
+<span class="annotation">    #   tX*: current thread's partition under tiled_copy X. A following g/s/r identifies</span>
+<span class="annotation">    #        global/shared/register storage, as in tXgW, tXsX, and tXrX.</span>
+<span class="annotation">    #   Exception: tXrRstd and tXrMean are global destination partitions.</span>
+<span class="annotation">    # Signature labels mark [input], [output], or [configuration]. The kernel writes output</span>
+<span class="annotation">    # tensors in place; this device kernel itself has no return value.</span>
+<span class="annotation">    # L150: @cute.kernel declares the following Python function as a device kernel. During JIT</span>
+<span class="annotation">    #       compilation, CuTeDSL lowers its body to a GPU kernel instead of running it on the host.</span>
+    @cute.kernel
+<span class="annotation">    # L151: Defines the kernel parameter list and device-side function body.</span>
+    def kernel(
+<span class="annotation">        # L152 [configuration]: self carries the fixed dtype, N, is_layernorm, and launch</span>
+<span class="annotation">        #       configuration. These fields can participate in compile-time specialization.</span>
+        self,
+<span class="annotation">        # L153 [input]: mX is the complete input tensor. It is [M,N] in regular mode or [M,H,N]</span>
+<span class="annotation">        #       in per-head mode.</span>
+        mX: cute.Tensor,
+<span class="annotation">        # L154 [optional input]: mW is the complete weight tensor with shape [N] or [H,N].</span>
+<span class="annotation">        #       Its presence produces a separate kernel specialization.</span>
+        mW: Optional[cute.Tensor],
+<span class="annotation">        # L155 [optional input]: mB is the complete bias tensor with the same broadcast</span>
+<span class="annotation">        #       structure as the weight.</span>
+        mB: Optional[cute.Tensor],
+<span class="annotation">        # L156 [optional input]: mRes is the complete residual tensor with the same shape as mX.</span>
+        mRes: Optional[cute.Tensor],
+<span class="annotation">        # L157 [output]: mO is the complete output tensor allocated by the caller. The kernel writes</span>
+<span class="annotation">        #       the final result into it.</span>
+        mO: cute.Tensor,
+<span class="annotation">        # L158 [optional output]: mResO stores (x+residual) after FP32 addition</span>
+<span class="annotation">        #       and conversion to the requested storage dtype.</span>
+        mResO: Optional[cute.Tensor],
+<span class="annotation">        # L159 [optional output]: mRstd stores the per-row reciprocal standard deviation as</span>
+<span class="annotation">        #       FP32.</span>
+        mRstd: Optional[cute.Tensor],
+<span class="annotation">        # L160 [optional output]: mMean stores the per-row mean, with numerical meaning only in a</span>
+<span class="annotation">        #       LayerNorm specialization.</span>
+        mMean: Optional[cute.Tensor],
+<span class="annotation">        # L161 [input]: eps is a runtime FP32 scalar, so changing epsilon does not select a different</span>
+<span class="annotation">        #       source branch.</span>
+        eps: Float32,
+<span class="annotation">        # L162 [configuration]: tiler_mn describes the logical (rows, columns) tile assigned</span>
+<span class="annotation">        #       to one CTA.</span>
+        tiler_mn: cute.Shape,
+<span class="annotation">        # L163 [configuration]: tiled_copy combines the copy atom, thread layout, and</span>
+<span class="annotation">        #       per-thread value layout.</span>
+<span class="annotation">        #       Every later partition_S/D uses this common ownership rule.</span>
+        tiled_copy: cute.TiledCopy,
+<span class="annotation">        # L164 [configuration]: threads_per_row is a compile-time integer that determines</span>
+<span class="annotation">        #       how many threads initially participate in one row reduction.</span>
+        threads_per_row: cutlass.Constexpr[int],
+    ):
+<span class="annotation">        # L166: Reads the CTA-local thread index and keeps only x dimension tidx; the thread</span>
+<span class="annotation">        #       block is one-dimensional.</span>
+        tidx, _, _ = cute.arch.thread_idx()
+<span class="annotation">        # L167: Reads grid coordinates. bidx selects a row tile and bidz selects a head, while</span>
+<span class="annotation">        #       the y coordinate is handled separately.</span>
+        bidx, _, bidz = cute.arch.block_idx()
+<span class="annotation">        # L168: When cluster_n==1, compile time fixes the feature-tile coordinate at zero.</span>
+<span class="annotation">        #       Otherwise block y is the CTA coordinate along N within the cluster.</span>
+        cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
+<span class="annotation">        # L169: Gets the tiled copy's thread-value layout. The reduction-buffer helper uses it</span>
+<span class="annotation">        #       to derive warps per row and cluster-buffer shape.</span>
+        tv_layout = tiled_copy.layout_tv_tiled
+
+</code></pre>
+
+<h3 id="en-tiles">3.2 Shared memory, head slicing, and CTA tiles</h3>
+<p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L171-L201">source L171-L201</a></p>
+
+<pre class="annotated-code" data-source-start="171" data-source-end="201"><code>
+<span class="annotation">        # L171: Creates the shared-memory allocator. CuTeDSL derives dynamic shared-memory size</span>
+<span class="annotation">        #       and object offsets from subsequent allocations.</span>
+        smem = cutlass.utils.SmemAllocator()
+<span class="annotation">        # L172: Begins allocation of input tile sX.</span>
+        sX = smem.allocate_tensor(
+<span class="annotation">            # L173: sX uses the input element type and tiler_mn shape. order=(1,0) makes the</span>
+<span class="annotation">            #       feature mode contiguous, and 16-byte alignment supports vector copies.</span>
+            mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
+        )
+<span class="annotation">        # L175: Compiles the residual shared-memory branch only when a residual tensor exists. A</span>
+<span class="annotation">        #       no-residual specialization reserves no such tile.</span>
+        if const_expr(mRes is not None):
+<span class="annotation">            # L176: Begins allocation of sRes.</span>
+            sRes = smem.allocate_tensor(
+<span class="annotation">                # L177: sRes preserves the residual's own storage dtype, which may differ from</span>
+<span class="annotation">                #       the input dtype.</span>
+                mRes.element_type,
+<span class="annotation">                # L178: The residual tile uses the same feature-contiguous logical layout as sX.</span>
+                cute.make_ordered_layout(tiler_mn, order=(1, 0)),
+<span class="annotation">                # L179: Requests the same 16-byte alignment.</span>
+                byte_alignment=16,
+            )
+<span class="annotation">        # L181: Allocates the row-reduction shared buffer. With cluster_n&gt;1, it also allocates</span>
+<span class="annotation">        #       an mbarrier array with one entry per reduction stage; a single-CTA</span>
+<span class="annotation">        #       specialization receives mbar_ptr=None.</span>
+        reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
+
+<span class="annotation">        # L183: The following block slices every related tensor by head.</span>
+        # Slice per head
+<span class="annotation">        # L184: Enters per-head mode when input rank is three. Rank is a JIT-known property, so</span>
+<span class="annotation">        #       compile time determines the branch.</span>
+        if const_expr(cute.rank(mX) == 3):
+<span class="annotation">            # L185: Starts rebinding all head-dependent tensors so the remaining body can</span>
+<span class="annotation">            #       operate on a two-dimensional [M,N] view.</span>
+            mX, mW, mB, mRes, mO, mResO, mRstd, mMean = [
+<span class="annotation">                # L186: For every present tensor, fixes the middle head mode at bidz and retains</span>
+<span class="annotation">                #       row and feature modes. An absent optional tensor remains None.</span>
+                mT[None, bidz, None] if const_expr(mT is not None) else None
+<span class="annotation">                # L187: Lists the input, parameters, outputs, and statistics that must use the</span>
+<span class="annotation">                #       same head coordinate.</span>
+                for mT in (mX, mW, mB, mRes, mO, mResO, mRstd, mMean)
+            ]
+
+<span class="annotation">        # L190: Reads true two-dimensional shape (M,N) from sliced mX. Row bounds, the tail</span>
+<span class="annotation">        #       predicate, and statistical divisors all use this shape.</span>
+        shape = (cute.size(mX, mode=[0]), cute.size(mX, mode=[1]))
+<span class="annotation">        # L191: Creates an identity tensor with the input shape. It allocates no data; applying</span>
+<span class="annotation">        #       the same layout operations yields logical (row,column) coordinates.</span>
+        idX = cute.make_identity_tensor(shape)
+<span class="annotation">        # L192: The following block tiles each full tensor to the region owned by this CTA.</span>
+        # Slice for CTAs
+<span class="annotation">        # L193: Starts the assignment that creates data tiles and the coordinate tile together.</span>
+        gX, gRes, gO, gResO, gRstd, gMean, cX = [
+<span class="annotation">            # L194: local_tile divides a tensor by tiler_mn and selects coordinate</span>
+<span class="annotation">            #       (bidx,cluster_y). Missing tensors do not participate.</span>
+            cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) if mT is not None else None
+<span class="annotation">            # L195: Applies the same tile coordinate to input, residual, outputs, side outputs,</span>
+<span class="annotation">            #       and identity tensor, keeping data and coordinate partitions isomorphic.</span>
+            for mT in (mX, mRes, mO, mResO, mRstd, mMean, idX)
+        ]
+<span class="annotation">        # L197: Begins separate tiling for weight and bias.</span>
+        gW, gB = [
+<span class="annotation">            # L198: __call__ expanded weight and bias with stride zero along rows, so their</span>
+<span class="annotation">            #       row-tile coordinate is always zero. cluster_y still selects each CTA's</span>
+<span class="annotation">            #       feature slice.</span>
+            cute.local_tile(mT, tiler_mn, (0, cluster_y)) if const_expr(mT is not None) else None
+<span class="annotation">            # L199: Applies that operation to weight and bias; an absent parameter remains None.</span>
+            for mT in (mW, mB)
+        ]
+
+</code></pre>
+
+<h3 id="en-partitions">3.3 Thread partitions, register fragments, and tail predicates</h3>
+<p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L202-L236">source L202-L236</a></p>
+
+<pre class="annotated-code" data-source-start="202" data-source-end="236"><code>
+<span class="annotation">        # L202: Takes the current tidx slice from CTA-wide tiled_copy. Every subsequent</span>
+<span class="annotation">        #       partition belongs to this thread.</span>
+        thr_copy_X = tiled_copy.get_slice(tidx)
+
+<span class="annotation">        # L204: When weight exists, uses the source-partition rule to select the elements this</span>
+<span class="annotation">        #       thread owns in gW.</span>
+        tXgW = thr_copy_X.partition_S(gW) if const_expr(mW is not None) else None
+<span class="annotation">        # L205: Applies the same source-partition rule to bias.</span>
+        tXgB = thr_copy_X.partition_S(gB) if const_expr(mB is not None) else None
+<span class="annotation">        # L206: tXgX is the current thread's global-input source partition.</span>
+        tXgX = thr_copy_X.partition_S(gX)
+<span class="annotation">        # L207: tXsX is the corresponding shared-memory destination partition. Its value</span>
+<span class="annotation">        #       coordinates match tXgX element by element.</span>
+        tXsX = thr_copy_X.partition_D(sX)
+<span class="annotation">        # L208: Compiles the residual partition body only when a residual exists.</span>
+        if const_expr(mRes is not None):
+<span class="annotation">            # L209: Gets the residual global source partition.</span>
+            tXgRes = thr_copy_X.partition_S(gRes)
+<span class="annotation">            # L210: Gets the residual shared destination partition.</span>
+            tXsRes = thr_copy_X.partition_D(sRes)
+<span class="annotation">        # L211: tXgO is the final global-output destination partition.</span>
+        tXgO = thr_copy_X.partition_D(gO)
+<span class="annotation">        # L212: Compiles a prenorm-output partition only when the caller requests residual_out.</span>
+        if const_expr(mResO is not None):
+<span class="annotation">            # L213: Gets the prenorm global-output destination partition.</span>
+            tXgResO = thr_copy_X.partition_D(gResO)
+<span class="annotation">        # L214: When rstd is requested, gets a destination partition from the expanded statistic</span>
+<span class="annotation">        #       tile. Despite the r in its name, this line creates no rmem tensor.</span>
+        tXrRstd = thr_copy_X.partition_D(gRstd) if const_expr(mRstd is not None) else None
+<span class="annotation">        # L215: Builds an isomorphic destination partition for optional mean output.</span>
+        tXrMean = thr_copy_X.partition_D(gMean) if const_expr(mMean is not None) else None
+<span class="annotation">        # L216: Partitions the identity tensor with the same source rule and selects the copy</span>
+<span class="annotation">        #       vector's first element. tXcX therefore exposes this thread's row and columns for</span>
+<span class="annotation">        #       its value iterations.</span>
+        tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
+
+<span class="annotation">        # L218: The following allocations create register fragments for global-to-register</span>
+<span class="annotation">        #       copies.</span>
+        # allocate fragments for gmem-&gt;rmem
+<span class="annotation">        # L219: When weight exists, creates a register fragment matching tXgW shape and layout.</span>
+<span class="annotation">        #       Its element type follows the weight by default.</span>
+        tXrW = cute.make_rmem_tensor_like(tXgW) if const_expr(mW is not None) else None
+<span class="annotation">        # L220: Creates the corresponding bias register fragment.</span>
+        tXrB = cute.make_rmem_tensor_like(tXgB) if const_expr(mB is not None) else None
+<span class="annotation">        # L221: Creates input fragment tXrX and output fragment tXrO together. The output</span>
+<span class="annotation">        #       fragment follows output storage dtype rather than being forced to input dtype.</span>
+        tXrX, tXrO = [cute.make_rmem_tensor_like(t) for t in (tXgX, tXgO)]
+<span class="annotation">        # L222: A residual specialization also needs a residual register fragment.</span>
+        if const_expr(mRes is not None):
+<span class="annotation">            # L223: Creates tXrRes with the residual global partition's shape, layout, and</span>
+<span class="annotation">            #       element type.</span>
+            tXrRes = cute.make_rmem_tensor_like(tXgRes)
+
+<span class="annotation">        # L225: Divides the tiled copy's thread count by warp size to get CTA warp count. This</span>
+<span class="annotation">        #       revision passes the value to the initialization helper, although the helper does</span>
+<span class="annotation">        #       not use that parameter.</span>
+        num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
+<span class="annotation">        # L226: In cluster mode, the first threads initialize one mbarrier per reduction stage,</span>
+<span class="annotation">        #       issue the init fence, and make the CTA arrive at a cluster rendezvous. The</span>
+<span class="annotation">        #       single-CTA specialization turns this helper into an empty operation.</span>
+        self._initialize_cluster(tidx, mbar_ptr, num_warps)
+
+<span class="annotation">        # L228: Determines at compile time whether all CTA feature tiles exactly cover true N.</span>
+<span class="annotation">        #       Exact coverage needs no per-element tail predicate.</span>
+        is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
+<span class="annotation">        # L229: Begins construction of the optional predicate tensor.</span>
+        tXpX = (
+<span class="annotation">            # L230: For an uneven tile, checks column&lt;N on the identity partition and creates a</span>
+<span class="annotation">            #       reusable Boolean predicate for this thread.</span>
+            copy_utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+<span class="annotation">            # L231: This condition selects the predicate helper only when is_even_N is false.</span>
+            if not is_even_N
+<span class="annotation">            # L232: Uses None to represent an unpredicated copy when coverage is exact.</span>
+            else None
+        )
+<span class="annotation">        # L234: Every later copy reuses the same feature-tail predicate.</span>
+        # Each copy will use the same predicate
+<span class="annotation">        # L235: Uses partial to bind pred=tXpX into QuACK's copy helper. Later calls supply only</span>
+<span class="annotation">        #       source, destination, and async selection.</span>
+        copy = partial(copy_utils.copy, pred=tXpX)
+
+</code></pre>
+
+<h3 id="en-load">3.4 <code>cp.async</code> staging, parameter loads, and residual fusion</h3>
+<p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L237-L261">source L237-L261</a></p>
+
+<pre class="annotated-code" data-source-start="237" data-source-end="261"><code>
+<span class="annotation">        # L237: Reads the logical row owned by this thread from the coordinate partition.</span>
+<span class="annotation">        #       Threads in the same row group receive the same row value.</span>
+        row = tXcX[0][0]
+<span class="annotation">        # L238: Checks at runtime whether the row is below true M, masking row groups beyond the</span>
+<span class="annotation">        #       batch in the last CTA.</span>
+        if row &lt; shape[0]:
+<span class="annotation">            # L239: Issues an input global-to-shared async copy for a valid row. QuACK's helper</span>
+<span class="annotation">            #       chooses a cp.async copy atom and applies the feature predicate.</span>
+            copy(tXgX, tXsX, is_async=True)
+<span class="annotation">            # L240: Compiles a second async-load path when residual is present.</span>
+            if const_expr(mRes is not None):
+<span class="annotation">                # L241: Moves this thread's residual partition asynchronously into sRes with the</span>
+<span class="annotation">                #       same column predicate as input.</span>
+                copy(tXgRes, tXsRes, is_async=True)
+<span class="annotation">        # L242: Commits the cp.async operations issued by this thread as one group. The call</span>
+<span class="annotation">        #       sits outside the row guard so all threads advance through a uniform group</span>
+<span class="annotation">        #       protocol; a thread with no valid copy commits an empty group.</span>
+        cute.arch.cp_async_commit_group()
+
+<span class="annotation">        # L244: If the configuration does not delay weight and bias, loads parameters while</span>
+<span class="annotation">        #       async input copies are outstanding, overlapping some latency.</span>
+        if const_expr(not self.delay_w_load):
+<span class="annotation">            # L245: The optional-weight specialization guard.</span>
+            if const_expr(mW is not None):
+<span class="annotation">                # L246: Copies weight synchronously from the global partition into its register</span>
+<span class="annotation">                #       fragment. The helper builds a copy atom from the weight's dtype and</span>
+<span class="annotation">                #       vector width.</span>
+                copy(tXgW, tXrW)
+<span class="annotation">            # L247: The optional-bias specialization guard.</span>
+            if const_expr(mB is not None):
+<span class="annotation">                # L248: Loads bias from global memory into its register fragment.</span>
+                copy(tXgB, tXrB)
+
+<span class="annotation">        # L250: Waits for every previously committed async group. Argument zero permits no older</span>
+<span class="annotation">        #       incomplete group to remain outstanding.</span>
+        cute.arch.cp_async_wait_group(0)
+<span class="annotation">        # L251: Vector-copies this thread's sX elements into tXrX. Each thread reads its own</span>
+<span class="annotation">        #       shared partition, so a whole-CTA barrier is unnecessary here.</span>
+        cute.autovec_copy(tXsX, tXrX)
+<span class="annotation">        # L252: Loads a TensorSSA from the register tensor and immediately converts it to FP32.</span>
+<span class="annotation">        #       Later addition, squaring, and reduction all use FP32.</span>
+        x = tXrX.load().to(cute.Float32)
+<span class="annotation">        # L253: Enters a compile-time body when residual is present.</span>
+        if const_expr(mRes is not None):
+<span class="annotation">            # L254: Moves the current thread's sRes partition into its residual register</span>
+<span class="annotation">            #       fragment.</span>
+            cute.autovec_copy(tXsRes, tXrRes)
+<span class="annotation">            # L255: Loads residual, converts it to FP32, and adds it to FP32 input. From here</span>
+<span class="annotation">            #       onward, x denotes (z=x+residual).</span>
+            x += tXrRes.load().to(cute.Float32)
+<span class="annotation">        # L256: Compiles the path that writes (z) when the caller requests a prenorm side</span>
+<span class="annotation">        #       output.</span>
+        if const_expr(mResO is not None):
+<span class="annotation">            # L257: Creates a temporary register fragment matching the global residual-output</span>
+<span class="annotation">            #       partition's shape, layout, and element type.</span>
+            tXrResO = cute.make_rmem_tensor_like(tXgResO)
+<span class="annotation">            # L258: Converts FP32 x to residual_out storage dtype and stores it in the temporary</span>
+<span class="annotation">            #       fragment. An FP32 destination preserves the full addition result.</span>
+            tXrResO.store(x.to(tXrResO.element_type))
+<span class="annotation">            # L259: Allows only a real row to execute the global store.</span>
+            if row &lt; shape[0]:
+<span class="annotation">                # L260: Copies the prenorm fragment to global destination; bound tXpX also masks</span>
+<span class="annotation">                #       tail columns.</span>
+                copy(tXrResO, tXgResO)
+
+</code></pre>
+
+<h3 id="en-layernorm">3.5 LayerNorm compile-time branch</h3>
+<p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L262-L312">source L262-L312</a></p>
+
+<p>This section still comments every line, but an ordinary RMSNorm specialization removes the body from lines 263 through 311 and selects the <code>else</code> path at line 312. The unified implementation needs two reduction slots for LayerNorm, one for mean and one for centered squares. RMSNorm uses only slot zero.</p>
+
+<pre class="annotated-code" data-source-start="262" data-source-end="312"><code>
+<span class="annotation">        # L262: Initially binds mean and rstd to None, satisfying DSL visibility and</span>
+<span class="annotation">        #       type-determination rules for variables used after control flow. Both</span>
+<span class="annotation">        #       compile-time branches rebind them.</span>
+        mean, rstd = None, None
+<span class="annotation">        # L263: Branches at compile time on self.is_layernorm. A LayerNorm build enters the</span>
+<span class="annotation">        #       body, while an RMSNorm build removes it.</span>
+        if const_expr(self.is_layernorm):
+<span class="annotation">            # L264: LayerNorm reduces the mean first, then the centered sum of squares.</span>
+            # LayerNorm: compute mean first, then variance
+<span class="annotation">            # L265: Begins the first row_reduce, which computes the full-row element sum.</span>
+            sum_x = row_reduce(
+<span class="annotation">                # L266: Passes this thread's FP32 TensorSSA fragment x to the reduction helper,</span>
+<span class="annotation">                #       which first sums within the fragment.</span>
+                x,
+<span class="annotation">                # L267: Selects addition as the reduction operation.</span>
+                cute.ReductionOp.ADD,
+<span class="annotation">                # L268: Specifies threads in one row group. The helper first reduces within an</span>
+<span class="annotation">                #       aligned subgroup of at most 32 lanes.</span>
+                threads_per_row,
+<span class="annotation">                # L269: Selects shared reduction-buffer stage zero. A multi-warp row places warp</span>
+<span class="annotation">                #       partials here.</span>
+                reduction_buffer[None, None, 0],
+<span class="annotation">                # L270: Passes mbarrier zero in cluster mode. Single-CTA mode passes None and</span>
+<span class="annotation">                #       uses block reduction.</span>
+                mbar_ptr + 0 if const_expr(self.cluster_n &gt; 1) else None,
+<span class="annotation">                # L271: Uses FP32 zero as the additive identity.</span>
+                init_val=0.0,
+<span class="annotation">                # L272: In cluster mode, invokes cluster_wait after obtaining warp-local</span>
+<span class="annotation">                #       partials. It pairs with initialization's cluster_arrive_relaxed,</span>
+<span class="annotation">                #       ensuring every peer completed mbarrier initialization before remote</span>
+<span class="annotation">                #       shared-memory reduction traffic begins.</span>
+                hook_fn=cute.arch.cluster_wait if const_expr(self.cluster_n &gt; 1) else None,
+            )
+<span class="annotation">            # L274: Divides by true N to obtain the mean; padded columns do not enter the</span>
+<span class="annotation">            #       divisor.</span>
+            mean = sum_x / shape[1]
+<span class="annotation">            # L275: Compiles a mean-output store only when the caller requests that side output.</span>
+            if const_expr(mMean is not None):
+<span class="annotation">                # L276: Only the thread that owns column 0 may write the row mean to global</span>
+<span class="annotation">                #       memory.</span>
+                # Only the thread corresponding to column 0 writes out the mean to gmem
+<span class="annotation">                # L277: Begins the runtime owner condition.</span>
+                if (
+<span class="annotation">                    # L278: Requires this thread's first logical column to be zero, selecting</span>
+<span class="annotation">                    #       one writer among threads that all hold mean.</span>
+                    tXcX[0][1] == 0
+<span class="annotation">                    # L279: Excludes a row beyond true M in the last row tile.</span>
+                    and row &lt; shape[0]
+<span class="annotation">                    # L280: A single CTA may write directly. Cluster mode permits only linear</span>
+<span class="annotation">                    #       cluster rank zero, preventing duplicate writes from peer CTAs that</span>
+<span class="annotation">                    #       own the same row.</span>
+                    and (self.cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0)
+                ):
+<span class="annotation">                    # L282: Writes FP32 mean to the destination partition's first element. This</span>
+<span class="annotation">                    #       is a global store, not a persistent rmem fragment named tXrMean.</span>
+                    tXrMean[0] = mean
+<span class="annotation">            # L283: When the configuration selects reload_from="smem", reloads input after the</span>
+<span class="annotation">            #       mean reduction to shorten the original x fragment's live range across that</span>
+<span class="annotation">            #       reduction.</span>
+            if const_expr(self.reload_from == "smem"):
+<span class="annotation">                # L284: Refills the input fragment from sX, which still holds the initially</span>
+<span class="annotation">                #       staged data.</span>
+                cute.autovec_copy(tXsX, tXrX)
+<span class="annotation">                # L285: Loads the refreshed fragment and converts it to FP32.</span>
+                x = tXrX.load().to(cute.Float32)
+<span class="annotation">                # L286: A residual specialization must restore residual as well.</span>
+                if const_expr(mRes is not None):
+<span class="annotation">                    # L287: Refills the residual fragment from sRes.</span>
+                    cute.autovec_copy(tXsRes, tXrRes)
+<span class="annotation">                    # L288: Reconstructs (x+residual) in FP32.</span>
+                    x += tXrRes.load().to(cute.Float32)
+<span class="annotation">            # L289: When the configuration selects reload_from="gmem", uses global reload</span>
+<span class="annotation">            #       instead. The choice is mutually exclusive with shared reload and fixed at</span>
+<span class="annotation">            #       compile time.</span>
+            elif const_expr(self.reload_from == "gmem"):
+<span class="annotation">                # L290: Synchronously reloads input from gX into its register fragment, with the</span>
+<span class="annotation">                #       feature predicate still applied.</span>
+                copy(tXgX, tXrX)
+<span class="annotation">                # L291: Loads the refreshed input and converts it to FP32.</span>
+                x = tXrX.load().to(cute.Float32)
+<span class="annotation">                # L292: The residual specialization guard.</span>
+                if const_expr(mRes is not None):
+<span class="annotation">                    # L293: Synchronously reloads residual from gRes.</span>
+                    copy(tXgRes, tXrRes)
+<span class="annotation">                    # L294: Reconstructs the fused input in FP32.</span>
+                    x += tXrRes.load().to(cute.Float32)
+<span class="annotation">            # L295: Subtracts the row mean from every register element to produce centered</span>
+<span class="annotation">            #       values.</span>
+            x_centered = x - mean
+<span class="annotation">            # L296: Compiles a tail correction when the feature tile contains padding.</span>
+            if const_expr(not is_even_N):
+<span class="annotation">                # L297: The mean pass zero-filled out-of-bounds lanes, but the variance pass</span>
+<span class="annotation">                #       needs another mask.</span>
+                # OOB lanes are zero-filled for the mean pass, but they must contribute zero
+<span class="annotation">                # L298: Otherwise an OOB lane would incorrectly contribute (0 - mean)^2 =</span>
+<span class="annotation">                #       mean^2.</span>
+                # to the variance pass (not mean^2 from (0 - mean)^2).
+<span class="annotation">                # L299: Creates an FP32 register tensor with the input fragment's layout for</span>
+<span class="annotation">                #       corrected centered values.</span>
+                tXrX_centered = cute.make_rmem_tensor_like(tXrX, Float32)
+<span class="annotation">                # L300: Stores all centered values into that fragment.</span>
+                tXrX_centered.store(x_centered)
+<span class="annotation">                # L301: Uses tXpX to replace out-of-bounds fragment elements with FP32 zero,</span>
+<span class="annotation">                #       removing their contribution to the square sum.</span>
+                utils.fill_oob(tXrX_centered, tXpX, fill_value=Float32.zero)
+<span class="annotation">                # L302: Loads the corrected TensorSSA and rebinds x_centered.</span>
+                x_centered = tXrX_centered.load()
+<span class="annotation">            # L303: Begins the second row reduction for centered square sum.</span>
+            sum_sq_x_sub_mean = row_reduce(
+<span class="annotation">                # L304: Squares the FP32 TensorSSA element by element as the reduction input.</span>
+                x_centered * x_centered,
+<span class="annotation">                # L305: Again selects addition.</span>
+                cute.ReductionOp.ADD,
+<span class="annotation">                # L306: Reuses the same threads_per_row mapping.</span>
+                threads_per_row,
+<span class="annotation">                # L307: Selects reduction-buffer stage one, keeping this pass separate from</span>
+<span class="annotation">                #       mean-pass stage zero.</span>
+                reduction_buffer[None, None, 1],
+<span class="annotation">                # L308: Selects the second mbarrier in cluster mode; single-CTA mode still</span>
+<span class="annotation">                #       passes None.</span>
+                mbar_ptr + 1 if const_expr(self.cluster_n &gt; 1) else None,
+<span class="annotation">                # L309: Uses FP32 zero as the square-sum identity.</span>
+                init_val=0.0,
+            )
+<span class="annotation">            # L311: Computes population variance using true N, adds eps, and requests a</span>
+<span class="annotation">            #       fast-math reciprocal square root to obtain rstd.</span>
+            rstd = cute.math.rsqrt(sum_sq_x_sub_mean / shape[1] + eps, fastmath=True)
+<span class="annotation">        # L312: Begins the compile-time else for is_layernorm=False. An ordinary RMSNorm</span>
+<span class="annotation">        #       specialization enters its statistics path here.</span>
+        else:
+</code></pre>
+
+<h3 id="en-rmsnorm">3.6 RMSNorm square-sum reduction, <code>rstd</code>, and delayed parameter loads</h3>
+<p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L313-L337">source L313-L337</a></p>
+
+<pre class="annotated-code" data-source-start="313" data-source-end="337"><code>
+<span class="annotation">            # L313: RMSNorm skips mean subtraction and directly reduces the input squares.</span>
+            # RMSNorm: compute sum of squares directly
+<span class="annotation">            # L314: Binds mean to compile-time FP32 zero for a determined value in the shared</span>
+<span class="annotation">            #       epilogue. The RMSNorm expression at line 350 chooses x*rstd and does not</span>
+<span class="annotation">            #       subtract mean.</span>
+            mean = const_expr(0.0)
+<span class="annotation">            # L315: Begins RMSNorm's only row_reduce.</span>
+            sum_sq_x = row_reduce(
+<span class="annotation">                # L316: Computes FP32 x*x element by element. With a residual, x already denotes</span>
+<span class="annotation">                #       fused FP32 (x+residual).</span>
+                x * x,
+<span class="annotation">                # L317: Selects addition as the reduction operation.</span>
+                cute.ReductionOp.ADD,
+<span class="annotation">                # L318: Combines fragment partials across the configured thread row group.</span>
+                threads_per_row,
+<span class="annotation">                # L319: Uses reduction-buffer stage zero. RMSNorm constructs ReductionBase with</span>
+<span class="annotation">                #       stage=1, so this is the only allocated slot.</span>
+                reduction_buffer[None, None, 0],
+<span class="annotation">                # L320: Passes mbar_ptr directly. It points to the sole mbarrier in a cluster</span>
+<span class="annotation">                #       specialization and is None in a single-CTA specialization.</span>
+                mbar_ptr,
+<span class="annotation">                # L321: Starts the square sum from FP32 zero.</span>
+                init_val=0.0,
+<span class="annotation">                # L322: Cluster mode completes the initialization rendezvous before remote</span>
+<span class="annotation">                #       shared-memory reduction; single-CTA mode injects no hook.</span>
+                hook_fn=cute.arch.cluster_wait if const_expr(self.cluster_n &gt; 1) else None,
+            )
+<span class="annotation">            # L324: Divides by true N for the mean square, adds epsilon, and computes a</span>
+<span class="annotation">            #       fast-math reciprocal square root, producing RMSNorm rstd.</span>
+            rstd = cute.math.rsqrt(sum_sq_x / shape[1] + eps, fastmath=True)
+<span class="annotation">        # L325: Compiles the side-output store only when backward or the caller needs saved</span>
+<span class="annotation">        #       rstd.</span>
+        if const_expr(mRstd is not None):
+<span class="annotation">            # L326: Only the thread that owns column 0 may write the row rstd to global memory.</span>
+            # Only the thread corresponding to column 0 writes out the rstd to gmem
+<span class="annotation">            # L327: Begins the writer-election condition.</span>
+            if (
+<span class="annotation">                # L328: Requires the current thread to correspond to logical column zero.</span>
+                tXcX[0][1] == 0
+<span class="annotation">                # L329: Requires the row to be below true M.</span>
+                and row &lt; shape[0]
+<span class="annotation">                # L330: Also requires linear cluster rank zero in cluster mode; single-CTA mode</span>
+<span class="annotation">                #       satisfies the condition automatically.</span>
+                and (self.cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0)
+            ):
+<span class="annotation">                # L332: Writes FP32 rstd into the row-statistic destination. Every participating</span>
+<span class="annotation">                #       thread has the reduction result, but only one emits a global store.</span>
+                tXrRstd[0] = rstd
+<span class="annotation">        # L333: When the configuration delays parameter loads, enters the weight and bias load</span>
+<span class="annotation">        #       body after reduction, shortening parameter-fragment register live ranges.</span>
+        if const_expr(self.delay_w_load):
+<span class="annotation">            # L334: The optional-weight specialization guard.</span>
+            if const_expr(mW is not None):
+<span class="annotation">                # L335: Copies weight from its global partition into the register fragment with</span>
+<span class="annotation">                #       the same feature-tail predicate.</span>
+                copy(tXgW, tXrW)
+<span class="annotation">            # L336: The optional-bias specialization guard.</span>
+            if const_expr(mB is not None):
+<span class="annotation">                # L337: Loads bias from global memory into its register fragment.</span>
+                copy(tXgB, tXrB)
+</code></pre>
+
+<h3 id="en-epilogue">3.7 Input reload, normalization, and affine epilogue</h3>
+<p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L338-L362">source L338-L362</a></p>
+
+<pre class="annotated-code" data-source-start="338" data-source-end="362"><code>
+<span class="annotation">        # L338: If the configuration selected either reload source, reconstructs the input</span>
+<span class="annotation">        #       fragment after reduction. The reload preserves values while shortening the live</span>
+<span class="annotation">        #       range of a wide original fragment across reduction.</span>
+        if const_expr(self.reload_from == "smem" or self.reload_from == "gmem"):
+<span class="annotation">            # L339: Selects shared-memory reload at compile time.</span>
+            if const_expr(self.reload_from == "smem"):
+<span class="annotation">                # L340: Refills the input register fragment from original sX.</span>
+                cute.autovec_copy(tXsX, tXrX)
+<span class="annotation">                # L341: A residual specialization needs a matching reload.</span>
+                if const_expr(mRes is not None):
+<span class="annotation">                    # L342: Refills the residual register fragment from sRes.</span>
+                    cute.autovec_copy(tXsRes, tXrRes)
+<span class="annotation">            # L343: The outer condition restricts the setting to smem or gmem, so this else</span>
+<span class="annotation">            #       unambiguously means global-memory reload.</span>
+            else:
+<span class="annotation">                # L344: Synchronously copies input from gX, reusing the tail predicate.</span>
+                copy(tXgX, tXrX)
+<span class="annotation">                # L345: The residual specialization guard.</span>
+                if const_expr(mRes is not None):
+<span class="annotation">                    # L346: Synchronously copies residual from gRes.</span>
+                    copy(tXgRes, tXrRes)
+<span class="annotation">            # L347: Regardless of reload source, loads the refreshed input TensorSSA and</span>
+<span class="annotation">            #       converts it to FP32.</span>
+            x = tXrX.load().to(cute.Float32)
+<span class="annotation">            # L348: The residual specialization guard.</span>
+            if const_expr(mRes is not None):
+<span class="annotation">                # L349: Loads residual, converts it to FP32, and reconstructs fused</span>
+<span class="annotation">                #       (x+residual).</span>
+                x += tXrRes.load().to(cute.Float32)
+<span class="annotation">        # L350: Selects the normalization formula at compile time. LayerNorm uses (x-mean)*rstd;</span>
+<span class="annotation">        #       RMSNorm uses x*rstd. The generated specialization has no runtime mode test.</span>
+        x_hat = (x - mean) * rstd if const_expr(self.is_layernorm) else x * rstd
+<span class="annotation">        # L351: Binds x_hat to epilogue accumulator y, which can then fuse affine operations in</span>
+<span class="annotation">        #       place.</span>
+        y = x_hat
+<span class="annotation">        # L352: Compiles the scale body when weight is present.</span>
+        if const_expr(mW is not None):
+<span class="annotation">            # L353: Loads a TensorSSA from the weight register fragment and converts it to FP32.</span>
+            w = tXrW.load().to(cute.Float32)
+<span class="annotation">            # L354: Retains offset addition only for a nonzero compile-time weight_offset.</span>
+<span class="annotation">            #       Ordinary zero-offset RMSNorm emits no such addition.</span>
+            if const_expr(self.weight_offset != 0.0):
+<span class="annotation">                # L355: Add the offset in FP32 so (1 + w) does not first round through the</span>
+<span class="annotation">                #       weight dtype.</span>
+                # fp32 add so e.g. (1 + w) doesn't round through the weight dtype
+<span class="annotation">                # L356: Converts the specialization's fixed offset to FP32 and adds it to</span>
+<span class="annotation">                #       weight.</span>
+                w += Float32(self.weight_offset)
+<span class="annotation">            # L357: Performs elementwise y*=w in FP32.</span>
+            y *= w
+<span class="annotation">        # L358: Compiles the add body when bias is present.</span>
+        if const_expr(mB is not None):
+<span class="annotation">            # L359: Loads the bias fragment, converts it to FP32, and adds it to y.</span>
+            y += tXrB.load().to(cute.Float32)
+<span class="annotation">        # L360: Converts the FP32 epilogue result to mO storage dtype and stores it in the</span>
+<span class="annotation">        #       output register fragment.</span>
+        tXrO.store(y.to(tXrO.element_type))
+<span class="annotation">        # L361: Allows only a real row to perform the final global store.</span>
+        if row &lt; shape[0]:
+<span class="annotation">            # L362: Copies the output fragment to gO; bound tXpX masks the feature tail. The</span>
+<span class="annotation">            #       kernel is complete and returns no separate value.</span>
+            copy(tXrO, tXgO)
+</code></pre>
+
+<h2 id="en-reading">4. Reading conclusions</h2>
+
+<p>The kernel can be reduced to four ownership transformations. <code>local_tile</code> assigns a complete tensor to CTAs, <code>ThrCopy.partition_S/D</code> divides each CTA tile among threads, <code>make_rmem_tensor_like</code> creates isomorphic per-thread register storage, and <code>row_reduce</code> combines distributed values along the same row group. A CuTe layout is a mapping description. Copies, loads, stores, and reduction helpers perform the data movement.</p>
+
+<p>For an RMSNorm specialization, the numerical path consists of input staging at lines 237 through 255, the square-sum reduction at lines 315 through 324, and reload plus epilogue at lines 338 through 362. The remaining source handles side outputs, per-head operation, residuals, tails, LayerNorm reuse, and cluster scaling. Generated-code or performance analysis must first identify the specialization selected by actual dtype, <code>N</code>, and configuration. The complete Python source alone does not establish which instructions remain in a given specialization.</p>
+
+<h2 id="en-refs">References</h2>
+
+<ul>
+  <li><a href="https://mirror.math.princeton.edu/pub/oldlinux/download/clk011c-1.9.6pre.pdf">Zhao Jiong, <cite>Fully Annotated Linux Kernel</cite>: layout reference for inline source commentary</a></li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L150-L362">QuACK <code>RMSNorm.kernel</code>, commit <code>14b0b71</code></a></li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/reduction_base.py#L12-L94">QuACK <code>ReductionBase</code>: tiling and reduction storage</a></li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/reduce.py#L92-L267">QuACK <code>row_reduce</code>: warp, block, and cluster reduction</a></li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/copy_utils.py#L307-L396">QuACK copy atoms, 2D tiled copy, and feature predicates</a></li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm_config.py#L16-L91">QuACK RMSNorm forward launch configuration</a></li>
+  <li><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/tests/test_rmsnorm.py#L29-L144">QuACK RMSNorm correctness tests</a></li>
+  <li><a href="https://docs.nvidia.com/cutlass/4.7.0/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html">NVIDIA CuTe DSL 4.7.0 Introduction</a></li>
+  <li><a href="https://docs.nvidia.com/cutlass/4.7.0/media/docs/pythonDSL/cute_dsl_general/dsl_control_flow.html">NVIDIA CuTe DSL 4.7.0 Control Flow</a></li>
+  <li><a href="https://docs.nvidia.com/cutlass/4.7.0/media/docs/pythonDSL/cute_dsl_api/cute.html">NVIDIA CuTe DSL 4.7.0 <code>cute</code> API</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async">PTX ISA: <code>cp.async</code></a></li>
+</ul>
+
+</div>
+
+</main>
+</div>
+</body>
+</html>

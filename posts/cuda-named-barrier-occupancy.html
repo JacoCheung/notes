@@ -10,10 +10,10 @@
 <meta name="post:date"            content="2026-08-27">
 <meta name="post:tags"            content="GPU, CUDA, Synchronization, CUTLASS, CuTe DSL">
 <meta name="post:tags_en"         content="GPU, CUDA, Synchronization, CUTLASS, CuTe DSL">
-<meta name="post:reading"         content="16 分钟">
-<meta name="post:reading_en"      content="16 min">
-<meta name="post:summary"         content="PTX named barrier 为同一 CTA 的完整 warp 组维护带编号、按 generation 复用的到达状态。参与计数、aligned 约束与 ID 所有权决定同步正确性，NCU launch metric 给出其对 resident block 数的静态限制。">
-<meta name="post:summary_en"      content="PTX named barriers provide numbered, generation-reused arrival state for selected full warps within one CTA, enabling producer-consumer handoffs without a full-CTA rendezvous. Correctness follows from participant counts, alignment rules, and ID ownership, while Nsight Compute barrier launch metrics expose the compiled resource limit on resident blocks.">
+<meta name="post:reading"         content="18 分钟">
+<meta name="post:reading_en"      content="18 min">
+<meta name="post:summary"         content="沿一个 producer/consumer 循环分析 shared buffer 的 ready/reuse 交接，解释128线程到达计数、barrier代际复用、ID所有权与编译后的occupancy约束，并对照CUDA、CUTLASS和CuTe DSL接口。">
+<meta name="post:summary_en"      content="Follow a producer-consumer loop through ready and reuse handoffs, arrival counts, barrier generations, and ID ownership, then connect compiled barrier usage to occupancy and compare CUDA, CUTLASS, and CuTe DSL interfaces.">
 <meta name="post:series"          content="gpu-programming-basics">
 <meta name="post:series_title"    content="GPU Programming Basics">
 <meta name="post:series_title_en" content="GPU Programming Basics">
@@ -52,7 +52,7 @@
   }
   table.note-table {
     width: 100%;
-    min-width: 820px;
+    min-width: 700px;
     border-collapse: collapse;
     font-size: 13.5px;
   }
@@ -99,7 +99,7 @@
   .diagram-svg {
     display: block;
     width: 100%;
-    min-width: 920px;
+    min-width: 760px;
     height: auto;
   }
   .diagram-svg text {
@@ -120,339 +120,218 @@
     overflow-x: auto;
     overflow-y: hidden;
   }
+.reading-guide { margin: 24px 0 34px; padding: 13px 0 16px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+  .reading-guide p { margin: 0 0 7px; color: var(--fg-muted); font-size: 13px; }
+  .reading-guide ul { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 24px; margin: 0; padding: 0; list-style: none; }
+  .reading-guide li { margin: 0; font-size: 14px; }
+  .anchor-alias { display: block; }
+  @media (max-width: 620px) { .reading-guide ul { grid-template-columns: 1fr; } }
+
+  .post-page main.content h2[id], .post-page main.content h3[id], .post-page main.content h4[id], .post-page main.content .legacy-anchor { scroll-margin-top: 80px; }
+  .article-toc > summary { display: none; }
+  .post-page aside.toc ul ul { padding-left: 12px; margin: 3px 0 6px; }
+  .post-page aside.toc ul ul a { font-size: 12px; }
+  .post-page main.content .reading-guide p { font-size: 15px; line-height: 1.75; }
+  @media (max-width: 1099px) {
+    .post-page main.content .article-toc { margin: 0 0 24px; }
+    .article-toc > summary { display: list-item; cursor: pointer; padding: 10px 0; color: var(--fg-muted); font-size: 15px; }
+    .article-toc > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+    .post-page .article-toc aside.toc { margin: 6px 0 0 !important; }
+    .post-page .article-toc aside.toc ul ul { columns: 1; }
+  }
+  @media (min-width: 1100px) { .diagram-svg { min-width: 0; } }
 </style>
 </head>
 <body>
 <div class="layout">
-  <aside class="toc">
-    <div class="toc-title">目录 · TOC</div>
-    <div class="lang-zh">
-    <ul>
-      <li><a href="#zh-definition">0. Named barrier 的位置</a></li>
-      <li><a href="#zh-semantics">1. 到达、等待与复用</a></li>
-      <li><a href="#zh-use-case">2. 分组同步协议</a></li>
-      <li><a href="#zh-occupancy">3. Named barrier 的 occupancy 约束</a></li>
-      <li><a href="#zh-instructions">4. PTX 拼写、约束与 SASS</a></li>
-      <li><a href="#zh-history">5. 同步机制选择</a></li>
-      <li><a href="#zh-cuda">6. CUDA C/C++</a></li>
-      <li><a href="#zh-cutlass">7. CUTLASS C++</a></li>
-      <li><a href="#zh-cute">8. CuTe DSL</a></li>
-      <li><a href="#zh-checklist">9. 正确性检查</a></li>
-      <li><a href="#zh-refs">参考资料</a></li>
-    </ul>
-    </div>
-    <div class="lang-en">
-    <ul>
-      <li><a href="#en-definition">0. Position in the synchronization hierarchy</a></li>
-      <li><a href="#en-semantics">1. Arrival, waiting, and reuse</a></li>
-      <li><a href="#en-use-case">2. Group synchronization protocol</a></li>
-      <li><a href="#en-occupancy">3. Named-barrier occupancy constraints</a></li>
-      <li><a href="#en-instructions">4. PTX forms, constraints, and SASS</a></li>
-      <li><a href="#en-history">5. Choosing a synchronization mechanism</a></li>
-      <li><a href="#en-cuda">6. CUDA C/C++</a></li>
-      <li><a href="#en-cutlass">7. CUTLASS C++</a></li>
-      <li><a href="#en-cute">8. CuTe DSL</a></li>
-      <li><a href="#en-checklist">9. Correctness checks</a></li>
-      <li><a href="#en-refs">References</a></li>
-    </ul>
-    </div>
-  </aside>
 
 <main class="content">
+<details class="article-toc" open>
+<summary><span class="lang-zh">目录与系列</span><span class="lang-en">Contents and series</span></summary>
+<aside class="toc"><div class="toc-title">目录 · TOC</div>
+<div class="lang-zh"><ul>
+<li><a href="#zh-use-case">1. Shared buffer 的两次交接</a></li>
+<li><a href="#zh-cuda">2. 完整 CUDA 循环</a></li>
+<li><a href="#zh-control-flow">Warp-role 控制流</a></li>
+<li><a href="#zh-semantics">3. Arrival 与 generation</a></li>
+<li><a href="#zh-occupancy">4. Barrier 与 block 驻留</a></li>
+<li><a href="#zh-checklist">5. 正确性与性能验证</a></li>
+<li><a href="#zh-cutlass">附录 A：CUTLASS C++</a></li>
+<li><a href="#zh-cute">附录 B：CuTe DSL</a></li>
+<li><a href="#zh-history">附录 C：机制选择</a></li>
+<li><a href="#zh-instructions">附录 D：PTX 与 SASS</a></li>
+<li><a href="#zh-refs">参考资料</a></li>
+</ul></div>
+<div class="lang-en"><ul>
+<li><a href="#en-use-case">1. Two buffer handoffs</a></li>
+<li><a href="#en-cuda">2. The CUDA loop</a></li>
+<li><a href="#en-control-flow">Warp-role control flow</a></li>
+<li><a href="#en-semantics">3. Arrivals and generations</a></li>
+<li><a href="#en-occupancy">4. Barriers and block residency</a></li>
+<li><a href="#en-checklist">5. Correctness and performance</a></li>
+<li><a href="#en-cutlass">Appendix A: CUTLASS C++</a></li>
+<li><a href="#en-cute">Appendix B: CuTe DSL</a></li>
+<li><a href="#en-history">Appendix C: Mechanism choice</a></li>
+<li><a href="#en-instructions">Appendix D: PTX and SASS</a></li>
+<li><a href="#en-refs">References</a></li>
+</ul></div>
+</aside>
+</details>
 
 <div class="lang-zh">
-
 <h1>CUDA Named Barrier：CTA 内分组同步与 Occupancy 约束</h1>
+<p class="lead">一个 CTA 反复处理 shared memory 中的 tile：producer warps 搬入数据，consumer warps 读取并计算。只保护第一次读取还不够。Producer 处理下一块数据时，还必须知道 consumer 已经用完上一块，否则同一块 shared memory 会被提前覆盖。Named barrier 可以把这两次交接分别命名，让发出到达信号的一方继续执行独立工作。读懂这样的循环，需要先跟踪 buffer 的使用权，再计算每个 barrier 的参与人数。</p>
 
-<p class="lead">一个 warp-specialized CTA 同时包含搬运 shared-memory tile 的 producer warps 和执行计算的 consumer warps。两组 warp 必须在“数据就绪”和“buffer 可复用”两个时刻交接，同时让其他角色继续执行独立工作。<code>__syncwarp()</code> 覆盖一个 warp 内的 lanes，<code>__syncthreads()</code> 覆盖整个 CTA；固定的跨 warp 子集需要介于两者之间的同步范围。PTX named barrier 提供这种范围：它用 CTA 内编号、按 generation 复用的同步状态协调完整 warp group，而编译后的 barrier 用量还会进入 block 驻留资源模型。</p>
+<nav class="reading-guide" aria-label="文章快速索引">
+  <p>快速索引</p>
+  <ul>
+    <li><a href="#zh-use-case">理解交接：ready 与 reuse 各保护什么</a></li>
+    <li><a href="#zh-cuda">检查实现：一个可循环复用的 CUDA kernel</a></li>
+    <li><a href="#zh-semantics">排查计数：128 个 arrival 与 generation</a></li>
+    <li><a href="#zh-occupancy">分析驻留：barrier count 如何进入 occupancy</a></li>
+  </ul>
+</nav>
 
-<h2 id="zh-definition">0. Named barrier 在同步层级中的位置</h2>
+<h2 id="zh-use-case">1. 一块 shared buffer 的两次交接</h2>
+<p>设一个 CTA 有四个 warp：W0、W1 是 producer，负责写入 64 个 float；W2、W3 是 consumer，负责读取这些值并将两倍的结果写回 global memory。所有轮次共用同一个 <code>tile[64]</code>。这段计算很简单，目的是把 buffer 的交接完整地展现出来。</p>
+<p>Consumer 开始读之前，需要等 producer 写完，这次交接叫 <code>ready</code>。Consumer 读完之后，需要通知 producer 可以覆盖 buffer，这次交接叫 <code>reuse</code>。两个方向保护的是不同的内存访问：ready 保护读到新数据，reuse 保护旧数据在读取结束前不被破坏。</p>
 
-<p>PTX named barrier 是 CTA 作用域、由 ID 选择的同步状态。每个 CTA 有 0 到 15 共 16 个逻辑 ID，每个 ID 独立维护一条同步通道。一次 generation 从 barrier 初始化或上一代完成后的重新初始化开始；当该 ID 记录的 arrival 达到指令给出的 thread count 时，本代完成、等待者被释放，barrier 随后进入下一代。</p>
+<span id="zh-definition" class="anchor-alias"></span>
+<p>PTX named barrier 是同一 CTA 内由 ID 选择的同步状态，ID 范围为 0 到 15。对这个循环，令 ID 1 表示 ready，ID 2 表示 reuse。<code>barrier.cta.arrive</code>记录到达后允许执行 warp 继续前进；<code>barrier.cta.sync</code>既记录到达，也等待其他参与者。因此 producer 在 ready 上 arrive、在 reuse 上 sync，consumer 则反过来。</p>
 
-<p>Thread count 以线程为单位，并且必须是 warp size 的整数倍，因此 named barrier 协调的是完整 warp group。执行 <code>arrive</code> 的 warp 贡献 arrival 后继续执行；执行 <code>sync</code> 的 warp 同样贡献 arrival，并等待本代完成。CTA scope、ID、generation 与 arrival completion 共同构成 named barrier 的操作模型。</p>
+<div class="diagram-frame"><div class="diagram-title">Ready 与 reuse 的循环交接</div>
+<svg class="diagram-svg" viewBox="0 0 800 440" role="img" aria-labelledby="zh-named-title zh-named-desc">
+<title id="zh-named-title">Ready 与 reuse 的循环交接</title>
+<desc id="zh-named-desc">左侧两个producer warp写tile，ready到达后预取下一轮寄存器值。右侧两个consumer warp在ready上同步，然后读取tile并到达reuse。Producer在reuse上同步后才能覆盖tile。两个barrier每代都需要128线程参与。</desc>
+<defs><marker id="zh-named-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10z" fill="#71717a"/></marker></defs>
+<text x="149" y="30" text-anchor="middle" font-size="16">W0, W1: Producer</text>
+<text x="651" y="30" text-anchor="middle" font-size="16">W2, W3: Consumer</text>
+<rect class="producer" x="24" y="53" width="250" height="52" rx="5"/><text x="149" y="84" text-anchor="middle" font-size="15">写入 tile(t)</text>
+<rect class="barrier" x="24" y="139" width="250" height="52" rx="5"/><text x="149" y="170" text-anchor="middle" font-size="15">ready.arrive</text>
+<rect class="barrier" x="526" y="139" width="250" height="52" rx="5"/><text x="651" y="170" text-anchor="middle" font-size="15">ready.sync</text>
+<path class="arrow" d="M274 165 H518" marker-end="url(#zh-named-arrow)"/>
+<text x="400" y="145" text-anchor="middle" font-size="13">ID 1 · count = 128</text>
+<rect class="producer" x="24" y="225" width="250" height="52" rx="5"/><text x="149" y="256" text-anchor="middle" font-size="15">预取输入(t+1)到寄存器</text>
+<rect class="consumer" x="526" y="225" width="250" height="52" rx="5"/><text x="651" y="256" text-anchor="middle" font-size="15">读取 tile(t)，完成当前计算</text>
+<rect class="barrier" x="24" y="311" width="250" height="52" rx="5"/><text x="149" y="342" text-anchor="middle" font-size="15">reuse.sync</text>
+<rect class="barrier" x="526" y="311" width="250" height="52" rx="5"/><text x="651" y="342" text-anchor="middle" font-size="15">reuse.arrive</text>
+<path class="arrow" d="M526 337 H282" marker-end="url(#zh-named-arrow)"/>
+<text x="400" y="316" text-anchor="middle" font-size="13">ID 2 · count = 128</text>
+<path class="arrow" d="M149 105 V131" marker-end="url(#zh-named-arrow)"/>
+<path class="arrow" d="M149 191 V217" marker-end="url(#zh-named-arrow)"/>
+<path class="arrow" d="M149 277 V303" marker-end="url(#zh-named-arrow)"/>
+<path class="arrow" d="M651 191 V217" marker-end="url(#zh-named-arrow)"/>
+<path class="arrow" d="M651 277 V303" marker-end="url(#zh-named-arrow)"/>
+<text x="24" y="402" font-size="13" class="muted"><tspan x="24">reuse 完成后才覆盖 buffer；下一轮重新使用相同 ID。</tspan><tspan x="24" dy="22">这是协议顺序图，不表示测得的耗时。</tspan></text>
+</svg></div>
 
-<div class="table-scroll">
-<table class="note-table">
-  <thead>
-    <tr><th>机制</th><th>作用域</th><th>参与者</th><th>实现与资源表示</th><th>典型用途</th></tr>
-  </thead>
-  <tbody>
-    <tr><td><code>__syncwarp(mask)</code></td><td>单个 warp</td><td>mask 指定的 lane</td><td>warp 同步状态</td><td>warp 内交换数据</td></tr>
-    <tr><td><code>__syncthreads()</code></td><td>CTA</td><td>整个 block</td><td>CTA barrier 资源，通常使用 ID 0</td><td>全 CTA shared-memory 阶段</td></tr>
-    <tr><td>Named barrier</td><td>CTA</td><td>若干完整 warp</td><td>occupancy 模型中的 CTA barrier 资源</td><td>warp specialization、分组 rendezvous</td></tr>
-    <tr><td><code>cuda::barrier</code> / <code>mbarrier</code></td><td>CTA；Hopper 还支持 cluster 访问</td><td>可配置 arrival count</td><td>shared memory 中的 64-bit 对象</td><td>TMA、异步 copy、多阶段 pipeline</td></tr>
-    <tr><td>Cluster barrier</td><td>Thread Block Cluster</td><td>cluster 内 CTA</td><td>cluster 同步资源</td><td>跨 CTA DSMEM 协作</td></tr>
-  </tbody>
-</table>
-</div>
+<p>四个 warp 在这个例子中都参与同步，展示的是 arrival 与等待的分离。Producer 发出 ready 后，可以把下一轮输入先读到寄存器中，同时 consumer 读取当前 shared tile；只有再次写入 tile 之前，producer 才必须经过 reuse。对于更大的 CTA，同样的协议也可以只覆盖指定的完整 warp 组，让其他角色继续工作。</p>
 
-<div class="note-box">
-  <p>这 16 个 ID 构成每个 CTA 的逻辑命名空间。SM 级资源关系以 NCU 报告的 barrier count 和 barrier occupancy limit 为操作边界；公开资料没有披露对应状态阵列的大小、编码和分配电路。</p>
-</div>
+<h2 id="zh-cuda">2. 将 ready/reuse 写进一个循环</h2>
+<p>下面给出完整的 device-side 示例。使用 CUDA 13.1.1 编译，目标为 <code>sm_70+</code>，按 <code>&lt;&lt;&lt;1, 128&gt;&gt;&gt;</code>启动。<code>input</code> 与 <code>output</code> 是互不重叠的设备 buffer，各至少容纳 <code>num_tiles * 64</code> 个 float。Host 端的分配、初始化和计时不在这段 kernel 中；这里没有声称已测得并行收益。</p>
+<pre class="code">// named_barrier.cu
+#include &lt;cuda_runtime.h&gt;
 
-<h2 id="zh-semantics">1. 到达、等待与复用</h2>
+__device__ __forceinline__ void ready_arrive() {
+  asm volatile("barrier.cta.arrive 1, 128;" ::: "memory");
+}
+__device__ __forceinline__ void ready_sync() {
+  asm volatile("barrier.cta.sync 1, 128;" ::: "memory");
+}
+__device__ __forceinline__ void reuse_arrive() {
+  asm volatile("barrier.cta.arrive 2, 128;" ::: "memory");
+}
+__device__ __forceinline__ void reuse_sync() {
+  asm volatile("barrier.cta.sync 2, 128;" ::: "memory");
+}
 
-<p>ID 区分并行存在的同步通道，generation 则区分同一通道上先后发生的 rendezvous。程序必须让所有参与 warp 以一致顺序进入各代；named barrier 本身不向程序暴露 phase token。</p>
+// Launch with &lt;&lt;&lt;1, 128&gt;&gt;&gt;. Each buffer holds num_tiles * 64 floats.
+__global__ void producer_consumer(const float* input, float* output,
+                                  int num_tiles) {
+  __shared__ float tile[64];
+  const int tid = threadIdx.x;
+  const int warp = tid / 32;
 
-<div class="table-scroll">
-<table class="note-table">
-  <thead>
-    <tr><th>PTX</th><th>执行 warp 是否贡献 arrival</th><th>是否等待其他参与 warp</th><th>用途</th></tr>
-  </thead>
-  <tbody>
-    <tr><td><code>bar.sync id, count</code></td><td>是</td><td>是</td><td>到达并等待本轮完成</td></tr>
-    <tr><td><code>bar.arrive id, count</code></td><td>是</td><td>否</td><td>发出到达信号后继续执行</td></tr>
-    <tr><td><code>bar.red.* id, count, pred</code></td><td>是</td><td>是</td><td>同步并对参与线程的 predicate 做规约</td></tr>
-  </tbody>
-</table>
-</div>
+  if (num_tiles &lt;= 0) return;  // Uniform across the CTA.
 
-<p>同一 active barrier 的一代协议必须选择一致的操作族。PTX 将 <code>barrier.red</code> 与 <code>sync</code> 或 <code>arrive</code> 混用定义为不可预测行为；需要 predicate 规约时，所有参与者都应执行 matching <code>barrier.red</code>。</p>
+  if (warp &lt; 2) {
+    float next_value = input[tid];
+    for (int t = 0; t &lt; num_tiles; ++t) {
+      tile[tid] = next_value;
+      ready_arrive();
 
-<p>指令里的 <code>count</code> 以线程为单位，但硬件按 warp 记录到达。执行 barrier 的线程先与同一 warp 中尚未退出的线程会合，随后该 warp 的到达才被计入；显式 <code>count</code> 因而必须是 warp size 的整数倍。这里不能把单个 lane 当作可独立到达的参与者。</p>
+      // Fetch into a register while consumers read the shared tile.
+      if (t + 1 &lt; num_tiles)
+        next_value = input[size_t(t + 1) * 64 + tid];
 
-<p><code>sync</code> 的完整语义是 <em>arrive and wait</em>，不存在单独的 <em>wait</em>。假设两个 producer warp 执行 <code>arrive</code>，两个 consumer warp 执行 <code>sync</code>，那么 barrier 的参与线程数应为：</p>
+      reuse_sync();          // Shared tile is now safe to overwrite.
+    }
+  } else {
+    const int rank = tid - 64;
+    for (int t = 0; t &lt; num_tiles; ++t) {
+      ready_sync();          // Also contributes an arrival.
+      output[size_t(t) * 64 + rank] = 2.0f * tile[rank];
+      reuse_arrive();         // No further reads of this tile.
+    }
+  }
+}</pre>
+<p>按第 $t$ 轮跟踪这段代码，producer 先把 <code>next_value</code> 写入 <code>tile</code>，然后到达 ready。Consumer 的 ready sync 完成后才能读取 tile。此时 producer 的下一次 global load 写入自己的寄存器，不覆盖 shared memory，因此可以与 consumer 的读取并行。Consumer 到达 reuse 后不再读取当前 tile，producer 的 reuse sync 完成后才能进入下一轮并覆盖它。</p>
+<p>循环结束后的预期结果是每个元素满足 $output[i]=2\times input[i]$，同一位置的 shared-memory 存储在各轮之间反复使用。最后一轮仍完成 reuse 交接，所有参与 warp 的调用次数保持一致；<code>num_tiles &lt;= 0</code> 的返回在整个 CTA 上一致，不会留下其他 warp 等待。</p>
 
+<h3 id="zh-control-flow">Warp-role 分支中的指令约束</h3>
+<p>两个分支按 warp ID 划分，一个 warp 的所有 lanes 执行相同路径。它们却没有让整个 CTA 执行同一条 barrier 指令，因此示例使用不带 <code>.aligned</code> 的 <code>barrier.cta.*</code>。<code>bar.sync</code> 和 <code>bar.arrive</code> 是 aligned 别名，不能在这里直接替换。PTX 对 <code>sm_6x</code> 及更早目标还保留 aligned 限制，所以本例要求 <code>sm_70+</code>。这些控制流和内存顺序要求见 <a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-bar">PTX 13.1.1 的 barrier 定义</a>。</p>
+<p>Inline PTX 中的 <code>"memory"</code> clobber 告诉编译器该语句影响内存访问排序，barrier 指令本身则提供参与线程之间的硬件同步。读写通过同一 CTA 的 matching barrier 建立顺序；跨 CTA 的数据交接需要其他同步机制。</p>
+
+<h2 id="zh-semantics">3. 到达计数与下一代 barrier</h2>
+<p>ready 的参与者包括两组 warp。Producer 的 arrive 贡献 64 个线程，consumer 的 sync 也贡献 64 个线程，所以指令中的 count 为：</p>
 <p>\[
-N_{\mathrm{arrival}}
-=
-2\times32
-+
-2\times32
-=128.
+N_{\mathrm{ready}}=2\times32+2\times32=128.
 \]</p>
+<p>reuse 只是交换了谁 arrive、谁 sync，参与人数仍为 128。这个 count 的单位是线程，显式给出时必须为 warp size 的整数倍。PTX 的 barrier 指令会先让执行线程与同 warp 中尚未退出的线程会合，再记录 warp 的到达；不能把一个 lane 当作独立的跨 warp 参与者。</p>
 
-<p>若错误地把 count 写成 64，producer 的两个 warp 到达后 barrier 已经完成；consumer 随后执行的 <code>sync</code> 会落入下一代 barrier，语义随即错位。CuTe DSL 的 <code>NamedBarrier.wait()</code> 也会转发到 <code>arrive_and_wait()</code>，原因正是 named barrier 没有独立的纯等待操作。</p>
+<h3 id="zh-generations">同一个 ID 如何区分各轮</h3>
+<p>当一代 barrier 的 arrival 达到要求时，等待者继续执行，barrier 自动重新初始化，供下一代使用。程序不持有 named barrier 的 phase token，而是通过双方一致的调用顺序维持代际关系。上面的循环每轮都按 ready、reuse 的顺序推进；reuse 阻止 producer 提前覆盖 buffer，下一轮 ready 又阻止 consumer 提前读取。</p>
+<p>若把 ready 的 count 错写成 64，一种可能的顺序是两个 producer warp 先到达，立即完成本代。随后 consumer 的 sync 就进入下一代，原本要配对的两组参与者被拆开了。其他交错也可能过早释放部分参与者。程序需要的是四个 warp 的一次交接，所以 count 必须包含执行 sync 的线程。</p>
+<p>这也解释了部分 wrapper 的命名：CuTe DSL 的 <code>NamedBarrier.wait()</code> 仍然会 arrive。把它当作 <code>mbarrier</code> 的纯等待接口，会少算 consumer 的参与人数。具体 API 路由列在<a href="#zh-cute">附录 B</a>。</p>
 
-<p>同步完成还建立参与线程之间的 CTA 内存顺序。Producer 在 arrival 之前写入 shared memory，consumer 从 matching barrier 返回后可以读取这些数据。它不是跨 CTA 的可见性协议，也不能代替 cluster 或 device scope 的同步。</p>
+<h3 id="zh-ids">ID 所有权与协议复用</h3>
+<p>同一 CTA 的 16 个 ID 是同步通道的逻辑命名空间。将 ready 和 reuse 分配给两个 ID，双方才可以在不同方向上推进。循环重复使用 ID 1，并不会为每轮再消耗一个新 ID；但两个独立协议若同时使用 ID 1，就会把彼此的 arrival 混在一起。</p>
+<p>需要复用 ID 时，应先证明上一代已经完成，且所有角色对下一代的顺序一致。直接把 ready 与 reuse 合并以减少 ID，必须重新设计并证明协议。库代码也会占用 ID：<code>__syncthreads()</code> 通常使用 ID 0，CUTLASS 还保留若干内部 ID，插入新同步点前需要核对最终使用的编号。</p>
 
-<h2 id="zh-use-case">2. 分组同步协议</h2>
-
-<p>下面的 CTA 有四个 warp。W0、W1 写 shared-memory tile，W2、W3 消费 tile。两个 barrier 分别表达“数据已就绪”和“缓冲区可重用”。Producer 发出 <code>arrive</code> 后可以继续做独立的地址计算或下一次 global-memory 预取；只有在覆盖缓冲区前才等待 consumer。</p>
-
-<div class="diagram-frame">
-  <div class="diagram-title">双 named barrier 的 producer-consumer 协议</div>
-  <svg class="diagram-svg" viewBox="0 0 1120 560" role="img" aria-label="Producer and consumer warps coordinated by two named barriers">
-    <defs>
-      <marker id="named-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-        <path d="M 0 0 L 10 5 L 0 10 z" fill="#71717a"></path>
-      </marker>
-    </defs>
-
-    <text x="40" y="35" font-size="15" font-weight="600">CTA: 4 warps / 128 threads</text>
-
-    <rect class="producer" x="40" y="70" width="215" height="78" rx="7"></rect>
-    <text x="148" y="100" text-anchor="middle" font-size="14" font-weight="600">W0, W1 · Producer</text>
-    <text class="mono muted" x="148" y="125" text-anchor="middle" font-size="11">store shared tile</text>
-
-    <rect class="barrier" x="335" y="70" width="210" height="78" rx="7"></rect>
-    <text x="440" y="100" text-anchor="middle" font-size="14" font-weight="600">ready · ID 1</text>
-    <text class="mono muted" x="440" y="125" text-anchor="middle" font-size="11">count = 128</text>
-
-    <rect class="consumer" x="625" y="70" width="215" height="78" rx="7"></rect>
-    <text x="733" y="100" text-anchor="middle" font-size="14" font-weight="600">W2, W3 · Consumer</text>
-    <text class="mono muted" x="733" y="125" text-anchor="middle" font-size="11">load and compute</text>
-
-    <path class="arrow" d="M255 109 L328 109" marker-end="url(#named-arrow)"></path>
-    <text class="mono muted" x="291" y="96" text-anchor="middle" font-size="10">arrive</text>
-    <path class="arrow" d="M618 109 L552 109" marker-end="url(#named-arrow)"></path>
-    <text class="mono muted" x="585" y="96" text-anchor="middle" font-size="10">sync</text>
-
-    <rect class="resource" x="40" y="188" width="800" height="82" rx="7"></rect>
-    <text x="440" y="219" text-anchor="middle" font-size="14" font-weight="600">shared-memory tile</text>
-    <text class="muted" x="440" y="244" text-anchor="middle" font-size="12">ready barrier 完成后 consumer 才读取；empty barrier 完成前 producer 不覆盖</text>
-
-    <path class="arrow" d="M148 148 L148 180" marker-end="url(#named-arrow)"></path>
-    <path class="arrow" d="M733 180 L733 148" marker-end="url(#named-arrow)"></path>
-
-    <rect class="barrier" x="335" y="310" width="210" height="78" rx="7"></rect>
-    <text x="440" y="340" text-anchor="middle" font-size="14" font-weight="600">empty · ID 2</text>
-    <text class="mono muted" x="440" y="365" text-anchor="middle" font-size="11">count = 128</text>
-
-    <path class="arrow" d="M625 349 L552 349" marker-end="url(#named-arrow)"></path>
-    <text class="mono muted" x="585" y="336" text-anchor="middle" font-size="10">arrive</text>
-    <path class="arrow" d="M328 349 L262 349" marker-end="url(#named-arrow)"></path>
-    <text class="mono muted" x="295" y="336" text-anchor="middle" font-size="10">sync</text>
-
-    <rect class="producer" x="40" y="310" width="215" height="78" rx="7"></rect>
-    <text x="148" y="340" text-anchor="middle" font-size="14" font-weight="600">Producer resumes</text>
-    <text class="mono muted" x="148" y="365" text-anchor="middle" font-size="11">reuse shared tile</text>
-
-    <rect class="consumer" x="625" y="310" width="215" height="78" rx="7"></rect>
-    <text x="733" y="340" text-anchor="middle" font-size="14" font-weight="600">Consumer finishes</text>
-    <text class="mono muted" x="733" y="365" text-anchor="middle" font-size="11">release shared tile</text>
-
-    <rect class="resource" x="900" y="70" width="180" height="318" rx="7"></rect>
-    <text x="990" y="101" text-anchor="middle" font-size="14" font-weight="600">CTA barrier state</text>
-    <rect class="barrier" x="930" y="132" width="120" height="48" rx="5"></rect>
-    <text class="mono" x="990" y="161" text-anchor="middle" font-size="11">ID 1 · ready</text>
-    <rect class="barrier" x="930" y="196" width="120" height="48" rx="5"></rect>
-    <text class="mono" x="990" y="225" text-anchor="middle" font-size="11">ID 2 · empty</text>
-    <text class="muted" x="990" y="285" text-anchor="middle" font-size="11">arrival count</text>
-    <text class="muted" x="990" y="307" text-anchor="middle" font-size="11">waiting warps</text>
-    <text class="muted" x="990" y="329" text-anchor="middle" font-size="11">automatic reinitialize</text>
-    <text class="muted" x="990" y="363" text-anchor="middle" font-size="10">finite SM resource</text>
-
-    <path class="arrow" d="M545 109 C700 25, 850 25, 920 145" marker-end="url(#named-arrow)"></path>
-    <path class="arrow" d="M545 349 C700 450, 850 430, 920 226" marker-end="url(#named-arrow)"></path>
-
-    <text class="muted" x="40" y="458" font-size="12">同一 CTA 内可建立多条独立 rendezvous；barrier 自动按 generation 复用。</text>
-    <text class="muted" x="40" y="485" font-size="12">这里的 count 是每一代的总 arrival 数，包含执行 sync 的线程。</text>
-    <text class="muted" x="40" y="512" font-size="12">分支必须保持 warp-uniform，并保证每个参与 warp 恰好到达 matching barrier 一次。</text>
-  </svg>
-</div>
-
-<p>Named barrier 常用于 warp-specialized GEMM、transpose、epilogue，以及少量固定 warp group 之间的控制交接。收益来自更小的同步集合和单向 arrival：不相关的 warp 无须停在全 CTA barrier 上，producer 也能把部分工作与 consumer 计算重叠。</p>
-
-<h2 id="zh-occupancy">3. Named barrier 的 occupancy 约束</h2>
-
-<p>前两节描述了一个 CTA 在运行时如何使用 barrier generation 完成交接。多个 CTA 同时驻留在 SM 上时，每个 CTA 所需的 barrier 状态还参与 block 准入，因此编译后的 named-barrier 用量成为静态资源约束。PTX 规定 arrival、等待与自动重新初始化语义；NCU Occupancy Calculator 提供每 CTA barrier 用量和目标设备 barrier 容量。下面以这组公开接口建立 occupancy 模型，不延伸到尚未公开的物理存储与分配电路。</p>
-
-<p>若用 $H_{\mathrm{CTA}}$ 表示 profiler 采用的每 CTA barrier 用量，用 $H_{\mathrm{SM}}$ 表示目标设备在该模型中的容量，那么 barrier 单项给出的 resident block 上限可写成：</p>
-
+<h2 id="zh-occupancy">4. 从两条同步通道到 block 驻留</h2>
+<p>一个 CTA 在循环中重复使用 barrier 状态；多个 CTA 同时进入 SM 时，则各自需要独立的状态。这部分用量也会进入静态 occupancy 计算。程序中使用 ID 1 和 ID 2，描述的是协议设计；编译器为 kernel 记录了多少 barrier 资源，需要从 launch 数据读取。</p>
+<p>记每 CTA 的已编译 barrier 用量为 $H_{\mathrm{CTA}}$，目标设备在 occupancy 模型中的容量为 $H_{\mathrm{SM}}$，barrier 单项可允许的 block 数用下面的容量模型理解：</p>
 <p>\[
-B_{\mathrm{barrier}}
-=
-\left\lfloor
-\frac{H_{\mathrm{SM}}}{H_{\mathrm{CTA}}}
-\right\rfloor.
+B_{\mathrm{barrier}}=\left\lfloor\frac{H_{\mathrm{SM}}}{H_{\mathrm{CTA}}}\right\rfloor,\qquad
+B_{\mathrm{resident}}=\min\left(B_{\mathrm{warp}},B_{\mathrm{block}},B_{\mathrm{register}},B_{\mathrm{smem}},B_{\mathrm{barrier}}\right).
 \]</p>
-
-<p>最终 occupancy 仍由所有资源上限的最小值决定：</p>
-
-<p>\[
-B_{\mathrm{resident}}
-=
-\min\left(
-B_{\mathrm{warp}},
-B_{\mathrm{block}},
-B_{\mathrm{register}},
-B_{\mathrm{smem}},
-B_{\mathrm{barrier}}
-\right).
-\]</p>
-
-<p><a href="https://docs.nvidia.com/nsight-compute/2025.3/ProfilingGuide/index.html#metrics-ref-launch">Nsight Compute</a> 用以下 launch metrics 暴露这部分信息：</p>
-
-<div class="table-scroll">
-<table class="note-table">
-  <thead>
-    <tr><th>Metric</th><th>含义</th><th>阅读方式</th></tr>
-  </thead>
-  <tbody>
-    <tr><td><code>launch__barrier_count</code></td><td>NCU 为该 kernel launch 报告的 barrier 数</td><td>作为 occupancy 模型的每 block barrier 用量读取</td></tr>
-    <tr><td><code>launch__occupancy_limit_barriers</code></td><td>由已用 barrier 数造成的 occupancy limit</td><td>与其他 <code>launch__occupancy_limit_*</code> 一起判断实际最小项</td></tr>
-    <tr><td><code>launch__occupancy_per_barrier_count</code></td><td>barrier count 变化时的 occupancy 曲线</td><td>用于分析减少 barrier 是否能提高驻留度</td></tr>
-  </tbody>
-</table>
-</div>
-
-<pre class="code">ncu --metrics \
+<p>这里各个 $B$ 都以 block 为单位。完整的驻留资源分析见 <a href="gpu-occupancy-resource-limits.html">GPU Occupancy 的驻留资源模型</a>。设备的 barrier 容量随架构变化；PTX 的 16 个逻辑 ID 并不直接给出 SM 的物理状态数量。</p>
+<div class="table-scroll"><table class="note-table"><thead><tr><th>Metric</th><th>含义</th></tr></thead><tbody><tr><td><code>launch__barrier_count</code></td><td>Kernel launch 报告的 barrier 用量</td></tr><tr><td><code>launch__occupancy_limit_barriers</code></td><td>Barrier 资源允许的 resident blocks</td></tr><tr><td><code>launch__occupancy_per_barrier_count</code></td><td>Barrier count 变化时的 active warp 数</td></tr></tbody></table></div>
+<p>这三项名称来自 <a href="https://archive.docs.nvidia.com/nsight-compute/2025.3/ProfilingGuide/index.html#metrics-ref-launch">NCU 2025.3 Launch Metrics</a>。<a href="https://archive.docs.nvidia.com/nsight-compute/2025.3/OccupancyCalculatorPythonInterface/index.html">Occupancy Calculator</a>的对应输入为 <code>num_block_barriers</code>，设备容量字段为 <code>block_barriers_per_sm</code>。先读取实际 kernel 的数据，再判断减少 barrier 是否能跨过驻留数量的整数边界。</p>
+<pre class="code"># Run the application that launches the kernel.
+ncu --metrics \
   launch__barrier_count,\
   launch__occupancy_limit_barriers,\
   launch__occupancy_per_barrier_count \
   ./named_barrier_example</pre>
 
-<p>NCU Occupancy Calculator 的输入项叫 <code>num_block_barriers</code>，设备侧容量叫 <code>block_barriers_per_sm</code>。后者与架构有关，不应拿某一代 GPU 的数值套到所有设备上。最可靠的判断来自目标 GPU 上的 NCU 结果，而不是只数源码里出现了几个 barrier ID。</p>
+<h3 id="zh-static-dynamic">驻留受限与等待时间是两件事</h3>
+<p><code>launch__occupancy_limit_barriers</code>回答资源最多允许驻留几个 block。运行中的 Stall Barrier 则表示 warp 正在等待同步。在这个 producer/consumer 循环里，如果两组工作量不平衡，快的一组可能花很多时间等慢的一组，即便最终 occupancy 由寄存器限制。</p>
+<p>减少 barrier 资源用量，也不必然增加驻留：容量整除后的 block 数可能没变，其他资源也可能接替成为限制项。若一次调整把 barrier limiter 从两个 block 提高到四个，而寄存器只允许三个，最终只能驻留三个。之后是否更快，还要比较 kernel 时间以及两组 warp 的等待情况。</p>
 
-<div class="note-box warn">
-  <p><strong>静态准入与运行时等待由不同信号描述。</strong><code>launch__occupancy_limit_barriers</code> 给出 kernel launch 时的 resident-block 上限；Stall Barrier 表示 warp 在执行期间等待同步。一个 kernel 可以由寄存器决定 occupancy，同时产生大量 barrier stall；也可以由 barrier 资源降低 residency，而运行时等待很少。</p>
-</div>
-
-<p>PTX 允许 barrier ID 使用立即数或寄存器，这条规则描述指令如何选择逻辑通道；目标 GPU 上的 <code>launch__barrier_count</code> 才给出 occupancy 模型采用的 barrier 用量。<code>nvcc --resource-usage</code> 与 <code>-Xptxas=-v</code> 可补充核对寄存器、shared memory 等其他静态资源。<code>ptxas</code> 如何分配物理 barrier 状态仍在公开证据边界之外，而固定协议使用常量 ID 更便于审计。</p>
-
-<h2 id="zh-instructions">4. PTX 拼写、约束与 SASS</h2>
-
-<p>Profiler 给出编译后的 barrier 数量，PTX 与 SASS 则说明这些 barrier 执行了哪一种操作。第 1 节中的三种操作各有两组 PTX 拼写：<code>bar.sync</code>、<code>bar.arrive</code> 与 <code>bar.red.*</code> 是 aligned 别名；<code>barrier.cta.sync</code>、<code>barrier.cta.arrive</code> 与 <code>barrier.cta.red.*</code> 提供现代 CTA 形式。它们常分别 lowering 为 <code>BAR.SYNC</code>、<code>BAR.ARRIVE</code> 与 <code>BAR.RED.*</code>。<code>bar.warp.sync</code> / <code>WARPSYNC</code> 的作用域是单个 warp。</p>
-
-<p><code>.aligned</code> 要求 CTA 中所有线程执行同一条 barrier 指令，条件比 warp 内一致更严格。Warp-role 分支只让部分 warp 执行某条 barrier，因此必须使用 non-aligned <code>barrier.cta.*</code> 形式，并以 <code>sm_70+</code> 为目标；在 <code>sm_6x</code> 及更早架构上，未写 <code>.aligned</code> 的形式仍按 aligned 处理。无论使用哪种形式，参与数量和每代到达次数都必须匹配，否则可能死锁或跨代错位。</p>
-
-<p>SASS 是架构相关的最终机器码，具体修饰符和操作数显示会随 GPU 与反汇编器变化。可以用下列命令确认实际 lowering：</p>
-
-<pre class="code">nvcc -arch=sm_90 -lineinfo -Xptxas=-v named_barrier.cu -o named_barrier
-cuobjdump --dump-sass named_barrier | grep -E 'BAR|WARPSYNC'
-
-# 或直接查看 cubin
-nvdisasm named_barrier.cubin | grep -E 'BAR|WARPSYNC'</pre>
-
-<p>反汇编中的 <code>BAR.SYNC</code>、<code>BAR.ARRIVE</code> 与 <code>BAR.RED.*</code> 对应 CTA named-barrier 操作；<code>BSYNC</code> 表示控制流 reconvergence，<code>DEPBAR</code> 表示指令依赖管理。分析 occupancy barrier count 时应按指令语义分类，而不是按助记符是否包含 <code>BAR</code> 分类。</p>
-
-<h2 id="zh-history">5. 同步机制选择</h2>
-
-<p>PTX 指令语义确定之后，机制选择取决于参与范围和协议所需的状态。Named barrier 是 CTA 内编号通道，适合固定的完整 warp group，并允许 arrival 方继续执行；<code>mbarrier</code> 是 shared memory 中的 64-bit 可寻址对象，带有 phase 与 arrival state，并可在相应架构上跟踪异步 transaction completion。全 CTA 阶段、异步数据移动和跨 CTA 协作分别对应不同作用域的原语。</p>
-<div class="table-scroll">
-<table class="note-table">
-  <thead>
-    <tr><th>需求</th><th>优先机制</th><th>理由</th></tr>
-  </thead>
-  <tbody>
-    <tr><td>一个 warp 内交换数据</td><td><code>__syncwarp(mask)</code></td><td>作用域最小，不占 CTA named-barrier 通道</td></tr>
-    <tr><td>整个 CTA 共同完成一个阶段</td><td><code>__syncthreads()</code></td><td>语义直接，参与者不易算错</td></tr>
-    <tr><td>固定的完整 warp group 之间同步</td><td>Named barrier</td><td>可命名多个通道，支持 non-blocking arrival</td></tr>
-    <tr><td>异步 copy/TMA 完成通知或多 stage pipeline</td><td><code>cuda::barrier</code> / <code>mbarrier</code></td><td>支持 phase、token 与 transaction count</td></tr>
-    <tr><td>跨 CTA 协作</td><td>Cluster barrier、cluster mbarrier 或全局协议</td><td>Named barrier 的作用域严格限制在 CTA</td></tr>
-  </tbody>
-</table>
-</div>
-
-<h2 id="zh-cuda">6. CUDA C/C++：使用 inline PTX</h2>
-
-<p>选择 named barrier 后，同一套 ready/empty 协议可以直接写成 inline PTX。示例以 <code>sm_70+</code> 为目标，因为 warp-role 分支需要 non-aligned 形式。这个 128-thread CTA 由两个 producer warp 写 shared memory、两个 consumer warp 读取；ID 1 表示 <code>ready</code>，ID 2 表示 <code>empty</code>。</p>
-
-<pre class="code">// named_barrier.cu
-#include &lt;cuda_runtime.h&gt;
-
-__device__ __forceinline__ void arrive_ready() {
-  asm volatile("barrier.cta.arrive 1, 128;" ::: "memory");
-}
-
-__device__ __forceinline__ void wait_ready() {
-  // sync also contributes an arrival.
-  asm volatile("barrier.cta.sync 1, 128;" ::: "memory");
-}
-
-__device__ __forceinline__ void arrive_empty() {
-  asm volatile("barrier.cta.arrive 2, 128;" ::: "memory");
-}
-
-__device__ __forceinline__ void wait_empty() {
-  asm volatile("barrier.cta.sync 2, 128;" ::: "memory");
-}
-
-__global__ void producer_consumer(const int* input, int* output) {
-  __shared__ int tile[64];
-
-  int tid = threadIdx.x;
-  int warp = tid / 32;
-
-  if (warp &lt; 2) {
-    tile[tid] = input[tid];
-    arrive_ready();
-
-    // Work independent of tile reuse can overlap consumer computation.
-    int next_index = tid + blockDim.x;
-    asm volatile("" :: "r"(next_index));
-
-    wait_empty();
-  } else {
-    wait_ready();
-    int lane_in_group = tid - 64;
-    output[lane_in_group] = 2 * tile[lane_in_group];
-    arrive_empty();
-  }
-}</pre>
-
-<p>这里四个 warp 都参与 ID 1 和 ID 2 的每一代同步，所以 count 都是 128。两条分支按 warp ID 划分，warp 内没有 divergence。示例只演示一次交接；循环复用时，双方必须以相同顺序进入下一代 barrier。</p>
-
-<h2 id="zh-cutlass">7. CUTLASS C++：<code>cutlass::arch::NamedBarrier</code></h2>
+<h2 id="zh-checklist">5. 验证一次交接，再验证整个循环</h2>
+<p>这段代码的正确性依赖两条顺序：写 tile 必须先于 consumer 读取，consumer 的读取必须先于下一次覆盖。检查时可以先用一轮输入确认结果，再用两轮不同的数据覆盖同一个 buffer，最后扩大轮数，检查所有输出。任何一组 warp 的提前退出、不同循环次数或不一致 count，都会破坏这两条顺序。</p>
+<p>把协议接入已有 kernel 后，还需要核对 ID 是否与库内部同步冲突，并查看生成的 PTX/SASS 是否保留了预期操作。若要评估收益，用相同输入和计时条件比较原同步方案与新方案，同时记录 compiled barrier count、其他 occupancy limiter 和运行时等待。对这个四 warp 示例，收益候选是 producer 的寄存器预取与 consumer 工作重叠；能否实现、重叠多少，需要实际测量。</p>
+<p>当数据搬运改成 TMA 或需要跟踪异步事务完成时，协议还会增加 arrival 以外的完成条件。此时可以继续阅读 <a href="inline-assembly-aarch64-ptx-core-loops.html#zh-tma">TMA 与 mbarrier 内环</a>。Named barrier 的 ready/reuse 设计仍能帮助厘清 buffer 生命周期，但实际完成通知应由所选异步机制承担。</p>
+<h2 id="zh-cutlass">附录 A：CUTLASS C++ 的 ID 映射</h2>
 
 <p>CUTLASS 在固定 revision <a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/include/cutlass/arch/barrier.h"><code>include/cutlass/arch/barrier.h</code></a> 中封装了 named barrier。该 wrapper 需要 CUDA Toolkit 12+ 和 <code>sm_90+</code>。该版本保留 ID 1 到 7 供库内部使用；面向用户的构造函数会把 user ID 加 8，因此 user ID 0 到 7 映射到最终 ID 8 到 15。源码还提醒 ID 0 可能与 <code>__syncthreads()</code> 冲突。这里描述的是该 revision 的 CUTLASS 策略，不是 PTX 对所有库的约定。</p>
 
+<p>下面只展开一轮交接，用来对照 wrapper 调用。按128线程启动，输入输出各至少64个元素，ready/empty 对应正文的 ready/reuse。</p>
 <pre class="code">#include &lt;cutlass/arch/barrier.h&gt;
 
-__global__ void cutlass_named_barrier(const int* input, int* output) {
-  __shared__ int tile[64];
+__global__ void cutlass_named_barrier(const float* input, float* output) {
+  __shared__ float tile[64];
 
   int tid = threadIdx.x;
   int warp = tid / 32;
@@ -471,7 +350,7 @@ __global__ void cutlass_named_barrier(const int* input, int* output) {
   } else {
     ready.arrive_and_wait_unaligned();
     int lane_in_group = tid - 64;
-    output[lane_in_group] = 2 * tile[lane_in_group];
+    output[lane_in_group] = 2.0f * tile[lane_in_group];
     empty.arrive_unaligned();
   }
 }</pre>
@@ -480,10 +359,11 @@ __global__ void cutlass_named_barrier(const int* input, int* output) {
 
 <p>库内部的 <code>ReservedNamedBarriers</code> 枚举说明了这些 slot 的实际用途，包括 epilogue、transpose、Stream-K、tensor-memory allocation 和部分 mainloop 协议。向已有 CUTLASS kernel 插入自定义 barrier 时，应使用用户构造函数，避免直接占用内部 ID。</p>
 
-<h2 id="zh-cute">8. CuTe DSL：<code>pipeline.NamedBarrier</code></h2>
+<h2 id="zh-cute">附录 B：CuTe DSL 的到达与等待接口</h2>
 
 <p>同一 revision 的 CuTe DSL 在 <a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/python/CuTeDSL/cutlass/pipeline/helpers.py"><code>cutlass.pipeline</code></a> 中提供 <code>NamedBarrier</code>。与 CUTLASS C++ 用户构造函数不同，这里的 <code>barrier_id</code> 直接对应 PTX ID，范围为 0 到 15；该实现会对 ID 0 发出警告。</p>
 
+<p>以下是协议伪代码：保留真实 API 调用，省略 shared-memory tensor 的分配、数据读写和 host launch；它不能单独作为完整 kernel 运行。</p>
 <pre class="code">import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 
@@ -524,331 +404,196 @@ cute.arch.barrier(
 
 <p><code>aligned=False</code> 会选择 non-aligned <code>barrier.cta.arrive</code> 路径。CuTe DSL 接口仍在演进，实际工程应固定 CUTLASS revision，并链接相同 revision 的源码，而不是只依赖类名相似。</p>
 
-<h2 id="zh-checklist">9. 正确性与性能检查</h2>
+<h2 id="zh-history">附录 C：同步机制的选择</h2>
 
-<p>CUDA、CUTLASS 与 CuTe DSL 最终都必须满足同一套 generation 协议。检查实现时，可以沿作用域、arrival 数量、控制流和资源信号逐项核对：</p>
+<p>PTX 指令语义确定之后，机制选择取决于参与范围和协议所需的状态。Named barrier 是 CTA 内编号通道，适合固定的完整 warp group，并允许 arrival 方继续执行；<code>mbarrier</code> 是 shared memory 中的 64-bit 可寻址对象，带有 phase 与 arrival state，并可在相应架构上跟踪异步 transaction completion。全 CTA 阶段、异步数据移动和跨 CTA 协作分别对应不同作用域的原语。</p>
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>需求</th><th>优先机制</th><th>理由</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>一个 warp 内交换数据</td><td><code>__syncwarp(mask)</code></td><td>作用域最小，不占 CTA named-barrier 通道</td></tr>
+    <tr><td>整个 CTA 共同完成一个阶段</td><td><code>__syncthreads()</code></td><td>语义直接，参与者不易算错</td></tr>
+    <tr><td>固定的完整 warp group 之间同步</td><td>Named barrier</td><td>可命名多个通道，支持 non-blocking arrival</td></tr>
+    <tr><td>异步 copy/TMA 完成通知或多 stage pipeline</td><td><code>cuda::barrier</code> / <code>mbarrier</code></td><td>支持 phase、token 与 transaction count</td></tr>
+    <tr><td>跨 CTA 协作</td><td>Cluster barrier、cluster mbarrier 或全局协议</td><td>Named barrier 的作用域严格限制在 CTA</td></tr>
+  </tbody>
+</table>
+</div>
 
-<ol>
-  <li><strong>确认作用域。</strong>Named barrier 只能同步同一 CTA；跨 CTA 必须换用 cluster 或全局协议。</li>
-  <li><strong>按每一代计算 arrival。</strong>执行 <code>sync</code> 或 <code>wait</code> 的 warp 也贡献 arrival，其线程数必须纳入 count。</li>
-  <li><strong>统一操作族。</strong>同一 active barrier 上的参与者不能混用 <code>barrier.red</code> 与 <code>sync</code>/<code>arrive</code>。</li>
-  <li><strong>满足 aligned 条件。</strong>参与线程数必须是 32 的倍数；只有整个 CTA 执行同一 barrier 指令时才使用 aligned 形式。Warp-role 分支应在 <code>sm_70+</code> 上使用 non-aligned 形式。</li>
-  <li><strong>保证调用次数对称。</strong>循环中的 producer 与 consumer 必须按相同 generation 反复使用 barrier。</li>
-  <li><strong>管理 ID 所有权。</strong>不要与 <code>__syncthreads()</code>、CUTLASS 内部协议或其他库代码复用同一硬件 ID。</li>
-  <li><strong>分别看静态与动态指标。</strong>用 <code>launch__occupancy_limit_barriers</code> 判断驻留限制，用 Warp State Statistics 判断实际等待。</li>
-</ol>
-
-<p>静态 occupancy 代价由编译后的 barrier 用量决定。一次优化只有同时满足两个条件才会提高 resident block 数：目标 GPU 上的 <code>launch__barrier_count</code> 确实下降，并且 barrier 原本就是最紧的资源限制。源码中的 ID 数量只描述协议结构，最终计数仍以 profiler 为准；复用 ID 还必须保持 generation 独立，否则会引入额外依赖或死锁。</p>
-
-<h2 id="zh-refs">参考资料</h2>
-
-<ul>
+<h2 id="zh-instructions">附录 D：PTX 操作与 SASS 检查</h2>
+<p><code>barrier.cta.arrive</code>贡献 arrival 后继续执行，<code>barrier.cta.sync</code>贡献 arrival 并等待；<code>barrier.cta.red.*</code>还会对参与者的 predicate 做规约。同一 active barrier 上可以按协议配对 arrive 与 sync，但不能再混入 red，PTX 将后者定义为不可预测行为。</p>
+<p><code>bar.sync</code>、<code>bar.arrive</code> 和 <code>bar.red.*</code>分别是带 <code>.aligned</code> 的别名。Aligned 要求整个 CTA 执行同一条 barrier 指令，不能只检查 warp 内是否一致。Barrier ID 可以是立即数或寄存器，固定协议使用常量 ID 更便于核对所有权。</p>
+<p>正文文件包含 device code，可以先生成 cubin，再检查实际 SASS。它没有 host <code>main()</code>，因此这里使用 <code>-cubin</code>：</p>
+<pre class="code">nvcc -arch=sm_90 -lineinfo -cubin named_barrier.cu -o named_barrier.cubin
+nvdisasm named_barrier.cubin | rg 'BAR|WARPSYNC'</pre>
+<p>CTA barrier 常对应 <code>BAR.SYNC</code>、<code>BAR.ARRIVE</code> 和 <code>BAR.RED.*</code>；单 warp 的 <code>bar.warp.sync</code> 对应 <code>WARPSYNC</code>。<code>BSYNC</code>用于控制流 reconvergence，<code>DEPBAR</code>用于指令依赖管理。实际编码随目标架构变化，按 <a href="https://docs.nvidia.com/cuda/archive/13.1.1/cuda-binary-utilities/">CUDA Binary Utilities</a> 的指令分类读结果，不能把含有 BAR 字符的指令都算成 named-barrier 资源。</p><h2 id="zh-refs">参考资料</h2><ul>
   <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-bar">PTX ISA: <code>bar</code> and <code>barrier</code></a></li>
   <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/cuda-programming-guide/04-special-topics/async-barriers.html">CUDA Programming Guide: Asynchronous Barriers</a></li>
-  <li><a href="https://docs.nvidia.com/nsight-compute/2025.3/ProfilingGuide/index.html#metrics-ref-launch">Nsight Compute Profiling Guide: Launch Metrics</a></li>
-  <li><a href="https://docs.nvidia.com/nsight-compute/2025.3/OccupancyCalculatorPythonInterface/index.html">Nsight Compute Occupancy Calculator Python Interface</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2025.3/ProfilingGuide/index.html#metrics-ref-launch">Nsight Compute Profiling Guide: Launch Metrics</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2025.3/OccupancyCalculatorPythonInterface/index.html">Nsight Compute Occupancy Calculator Python Interface</a></li>
   <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/cuda-binary-utilities/">CUDA Binary Utilities: SASS Instruction Set Reference</a></li>
   <li><a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/include/cutlass/arch/barrier.h">CUTLASS at <code>ffa119a</code>: <code>cutlass::arch::NamedBarrier</code></a></li>
   <li><a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/python/CuTeDSL/cutlass/pipeline/helpers.py">CuTe DSL at <code>ffa119a</code>: <code>pipeline.NamedBarrier</code></a></li>
   <li><a href="https://docs.nvidia.com/cutlass/4.7.0/media/docs/pythonDSL/primitives.html">CuTe DSL Primitive Operations</a></li>
 </ul>
-
 </div>
 
 <div class="lang-en">
-
 <h1>CUDA Named Barriers: CTA-Local Synchronization and Occupancy Constraints</h1>
+<p class="lead">A CTA repeatedly processes tiles in shared memory: producer warps fill the buffer and consumer warps read it to compute. Protecting the first read is only half the protocol. Before producing the next tile, the producers must also know that consumers have finished using the previous one. Otherwise, they overwrite data still being read. Named barriers can give these handoffs separate names and let an arriving group continue independent work. Understanding the loop starts with buffer ownership, followed by the participant count at each barrier.</p>
 
-<p class="lead">A warp-specialized CTA contains producer warps that fill a shared-memory tile and consumer warps that compute from it. The groups must hand off at “data ready” and “buffer reusable” points while unrelated work remains able to proceed. <code>__syncwarp()</code> covers lanes within one warp, whereas <code>__syncthreads()</code> covers the entire CTA; a fixed subset spanning several warps needs a scope between them. PTX named barriers provide that scope through numbered CTA-local state reused across generations, and the compiled barrier usage also participates in block-residency limits.</p>
+<nav class="reading-guide" aria-label="Article quick links">
+  <p>Quick links</p>
+  <ul>
+    <li><a href="#en-use-case">Follow ownership: what ready and reuse protect</a></li>
+    <li><a href="#en-cuda">Inspect the implementation: a repeating CUDA loop</a></li>
+    <li><a href="#en-semantics">Check arrivals: 128 participants and generations</a></li>
+    <li><a href="#en-occupancy">Analyze residency: barrier resource limits</a></li>
+  </ul>
+</nav>
 
-<h2 id="en-definition">0. Position in the synchronization hierarchy</h2>
+<h2 id="en-use-case">1. Two handoffs for one shared buffer</h2>
+<p>Consider a CTA with four warps. W0 and W1 produce a tile of 64 floats; W2 and W3 read it and write twice each value to global memory. Every iteration reuses the same <code>tile[64]</code>. The calculation is deliberately simple so the complete buffer handoff remains visible.</p>
+<p>Consumers must wait for producer writes before reading; call this handoff <code>ready</code>. Once they finish reading, consumers must let producers overwrite the buffer; call that handoff <code>reuse</code>. Each protects a different access: ready makes the new data available to readers, while reuse keeps old data intact until those reads finish.</p>
 
-<p>A PTX named barrier is CTA-scoped synchronization state selected by an ID. Each CTA has 16 logical IDs, numbered 0 through 15, and each ID maintains an independent synchronization channel. A generation begins when the barrier is initialized or reinitialized after the preceding generation. It completes when the arrivals recorded for that ID reach the instruction's thread count, at which point waiting warps are released and the barrier enters the next generation.</p>
+<span id="en-definition" class="anchor-alias"></span>
+<p>A PTX named barrier is synchronization state selected by an ID within one CTA. IDs range from 0 through 15. Assign ID 1 to ready and ID 2 to reuse. <code>barrier.cta.arrive</code> records arrival and allows the warp to continue; <code>barrier.cta.sync</code> records arrival and waits for the other participants. Producers therefore arrive at ready and synchronize at reuse, while consumers do the reverse.</p>
 
-<p>The thread count is expressed in threads and must be a multiple of the warp size, so named barriers coordinate groups of complete warps. A warp executing <code>arrive</code> contributes an arrival and continues; a warp executing <code>sync</code> also contributes an arrival and waits for the generation to complete. CTA scope, ID, generation, and arrival completion together define the operational model.</p>
+<div class="diagram-frame"><div class="diagram-title">A repeating ready/reuse handoff</div>
+<svg class="diagram-svg" viewBox="0 0 800 440" role="img" aria-labelledby="en-named-title en-named-desc">
+<title id="en-named-title">A repeating ready/reuse handoff</title>
+<desc id="en-named-desc">Two producer warps write a tile and arrive at ready, then prefetch into registers. Two consumer warps synchronize at ready, read the tile, and arrive at reuse. Producers synchronize at reuse before overwriting. Both barriers count 128 threads per generation.</desc>
+<defs><marker id="en-named-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10z" fill="#71717a"/></marker></defs>
+<text x="149" y="30" text-anchor="middle" font-size="16">W0, W1: Producer</text>
+<text x="651" y="30" text-anchor="middle" font-size="16">W2, W3: Consumer</text>
+<rect class="producer" x="24" y="53" width="250" height="52" rx="5"/><text x="149" y="84" text-anchor="middle" font-size="15">Write tile(t)</text>
+<rect class="barrier" x="24" y="139" width="250" height="52" rx="5"/><text x="149" y="170" text-anchor="middle" font-size="15">ready.arrive</text>
+<rect class="barrier" x="526" y="139" width="250" height="52" rx="5"/><text x="651" y="170" text-anchor="middle" font-size="15">ready.sync</text>
+<path class="arrow" d="M274 165 H518" marker-end="url(#en-named-arrow)"/>
+<text x="400" y="145" text-anchor="middle" font-size="13">ID 1 · count = 128</text>
+<rect class="producer" x="24" y="225" width="250" height="52" rx="5"/><text x="149" y="256" text-anchor="middle" font-size="15">Prefetch input(t+1) into registers</text>
+<rect class="consumer" x="526" y="225" width="250" height="52" rx="5"/><text x="651" y="256" text-anchor="middle" font-size="15">Read tile(t), finish current work</text>
+<rect class="barrier" x="24" y="311" width="250" height="52" rx="5"/><text x="149" y="342" text-anchor="middle" font-size="15">reuse.sync</text>
+<rect class="barrier" x="526" y="311" width="250" height="52" rx="5"/><text x="651" y="342" text-anchor="middle" font-size="15">reuse.arrive</text>
+<path class="arrow" d="M526 337 H282" marker-end="url(#en-named-arrow)"/>
+<text x="400" y="316" text-anchor="middle" font-size="13">ID 2 · count = 128</text>
+<path class="arrow" d="M149 105 V131" marker-end="url(#en-named-arrow)"/>
+<path class="arrow" d="M149 191 V217" marker-end="url(#en-named-arrow)"/>
+<path class="arrow" d="M149 277 V303" marker-end="url(#en-named-arrow)"/>
+<path class="arrow" d="M651 191 V217" marker-end="url(#en-named-arrow)"/>
+<path class="arrow" d="M651 277 V303" marker-end="url(#en-named-arrow)"/>
+<text x="24" y="402" font-size="13" class="muted"><tspan x="24">After reuse completes, overwrite the buffer and reuse the same IDs.</tspan><tspan x="24" dy="22">This diagram shows protocol order, not measured timing.</tspan></text>
+</svg></div>
 
-<div class="table-scroll">
-<table class="note-table">
-  <thead>
-    <tr><th>Mechanism</th><th>Scope</th><th>Participants</th><th>Implementation and resource model</th><th>Typical use</th></tr>
-  </thead>
-  <tbody>
-    <tr><td><code>__syncwarp(mask)</code></td><td>One warp</td><td>Lanes selected by the mask</td><td>Warp synchronization state</td><td>Data exchange within a warp</td></tr>
-    <tr><td><code>__syncthreads()</code></td><td>CTA</td><td>The whole block</td><td>CTA barrier resource, normally ID 0</td><td>Full-CTA shared-memory stages</td></tr>
-    <tr><td>Named barrier</td><td>CTA</td><td>Selected full warps</td><td>CTA barrier resource in the occupancy model</td><td>Warp specialization and group rendezvous</td></tr>
-    <tr><td><code>cuda::barrier</code> / <code>mbarrier</code></td><td>CTA; Hopper also permits cluster access</td><td>Configurable arrival count</td><td>A 64-bit object in shared memory</td><td>TMA, asynchronous copies, and multistage pipelines</td></tr>
-    <tr><td>Cluster barrier</td><td>Thread Block Cluster</td><td>CTAs in the cluster</td><td>Cluster synchronization resources</td><td>Cross-CTA DSMEM cooperation</td></tr>
-  </tbody>
-</table>
-</div>
+<p>All four warps participate in this example, which demonstrates the separation of arrival from waiting. After signaling ready, producers can fetch the next input into registers while consumers read the current shared tile. Producers need to complete reuse only before their next shared-memory write. In a larger CTA, the same protocol can cover a selected set of complete warps while unrelated roles continue working.</p>
 
-<div class="note-box">
-  <p>The 16 IDs form a logical namespace for each CTA. The SM-level resource relationship is bounded operationally by the barrier count and barrier occupancy limit reported by Nsight Compute. Public documentation does not disclose the size, encoding, or allocation circuitry of the corresponding physical state.</p>
-</div>
+<h2 id="en-cuda">2. A loop with ready and reuse barriers</h2>
+<p>The complete device-side example below uses CUDA 13.1.1, targets <code>sm_70+</code>, and is launched with <code>&lt;&lt;&lt;1, 128&gt;&gt;&gt;</code>. The device buffers <code>input</code> and <code>output</code> do not overlap and each contains at least <code>num_tiles * 64</code> floats. Host allocation, initialization, and timing are outside the kernel; no overlap speedup is claimed here.</p>
+<pre class="code">// named_barrier.cu
+#include &lt;cuda_runtime.h&gt;
 
-<h2 id="en-semantics">1. Arrival, waiting, and reuse</h2>
+__device__ __forceinline__ void ready_arrive() {
+  asm volatile("barrier.cta.arrive 1, 128;" ::: "memory");
+}
+__device__ __forceinline__ void ready_sync() {
+  asm volatile("barrier.cta.sync 1, 128;" ::: "memory");
+}
+__device__ __forceinline__ void reuse_arrive() {
+  asm volatile("barrier.cta.arrive 2, 128;" ::: "memory");
+}
+__device__ __forceinline__ void reuse_sync() {
+  asm volatile("barrier.cta.sync 2, 128;" ::: "memory");
+}
 
-<p>An ID distinguishes synchronization channels that coexist, while a generation distinguishes successive rendezvous on one channel. All participating warps must enter those generations in a consistent order; a named barrier does not expose a phase token to the program.</p>
+// Launch with &lt;&lt;&lt;1, 128&gt;&gt;&gt;. Each buffer holds num_tiles * 64 floats.
+__global__ void producer_consumer(const float* input, float* output,
+                                  int num_tiles) {
+  __shared__ float tile[64];
+  const int tid = threadIdx.x;
+  const int warp = tid / 32;
 
-<div class="table-scroll">
-<table class="note-table">
-  <thead>
-    <tr><th>PTX</th><th>Executing warp contributes an arrival</th><th>Waits for other participating warps</th><th>Purpose</th></tr>
-  </thead>
-  <tbody>
-    <tr><td><code>bar.sync id, count</code></td><td>Yes</td><td>Yes</td><td>Arrive and wait for the current phase</td></tr>
-    <tr><td><code>bar.arrive id, count</code></td><td>Yes</td><td>No</td><td>Signal arrival and continue</td></tr>
-    <tr><td><code>bar.red.* id, count, pred</code></td><td>Yes</td><td>Yes</td><td>Synchronize and reduce participant predicates</td></tr>
-  </tbody>
-</table>
-</div>
+  if (num_tiles &lt;= 0) return;  // Uniform across the CTA.
 
-<p>Each generation on an active barrier must use one consistent operation family. PTX defines mixing <code>barrier.red</code> with <code>sync</code> or <code>arrive</code> on the same active barrier as unpredictable behavior. A predicate-reduction protocol therefore requires every participant to execute the matching <code>barrier.red</code>.</p>
+  if (warp &lt; 2) {
+    float next_value = input[tid];
+    for (int t = 0; t &lt; num_tiles; ++t) {
+      tile[tid] = next_value;
+      ready_arrive();
 
-<p>The instruction's <code>count</code> is expressed in threads, but arrival is recorded by warp. Threads executing the barrier first rendezvous with non-exited threads in their warp, after which the warp's arrival is counted. An explicit <code>count</code> must therefore be a multiple of the warp size; individual lanes are not independent participants.</p>
+      // Fetch into a register while consumers read the shared tile.
+      if (t + 1 &lt; num_tiles)
+        next_value = input[size_t(t + 1) * 64 + tid];
 
-<p>The full meaning of <code>sync</code> is <em>arrive and wait</em>; named barriers do not provide a separate pure <em>wait</em>. If two producer warps execute <code>arrive</code> and two consumer warps execute <code>sync</code>, the participant count is:</p>
+      reuse_sync();          // Shared tile is now safe to overwrite.
+    }
+  } else {
+    const int rank = tid - 64;
+    for (int t = 0; t &lt; num_tiles; ++t) {
+      ready_sync();          // Also contributes an arrival.
+      output[size_t(t) * 64 + rank] = 2.0f * tile[rank];
+      reuse_arrive();         // No further reads of this tile.
+    }
+  }
+}</pre>
+<p>In iteration $t$, producers first write <code>next_value</code> into <code>tile</code> and arrive at ready. Consumers can read only after their ready sync completes. The producers' next global load writes a private register rather than shared memory, so it can overlap the consumer reads. Consumers stop reading the current tile before arriving at reuse. Producers complete their reuse sync before the next iteration overwrites that tile.</p>
+<p>After the loop, the expected result is $output[i]=2\times input[i]$ for every element, despite reusing the same shared-memory locations each iteration. The final iteration also completes the reuse handoff, keeping the call counts consistent across participating warps. The return for <code>num_tiles &lt;= 0</code> is uniform across the CTA and leaves no other warp waiting.</p>
 
+<h3 id="en-control-flow">Instruction constraints inside warp-role branches</h3>
+<p>The branches use warp ID, so all lanes of a warp take the same path. The entire CTA does not execute the same barrier instruction, however, so the example uses <code>barrier.cta.*</code> without <code>.aligned</code>. The spellings <code>bar.sync</code> and <code>bar.arrive</code> are aligned aliases and cannot simply replace them here. Targets <code>sm_6x</code> and earlier retain the aligned restrictions, hence the <code>sm_70+</code> requirement. These control-flow and memory-ordering rules are specified by <a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-bar">PTX 13.1.1</a>.</p>
+<p>The inline-PTX <code>"memory"</code> clobber tells the compiler that the statement affects memory ordering; the barrier instruction provides hardware synchronization among participants. Matching barriers establish the ordering within this CTA. Cross-CTA handoffs require a different synchronization mechanism.</p>
+
+<h2 id="en-semantics">3. Count arrivals and track the next generation</h2>
+<p>Both groups participate in ready. Producer arrivals contribute 64 threads, and consumer sync operations contribute another 64, giving:</p>
 <p>\[
-N_{\mathrm{arrival}}
-=
-2\times32
-+
-2\times32
-=128.
+N_{\mathrm{ready}}=2\times32+2\times32=128.
 \]</p>
+<p>Reuse exchanges the arriving and waiting roles but still has 128 participants. The explicit count is in threads and must be a multiple of the warp size. PTX barrier instructions first rendezvous with non-exited threads in the executing warp, then record the warp's arrival. An individual lane is not an independent participant in this cross-warp protocol.</p>
 
-<p>If the count is incorrectly set to 64, the two producer warps complete the barrier before the consumers arrive. A later consumer <code>sync</code> then belongs to the next generation, and the protocol becomes misaligned. CuTe DSL's <code>NamedBarrier.wait()</code> also forwards to <code>arrive_and_wait()</code> because this mechanism has no wait-only operation.</p>
+<h3 id="en-generations">How one ID distinguishes successive iterations</h3>
+<p>When a generation reaches its required arrivals, waiters resume and the barrier automatically reinitializes for reuse. The program does not hold a phase token for a named barrier. It keeps generations matched through a consistent call order. Every iteration above proceeds through ready and reuse: reuse prevents an early producer overwrite, and the next ready prevents an early consumer read.</p>
+<p>Setting the ready count incorrectly to 64 permits an execution in which both producer warps arrive first and complete the generation. Consumers then synchronize on the next generation, separating the groups that were supposed to meet. Other interleavings can release only part of the intended group too early. The protocol requires one handoff among all four warps, so the count must include threads executing sync.</p>
+<p>This explains a wrapper naming detail as well: CuTe DSL's <code>NamedBarrier.wait()</code> still arrives. Treating it like an <code>mbarrier</code> wait-only operation would omit consumers from the count. The API mappings are covered in <a href="#en-cute">Appendix B</a>.</p>
 
-<p>Barrier completion also orders CTA memory operations among participants. A producer can write shared memory before arrival, and a consumer can read that data after returning from the matching barrier. This is not a cross-CTA visibility protocol and cannot replace cluster-scope or device-scope synchronization.</p>
+<h3 id="en-ids">ID ownership and protocol reuse</h3>
+<p>The 16 IDs form a logical synchronization namespace for each CTA. Assigning separate IDs to ready and reuse allows the two handoff directions to progress independently. Repeating ID 1 in a loop does not allocate another ID for every iteration. Two independent protocols using ID 1 concurrently, however, would mix their arrivals.</p>
+<p>Before reusing an ID, establish that the previous generation has finished and every role agrees on the next generation's order. Combining ready and reuse to save an ID requires a redesigned and revalidated protocol. Library code also uses IDs: <code>__syncthreads()</code> normally uses ID 0, and CUTLASS reserves several internal IDs. Check the final IDs before adding synchronization to existing code.</p>
 
-<h2 id="en-use-case">2. Group synchronization protocol</h2>
-
-<p>The following CTA contains four warps. W0 and W1 write a shared-memory tile; W2 and W3 consume it. Two barriers represent "data ready" and "buffer reusable." After producers issue <code>arrive</code>, they may continue with independent address calculations or prefetch the next global-memory input. They need to wait only before overwriting the shared buffer.</p>
-
-<div class="diagram-frame">
-  <div class="diagram-title">Producer-consumer protocol with two named barriers</div>
-  <svg class="diagram-svg" viewBox="0 0 1120 560" role="img" aria-label="Producer and consumer warps coordinated by two named barriers">
-    <defs>
-      <marker id="named-arrow-en" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-        <path d="M 0 0 L 10 5 L 0 10 z" fill="#71717a"></path>
-      </marker>
-    </defs>
-
-    <text x="40" y="35" font-size="15" font-weight="600">CTA: 4 warps / 128 threads</text>
-
-    <rect class="producer" x="40" y="70" width="215" height="78" rx="7"></rect>
-    <text x="148" y="100" text-anchor="middle" font-size="14" font-weight="600">W0, W1 · Producer</text>
-    <text class="mono muted" x="148" y="125" text-anchor="middle" font-size="11">store shared tile</text>
-
-    <rect class="barrier" x="335" y="70" width="210" height="78" rx="7"></rect>
-    <text x="440" y="100" text-anchor="middle" font-size="14" font-weight="600">ready · ID 1</text>
-    <text class="mono muted" x="440" y="125" text-anchor="middle" font-size="11">count = 128</text>
-
-    <rect class="consumer" x="625" y="70" width="215" height="78" rx="7"></rect>
-    <text x="733" y="100" text-anchor="middle" font-size="14" font-weight="600">W2, W3 · Consumer</text>
-    <text class="mono muted" x="733" y="125" text-anchor="middle" font-size="11">load and compute</text>
-
-    <path class="arrow" d="M255 109 L328 109" marker-end="url(#named-arrow-en)"></path>
-    <text class="mono muted" x="291" y="96" text-anchor="middle" font-size="10">arrive</text>
-    <path class="arrow" d="M618 109 L552 109" marker-end="url(#named-arrow-en)"></path>
-    <text class="mono muted" x="585" y="96" text-anchor="middle" font-size="10">sync</text>
-
-    <rect class="resource" x="40" y="188" width="800" height="82" rx="7"></rect>
-    <text x="440" y="219" text-anchor="middle" font-size="14" font-weight="600">shared-memory tile</text>
-    <text class="muted" x="440" y="244" text-anchor="middle" font-size="12">Consumers read after ready; producers do not overwrite before empty</text>
-
-    <path class="arrow" d="M148 148 L148 180" marker-end="url(#named-arrow-en)"></path>
-    <path class="arrow" d="M733 180 L733 148" marker-end="url(#named-arrow-en)"></path>
-
-    <rect class="barrier" x="335" y="310" width="210" height="78" rx="7"></rect>
-    <text x="440" y="340" text-anchor="middle" font-size="14" font-weight="600">empty · ID 2</text>
-    <text class="mono muted" x="440" y="365" text-anchor="middle" font-size="11">count = 128</text>
-
-    <path class="arrow" d="M625 349 L552 349" marker-end="url(#named-arrow-en)"></path>
-    <text class="mono muted" x="585" y="336" text-anchor="middle" font-size="10">arrive</text>
-    <path class="arrow" d="M328 349 L262 349" marker-end="url(#named-arrow-en)"></path>
-    <text class="mono muted" x="295" y="336" text-anchor="middle" font-size="10">sync</text>
-
-    <rect class="producer" x="40" y="310" width="215" height="78" rx="7"></rect>
-    <text x="148" y="340" text-anchor="middle" font-size="14" font-weight="600">Producer resumes</text>
-    <text class="mono muted" x="148" y="365" text-anchor="middle" font-size="11">reuse shared tile</text>
-
-    <rect class="consumer" x="625" y="310" width="215" height="78" rx="7"></rect>
-    <text x="733" y="340" text-anchor="middle" font-size="14" font-weight="600">Consumer finishes</text>
-    <text class="mono muted" x="733" y="365" text-anchor="middle" font-size="11">release shared tile</text>
-
-    <rect class="resource" x="900" y="70" width="180" height="318" rx="7"></rect>
-    <text x="990" y="101" text-anchor="middle" font-size="14" font-weight="600">CTA barrier state</text>
-    <rect class="barrier" x="930" y="132" width="120" height="48" rx="5"></rect>
-    <text class="mono" x="990" y="161" text-anchor="middle" font-size="11">ID 1 · ready</text>
-    <rect class="barrier" x="930" y="196" width="120" height="48" rx="5"></rect>
-    <text class="mono" x="990" y="225" text-anchor="middle" font-size="11">ID 2 · empty</text>
-    <text class="muted" x="990" y="285" text-anchor="middle" font-size="11">arrival count</text>
-    <text class="muted" x="990" y="307" text-anchor="middle" font-size="11">waiting warps</text>
-    <text class="muted" x="990" y="329" text-anchor="middle" font-size="11">automatic reinitialize</text>
-    <text class="muted" x="990" y="363" text-anchor="middle" font-size="10">finite SM resource</text>
-
-    <path class="arrow" d="M545 109 C700 25, 850 25, 920 145" marker-end="url(#named-arrow-en)"></path>
-    <path class="arrow" d="M545 349 C700 450, 850 430, 920 226" marker-end="url(#named-arrow-en)"></path>
-
-    <text class="muted" x="40" y="458" font-size="12">A CTA may maintain several independent rendezvous; each barrier is reused by generation.</text>
-    <text class="muted" x="40" y="485" font-size="12">The count is the total number of arrivals in one generation, including threads that execute sync.</text>
-    <text class="muted" x="40" y="512" font-size="12">Branches must be warp-uniform, and each participating warp must reach the matching barrier once.</text>
-  </svg>
-</div>
-
-<p>Named barriers commonly appear in warp-specialized GEMM, transpose, epilogue, and control handoffs among a small, fixed set of warp groups. The benefit comes from a smaller synchronization set and one-way arrival. Unrelated warps do not stop at a full-CTA barrier, and producers can overlap some work with consumer computation.</p>
-
-<h2 id="en-occupancy">3. Named-barrier occupancy constraints</h2>
-
-<p>The first two sections describe how one CTA uses barrier generations to hand work off at runtime. When several CTAs reside on an SM, the barrier state required by each CTA also participates in block admission, which makes compiled named-barrier usage a static resource constraint. PTX specifies arrival, waiting, and automatic reinitialization semantics, while the Nsight Compute Occupancy Calculator provides per-CTA barrier usage and target-device capacity. The occupancy model below stays within those public interfaces and does not extend to undisclosed storage or allocation circuitry.</p>
-
-<p>Let $H_{\mathrm{CTA}}$ be the profiler's per-CTA barrier usage and $H_{\mathrm{SM}}$ the corresponding capacity for the target device. The barrier resource alone gives the following resident-block limit:</p>
-
+<h2 id="en-occupancy">4. From two synchronization channels to block residency</h2>
+<p>A CTA reuses its barrier state through the loop. Multiple CTAs entering the same SM need independent state, and this usage participates in static occupancy calculations. IDs 1 and 2 describe the source-level protocol. Launch data tells us how much barrier resource the compiler records for the kernel.</p>
+<p>Let $H_{\mathrm{CTA}}$ be compiled barrier usage per CTA and $H_{\mathrm{SM}}$ the target-device capacity in the occupancy model. The capacity relationship can be understood as:</p>
 <p>\[
-B_{\mathrm{barrier}}
-=
-\left\lfloor
-\frac{H_{\mathrm{SM}}}{H_{\mathrm{CTA}}}
-\right\rfloor.
+B_{\mathrm{barrier}}=\left\lfloor\frac{H_{\mathrm{SM}}}{H_{\mathrm{CTA}}}\right\rfloor,\qquad
+B_{\mathrm{resident}}=\min\left(B_{\mathrm{warp}},B_{\mathrm{block}},B_{\mathrm{register}},B_{\mathrm{smem}},B_{\mathrm{barrier}}\right).
 \]</p>
-
-<p>Final occupancy is still determined by the minimum of all resource limits:</p>
-
-<p>\[
-B_{\mathrm{resident}}
-=
-\min\left(
-B_{\mathrm{warp}},
-B_{\mathrm{block}},
-B_{\mathrm{register}},
-B_{\mathrm{smem}},
-B_{\mathrm{barrier}}
-\right).
-\]</p>
-
-<p><a href="https://docs.nvidia.com/nsight-compute/2025.3/ProfilingGuide/index.html#metrics-ref-launch">Nsight Compute</a> exposes this part of the model through the following launch metrics:</p>
-
-<div class="table-scroll">
-<table class="note-table">
-  <thead>
-    <tr><th>Metric</th><th>Meaning</th><th>Interpretation</th></tr>
-  </thead>
-  <tbody>
-    <tr><td><code>launch__barrier_count</code></td><td>The barrier count reported by NCU for this kernel launch</td><td>Read it as the per-block barrier usage used by the occupancy model</td></tr>
-    <tr><td><code>launch__occupancy_limit_barriers</code></td><td>The occupancy limit imposed by the barriers in use</td><td>Compare it with other <code>launch__occupancy_limit_*</code> metrics to find the actual minimum</td></tr>
-    <tr><td><code>launch__occupancy_per_barrier_count</code></td><td>Occupancy as the barrier count changes</td><td>Shows whether reducing barrier usage could increase residency</td></tr>
-  </tbody>
-</table>
-</div>
-
-<pre class="code">ncu --metrics \
+<p>Each $B$ is measured in blocks. The full resource calculation is developed in <a href="gpu-occupancy-resource-limits.html">GPU Occupancy: Residency Resource Model</a>. Barrier capacity varies by architecture; the 16 logical PTX IDs do not directly specify a physical state count for the SM.</p>
+<div class="table-scroll"><table class="note-table"><thead><tr><th>Metric</th><th>Meaning</th></tr></thead><tbody><tr><td><code>launch__barrier_count</code></td><td>Barrier usage reported for the kernel launch</td></tr><tr><td><code>launch__occupancy_limit_barriers</code></td><td>Resident blocks permitted by barrier resources</td></tr><tr><td><code>launch__occupancy_per_barrier_count</code></td><td>Active warp counts as barrier usage changes</td></tr></tbody></table></div>
+<p>These names come from <a href="https://archive.docs.nvidia.com/nsight-compute/2025.3/ProfilingGuide/index.html#metrics-ref-launch">NCU 2025.3 Launch Metrics</a>. The <a href="https://archive.docs.nvidia.com/nsight-compute/2025.3/OccupancyCalculatorPythonInterface/index.html">Occupancy Calculator</a> calls the input <code>num_block_barriers</code> and the device-capacity field <code>block_barriers_per_sm</code>. Read the actual kernel data before deciding whether a reduction would cross an integer residency boundary.</p>
+<pre class="code"># Run the application that launches the kernel.
+ncu --metrics \
   launch__barrier_count,\
   launch__occupancy_limit_barriers,\
   launch__occupancy_per_barrier_count \
   ./named_barrier_example</pre>
 
-<p>The Nsight Compute Occupancy Calculator calls its input <code>num_block_barriers</code> and the device capacity <code>block_barriers_per_sm</code>. The latter is architecture-dependent, so a value from one GPU generation should not be applied to every device. Results collected on the target GPU are more reliable than a count of barrier IDs in source code.</p>
+<h3 id="en-static-dynamic">Residency limits and runtime waits</h3>
+<p><code>launch__occupancy_limit_barriers</code> reports the block residency permitted by barrier resources. Runtime Stall Barrier reports warps waiting for synchronization. If the producer and consumer workloads are unbalanced, the faster group may spend substantial time waiting even while registers determine the kernel's occupancy.</p>
+<p>Reducing barrier resource usage need not increase residency. Integer division may still permit the same number of blocks, or another resource may become the limiter. If a change raises the barrier limit from two blocks to four while registers permit three, the final limit becomes three. Whether that improves performance still depends on kernel time and the two groups' waiting behavior.</p>
 
-<div class="note-box warn">
-  <p><strong>Static admission and runtime waiting use separate signals.</strong> <code>launch__occupancy_limit_barriers</code> gives the resident-block limit at kernel launch, while Stall Barrier reports warps waiting for synchronization during execution. Registers may determine a kernel's occupancy even when it has substantial barrier stalls; barrier resources may also reduce residency while runtime waiting remains small.</p>
-</div>
-
-<p>PTX permits a barrier ID to be an immediate or a register operand; this rule describes how an instruction selects a logical channel. <code>launch__barrier_count</code> on the target GPU supplies the barrier usage consumed by the occupancy model. <code>nvcc --resource-usage</code> and <code>-Xptxas=-v</code> complement it with register, shared-memory, and other static-resource statistics. The physical allocation performed by <code>ptxas</code> remains outside the public evidence boundary, while constant IDs make fixed protocols easier to audit.</p>
-
-<h2 id="en-instructions">4. PTX forms, constraints, and SASS</h2>
-
-<p>The profiler reports how many compiled barriers participate in residency; PTX and SASS identify the operations performed by those barriers. The three operations in Section 1 each have two PTX spellings. <code>bar.sync</code>, <code>bar.arrive</code>, and <code>bar.red.*</code> are aligned aliases; <code>barrier.cta.sync</code>, <code>barrier.cta.arrive</code>, and <code>barrier.cta.red.*</code> are the modern CTA forms. They commonly lower to <code>BAR.SYNC</code>, <code>BAR.ARRIVE</code>, and <code>BAR.RED.*</code>, respectively. <code>bar.warp.sync</code> / <code>WARPSYNC</code> has single-warp scope.</p>
-
-<p>The <code>.aligned</code> form requires every thread in the CTA to execute the same barrier instruction, a stronger condition than warp-uniform control flow. A warp-role branch executes a given barrier in only part of the CTA, so it must use a non-aligned <code>barrier.cta.*</code> form and target <code>sm_70+</code>. On <code>sm_6x</code> and earlier targets, a spelling without <code>.aligned</code> is still treated as aligned. In either form, the participant count and number of arrivals per generation must agree. A mismatch can deadlock the CTA or shift participants into different generations.</p>
-
-<p>SASS is architecture-specific machine code, so modifiers and displayed operands vary with the GPU and disassembler. The following commands show the actual lowering:</p>
-
-<pre class="code">nvcc -arch=sm_90 -lineinfo -Xptxas=-v named_barrier.cu -o named_barrier
-cuobjdump --dump-sass named_barrier | grep -E 'BAR|WARPSYNC'
-
-# Or inspect a cubin directly
-nvdisasm named_barrier.cubin | grep -E 'BAR|WARPSYNC'</pre>
-
-<p>In disassembly, <code>BAR.SYNC</code>, <code>BAR.ARRIVE</code>, and <code>BAR.RED.*</code> implement CTA named-barrier operations; <code>BSYNC</code> represents control-flow reconvergence, and <code>DEPBAR</code> manages instruction dependencies. Interpret an occupancy barrier count by instruction semantics rather than by whether a mnemonic contains <code>BAR</code>.</p>
-
-<h2 id="en-history">5. Choosing a synchronization mechanism</h2>
-
-<p>Once the instruction semantics are clear, mechanism selection follows from participant scope and the state required by the protocol. A named barrier is a numbered CTA-local channel for fixed groups of complete warps and permits an arriving group to continue. An <code>mbarrier</code> is an addressable 64-bit object in shared memory with phase and arrival state, and it can track asynchronous transaction completion on architectures that provide the corresponding operations. Full-CTA phases, asynchronous data movement, and cross-CTA cooperation map to primitives with different scopes.</p>
-
-<div class="table-scroll">
-<table class="note-table">
-  <thead>
-    <tr><th>Requirement</th><th>Preferred mechanism</th><th>Reason</th></tr>
-  </thead>
-  <tbody>
-    <tr><td>Exchange data within one warp</td><td><code>__syncwarp(mask)</code></td><td>It has the narrowest scope and uses no CTA named-barrier channel</td></tr>
-    <tr><td>Complete one phase across an entire CTA</td><td><code>__syncthreads()</code></td><td>The semantics are direct and participant counts are hard to misstate</td></tr>
-    <tr><td>Synchronize fixed groups of complete warps</td><td>Named barrier</td><td>Several channels can be named, and arrival need not block</td></tr>
-    <tr><td>Signal asynchronous copy or TMA completion, or build a multistage pipeline</td><td><code>cuda::barrier</code> / <code>mbarrier</code></td><td>Supports phases, tokens, and transaction counts</td></tr>
-    <tr><td>Coordinate across CTAs</td><td>Cluster barrier, cluster mbarrier, or a global protocol</td><td>A named barrier is strictly CTA-local</td></tr>
-  </tbody>
-</table>
-</div>
-
-<h2 id="en-cuda">6. CUDA C/C++ with inline PTX</h2>
-
-<p>Once a named barrier is selected, the ready/empty protocol can be written directly with inline PTX. The example targets <code>sm_70+</code> because the warp-role branches require non-aligned forms. The 128-thread CTA assigns two producer warps to write shared memory and two consumer warps to read it. ID 1 denotes <code>ready</code>; ID 2 denotes <code>empty</code>.</p>
-
-<pre class="code">// named_barrier.cu
-#include &lt;cuda_runtime.h&gt;
-
-__device__ __forceinline__ void arrive_ready() {
-  asm volatile("barrier.cta.arrive 1, 128;" ::: "memory");
-}
-
-__device__ __forceinline__ void wait_ready() {
-  // sync also contributes an arrival.
-  asm volatile("barrier.cta.sync 1, 128;" ::: "memory");
-}
-
-__device__ __forceinline__ void arrive_empty() {
-  asm volatile("barrier.cta.arrive 2, 128;" ::: "memory");
-}
-
-__device__ __forceinline__ void wait_empty() {
-  asm volatile("barrier.cta.sync 2, 128;" ::: "memory");
-}
-
-__global__ void producer_consumer(const int* input, int* output) {
-  __shared__ int tile[64];
-
-  int tid = threadIdx.x;
-  int warp = tid / 32;
-
-  if (warp &lt; 2) {
-    tile[tid] = input[tid];
-    arrive_ready();
-
-    // Work independent of tile reuse can overlap consumer computation.
-    int next_index = tid + blockDim.x;
-    asm volatile("" :: "r"(next_index));
-
-    wait_empty();
-  } else {
-    wait_ready();
-    int lane_in_group = tid - 64;
-    output[lane_in_group] = 2 * tile[lane_in_group];
-    arrive_empty();
-  }
-}</pre>
-
-<p>All four warps participate in every generation of ID 1 and ID 2, so both counts are 128. Branches are selected by warp ID and do not diverge within a warp. The example performs one handoff. In a loop, both sides must enter successive generations in the same order.</p>
-
-<h2 id="en-cutlass">7. CUTLASS C++: <code>cutlass::arch::NamedBarrier</code></h2>
+<h2 id="en-checklist">5. Validate one handoff, then the whole loop</h2>
+<p>Correctness requires two orderings: tile writes precede consumer reads, and those reads precede the next overwrite. Start with one iteration to check the result, then use two different tiles through the same buffer and finally increase the iteration count while checking every output. Early exits, unequal loop counts, or inconsistent participant counts can break these orderings.</p>
+<p>After integrating the protocol into an existing kernel, check for conflicts with library barrier IDs and inspect the expected operations in generated PTX/SASS. To evaluate performance, compare the old and new synchronization schemes under the same inputs and timing conditions. Record compiled barrier count, other occupancy limiters, and runtime waits. In this four-warp example, the possible gain is overlap between producer register prefetches and consumer work; whether that overlap occurs and how much it helps require measurement.</p>
+<p>TMA transfers and other asynchronous operations add completion conditions beyond thread arrival. The <a href="inline-assembly-aarch64-ptx-core-loops.html#en-tma">TMA and mbarrier inner loop</a> develops that protocol. Ready/reuse reasoning still helps establish the buffer lifetime, while the selected asynchronous mechanism must provide the actual completion notification.</p>
+<h2 id="en-cutlass">Appendix A: CUTLASS C++ ID mapping</h2>
 
 <p>CUTLASS wraps named barriers in <a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/include/cutlass/arch/barrier.h"><code>include/cutlass/arch/barrier.h</code></a> at revision <code>ffa119a</code>. This wrapper requires CUDA Toolkit 12 or later and <code>sm_90+</code>. That revision reserves IDs 1 through 7 for internal use. The public constructor adds 8 to a user ID, so user IDs 0 through 7 map to final IDs 8 through 15. The source also warns that ID 0 may conflict with <code>__syncthreads()</code>. This is a policy of that CUTLASS revision, not a universal PTX convention.</p>
 
+<p>The example expands one handoff to show the wrapper calls. Launch 128 threads with at least 64 elements in each input/output buffer; ready/empty correspond to the main example's ready/reuse.</p>
 <pre class="code">#include &lt;cutlass/arch/barrier.h&gt;
 
-__global__ void cutlass_named_barrier(const int* input, int* output) {
-  __shared__ int tile[64];
+__global__ void cutlass_named_barrier(const float* input, float* output) {
+  __shared__ float tile[64];
 
   int tid = threadIdx.x;
   int warp = tid / 32;
@@ -867,7 +612,7 @@ __global__ void cutlass_named_barrier(const int* input, int* output) {
   } else {
     ready.arrive_and_wait_unaligned();
     int lane_in_group = tid - 64;
-    output[lane_in_group] = 2 * tile[lane_in_group];
+    output[lane_in_group] = 2.0f * tile[lane_in_group];
     empty.arrive_unaligned();
   }
 }</pre>
@@ -876,10 +621,11 @@ __global__ void cutlass_named_barrier(const int* input, int* output) {
 
 <p>The library's <code>ReservedNamedBarriers</code> enumeration shows where internal slots are used, including epilogues, transpose, Stream-K, tensor-memory allocation, and several mainloop protocols. Custom synchronization added to an existing CUTLASS kernel should use the public constructor instead of directly claiming an internal ID.</p>
 
-<h2 id="en-cute">8. CuTe DSL: <code>pipeline.NamedBarrier</code></h2>
+<h2 id="en-cute">Appendix B: CuTe DSL arrival and wait interfaces</h2>
 
 <p>At the same revision, CuTe DSL exposes <code>NamedBarrier</code> through <a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/python/CuTeDSL/cutlass/pipeline/helpers.py"><code>cutlass.pipeline</code></a>. Unlike the CUTLASS C++ public constructor, its <code>barrier_id</code> maps directly to a PTX ID from 0 through 15. The implementation warns when ID 0 is selected.</p>
 
+<p>The following is protocol pseudocode. It retains the actual API calls but omits shared-memory tensor allocation, data accesses, and the host launch; it is not a complete runnable kernel.</p>
 <pre class="code">import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 
@@ -920,38 +666,55 @@ cute.arch.barrier(
 
 <p><code>aligned=False</code> selects the non-aligned <code>barrier.cta.arrive</code> path. CuTe DSL interfaces continue to evolve, so production code should pin a CUTLASS revision and link documentation to that same revision instead of relying on similar class names across releases.</p>
 
-<h2 id="en-checklist">9. Correctness and performance checks</h2>
+<h2 id="en-history">Appendix C: Choosing a synchronization mechanism</h2>
 
-<p>CUDA, CUTLASS, and CuTe DSL ultimately obey the same generation protocol. An implementation can be checked in order across scope, arrival count, control flow, and resource signals:</p>
+<p>Once the instruction semantics are clear, mechanism selection follows from participant scope and the state required by the protocol. A named barrier is a numbered CTA-local channel for fixed groups of complete warps and permits an arriving group to continue. An <code>mbarrier</code> is an addressable 64-bit object in shared memory with phase and arrival state, and it can track asynchronous transaction completion on architectures that provide the corresponding operations. Full-CTA phases, asynchronous data movement, and cross-CTA cooperation map to primitives with different scopes.</p>
 
-<ol>
-  <li><strong>Confirm the scope.</strong> A named barrier synchronizes only one CTA. Cross-CTA protocols require cluster or global synchronization.</li>
-  <li><strong>Count arrivals for every generation.</strong> Warps executing <code>sync</code> or <code>wait</code> also contribute arrivals, so their threads belong in the count.</li>
-  <li><strong>Use one operation family.</strong> Participants on the same active barrier must not mix <code>barrier.red</code> with <code>sync</code>/<code>arrive</code>.</li>
-  <li><strong>Satisfy the aligned condition.</strong> The participant count must be a multiple of 32. Use an aligned form only when the entire CTA executes the same barrier instruction; use a non-aligned form on <code>sm_70+</code> for warp-role branches.</li>
-  <li><strong>Keep call counts symmetric.</strong> Producers and consumers in a loop must reuse each barrier through matching generations.</li>
-  <li><strong>Manage ID ownership.</strong> Do not reuse an ID already claimed by <code>__syncthreads()</code>, a CUTLASS protocol, or another library component.</li>
-  <li><strong>Separate static and dynamic metrics.</strong> Use <code>launch__occupancy_limit_barriers</code> for residency limits and Warp State Statistics for runtime waiting.</li>
-</ol>
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Requirement</th><th>Preferred mechanism</th><th>Reason</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Exchange data within one warp</td><td><code>__syncwarp(mask)</code></td><td>It has the narrowest scope and uses no CTA named-barrier channel</td></tr>
+    <tr><td>Complete one phase across an entire CTA</td><td><code>__syncthreads()</code></td><td>The semantics are direct and participant counts are hard to misstate</td></tr>
+    <tr><td>Synchronize fixed groups of complete warps</td><td>Named barrier</td><td>Several channels can be named, and arrival need not block</td></tr>
+    <tr><td>Signal asynchronous copy or TMA completion, or build a multistage pipeline</td><td><code>cuda::barrier</code> / <code>mbarrier</code></td><td>Supports phases, tokens, and transaction counts</td></tr>
+    <tr><td>Coordinate across CTAs</td><td>Cluster barrier, cluster mbarrier, or a global protocol</td><td>A named barrier is strictly CTA-local</td></tr>
+  </tbody>
+</table>
+</div>
 
-<p>Static occupancy cost follows the compiled barrier usage. An optimization can increase resident block count only when it lowers <code>launch__barrier_count</code> on the target GPU and barriers were already the tightest resource limit. Source-level ID count describes protocol structure; the profiler supplies the compiled count. Any ID reuse must also preserve independent generations, or it can introduce extra dependencies or deadlock.</p>
-
-<h2 id="en-refs">References</h2>
-
-<ul>
+<h2 id="en-instructions">Appendix D: PTX operations and SASS inspection</h2>
+<p><code>barrier.cta.arrive</code> contributes an arrival and continues, while <code>barrier.cta.sync</code> contributes an arrival and waits. <code>barrier.cta.red.*</code> also reduces participant predicates. A protocol can pair arrive and sync on the same active barrier, but must not mix red into it; PTX defines that mixture as unpredictable.</p>
+<p><code>bar.sync</code>, <code>bar.arrive</code>, and <code>bar.red.*</code> are aliases with <code>.aligned</code>. Aligned requires the entire CTA to execute the same barrier instruction; warp-uniform control flow alone is insufficient. IDs can be immediate or register operands, while constants make ownership easier to check in a fixed protocol.</p>
+<p>The main example contains device code, so generate a cubin before inspecting SASS. It has no host <code>main()</code>; the command therefore uses <code>-cubin</code>:</p>
+<pre class="code">nvcc -arch=sm_90 -lineinfo -cubin named_barrier.cu -o named_barrier.cubin
+nvdisasm named_barrier.cubin | rg 'BAR|WARPSYNC'</pre>
+<p>CTA barriers commonly appear as <code>BAR.SYNC</code>, <code>BAR.ARRIVE</code>, and <code>BAR.RED.*</code>; single-warp <code>bar.warp.sync</code> corresponds to <code>WARPSYNC</code>. <code>BSYNC</code> handles control-flow reconvergence, while <code>DEPBAR</code> manages instruction dependencies. Encoding varies by target architecture. Use the classifications in <a href="https://docs.nvidia.com/cuda/archive/13.1.1/cuda-binary-utilities/">CUDA Binary Utilities</a>; a mnemonic containing BAR does not by itself identify a named-barrier resource.</p><h2 id="en-refs">References</h2><ul>
   <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-bar">PTX ISA: <code>bar</code> and <code>barrier</code></a></li>
   <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/cuda-programming-guide/04-special-topics/async-barriers.html">CUDA Programming Guide: Asynchronous Barriers</a></li>
-  <li><a href="https://docs.nvidia.com/nsight-compute/2025.3/ProfilingGuide/index.html#metrics-ref-launch">Nsight Compute Profiling Guide: Launch Metrics</a></li>
-  <li><a href="https://docs.nvidia.com/nsight-compute/2025.3/OccupancyCalculatorPythonInterface/index.html">Nsight Compute Occupancy Calculator Python Interface</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2025.3/ProfilingGuide/index.html#metrics-ref-launch">Nsight Compute Profiling Guide: Launch Metrics</a></li>
+  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2025.3/OccupancyCalculatorPythonInterface/index.html">Nsight Compute Occupancy Calculator Python Interface</a></li>
   <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/cuda-binary-utilities/">CUDA Binary Utilities: SASS Instruction Set Reference</a></li>
   <li><a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/include/cutlass/arch/barrier.h">CUTLASS at <code>ffa119a</code>: <code>cutlass::arch::NamedBarrier</code></a></li>
   <li><a href="https://github.com/NVIDIA/cutlass/blob/ffa119a1255d78998536107466cc7097ecefa393/python/CuTeDSL/cutlass/pipeline/helpers.py">CuTe DSL at <code>ffa119a</code>: <code>pipeline.NamedBarrier</code></a></li>
   <li><a href="https://docs.nvidia.com/cutlass/4.7.0/media/docs/pythonDSL/primitives.html">CuTe DSL Primitive Operations</a></li>
 </ul>
-
 </div>
-
 </main>
 </div>
+<script>
+(function () {
+  const contents = document.querySelector('.article-toc');
+  const compact = window.matchMedia('(max-width: 1099px)');
+  function fitContents() { contents.open = !compact.matches; }
+  fitContents();
+  compact.addEventListener('change', fitContents);
+  contents.addEventListener('click', function (event) {
+    if (compact.matches && event.target.closest('a[href^="#"]')) contents.open = false;
+  });
+})();
+</script>
 </body>
 </html>

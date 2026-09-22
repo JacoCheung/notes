@@ -1,0 +1,1463 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>嵌入汇编的约束模型与核心循环：AArch64 与 NVIDIA PTX</title>
+<meta name="post:title"           content="嵌入汇编的约束模型与核心循环：AArch64 与 NVIDIA PTX">
+<meta name="post:title_en"        content="Inline Assembly Constraint Models and Core Loops: AArch64 and NVIDIA PTX">
+<meta name="post:slug"            content="inline-assembly-aarch64-ptx-core-loops">
+<meta name="post:date"            content="2026-09-03">
+<meta name="post:tags"            content="Inline Assembly, AArch64, PTX, cp.async, ldmatrix, Tensor Core, TMA">
+<meta name="post:tags_en"         content="Inline Assembly, AArch64, PTX, cp.async, ldmatrix, Tensor Core, TMA">
+<meta name="post:reading"         content="36 分钟">
+<meta name="post:reading_en"      content="36 min">
+<meta name="post:summary"         content="从同一个 FP32 加法的值参数与指针参数出发，解释 AArch64/GCC 如何处理寄存器约束、内存依赖和 clobber，再跟踪 Neoverse V2 的完整编译记录。CUDA 部分沿用这一契约，分别展开 cp.async 双缓冲、ldmatrix/mma 的 lane 映射，以及 TMA/mbarrier 的完成与复用协议。">
+<meta name="post:summary_en"      content="Trace value and pointer versions of one FP32 addition through AArch64 constraints, memory dependencies, clobbers, and a complete Neoverse V2 GCC compilation record. Then apply the same contract to CUDA through cp.async double buffering, ldmatrix/mma lane mappings, and TMA/mbarrier completion and reuse.">
+<meta name="post:series"          content="gpu-programming-basics">
+<meta name="post:series_title"    content="GPU Programming Basics">
+<meta name="post:series_title_en" content="GPU Programming Basics">
+<meta name="post:series_order"    content="9">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(','\\)'], ['$','$']], displayMath: [['\\[','\\]'], ['$$','$$']] },
+    options: { skipHtmlTags: ['script', 'style', 'pre', 'code'] }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
+<script src="../lang-toggle.js" defer></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Geist+Mono:wght@400;500&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  main.content { max-width: 1060px; min-width: 0; padding: 56px 32px 96px; letter-spacing: 0; }
+  main.content h1,
+  main.content h2,
+  main.content h3 { letter-spacing: 0; }
+  .reading-guide { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 22px 0 34px; padding: 14px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); font-size: 14px; }
+  .reading-guide strong { color: var(--fg-muted); font-weight: 500; }
+  .reading-guide a { text-decoration: none; }
+  .reading-guide a:hover { text-decoration: underline; }
+  .lead {
+    max-width: 86ch;
+    margin: -6px 0 30px;
+    color: var(--fg-muted);
+    font-size: 17px;
+    line-height: 1.8;
+  }
+  .table-scroll {
+    max-width: 100%;
+    margin: 18px 0 26px;
+    overflow-x: auto;
+  }
+  table.note-table {
+    width: 100%;
+    min-width: 700px;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  table.note-table th,
+  table.note-table td {
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    text-align: left;
+    vertical-align: top;
+  }
+  table.note-table th { background: var(--bg-elevated); font-weight: 600; }
+  .note-box {
+    margin: 18px 0 26px;
+    padding: 12px 16px;
+    border-left: 3px solid var(--accent);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    background: var(--accent-tint);
+  }
+  .note-box.warn {
+    border-left-color: #d97706;
+    background: rgba(217, 119, 6, 0.08);
+  }
+  .note-box p { margin: 6px 0; }
+  .diagram-frame {
+    max-width: 100%;
+    margin: 20px 0 30px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    box-sizing: border-box;
+  }
+  .diagram-title {
+    margin-bottom: 10px;
+    color: var(--fg-subtle);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  .diagram-svg {
+    display: block;
+    width: 100%;
+    min-width: 720px;
+    height: auto;
+  }
+  .diagram-svg text { fill: var(--fg); font-family: var(--font-sans); letter-spacing: 0; }
+  .diagram-svg .mono { font-family: var(--font-mono); }
+  .diagram-svg .muted { fill: var(--fg-muted); }
+  .diagram-svg .box { fill: var(--bg); stroke: var(--border-strong); stroke-width: 1.2; }
+  .diagram-svg .accent { fill: rgba(190, 24, 93, 0.08); stroke: #be185d; stroke-width: 1.3; }
+  .diagram-svg .ready { fill: rgba(5, 150, 105, 0.09); stroke: #059669; stroke-width: 1.3; }
+  .diagram-svg .arrow { fill: none; stroke: var(--fg-muted); stroke-width: 1.4; }
+  pre.code { tab-size: 2; }
+  main.content mjx-container[display="true"] {
+    max-width: 100%;
+    padding-bottom: 2px;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  @media (max-width: 960px) {
+    main.content { width: 100%; max-width: 100%; padding: 48px 20px 80px; }
+  }
+  @media (max-width: 720px) {
+    .lead { font-size: 16px; }
+    .diagram-frame { padding: 12px; }
+  }
+
+  .post-page main.content h2[id], .post-page main.content h3[id], .post-page main.content h4[id], .post-page main.content .legacy-anchor { scroll-margin-top: 80px; }
+  .article-toc > summary { display: none; }
+  .post-page aside.toc ul ul { padding-left: 12px; margin: 3px 0 6px; }
+  .post-page aside.toc ul ul a { font-size: 12px; }
+  .post-page main.content .reading-guide p { font-size: 15px; line-height: 1.75; }
+  @media (max-width: 1099px) {
+    .post-page main.content .article-toc { margin: 0 0 24px; }
+    .article-toc > summary { display: list-item; cursor: pointer; padding: 10px 0; color: var(--fg-muted); font-size: 15px; }
+    .article-toc > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+    .post-page .article-toc aside.toc { margin: 6px 0 0 !important; }
+    .post-page .article-toc aside.toc ul ul { columns: 1; }
+  }
+  @media (min-width: 1100px) { .diagram-svg { min-width: 0; } }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<main class="content">
+<details class="article-toc" open>
+<summary><span class="lang-zh">目录与系列</span><span class="lang-en">Contents and series</span></summary>
+<aside class="toc"><div class="toc-title">目录 · TOC</div>
+<div class="lang-zh"><ul>
+<li><a href="#zh-contract">1. 从加法读懂契约</a></li>
+<li><a href="#zh-gnu-pointer">2. 指针与内存依赖</a></li>
+<li><a href="#zh-gnu-output">3. GCC 实测结果</a></li>
+<li><a href="#zh-ptx">4. 同一加法的 PTX 写法</a></li>
+<li><a href="#zh-ptx-loops">5. GPU 内环阅读路径</a><ul><li><a href="#zh-cpasync">cp.async</a></li><li><a href="#zh-ldmatrix">ldmatrix / mma.sync</a></li><li><a href="#zh-tma">TMA / mbarrier</a></li></ul></li>
+<li><a href="#zh-verify">6. 验证结果与收益</a></li>
+<li><a href="#zh-gnu">附录 A：语法与约束</a></li>
+<li><a href="#zh-gcc-record">附录 B：完整编译记录</a></li>
+<li><a href="#zh-isa-versions">附录 C：版本边界</a></li>
+<li><a href="#zh-refs">参考资料</a></li>
+</ul></div>
+<div class="lang-en"><ul>
+<li><a href="#en-contract">1. The addition contract</a></li>
+<li><a href="#en-gnu-pointer">2. Pointers and memory</a></li>
+<li><a href="#en-gnu-output">3. GCC experiment</a></li>
+<li><a href="#en-ptx">4. The PTX addition</a></li>
+<li><a href="#en-ptx-loops">5. GPU loop reading paths</a><ul><li><a href="#en-cpasync">cp.async</a></li><li><a href="#en-ldmatrix">ldmatrix / mma.sync</a></li><li><a href="#en-tma">TMA / mbarrier</a></li></ul></li>
+<li><a href="#en-verify">6. Validation and performance</a></li>
+<li><a href="#en-gnu">Appendix A: Syntax</a></li>
+<li><a href="#en-gcc-record">Appendix B: GCC record</a></li>
+<li><a href="#en-isa-versions">Appendix C: Versions</a></li>
+<li><a href="#en-refs">References</a></li>
+</ul></div>
+</aside>
+</details>
+<div class="lang-zh">
+<h1>嵌入汇编的约束模型与核心循环：AArch64 与 NVIDIA PTX</h1>
+<p class="lead">同样是把两个 float 相加，一段 AArch64 内嵌汇编只生成 <code>fadd</code> 和 <code>ret</code>，另一段却在返回前多出一条 <code>fmov</code>。区别来自参数与临时寄存器的写法。顺着这两个函数看下去，就能看见编译器怎样接收汇编的输入、分配输出，又怎样处理模板没有直接暴露的内存访问。CUDA 的 inline PTX 沿用这类接口；进入异步复制和 Tensor Core 循环后，还要补上参与线程、数据布局和完成等待。</p>
+
+<nav class="reading-guide" aria-label="快速索引">
+  <strong>快速索引</strong>
+  <a href="#zh-contract">读懂一条 asm</a>
+  <a href="#zh-gnu-pointer">检查指针与副作用</a>
+  <a href="#zh-gnu-output">追踪 GCC 编译结果</a>
+  <a href="#zh-ptx-loops">选择 GPU 内环案例</a>
+  <a href="#zh-verify">验证正确性与收益</a>
+</nav>
+
+<h2 id="zh-contract">1. 从一条加法读懂编译器契约</h2>
+<p>先把需求缩到最小：C 接收两个 FP32 值，AArch64 的 <code>fadd</code> 计算和，结果回到 C。普通 <code>return lhs + rhs</code> 已能表达这个运算；这里展开它，是为了逐项观察 asm 接口。</p>
+<pre class="code">float add_f32(float lhs, float rhs) {
+  float out;
+  asm(
+      "fadd %s0, %s1, %s2"
+      : "=w"(out)
+      : "w"(lhs), "w"(rhs));
+  return out;
+}
+</pre>
+<p>模板中的 <code>%s0</code>、<code>%s1</code>、<code>%s2</code> 还没有固定寄存器编号。编译器先读取冒号后的 operand 列表，按 output 在前、input 在后的顺序，把 <code>out</code>、<code>lhs</code>、<code>rhs</code> 编为 0、1、2，再根据约束选择寄存器。</p>
+<div class="table-scroll"><table class="note-table">
+<thead><tr><th>本例写法</th><th>编译器据此知道什么</th><th>模板怎样使用它</th></tr></thead>
+<tbody>
+<tr><td><code>"=w"(out)</code></td><td>写入一个新浮点值，使用 AArch64 FP/SIMD register class</td><td><code>%s0</code> 是该输出寄存器的 32-bit FP 视图</td></tr>
+<tr><td><code>"w"(lhs), "w"(rhs)</code></td><td>读取两个 C 值，输入需要 FP/SIMD registers</td><td><code>%s1</code>、<code>%s2</code> 是加法的两个源</td></tr>
+<tr><td>没有 clobber</td><td>没有额外固定临时寄存器、NZCV flags 或内存访问需要声明</td><td>所有数据依赖都在上述 operands 中</td></tr>
+</tbody></table></div>
+<p><a href="https://gcc.gnu.org/onlinedocs/gcc-15.1.0/gcc/Machine-Constraints.html" target="_blank" rel="noopener">AArch64 的 <code>w</code> constraint</a> 选择寄存器类别，模板中的 <code>s</code> modifier 再选择寄存器名称的宽度形式。一次实际展开可以是 <code>fadd s0, s0, s1</code>：输出与第一个输入复用 <code>s0</code>。单条 <code>fadd</code> 允许这样的源、目的重叠，<code>=</code> 因而足够。结果通过 <code>out</code> 被 C 使用，也就不需要靠 <code>volatile</code> 保留这条 asm。</p>
+
+<h3 id="zh-gnu-symbolic">把位置编号换成名称</h3>
+<p>函数稍长以后，反复数 <code>%0</code>、<code>%1</code> 容易出错。GNU extended asm 允许给 operand 命名；下面只改变引用方式，输入、输出契约保持相同。</p>
+<pre class="code">float add_f32_named(float lhs, float rhs) {
+  float out;
+  asm(
+      "fadd %s[out], %s[lhs], %s[rhs]"
+      : [out] "=w"(out)
+      : [lhs] "w"(lhs), [rhs] "w"(rhs));
+  return out;
+}
+</pre>
+<p><code>[lhs]</code> 在 operand 列表中声明名称，<code>%[lhs]</code> 在模板中引用它，<code>%s[lhs]</code> 另外要求以 <code>sN</code> 形式输出寄存器名称。这些方括号都属于 GNU asm 语法。下一步把参数改为指针时，模板里还会出现另一种方括号。</p>
+
+<h2 id="zh-gnu-pointer">2. 参数改为指针后，少声明了一条什么依赖</h2>
+<p>现在由 asm 自己从内存取两个值。输入的 C 类型变成 <code>const float*</code>，地址使用通用寄存器；两条 <code>ldr</code> 固定把数据装入 <code>s0</code> 和 <code>s1</code>。</p>
+<pre class="code">float add_f32_from_memory(const float* lhs, const float* rhs) {
+  float out;
+  asm(
+      "ldr s0, [%[lhs_ptr]]\n\t"
+      "ldr s1, [%[rhs_ptr]]\n\t"
+      "fadd %s[out], s0, s1"
+      : [out] "=w"(out)
+      : [lhs_ptr] "r"(lhs), [rhs_ptr] "r"(rhs)
+      : "v0", "v1", "memory");
+  return out;
+}
+</pre>
+<p><code>[lhs_ptr] "r"(lhs)</code> 声明一个名为 <code>lhs_ptr</code> 的地址 operand。假设编译器把它放进 <code>x0</code>，模板中的 <code>%[lhs_ptr]</code> 就展开为 <code>x0</code>，外层的 <code>[%[lhs_ptr]]</code> 则成为 AArch64 的内存操作数 <code>[x0]</code>。GNU 命名引用到此结束，剩下的方括号由 AArch64 assembler 解释。</p>
+<p>这段模板比前一个函数多承担了两项责任。固定写入的 <code>s0</code>、<code>s1</code> 必须通过 <code>"v0", "v1"</code> 声明 clobber，使编译器为 <code>out</code> 另选位置。两次 <code>ldr</code> 读取的内存也要声明：<code>"r"(lhs)</code> 只告诉编译器地址值参与计算，<code>*lhs</code> 的内容则由 <code>"memory"</code> 纳入依赖。</p>
+<p>若删掉 <code>"memory"</code>，这份契约就把输出描述成仅依赖两个地址值。函数内联到调用方后，即使调用方修改了 <code>*lhs</code>，编译器也无法从 operands 得知 asm 需要读取新值；相关 store 的移动或 asm 的合并便可能改变结果。汇编器仍然能接受每条指令，错误出在 C 与模板交接的数据流上。</p>
+
+<h3 id="zh-memory-footprint">已知访问范围时，声明具体内存对象</h3>
+<p><code>"memory"</code> 保守地覆盖未列出的内存读写。这个函数只读两个 float，可以保留地址 operands，再添加两个 memory inputs，把范围收窄：</p>
+<pre class="code">asm(
+    "ldr s0, [%[lhs_ptr]]\n\t"
+    "ldr s1, [%[rhs_ptr]]\n\t"
+    "fadd %s[out], s0, s1"
+    : [out] "=w"(out)
+    : [lhs_ptr] "r"(lhs),
+      [rhs_ptr] "r"(rhs),
+      [lhs_mem] "m"(*lhs),  // 精确声明读取 *lhs
+      [rhs_mem] "m"(*rhs)   // 精确声明读取 *rhs
+    : "v0", "v1");
+</pre>
+<p><code>lhs_mem</code> 和 <code>rhs_mem</code> 不必出现在指令文本中；它们给编译器补上 <code>*lhs</code>、<code>*rhs</code> 的读取依赖，实际取数仍由 <code>ldr</code> 完成。<a href="https://gcc.gnu.org/onlinedocs/gcc-15.1.0/gcc/Extended-Asm.html#Clobbers-and-Scratch-Registers" target="_blank" rel="noopener">GCC 的 clobber 文档</a> 给出了这种同时声明地址和被访问对象的方式。</p>
+
+<h3 id="zh-side-effects">把保留、依赖和硬件同步分别落实</h3>
+<p><code>volatile</code> 适合保留无法由 outputs 完整表达的副作用，例如提交异步复制或触发同步指令。它仍允许编译器进行部分移动，不能补上遗漏的内存依赖。Memory operands 与 <code>"memory"</code> 约束编译器如何安排内存访问；CPU 的跨核顺序和 GPU 的异步完成，则需要各自 ISA 的 fence、barrier 或 wait。</p>
+<div class="diagram-frame"><div class="diagram-title">指针版本的编译器依赖</div>
+<svg class="diagram-svg" viewBox="0 0 780 238" role="img" aria-labelledby="zh-asm-title zh-asm-desc">
+<title id="zh-asm-title">地址、内存内容与输出</title>
+<desc id="zh-asm-desc">地址 inputs 进入 ldr 和 fadd 模板，output 与 clobber 声明结果和寄存器改写，单独的 memory dependency 声明读取指针指向的内容。</desc>
+<defs><marker id="zh-asm-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#71717a"></path></marker></defs>
+<rect class="box" x="16" y="18" width="218" height="96" rx="4"></rect>
+<text x="125" y="44" text-anchor="middle" font-size="15" font-weight="600">地址 inputs</text>
+<text class="mono" x="125" y="71" text-anchor="middle" font-size="13">"r"(lhs), "r"(rhs)</text>
+<text class="muted" x="125" y="94" text-anchor="middle" font-size="12">传入地址数值</text>
+<rect class="accent" x="280" y="18" width="220" height="96" rx="4"></rect>
+<text x="390" y="44" text-anchor="middle" font-size="15" font-weight="600">汇编模板</text>
+<text class="mono" x="390" y="71" text-anchor="middle" font-size="13">ldr → ldr → fadd</text>
+<text class="muted" x="390" y="94" text-anchor="middle" font-size="12">读取内存并计算</text>
+<rect class="ready" x="546" y="18" width="218" height="96" rx="4"></rect>
+<text x="655" y="44" text-anchor="middle" font-size="15" font-weight="600">输出与寄存器改写</text>
+<text class="mono" x="655" y="71" text-anchor="middle" font-size="13">"=w"(out)</text>
+<text class="mono muted" x="655" y="94" text-anchor="middle" font-size="12">clobber: "v0", "v1"</text>
+<path class="arrow" d="M234 65H274" marker-end="url(#zh-asm-arrow)"></path>
+<path class="arrow" d="M500 65H540" marker-end="url(#zh-asm-arrow)"></path>
+<rect class="box" x="130" y="156" width="520" height="66" rx="4"></rect>
+<text x="390" y="181" text-anchor="middle" font-size="14">内存内容另有依赖</text>
+<text class="mono muted" x="390" y="204" text-anchor="middle" font-size="12">"memory" 或 "m"(*lhs), "m"(*rhs)</text>
+<path class="arrow" d="M390 156V120" marker-end="url(#zh-asm-arrow)"></path>
+</svg></div>
+<p>沿着这张图检查一个 wrapper，可以先找 C 值怎样进入指令，再找结果怎样返回，最后查看是否还有固定寄存器或指针间接访问。<code>+</code> 表示旧值也会被读取，<code>&amp;</code> 处理多指令模板提前改写输出的情况；完整语法与约束表放在 <a href="#zh-gnu">附录 A</a>，方便写代码时查阅。</p>
+
+<h2 id="zh-gnu-output">3. 在 Neoverse V2 的 GCC 输出里找到这些选择</h2>
+<p>2026-09-03 在 ComputeLab-SC 的 AArch64 节点上，原始实验用 GCC 13.3.0 编译了上述 named-operand 值参数版本和带 <code>"memory"</code> 的指针版本。将 object 与最小 driver 链接后，输入 <code>1.25</code> 和 <code>2.5</code> 得到 <code>value=3.75 pointer=3.75</code>，退出状态为 0。这是两个数据路径的一次运行记录；没有计时结果，也没有覆盖所有浮点边界。</p>
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>项目</th><th>实测值</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>日期</td><td>2026-09-03</td></tr>
+    <tr><td>Architecture</td><td><code>aarch64</code></td></tr>
+    <tr><td>CPU</td><td>Arm Neoverse V2，72 cores</td></tr>
+    <tr><td>Compiler</td><td><code>gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code></td></tr>
+    <tr><td>Target options</td><td><code>-std=gnu11 -O2 -mcpu=neoverse-v2 -fverbose-asm</code></td></tr>
+  </tbody>
+</table>
+</div>
+<p>先取出生成文件中两个函数的指令，差异就很清楚：</p>
+<pre class="code">add_f32:
+    fadd s0, s0, s1
+    ret
+
+add_f32_from_memory:
+    ldr  s0, [x0]
+    ldr  s1, [x1]
+    fadd s2, s0, s1
+    fmov s0, s2
+    ret
+</pre>
+<p>按照 <a href="https://github.com/ARM-software/abi-aa/blob/2025Q1/aapcs64/aapcs64.rst" target="_blank" rel="noopener">AAPCS64</a>，两个 float 参数进入 <code>s0</code>、<code>s1</code>，FP32 返回值也放在 <code>s0</code>。值参数版本允许输入、输出重叠，GCC 直接把结果留在返回寄存器。指针版本的参数进入 <code>x0</code>、<code>x1</code>，而 <code>v0</code>、<code>v1</code> 已列为 clobber，GCC 给输出分配了 <code>s2</code>，随后补一条 <code>fmov</code> 满足返回约定。</p>
+<p>多出的 move 因而可以追溯到模板固定占用了两个临时寄存器。它提醒我们检查 wrapper 周围的生成代码，单看 <code>fadd</code> 这一行无法评价代价。<a href="#zh-gcc-record">附录 B</a>保留完整源文件、<code>-E</code> / <code>-S</code> / <code>-c</code> 命令，以及带逐行解释的原始 <code>.s</code>；其中的 ELF、alignment 和 unwind directives 也都保留。</p>
+
+<h2 id="zh-ptx">4. 把同一个加法放进 CUDA inline PTX</h2>
+<p>GPU 版本仍然接收两个 float、返回一个 float。更换的是寄存器约束和模板指令；它必须放在 CUDA translation unit 中，与前面的 AArch64 函数分别编译。</p>
+<pre class="code">__device__ __forceinline__
+float add_f32(float lhs, float rhs) {
+  float out;
+  asm(
+      "add.rn.f32 %0, %1, %2;"
+      : "=f"(out)
+      : "f"(lhs), "f"(rhs));
+  return out;
+}</pre>
+<p><code>"=f"(out)</code> 选择一个 write-only 的 <code>.f32</code> PTX register，两个 <code>"f"</code> inputs 传入 FP32 值。<code>%0</code>、<code>%1</code>、<code>%2</code> 仍按 outputs 在前的顺序编号；<code>add.rn.f32</code> 则明确指定 round-to-nearest-even。逐位比较两种实现时，还应固定舍入和浮点环境。</p>
+<div class="table-scroll"><table class="note-table">
+<thead><tr><th>交接点</th><th>AArch64 inline asm</th><th>CUDA inline PTX</th></tr></thead>
+<tbody>
+<tr><td>输入与输出</td><td><code>"w"</code> / <code>"=w"</code>，FP/SIMD register class</td><td><code>"f"</code> / <code>"=f"</code>，<code>.f32</code> PTX register</td></tr>
+<tr><td>模板引用</td><td><code>%s0</code> 或 <code>%s[name]</code></td><td><code>%0</code> 等编号</td></tr>
+<tr><td>一次可能的展开</td><td><code>fadd s0, s0, s1</code></td><td><code>add.rn.f32 %f3, %f1, %f2;</code></td></tr>
+<tr><td>后端还要做什么</td><td>assembler 编码目标 ISA 指令</td><td><code>ptxas</code> 将虚拟 PTX registers 与指令继续 lowering 为 SASS</td></tr>
+</tbody></table></div>
+<p>因此，PTX 模板中的寄存器编号不能直接拿来计算最终硬件寄存器数。<code>ptxas</code> 的资源报告和 SASS 才能回答那个问题。CUDA 接口也只承诺其文档列出的 constraint 集合；GCC 的 <code>"m"</code>、<code>"w"</code> 等 CPU 写法不能直接移植过去。常用 PTX 类型映射见 <a href="#zh-ptx-constraints">附录 A 的 PTX 对照表</a>。</p>
+
+<h3 id="zh-address-spaces">地址和局部名字在 PTX 边界重新检查</h3>
+<p>CUDA 传入 asm 的 pointer 是 generic address。global 地址通常通过 64-bit <code>"l"</code> operand 传入；当指令要求 32-bit shared address 时，先用下面的 helper 转换，再以 <code>"r"</code> 传递。</p>
+<pre class="code">__device__ __forceinline__ uint32_t smem_addr(const void* p) {
+  return static_cast&lt;uint32_t&gt;(__cvta_generic_to_shared(p));
+}
+</pre>
+<p>例如 <code>[%0]</code> 的外层方括号属于 PTX addressing syntax，前端只替换内部 operand。模板若定义临时 <code>.reg</code> 或 label，就用花括号围成局部作用域，避免多次 inline 后重名。寄存器类型或指令形式与约束不匹配，通常要到 <code>ptxas</code> 才会报错。<a href="https://docs.nvidia.com/cuda/archive/13.1.1/inline-ptx-assembly/index.html" target="_blank" rel="noopener">CUDA 13.1.1 inline PTX 指南</a> 对这些接口规则有完整定义。</p>
+
+<h2 id="zh-ptx-loops">5. 三条 GPU 内环阅读路径</h2>
+<p>加法的结果在 asm 结束后就能作为 C 值使用。下面的循环开始承担另外两类责任：有的指令把数据分布到整个 warp，有的只提交复制，数据稍后才到。可以按手头的问题选择一条路径；三个例子各自说明完整的内环顺序，GPU 代码没有附带实测性能结果。</p>
+<div class="table-scroll"><table class="note-table">
+<thead><tr><th>阅读目标</th><th>所需背景与目标</th><th>循环要建立的条件</th></tr></thead>
+<tbody>
+<tr><td><a href="#zh-cpasync">两个 shared stage 轮流取数</a></td><td>CTA 同步、global/shared memory；<code>sm_80+</code></td><td>当前 copy group 完成，读者离开后才覆盖 stage</td></tr>
+<tr><td><a href="#zh-ldmatrix">把 shared tile 送入 Tensor Core</a></td><td>warp/lane、行列布局；本组合 <code>sm_80+</code></td><td>行地址与 fragment 对应，32 lanes 一起执行</td></tr>
+<tr><td><a href="#zh-tma">让 TMA 搬运二维 tile</a></td><td>tensor map、mbarrier phase；<code>sm_90+</code></td><td>初始化发布、到达与字节计数、等待和复用</td></tr>
+</tbody></table></div>
+<p>这些 device-side 示例使用 CUDA 13.1.1 的公开 PTX 定义。编译时需要 <code>&lt;cuda_runtime.h&gt;</code>、<code>&lt;cuda_fp16.h&gt;</code>、<code>&lt;cstdint&gt;</code> 和 <code>&lt;cstddef&gt;</code>；TMA 还使用 <code>&lt;cuda.h&gt;</code> 中的 <code>CUtensorMap</code>。共享上述 <code>smem_addr</code> helper，针对所选架构编译相应代码。</p>
+
+<h3 id="zh-cpasync">5.1 cp.async：提交下一块，等待当前块</h3>
+<p>普通 global load 先把值带入线程寄存器，再由线程写入 shared memory。Ampere 的 <code>cp.async</code> 提供 global-to-shared 异步复制：线程提交请求以后可以继续工作。这里每个线程复制一个 16-byte <code>float4</code>，两个 shared stage 交替使用。</p>
+<pre class="code">__device__ __forceinline__ void cp_async_16(void* dst_smem,
+    const void* src_gmem) {
+  const uint32_t dst = smem_addr(dst_smem);
+  asm volatile(
+      "cp.async.ca.shared.global [%0], [%1], 16;\n"
+      :: "r"(dst), "l"(src_gmem)
+      : "memory");
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+  asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+template &lt;int N&gt;
+__device__ __forceinline__ void cp_async_wait_group() {
+  asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory");
+}
+</pre>
+<p><code>commit_group</code> 把本线程此前尚未提交的 copies 组成一组。<code>wait_group N</code> 等到至多剩下最新的 \(N\) 组未完成。因此先提交 tile 0、再提交 tile 1，执行 <code>wait_group&lt;1&gt;</code> 后便可消费较老的 tile 0，而 tile 1 仍可继续传输。最后没有新 tile 可提交，就用 <code>wait_group&lt;0&gt;</code> 排空。</p>
+<div class="table-scroll"><table class="note-table">
+<thead><tr><th>三 tile 示例</th><th>本轮先提交</th><th>等待后消费</th><th>本轮读完后可复用</th></tr></thead>
+<tbody>
+<tr><td>预热</td><td>tile 0 → stage 0</td><td>尚未消费</td><td>stage 1 仍空</td></tr>
+<tr><td>第 0 轮</td><td>tile 1 → stage 1</td><td><code>wait_group&lt;1&gt;</code>；tile 0</td><td>stage 0</td></tr>
+<tr><td>第 1 轮</td><td>tile 2 → stage 0</td><td><code>wait_group&lt;1&gt;</code>；tile 1</td><td>stage 1</td></tr>
+<tr><td>第 2 轮</td><td>无</td><td><code>wait_group&lt;0&gt;</code>；tile 2</td><td>退出</td></tr>
+</tbody></table></div>
+<p>完整的 device-side kernel 如下。调用形状是 <code>scale2_cp_async&lt;128&gt;&lt;&lt;&lt;1, 128&gt;&gt;&gt;(...)</code>：这个教学版本由一个 CTA 处理 <code>tiles * Threads</code> 个 float4，输入、输出是互不重叠的完整数组，起始地址满足 16-byte 对齐。输出的每个分量都是输入的两倍。</p>
+<pre class="code">template &lt;int Threads&gt;
+__global__ void scale2_cp_async(float4* out, const float4* in, int tiles) {
+  static_assert(Threads &gt; 0 &amp;&amp; Threads &lt;= 1024);
+  __shared__ __align__(16) float4 stage[2][Threads];
+
+  const int tid = threadIdx.x;
+  if (tiles &lt;= 0) return;  // uniform for the whole CTA
+
+  cp_async_16(&amp;stage[0][tid], &amp;in[tid]);
+  cp_async_commit();
+
+  int read_stage = 0;
+  for (int tile = 0; tile &lt; tiles; ++tile) {
+    const int write_stage = read_stage ^ 1;
+    const bool has_next = tile + 1 &lt; tiles;
+
+    if (has_next) {
+      const size_t next = size_t(tile + 1) * Threads + tid;
+      cp_async_16(&amp;stage[write_stage][tid], &amp;in[next]);
+      cp_async_commit();
+      cp_async_wait_group&lt;1&gt;();
+    } else {
+      cp_async_wait_group&lt;0&gt;();
+    }
+
+    __syncthreads();
+    const float4 v = stage[read_stage][tid];
+    const size_t current = size_t(tile) * Threads + tid;
+    out[current] = {2.0f * v.x, 2.0f * v.y, 2.0f * v.z, 2.0f * v.w};
+
+    __syncthreads();  // readers finish before this stage is reused
+    read_stage = write_stage;
+  }
+}
+</pre>
+<p>两处 CTA 同步有不同作用。前一处把各线程已经等待到的复制结果交接给整个 CTA；后一处确认本轮读者都已离开，下一轮才覆盖刚读过的 stage。这个 scale 例子只读取各自负责的 float4，但保留了可供协作计算使用的 CTA 交接。两阶段安排提供复制与计算重叠的机会，是否缩短时间还取决于计算量和硬件负载。</p>
+<p>尾部不足一个完整 tile 时，需要对 load 和 output store 一起增加边界处理；<code>cp.async</code> 的 <code>src-size</code> / zero-fill 只解决复制端。增加 stage 时也要重新计算 wait depth、未完成组数与 shared memory 占用。<a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async" target="_blank" rel="noopener">PTX 的 cp.async 定义</a>明确了每线程 group 和完成可见性的范围。</p>
+
+<h3 id="zh-ldmatrix">5.2 ldmatrix 与 mma.sync：地址决定 fragment 的含义</h3>
+<p>数据已在 shared memory 中，下一步要让一个 warp 计算 \(D_{16\times8}=A_{16\times16}B_{16\times8}+C_{16\times8}\)。<code>mma.sync.m16n8k16</code> 的输入分布在 32 个 lane 中，每个 lane 持有 A 的四个 <code>.b32</code> registers、B 的两个，以及四个 FP32 accumulator。向指令传入正确宽度的寄存器，只完成了接口的一半；每个寄存器里的元素还必须放对位置。</p>
+<p><code>ldmatrix</code> 负责从 shared memory 装载 \(8\times8\) 的 16-bit 子矩阵并分发 fragment。<code>.x4</code> 的 lanes 0–7、8–15、16–23、24–31 分别提供四个子矩阵的行地址；<code>.x2</code> 由前两组提供两个。地址是 warp 协作装载的输入，结果分散到整个 warp。</p>
+<pre class="code">__device__ __forceinline__ void ldmatrix_x4(
+    uint32_t (&amp;dst)[4], const __half* src) {
+  const uint32_t addr = smem_addr(src);
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+      "{%0, %1, %2, %3}, [%4];\n"
+      : "=r"(dst[0]), "=r"(dst[1]), "=r"(dst[2]), "=r"(dst[3])
+      : "r"(addr)
+      : "memory");
+}
+
+__device__ __forceinline__ void ldmatrix_x2_trans(
+    uint32_t (&amp;dst)[2], const __half* src) {
+  const uint32_t addr = smem_addr(src);
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
+      "{%0, %1}, [%2];\n"
+      : "=r"(dst[0]), "=r"(dst[1])
+      : "r"(addr)
+      : "memory");
+}
+
+__device__ __forceinline__ void mma_m16n8k16(
+    float (&amp;acc)[4], const uint32_t (&amp;a)[4], const uint32_t (&amp;b)[2]) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+      "{%0, %1, %2, %3}, "
+      "{%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+      : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+        "r"(b[0]), "r"(b[1]));
+}
+</pre>
+<p>令 A 在 shared memory 中按 row-major \(16\times K\) 存放，B 按 row-major \(K\times8\) 存放。以下是嵌入 GEMM kernel 的完整 K-reduction 片段：外层已经装好 A/B 并完成必要的线程同步，\(K\) 为正的 16 倍数，基址 16-byte 对齐，所有 32 lanes 一致执行。它没有包含 global staging 和最终 accumulator store。</p>
+<pre class="code">// All 32 lanes execute this loop uniformly.
+// a_smem: row-major [16, K], b_smem: row-major [K, 8].
+const int lane = threadIdx.x &amp; 31;
+float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+for (int k0 = 0; k0 &lt; K; k0 += 16) {
+  const int a_row = lane &amp; 15;
+  const int a_col = k0 + (lane &gt;&gt; 4) * 8;
+  const int b_row = k0 + (lane &amp; 15);
+
+  uint32_t a_frag[4];
+  uint32_t b_frag[2];
+  ldmatrix_x4(a_frag, &amp;a_smem[a_row * K + a_col]);
+  ldmatrix_x2_trans(b_frag, &amp;b_smem[b_row * 8]);
+  mma_m16n8k16(acc, a_frag, b_frag);
+}
+</pre>
+<p>A 的 lane 地址依次覆盖左上、左下、右上、右下四个 \(8\times8\) 象限：<code>lane &amp; 15</code> 选择行，<code>(lane &gt;&gt; 4) * 8</code> 选择 K 方向的半块。B 的前 16 个 lanes 提供上下两个 \(8\times8\) 子矩阵的行地址，<code>.trans</code> 形成 <code>row.col</code> MMA 所需的 fragment。<code>"+f"(acc[i])</code> 表示每次 MMA 读取旧累加值并写回新值，正好对应 K 循环的递推。</p>
+<p>这些映射可逐项对照 <a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-16816-float" target="_blank" rel="noopener">PTX 的 m16n8k16 fragment 图</a>和 <a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#warp-level-matrix-instructions-ldmatrix" target="_blank" rel="noopener">ldmatrix 行地址规则</a>。换成 swizzled shared layout 时，必须连同地址公式一起改；增加 bank-conflict 规避和 accumulator store 时，也要维持同一份元素映射。布局较复杂后，CUTLASS/CuTe 可以承接这部分职责。</p>
+
+<h3 id="zh-tma">5.3 TMA 与 mbarrier：一个 stage 的两种完成条件</h3>
+<p>Hopper 的 TMA 用 tensor-map descriptor 保存 global tensor 的形状、stride、元素类型与 tile 布局。提交线程给出坐标，硬件搬运整个二维 tile。这样每轮可以由一个线程提交复制，但全部消费者仍需要知道 tile 何时到齐，以及旧数据何时可以被覆盖。</p>
+<p>这里为两个 shared stage 各放一个 <code>mbarrier</code>。它是一个 8-byte 对齐的 64-bit shared-memory 对象，跟踪当前 phase、arrival count 和 transaction count。每个 stage 每轮只有 thread 0 执行一次 <code>arrive.expect_tx</code>，所以初始化 arrival count 为 1；其他线程只等待，不算 arrival。Thread 0 同时登记 <code>TileBytes</code> 个预期字节，TMA 的 <code>complete_tx</code> 在复制完成时抵扣它们。到达计数与字节计数都满足后，这一 phase 才完成。</p>
+<p>下面使用 PTX 8.0 / <code>sm_90</code> 已有的 <code>.shared::cluster</code> destination 形式，目的地址和 barrier 都位于本 CTA。初始化后执行 <code>fence.mbarrier_init.release.cluster</code>，再用 CTA 同步发布初始化；这与 <a href="https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/include/cutlass/arch/barrier.h#L709-L722" target="_blank" rel="noopener">CUTLASS 的 barrier-init fence</a> 组合方式一致。等待 wrapper 显式使用 <code>.acquire.cta</code>。</p>
+<pre class="code">__device__ __forceinline__ void mbarrier_init(uint64_t* bar) {
+  const uint32_t addr = smem_addr(bar);
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n"
+               :: "r"(addr) : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_init_fence() {
+  asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+}
+
+__device__ __forceinline__ void mbarrier_arrive_expect_tx(
+    uint64_t* bar, uint32_t bytes) {
+  const uint32_t addr = smem_addr(bar);
+  asm volatile(
+      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 "
+      "_, [%0], %1;\n"
+      :: "r"(addr), "r"(bytes) : "memory");
+}
+
+__device__ __forceinline__ void tma_load_2d(
+    void* dst_smem, const CUtensorMap* map, int32_t x, int32_t y,
+    uint64_t* bar) {
+  const uint32_t dst = smem_addr(dst_smem);
+  const uint32_t mbar = smem_addr(bar);
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global."
+      "mbarrier::complete_tx::bytes.tile "
+      "[%0], [%1, {%2, %3}], [%4];\n"
+      :: "r"(dst), "l"(map), "r"(x), "r"(y), "r"(mbar)
+      : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_wait(
+    uint64_t* bar, uint32_t phase) {
+  const uint32_t addr = smem_addr(bar);
+  asm volatile(
+      "{\n\t"
+      ".reg .pred done;\n"
+      "WAIT:\n\t"
+      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 done, [%0], %1;\n\t"
+      "@done bra DONE;\n\t"
+      "bra WAIT;\n"
+      "DONE:\n\t"
+      "}\n"
+      :: "r"(addr), "r"(phase) : "memory");
+}
+</pre>
+<p>先提交 tile 0；每轮开始时把下一 tile 提交到另一个 stage，再等待读取当前 stage。每个线程分别保存两个 barrier 的 phase parity，初始都是 0。完成一次等待后只翻转刚使用的那个 parity；循环末尾的 CTA 同步保证读者已离开，之后才能再次填充那个 stage。</p>
+<pre class="code">template &lt;int TileRows, int TileCols&gt;
+__global__ void tma_consumer_loop(
+    const __grid_constant__ CUtensorMap tensor_map,
+    float* partial, int tiles) {
+  static_assert(TileRows &gt; 0 &amp;&amp; TileCols &gt; 0);
+  constexpr int TileElems = TileRows * TileCols;
+  constexpr uint32_t TileBytes = TileElems * sizeof(__half);
+
+  static_assert(TileBytes % 128 == 0);  // both stage bases remain aligned
+
+  __shared__ __align__(128) __half stage[2][TileElems];
+  __shared__ __align__(8) uint64_t full[2];
+
+  if (threadIdx.x == 0) {
+    mbarrier_init(&amp;full[0]);
+    mbarrier_init(&amp;full[1]);
+    mbarrier_init_fence();
+  }
+  __syncthreads();
+  if (tiles &lt;= 0) return;
+
+  uint32_t phase[2] = {0, 0};
+  if (threadIdx.x == 0) {
+    mbarrier_arrive_expect_tx(&amp;full[0], TileBytes);
+    const int32_t y = blockIdx.x * tiles * TileRows;
+    tma_load_2d(stage[0], &amp;tensor_map, 0, y, &amp;full[0]);
+  }
+
+  for (int tile = 0; tile &lt; tiles; ++tile) {
+    const int read_stage = tile &amp; 1;
+    const int write_stage = read_stage ^ 1;
+
+    if (threadIdx.x == 0 &amp;&amp; tile + 1 &lt; tiles) {
+      mbarrier_arrive_expect_tx(&amp;full[write_stage], TileBytes);
+      const int32_t y =
+          (blockIdx.x * tiles + tile + 1) * TileRows;
+      tma_load_2d(stage[write_stage], &amp;tensor_map, 0, y,
+                  &amp;full[write_stage]);
+    }
+
+    mbarrier_wait(&amp;full[read_stage], phase[read_stage]);
+    phase[read_stage] ^= 1;
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i &lt; TileElems; i += blockDim.x) {
+      sum += __half2float(stage[read_stage][i]);
+    }
+    partial[(size_t(blockIdx.x) * tiles + tile) * blockDim.x + threadIdx.x] = sum;
+
+    __syncthreads();
+  }
+}
+</pre>
+<p>例如依次读取 tiles 0、1、2、3 时，等待的是 <code>full[0]/phase 0</code>、<code>full[1]/phase 0</code>、<code>full[0]/phase 1</code>、<code>full[1]/phase 1</code>。每次复用仍只需要这一次 arrival，因为等待的线程没有额外 arrive。输出 <code>partial</code> 保存每个线程对当前 tile 的局部和，随后还可做一次 reduction。</p>
+<p>这个 kernel 要配套 host 构造的二维 FP16 tensor map：global 行列布局与坐标 <code>{x, y}</code> 一致，box dimensions 为 <code>{TileCols, TileRows}</code>，element strides 均为 1，interleave 与 swizzle 均关闭，global stride 与地址满足 <a href="https://docs.nvidia.com/cuda/archive/13.1.1/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html" target="_blank" rel="noopener"><code>cuTensorMapEncodeTiled</code> 的要求</a>。可从 <code>TileRows=16, TileCols=64</code> 这样的整 tile 开始，保证所有请求都在输入范围内，<code>partial</code> 至少容纳 <code>gridDim.x * tiles * blockDim.x</code> 个 float。代码使用一维 grid/block，坐标计算需在 int32 范围内；<code>TileBytes % 128 == 0</code> 保持两个 stage 起始地址都对齐。</p>
+<p>观察到 TMA 完成以后，复制结果通过隐含的 async/generic proxy fence 对消费者可见；其依据是 <a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#async-proxy" target="_blank" rel="noopener">PTX async proxy 的完成规则</a>。这里消费者只读取 shared tile。若改成先由线程写 shared memory、再让 TMA 从 shared 写回 global，便要在交接前加入相应的 <code>fence.proxy.async.shared::cta</code>，并使用 bulk async-group 的完成协议；那是不同的数据方向，不能只调换本例指针。</p>
+
+<h2 id="zh-verify">6. 用结果和生成代码决定 wrapper 是否值得保留</h2>
+<p>前面的 AArch64 记录把一条额外 move 追溯到了固定 clobber；三个 GPU 循环则展示了 asm 边界之外的工作：复制完成、lane layout 和 stage 复用。这些条件要先成立，才有可比较的执行时间。</p>
+<p>复现 AArch64 例子时，先比较值参数和指针参数的数值结果，再检查内联到调用方以后修改 pointed memory 的情况，并在不同优化级别下读取生成汇编。GPU 端先用 C++ reference 验证 scale 的每个 float4、GEMM 的完整输出、TMA 每个线程的局部和；至少覆盖 0、1、2 和多 tile，让预热、stage 再次使用和排空都发生。原 Neoverse V2 的一次成功运行只覆盖了所列输入。</p>
+<p>CUDA 代码用 <code>nvcc -keep -Xptxas=-v</code> 留下 PTX 与资源报告，随后用 <code>cuobjdump --dump-sass</code> 或 <code>nvdisasm</code> 检查最终指令。<code>compute-sanitizer</code> 的 memcheck、racecheck、synccheck 可以协助发现越界和同步问题；数值 reference 与协议推导仍要保留。修改后再固定输入、launch 配置和计时条件，比较 runtime、register pressure、shared memory 和 <a href="gpu-occupancy-resource-limits.html">occupancy</a>。</p>
+<p>如果 intrinsic 或库接口已经表达了相同语义，就让编译器继续看见外围计算与循环。需要保留 asm 时，将它收在最小的指令 wrapper 中，把架构要求、内存布局和完成协议写在调用点旁边。将来的维护者就能知道改动哪个条件时，需要重新验证哪一段循环。</p>
+<h2 id="zh-gnu">附录 A：写 wrapper 时查语法与约束</h2>
+
+<p><a href="https://gcc.gnu.org/onlinedocs/gcc-15.1.0/gcc/Extended-Asm.html" target="_blank" rel="noopener">GNU extended asm</a> 的语法把汇编文本与 C/C++ 数据流写在同一条语句中。非 <code>asm goto</code> 的 extended asm 形式如下：</p>
+
+<pre class="code">asm asm_qualifiers (
+    "assembler template"
+    : output_operands
+    : input_operands
+    : clobbers);
+</pre>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>字段</th><th>含义</th><th>语法要求</th><th>语义要求</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>asm_qualifiers</code></td><td><code>volatile</code>、<code>inline</code> 等限定符</td><td>可选</td><td>副作用无法由 output 表达时，通常需要 <code>volatile</code></td></tr>
+    <tr><td><code>assembler template</code></td><td>交给 assembler 的指令模板</td><td>必须提供</td><td>模板中的 operand 引用必须与后三个字段一致</td></tr>
+    <tr><td><code>output_operands</code></td><td>汇编写入的 C lvalue</td><td>允许为空</td><td>凡是由汇编产生或改写、且 C 代码随后可见的值，都必须列出</td></tr>
+    <tr><td><code>input_operands</code></td><td>汇编读取的 C expression</td><td>允许为空</td><td>凡是由 C 传入模板的值，都必须列出</td></tr>
+    <tr><td><code>clobbers</code></td><td>显式 output 之外被改写的寄存器，以及模板的其他副作用</td><td>允许为空；末尾空字段可以省略</td><td>固定临时寄存器、condition flags 和未显式建模的内存副作用必须声明</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>三个冒号字段在语法上都可以为空，但冒号必须保留到最后一个非空字段。只有模板、不写冒号的 <code>asm volatile("nop")</code> 属于 basic asm；有 input 而没有 output 时，需要用连续两个冒号跳过 output；只有 clobber 时则写三个冒号。下面的 <code>instruction</code> 仅表示模板占位符，用来展示四种语法形状。</p>
+
+<pre class="code">asm volatile("nop");                         // template only
+asm("instruction %0" : "=r"(out));          // output only
+asm("instruction %0" :: "r"(in));           // input, no output
+asm volatile("instruction" ::: "memory");   // clobber only
+</pre>
+
+<h3 id="zh-gnu-constraints">GNU operand 与 clobber</h3>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>写法</th><th>契约</th><th>典型用途</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>"=r"(out)</code></td><td>write-only output，由通用寄存器承载</td><td>汇编生成一个新值</td></tr>
+    <tr><td><code>"+r"(x)</code></td><td>read-write operand；同一个 C lvalue 同时是输入和输出</td><td>循环指针、计数器、累加器</td></tr>
+    <tr><td><code>"=&amp;r"(tmp)</code></td><td>early-clobber output，在所有 inputs 消费完之前就可能被写</td><td>多指令模板中的临时输出</td></tr>
+    <tr><td><code>"0"(x)</code></td><td>input 与第 0 个 output 使用同一位置</td><td>显式 tied operand</td></tr>
+    <tr><td><code>"r"(x)</code> / <code>"m"(x)</code></td><td>input 位于通用寄存器或可寻址内存</td><td>标量输入与直接内存 operand</td></tr>
+    <tr><td><code>"w"(x)</code></td><td>AArch64 FP/SIMD/SVE register class</td><td>浮点值与 vector 值</td></tr>
+    <tr><td><code>"i"(k)</code></td><td>编译期 immediate</td><td>位移量、指令模式和常量尺寸</td></tr>
+    <tr><td><code>"cc"</code></td><td>模板改变 condition flags</td><td><code>subs</code>、<code>cmp</code> 等指令</td></tr>
+    <tr><td><code>"memory"</code></td><td>模板访问了未完整列出的内存</td><td>指针间接访问、同步原语与设备 I/O</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>模板有多条指令时，尤其要检查输出是否在最后一个 input 被读之前就写入；这种输出需要 early-clobber 修饰符 <code>&amp;</code>。Output operand 必须是可写的 C lvalue，其 constraint 以 <code>=</code> 或 <code>+</code> 开头。Input operand 可以是一般 C expression，但 input-only operand 不允许被模板改写。Clobber 用于 compiler 没有通过 outputs 分配的固定寄存器和其他隐含状态；由 constraint 分配给 operands 的 registers 不应再次列入 clobber。</p>
+
+<h3 id="zh-ptx-constraints">PTX operand constraints</h3>
+
+<p>CUDA inline PTX 沿用冒号分隔的 asm 外形，但 operand constraint 对应 PTX register type，而不是 GCC 针对 CPU 定义的完整 constraint 集合。常用映射如下：</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>constraint</th><th>PTX register type</th><th>常见 C++ 承载类型</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>"h"</code></td><td><code>.u16</code></td><td><code>uint16_t</code></td></tr>
+    <tr><td><code>"r"</code></td><td><code>.u32</code></td><td><code>uint32_t</code>、shared-memory address</td></tr>
+    <tr><td><code>"l"</code></td><td><code>.u64</code></td><td><code>uint64_t</code>、64-bit generic pointer</td></tr>
+    <tr><td><code>"q"</code></td><td><code>.u128</code></td><td>支持 <code>__int128</code> 的平台</td></tr>
+    <tr><td><code>"f"</code></td><td><code>.f32</code></td><td><code>float</code></td></tr>
+    <tr><td><code>"d"</code></td><td><code>.f64</code></td><td><code>double</code></td></tr>
+    <tr><td><code>"n"</code></td><td>编译期整数 immediate</td><td>template parameter 或常量表达式</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>编号引用的真实 wrapper 可查阅固定提交中的 <a href="https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/include/cutlass/fast_math.h#L926" target="_blank" rel="noopener">CUTLASS fast_math.h</a> 与 <a href="https://github.com/flashinfer-ai/flashinfer/blob/971b0a6b9563be2af10048ce33dffe0d4bce6c8a/csrc/mhc/mhc_post.cu#L49-L57" target="_blank" rel="noopener">FlashInfer mhc_post.cu</a>。这些接口示例也便于对照模板里的编号与 operand 列表。</p><h2 id="zh-gcc-record">附录 B：完整 GCC 源码、命令与逐行汇编</h2><p>实验源文件 <code>add_f32.c</code> 使用 named operands，并保留函数名 <code>add_f32</code>。以下两段函数及后面的原始汇编对应正文列出的 2026-09-03 环境。</p><pre class="code">float add_f32(float lhs, float rhs) {
+  float out;
+  asm(
+      "fadd %s[out], %s[lhs], %s[rhs]"
+      : [out] "=w"(out)
+      : [lhs] "w"(lhs), [rhs] "w"(rhs));
+  return out;
+}
+
+float add_f32_from_memory(const float* lhs, const float* rhs) {
+  float out;
+  asm(
+      "ldr s0, [%[lhs_ptr]]\n\t"
+      "ldr s1, [%[rhs_ptr]]\n\t"
+      "fadd %s[out], s0, s1"
+      : [out] "=w"(out)
+      : [lhs_ptr] "r"(lhs), [rhs_ptr] "r"(rhs)
+      : "v0", "v1", "memory");
+  return out;
+}
+</pre><pre class="code">gcc -std=gnu11 -E -P add_f32.c -o add_f32.i
+
+gcc -std=gnu11 -O2 -mcpu=neoverse-v2 \
+    -fverbose-asm -S add_f32.c -o add_f32.s
+
+gcc -std=gnu11 -O2 -mcpu=neoverse-v2 \
+    -c add_f32.c -o add_f32.o
+</pre><p>源文件成为可执行指令之前会依次经过 preprocessing、compilation 和 assembly。<code>gcc -E</code> 只展开头文件与宏并产生预处理文件；它保留 asm template，也尚未进行寄存器分配。生成文本汇编文件的是 <code>gcc -S</code>，随后 <code>gcc -c</code> 才会调用 assembler 产生 object file。</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>阶段</th><th>命令</th><th>产物</th><th>本例中的变化</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Preprocessing</td><td><code>gcc -E -P add_f32.c -o add_f32.i</code></td><td><code>add_f32.i</code></td><td>源文件没有宏和头文件，两个 asm statements 原样保留</td></tr>
+    <tr><td>Compilation</td><td><code>gcc -O2 -S ...</code></td><td><code>add_f32.s</code></td><td>解析 constraints、分配 registers，并展开 assembler template</td></tr>
+    <tr><td>Assembly</td><td><code>gcc -O2 -c ...</code></td><td><code>add_f32.o</code></td><td>GNU assembler 把 AArch64 文本指令编码进 ELF object</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p><code>-fverbose-asm</code> 保留 source location、operand 名称和有效选项，注释随 GCC build 而变。下面保存 <code>add_f32.s</code> 的全部原始行，并在相关行前插入 <code>// [解读]</code>。机器指令与 directives 不受这些解释性注释影响。</p><pre class="code">// [解读] -mcpu=neoverse-v2 选择的 ISA baseline 与 extensions；assembler 据此检查指令。
+	.arch armv9-a+crc+profile+rng+memtag+sve2-bitperm+i8mm+bf16
+// [解读] 登记源文件名，供诊断和调试信息引用。
+	.file	"add_f32.c"
+// [解读] 以下两行由 -fverbose-asm 写入，只记录 compiler 及其依赖库版本。
+// GNU C11 (Ubuntu 13.3.0-6ubuntu2~24.04.1) version 13.3.0 (aarch64-linux-gnu)
+//	compiled by GNU C version 13.3.0, GMP version 6.3.0, MPFR version 4.2.1, MPC version 1.3.1, isl version isl-0.26-GMP
+
+// [解读] 下面仍是 verbose comments：GCC 内部参数以及本次生效的 compiler options。
+// GGC heuristics: --param ggc-min-expand=100 --param ggc-min-heapsize=131072
+// options passed: -mcpu=neoverse-v2 -mlittle-endian -mabi=lp64 -O2 -std=gnu11 -fasynchronous-unwind-tables -fstack-protector-strong -fstack-clash-protection
+// [解读] 切换到 executable code section。
+	.text
+// [解读] 2^2 = 4-byte alignment，匹配 AArch64 的 4-byte instruction width。
+	.align	2
+// [解读] 尝试把函数入口对齐到 2^5 = 32 bytes；超过 15 bytes 的 padding 会被放弃。
+	.p2align 5,,15
+// [解读] 向 linker 导出 add_f32，并把该 ELF symbol 标记为 function。
+	.global	add_f32
+	.type	add_f32, %function
+// [解读] 外部可见的函数入口 label。
+add_f32:
+// [解读] GCC 的 local function-begin label；以 .L 开头的 symbol 不对外导出。
+.LFB0:
+// [解读] 开始记录 stack unwinding 所需的 Call Frame Information。
+	.cfi_startproc
+// [解读] GCC 把后续 code 对应回源文件第 3 行，并以 #APP 标出 inline asm 的开始。
+// add_f32.c:3:   asm(
+#APP
+// [解读] asm text 的 source-location marker；末尾数字是 GCC line-marker flag。
+// 3 "add_f32.c" 1
+// [解读] s0 = s0 + s1。GCC 将 output 与第一个 input 合并到 s0，结果已经位于 ABI return register。
+// [解读] out、tmp97、tmp98 是 -fverbose-asm 添加的 operand names，不是 register names。
+	fadd s0, s0, s1	// out, tmp97, tmp98
+// [解读] 结束 asm source mapping，随后以 #NO_APP 关闭 inline-asm 区域。
+// 0 "" 2
+// add_f32.c:8: }
+#NO_APP
+// [解读] 默认等价于 ret x30；link register 保存 caller address，FP32 结果留在 s0。
+	ret
+// [解读] 结束当前函数的 Call Frame Information。
+	.cfi_endproc
+// [解读] GCC 的 local function-end label。
+.LFE0:
+// [解读] 当前位置减去 add_f32 入口，得到函数 symbol 的字节长度。
+	.size	add_f32, .-add_f32
+
+// [解读] 第二个函数重复建立 alignment、ELF symbol 属性与入口 label。
+	.align	2
+	.p2align 5,,15
+	.global	add_f32_from_memory
+	.type	add_f32_from_memory, %function
+add_f32_from_memory:
+.LFB1:
+	.cfi_startproc
+// [解读] 第二个 inline asm 对应源文件第 12 行。
+// add_f32.c:12:   asm(
+#APP
+// 12 "add_f32.c" 1
+// [解读] AAPCS64 将 lhs、rhs 两个 pointer arguments 放在 x0、x1；方括号表示 base-register addressing。
+	ldr s0, [x0]	// tmp97
+	ldr s1, [x1]	// tmp98
+// [解读] s2 = s0 + s1。v0、v1 已列入 clobbers，因此 GCC 为 output 分配 v2 的 FP32 视图 s2。
+	fadd s2, s0, s1	// out
+// [解读] 结束第二个 asm 的 source mapping 与 inline-asm 区域。
+// 0 "" 2
+// add_f32.c:20: }
+#NO_APP
+// [解读] GCC 把 s2 搬到 ABI 指定的 FP32 return register s0；这里没有数值类型转换。
+	fmov	s0, s2	//, out
+// [解读] 返回 caller，结果位于 s0。
+	ret
+// [解读] 关闭第二个函数的 unwind 范围，并记录 function-end label 与 symbol size。
+	.cfi_endproc
+.LFE1:
+	.size	add_f32_from_memory, .-add_f32_from_memory
+// [解读] 把 compiler identification 写入 object metadata。
+	.ident	"GCC: (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"
+// [解读] 生成 GNU stack note；空 flags 表示该 object 不申请 executable stack。
+	.section	.note.GNU-stack,"",@progbits
+</pre><p>两个函数都没有 <code>sub sp</code>、<code>stp</code> 等 prologue 指令，因为这次编译得到的 leaf functions 不需要 stack frame 或保存 callee-saved registers；<code>.cfi_*</code> directives 仍可记录 unwind metadata。<code>.align</code> 与 <code>.p2align</code> 的具体填充规则见下列 GNU assembler 引用。</p><h2 id="zh-isa-versions">附录 C：ISA 与目标版本</h2><p><code>cp.async</code> 与 <code>mma.sync.m16n8k16</code> 在 PTX 7.0 中面向 <code>sm_80+</code>；<code>ldmatrix</code> 本身从 PTX 6.5、<code>sm_75+</code> 开始。这里的 TMA tensor copy 与显式 barrier-init fence 使用 PTX 8.0、<code>sm_90+</code> 能力。较新的 <code>.shared::cta</code> TMA destination 是 PTX 8.6 扩展，替换时也要更新所声明的版本下限。源码引用以 commit 固定，NVIDIA 文档以 CUDA 13.1.1 固定。</p><h2 id="zh-refs">参考资料</h2>
+
+<ul>
+  <li><a href="https://gcc.gnu.org/onlinedocs/gcc-15.1.0/gcc/Extended-Asm.html" target="_blank" rel="noopener">GCC 15.1: Extended Asm</a></li>
+  <li><a href="https://gcc.gnu.org/onlinedocs/gcc-15.1.0/gcc/Machine-Constraints.html" target="_blank" rel="noopener">GCC 15.1: Machine Constraints（AArch64）</a></li>
+  <li><a href="https://github.com/ARM-software/abi-aa/blob/2025Q1/aapcs64/aapcs64.rst" target="_blank" rel="noopener">Arm AAPCS64 2025Q1：参数传递与返回值</a></li>
+  <li><a href="https://sourceware.org/binutils/docs/as/Align.html" target="_blank" rel="noopener">GNU assembler：<code>.align</code></a></li>
+  <li><a href="https://sourceware.org/binutils/docs/as/P2align.html" target="_blank" rel="noopener">GNU assembler：<code>.p2align</code></a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/inline-ptx-assembly/index.html" target="_blank" rel="noopener">NVIDIA: Using Inline PTX Assembly in CUDA</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async" target="_blank" rel="noopener">PTX ISA: <code>cp.async</code>, commit group and wait group</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#warp-level-matrix-instructions-ldmatrix" target="_blank" rel="noopener">PTX ISA: <code>ldmatrix</code></a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-16816-float" target="_blank" rel="noopener">PTX ISA: <code>mma.m16n8k16</code> matrix fragments</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-tensor" target="_blank" rel="noopener">PTX ISA: <code>cp.async.bulk.tensor</code></a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/cuda-programming-guide/04-special-topics/async-copies.html" target="_blank" rel="noopener">CUDA Programming Guide: Asynchronous Data Copies and TMA</a></li>
+  <li><a href="https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/include/cutlass/arch/barrier.h" target="_blank" rel="noopener">CUTLASS: SM90 transaction barrier inline PTX wrappers</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html" target="_blank" rel="noopener">CUDA Driver API 13.1.1: cuTensorMapEncodeTiled</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-test-wait-try-wait" target="_blank" rel="noopener">PTX ISA: mbarrier phase, acquire wait</a></li>
+</ul>
+</div>
+<div class="lang-en">
+<h1>Inline Assembly Constraint Models and Core Loops: AArch64 and NVIDIA PTX</h1>
+<p class="lead">Two AArch64 inline-assembly functions add the same pair of floats. One compiles to <code>fadd</code> and <code>ret</code>; the other needs an extra <code>fmov</code> before returning. The difference comes from their arguments and fixed temporary registers. Following these functions shows how the compiler receives inputs, allocates outputs, and accounts for memory accesses hidden inside a template. CUDA inline PTX uses a similar interface. Asynchronous copies and Tensor Core loops then add requirements for participating threads, data layout, and completion.</p>
+
+<nav class="reading-guide" aria-label="Quick reading guide">
+  <strong>Quick links</strong>
+  <a href="#en-contract">Read an asm statement</a>
+  <a href="#en-gnu-pointer">Check pointers and side effects</a>
+  <a href="#en-gnu-output">Trace the GCC output</a>
+  <a href="#en-ptx-loops">Choose a GPU loop</a>
+  <a href="#en-verify">Validate results and performance</a>
+</nav>
+
+<h2 id="en-contract">1. Read the compiler contract through one addition</h2>
+<p>Start with a small task: C receives two FP32 values, an AArch64 <code>fadd</code> computes their sum, and the result returns to C. An ordinary <code>return lhs + rhs</code> already expresses this operation. Expanding it into asm lets us inspect each part of the interface.</p>
+<pre class="code">float add_f32(float lhs, float rhs) {
+  float out;
+  asm(
+      "fadd %s0, %s1, %s2"
+      : "=w"(out)
+      : "w"(lhs), "w"(rhs));
+  return out;
+}
+</pre>
+<p>The template references <code>%s0</code>, <code>%s1</code>, and <code>%s2</code> do not yet select fixed register numbers. The compiler reads the operand lists after the colons, numbers outputs before inputs, and assigns <code>out</code>, <code>lhs</code>, and <code>rhs</code> indices 0, 1, and 2. It then chooses registers that satisfy their constraints.</p>
+<div class="table-scroll"><table class="note-table">
+<thead><tr><th>Form in this example</th><th>What the compiler learns</th><th>How the template uses it</th></tr></thead>
+<tbody>
+<tr><td><code>"=w"(out)</code></td><td>Write a new floating-point value in the AArch64 FP/SIMD register class</td><td><code>%s0</code> names the 32-bit FP view of that output</td></tr>
+<tr><td><code>"w"(lhs), "w"(rhs)</code></td><td>Read two C values from FP/SIMD registers</td><td><code>%s1</code> and <code>%s2</code> supply the addition's sources</td></tr>
+<tr><td>No clobber</td><td>No extra fixed temporary register, NZCV flag change, or memory access needs declaration</td><td>All data dependencies appear in the operands above</td></tr>
+</tbody></table></div>
+<p>The <a href="https://gcc.gnu.org/onlinedocs/gcc-15.1.0/gcc/Machine-Constraints.html" target="_blank" rel="noopener">AArch64 <code>w</code> constraint</a> selects a register class, while the template's <code>s</code> modifier selects the register-name width. An actual expansion can be <code>fadd s0, s0, s1</code>, reusing <code>s0</code> for the output and first input. A single <code>fadd</code> permits that source/destination overlap, so <code>=</code> is sufficient. C uses the result through <code>out</code>; the statement needs no <code>volatile</code> to retain this computation.</p>
+
+<h3 id="en-gnu-symbolic">Replace positional references with names</h3>
+<p>Counting <code>%0</code> and <code>%1</code> becomes error-prone as a function grows. GNU extended asm lets us name operands. The following version changes only their references; its input/output contract stays the same.</p>
+<pre class="code">float add_f32_named(float lhs, float rhs) {
+  float out;
+  asm(
+      "fadd %s[out], %s[lhs], %s[rhs]"
+      : [out] "=w"(out)
+      : [lhs] "w"(lhs), [rhs] "w"(rhs));
+  return out;
+}
+</pre>
+<p><code>[lhs]</code> declares a name in the operand list, <code>%[lhs]</code> refers to it in the template, and <code>%s[lhs]</code> additionally formats its register as <code>sN</code>. These brackets belong to GNU asm syntax. Changing the arguments to pointers introduces a second kind of bracket.</p>
+
+<h2 id="en-gnu-pointer">2. Pointer arguments introduce another dependency</h2>
+<p>Now let the asm load both values from memory. The C arguments become <code>const float*</code>, their addresses travel in general-purpose registers, and two <code>ldr</code> instructions load the values into fixed temporaries <code>s0</code> and <code>s1</code>.</p>
+<pre class="code">float add_f32_from_memory(const float* lhs, const float* rhs) {
+  float out;
+  asm(
+      "ldr s0, [%[lhs_ptr]]\n\t"
+      "ldr s1, [%[rhs_ptr]]\n\t"
+      "fadd %s[out], s0, s1"
+      : [out] "=w"(out)
+      : [lhs_ptr] "r"(lhs), [rhs_ptr] "r"(rhs)
+      : "v0", "v1", "memory");
+  return out;
+}
+</pre>
+<p><code>[lhs_ptr] "r"(lhs)</code> declares an address operand named <code>lhs_ptr</code>. If the compiler selects <code>x0</code>, <code>%[lhs_ptr]</code> expands to <code>x0</code>, and the surrounding <code>[%[lhs_ptr]]</code> becomes the AArch64 memory operand <code>[x0]</code>. GNU's named substitution ends there; the AArch64 assembler interprets the remaining brackets.</p>
+<p>This template has two additional responsibilities. Its fixed writes to <code>s0</code> and <code>s1</code> require the clobbers <code>"v0", "v1"</code>, so the compiler chooses another register for <code>out</code>. The memory read by the two loads must also be declared: <code>"r"(lhs)</code> describes a dependency on the address value, while <code>"memory"</code> adds the pointed-to contents.</p>
+<p>Removing <code>"memory"</code> would describe the output as depending only on two addresses. After inlining, the caller could change <code>*lhs</code>, yet the operands would not tell the compiler that this asm needs the new contents. Moving a related store or merging asm statements could then change the result. The assembler would still accept every instruction; the fault would be in the dataflow handed between C and the template.</p>
+
+<h3 id="en-memory-footprint">Declare specific objects when the footprint is known</h3>
+<p>A <code>"memory"</code> clobber conservatively covers memory accesses absent from the operand lists. This function reads only two floats, so we can retain the address operands and add two memory inputs to narrow the footprint:</p>
+<pre class="code">asm(
+    "ldr s0, [%[lhs_ptr]]\n\t"
+    "ldr s1, [%[rhs_ptr]]\n\t"
+    "fadd %s[out], s0, s1"
+    : [out] "=w"(out)
+    : [lhs_ptr] "r"(lhs),
+      [rhs_ptr] "r"(rhs),
+      [lhs_mem] "m"(*lhs),  // precisely declares the read from *lhs
+      [rhs_mem] "m"(*rhs)   // precisely declares the read from *rhs
+    : "v0", "v1");
+</pre>
+<p><code>lhs_mem</code> and <code>rhs_mem</code> need not appear in the instruction text. They add reads of <code>*lhs</code> and <code>*rhs</code> to the compiler's dependency graph; the <code>ldr</code> instructions still fetch the data. <a href="https://gcc.gnu.org/onlinedocs/gcc-15.1.0/gcc/Extended-Asm.html#Clobbers-and-Scratch-Registers" target="_blank" rel="noopener">GCC's clobber documentation</a> describes this combination of address operands and accessed objects.</p>
+
+<h3 id="en-side-effects">Account for retention, dependencies, and hardware synchronization</h3>
+<p><code>volatile</code> retains side effects that outputs cannot fully express, such as submitting an asynchronous copy or executing a synchronization instruction. It still permits some compiler movement and does not add a missing memory dependency. Memory operands and <code>"memory"</code> constrain the compiler's handling of memory accesses. CPU ordering across cores and GPU asynchronous completion require the appropriate ISA fence, barrier, or wait.</p>
+<div class="diagram-frame"><div class="diagram-title">Compiler dependencies of the pointer version</div>
+<svg class="diagram-svg" viewBox="0 0 780 238" role="img" aria-labelledby="en-asm-title en-asm-desc">
+<title id="en-asm-title">Addresses, memory contents, and outputs</title>
+<desc id="en-asm-desc">Address inputs enter ldr and fadd. An output and clobbers declare results and register changes. A separate memory dependency declares reads of pointed-to contents.</desc>
+<defs><marker id="en-asm-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#71717a"></path></marker></defs>
+<rect class="box" x="16" y="18" width="218" height="96" rx="4"></rect>
+<text x="125" y="44" text-anchor="middle" font-size="15" font-weight="600">Address inputs</text>
+<text class="mono" x="125" y="71" text-anchor="middle" font-size="13">"r"(lhs), "r"(rhs)</text>
+<text class="muted" x="125" y="94" text-anchor="middle" font-size="12">Pass address values</text>
+<rect class="accent" x="280" y="18" width="220" height="96" rx="4"></rect>
+<text x="390" y="44" text-anchor="middle" font-size="15" font-weight="600">Assembly template</text>
+<text class="mono" x="390" y="71" text-anchor="middle" font-size="13">ldr → ldr → fadd</text>
+<text class="muted" x="390" y="94" text-anchor="middle" font-size="12">Read memory and compute</text>
+<rect class="ready" x="546" y="18" width="218" height="96" rx="4"></rect>
+<text x="655" y="44" text-anchor="middle" font-size="15" font-weight="600">Output and register changes</text>
+<text class="mono" x="655" y="71" text-anchor="middle" font-size="13">"=w"(out)</text>
+<text class="mono muted" x="655" y="94" text-anchor="middle" font-size="12">clobber: "v0", "v1"</text>
+<path class="arrow" d="M234 65H274" marker-end="url(#en-asm-arrow)"></path>
+<path class="arrow" d="M500 65H540" marker-end="url(#en-asm-arrow)"></path>
+<rect class="box" x="130" y="156" width="520" height="66" rx="4"></rect>
+<text x="390" y="181" text-anchor="middle" font-size="14">Memory contents need their own dependency</text>
+<text class="mono muted" x="390" y="204" text-anchor="middle" font-size="12">"memory" or "m"(*lhs), "m"(*rhs)</text>
+<path class="arrow" d="M390 156V120" marker-end="url(#en-asm-arrow)"></path>
+</svg></div>
+<p>To inspect a wrapper using this diagram, follow C inputs into the instructions, then follow results back, and finally look for fixed registers or indirect memory accesses. <code>+</code> declares that an old value is also read; <code>&amp;</code> handles an output written early inside a multi-instruction template. The full syntax and constraint tables are in <a href="#en-gnu">Appendix A</a> for use while writing code.</p>
+
+<h2 id="en-gnu-output">3. Find those choices in the Neoverse V2 GCC output</h2>
+<p>On 2026-09-03, the original experiment compiled the named-operand value function and the pointer function with <code>"memory"</code> using GCC 13.3.0 on an AArch64 node in ComputeLab-SC. Linking the object with a minimal driver produced <code>value=3.75 pointer=3.75</code> for inputs <code>1.25</code> and <code>2.5</code>, with exit status 0. This records one execution of both data paths; it provides no timing or coverage of all floating-point boundaries.</p>
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Item</th><th>Measured value</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Date</td><td>2026-09-03</td></tr>
+    <tr><td>Architecture</td><td><code>aarch64</code></td></tr>
+    <tr><td>CPU</td><td>Arm Neoverse V2, 72 cores</td></tr>
+    <tr><td>Compiler</td><td><code>gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0</code></td></tr>
+    <tr><td>Target options</td><td><code>-std=gnu11 -O2 -mcpu=neoverse-v2 -fverbose-asm</code></td></tr>
+  </tbody>
+</table>
+</div>
+<p>Extracting the instructions for the two functions makes the difference visible:</p>
+<pre class="code">add_f32:
+    fadd s0, s0, s1
+    ret
+
+add_f32_from_memory:
+    ldr  s0, [x0]
+    ldr  s1, [x1]
+    fadd s2, s0, s1
+    fmov s0, s2
+    ret
+</pre>
+<p>Under <a href="https://github.com/ARM-software/abi-aa/blob/2025Q1/aapcs64/aapcs64.rst" target="_blank" rel="noopener">AAPCS64</a>, the two float arguments arrive in <code>s0</code> and <code>s1</code>, and an FP32 result returns in <code>s0</code>. The value function permits input/output overlap, so GCC leaves its result in the return register. The pointer function receives addresses in <code>x0</code> and <code>x1</code>, but clobbers <code>v0</code> and <code>v1</code>. GCC assigns the output to <code>s2</code>, then inserts <code>fmov</code> to satisfy the return convention.</p>
+<p>The extra move can thus be traced to the template's fixed temporaries. It gives a concrete reason to inspect generated code around a wrapper: the <code>fadd</code> line alone cannot reveal its cost. <a href="#en-gcc-record">Appendix B</a> preserves the complete source, the <code>-E</code>, <code>-S</code>, and <code>-c</code> commands, and the original <code>.s</code> file with line-by-line explanations, including its ELF, alignment, and unwind directives.</p>
+
+<h2 id="en-ptx">4. Put the same addition into CUDA inline PTX</h2>
+<p>The GPU version still receives two floats and returns one. Its register constraints and instruction template change. It belongs in a CUDA translation unit and is compiled separately from the preceding AArch64 functions.</p>
+<pre class="code">__device__ __forceinline__
+float add_f32(float lhs, float rhs) {
+  float out;
+  asm(
+      "add.rn.f32 %0, %1, %2;"
+      : "=f"(out)
+      : "f"(lhs), "f"(rhs));
+  return out;
+}</pre>
+<p><code>"=f"(out)</code> selects a write-only <code>.f32</code> PTX register, and the two <code>"f"</code> inputs carry FP32 values. <code>%0</code>, <code>%1</code>, and <code>%2</code> retain output-first numbering. <code>add.rn.f32</code> explicitly selects round-to-nearest-even. A bitwise comparison of the two implementations also requires fixed rounding and floating-point settings.</p>
+<div class="table-scroll"><table class="note-table">
+<thead><tr><th>Boundary</th><th>AArch64 inline asm</th><th>CUDA inline PTX</th></tr></thead>
+<tbody>
+<tr><td>Inputs and output</td><td><code>"w"</code> / <code>"=w"</code>: FP/SIMD register class</td><td><code>"f"</code> / <code>"=f"</code>: <code>.f32</code> PTX register</td></tr>
+<tr><td>Template reference</td><td><code>%s0</code> or <code>%s[name]</code></td><td>Numbered references such as <code>%0</code></td></tr>
+<tr><td>One possible expansion</td><td><code>fadd s0, s0, s1</code></td><td><code>add.rn.f32 %f3, %f1, %f2;</code></td></tr>
+<tr><td>Remaining backend work</td><td>The assembler encodes target-ISA instructions</td><td><code>ptxas</code> lowers virtual PTX registers and instructions to SASS</td></tr>
+</tbody></table></div>
+<p>PTX register numbers therefore do not directly establish the hardware register count. The <code>ptxas</code> resource report and SASS answer that question. The CUDA interface also defines its own supported constraint set; GCC CPU forms such as <code>"m"</code> and <code>"w"</code> do not transfer directly. Common PTX mappings appear in <a href="#en-ptx-constraints">the Appendix A reference table</a>.</p>
+
+<h3 id="en-address-spaces">Recheck addresses and local names at the PTX boundary</h3>
+<p>A CUDA pointer passed into asm is a generic address. A global address usually enters through a 64-bit <code>"l"</code> operand. If an instruction requires a 32-bit shared address, convert it using this helper before passing it through <code>"r"</code>.</p>
+<pre class="code">__device__ __forceinline__ uint32_t smem_addr(const void* p) {
+  return static_cast&lt;uint32_t&gt;(__cvta_generic_to_shared(p));
+}
+</pre>
+<p>For example, the outer brackets in <code>[%0]</code> belong to PTX addressing syntax; the front end substitutes only the operand inside them. Put temporary <code>.reg</code> declarations and labels inside a braced scope to avoid duplicate names after repeated inlining. Register-type or instruction-form mismatches usually surface in <code>ptxas</code>. The <a href="https://docs.nvidia.com/cuda/archive/13.1.1/inline-ptx-assembly/index.html" target="_blank" rel="noopener">CUDA 13.1.1 inline PTX guide</a> defines these interface rules.</p>
+
+<h2 id="en-ptx-loops">5. Three GPU loop reading paths</h2>
+<p>The addition's output is ready for C to use when its asm ends. These loops add two other responsibilities: some instructions distribute data across an entire warp, while others submit a copy whose data arrives later. Choose a path according to the task at hand. Each example preserves the complete inner-loop sequence; the GPU code has no accompanying performance measurements.</p>
+<div class="table-scroll"><table class="note-table">
+<thead><tr><th>Reading goal</th><th>Prerequisites and target</th><th>What the loop must establish</th></tr></thead>
+<tbody>
+<tr><td><a href="#en-cpasync">Alternate two shared stages</a></td><td>CTA synchronization and global/shared memory; <code>sm_80+</code></td><td>Complete the current copy group; wait for readers before overwriting</td></tr>
+<tr><td><a href="#en-ldmatrix">Feed a shared tile to Tensor Cores</a></td><td>Warps, lanes, and row/column layouts; this combination needs <code>sm_80+</code></td><td>Match row addresses to fragments; execute with all 32 lanes</td></tr>
+<tr><td><a href="#en-tma">Move a two-dimensional tile with TMA</a></td><td>Tensor maps and mbarrier phases; <code>sm_90+</code></td><td>Publish initialization; account for arrivals and bytes; wait and reuse</td></tr>
+</tbody></table></div>
+<p>These device-side examples follow the public PTX definitions in CUDA 13.1.1. They need <code>&lt;cuda_runtime.h&gt;</code>, <code>&lt;cuda_fp16.h&gt;</code>, <code>&lt;cstdint&gt;</code>, and <code>&lt;cstddef&gt;</code>; TMA also uses <code>CUtensorMap</code> from <code>&lt;cuda.h&gt;</code>. Reuse the <code>smem_addr</code> helper above and compile the selected code for its target architecture.</p>
+
+<h3 id="en-cpasync">5.1 cp.async: submit the next tile, wait for the current one</h3>
+<p>An ordinary global load brings a value into a thread register before the thread stores it to shared memory. Ampere's <code>cp.async</code> provides an asynchronous global-to-shared copy: the thread can continue working after submission. Here each thread copies one 16-byte <code>float4</code>, alternating between two shared stages.</p>
+<pre class="code">__device__ __forceinline__ void cp_async_16(void* dst_smem,
+    const void* src_gmem) {
+  const uint32_t dst = smem_addr(dst_smem);
+  asm volatile(
+      "cp.async.ca.shared.global [%0], [%1], 16;\n"
+      :: "r"(dst), "l"(src_gmem)
+      : "memory");
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+  asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+template &lt;int N&gt;
+__device__ __forceinline__ void cp_async_wait_group() {
+  asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory");
+}
+</pre>
+<p><code>commit_group</code> groups the issuing thread's previously uncommitted copies. <code>wait_group N</code> waits until at most the newest \(N\) groups remain pending. After submitting tile 0 and then tile 1, <code>wait_group&lt;1&gt;</code> permits consumption of the older tile 0 while tile 1 may still be transferring. When there is no next tile, <code>wait_group&lt;0&gt;</code> drains all remaining work.</p>
+<div class="table-scroll"><table class="note-table">
+<thead><tr><th>Three-tile example</th><th>Submit first</th><th>Wait, then consume</th><th>Reusable after reading</th></tr></thead>
+<tbody>
+<tr><td>Warm-up</td><td>tile 0 → stage 0</td><td>No consumption yet</td><td>stage 1 is still empty</td></tr>
+<tr><td>Iteration 0</td><td>tile 1 → stage 1</td><td><code>wait_group&lt;1&gt;</code>; tile 0</td><td>stage 0</td></tr>
+<tr><td>Iteration 1</td><td>tile 2 → stage 0</td><td><code>wait_group&lt;1&gt;</code>; tile 1</td><td>stage 1</td></tr>
+<tr><td>Iteration 2</td><td>None</td><td><code>wait_group&lt;0&gt;</code>; tile 2</td><td>Exit</td></tr>
+</tbody></table></div>
+<p>The complete device-side kernel follows. Its launch shape is <code>scale2_cp_async&lt;128&gt;&lt;&lt;&lt;1, 128&gt;&gt;&gt;(...)</code>: this teaching version uses one CTA for <code>tiles * Threads</code> float4 values. Input and output are disjoint full arrays with 16-byte-aligned starting addresses. Each output component is twice its input component.</p>
+<pre class="code">template &lt;int Threads&gt;
+__global__ void scale2_cp_async(float4* out, const float4* in, int tiles) {
+  static_assert(Threads &gt; 0 &amp;&amp; Threads &lt;= 1024);
+  __shared__ __align__(16) float4 stage[2][Threads];
+
+  const int tid = threadIdx.x;
+  if (tiles &lt;= 0) return;  // uniform for the whole CTA
+
+  cp_async_16(&amp;stage[0][tid], &amp;in[tid]);
+  cp_async_commit();
+
+  int read_stage = 0;
+  for (int tile = 0; tile &lt; tiles; ++tile) {
+    const int write_stage = read_stage ^ 1;
+    const bool has_next = tile + 1 &lt; tiles;
+
+    if (has_next) {
+      const size_t next = size_t(tile + 1) * Threads + tid;
+      cp_async_16(&amp;stage[write_stage][tid], &amp;in[next]);
+      cp_async_commit();
+      cp_async_wait_group&lt;1&gt;();
+    } else {
+      cp_async_wait_group&lt;0&gt;();
+    }
+
+    __syncthreads();
+    const float4 v = stage[read_stage][tid];
+    const size_t current = size_t(tile) * Threads + tid;
+    out[current] = {2.0f * v.x, 2.0f * v.y, 2.0f * v.z, 2.0f * v.w};
+
+    __syncthreads();  // readers finish before this stage is reused
+    read_stage = write_stage;
+  }
+}
+</pre>
+<p>The two CTA synchronizations serve different purposes. The first hands each thread's completed copies to the whole CTA. The second establishes that all readers have finished before a later iteration overwrites that stage. This scale example reads only each thread's own float4, but retains the CTA handoff needed by cooperative computation. Two stages allow copying and computation to overlap; a reduction in runtime still depends on the amount of computation and hardware load.</p>
+<p>A partial final tile needs bounds handling on both its loads and output stores. The <code>src-size</code> / zero-fill form of <code>cp.async</code> addresses only the copy side. Adding stages also requires recalculating the wait depth, pending-group count, and shared-memory footprint. The <a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async" target="_blank" rel="noopener">PTX cp.async definition</a> specifies the scope of per-thread groups and completion visibility.</p>
+
+<h3 id="en-ldmatrix">5.2 ldmatrix and mma.sync: addresses give fragments their meaning</h3>
+<p>With data in shared memory, let one warp compute \(D_{16\times8}=A_{16\times16}B_{16\times8}+C_{16\times8}\). The inputs of <code>mma.sync.m16n8k16</code> are distributed across 32 lanes. Each lane holds four <code>.b32</code> registers for A, two for B, and four FP32 accumulators. Passing registers of the right width establishes only part of the interface; the elements inside them must occupy the expected positions.</p>
+<p><code>ldmatrix</code> loads \(8\times8\) submatrices of 16-bit elements from shared memory and distributes their fragments. For <code>.x4</code>, lanes 0–7, 8–15, 16–23, and 24–31 supply row addresses for four submatrices. For <code>.x2</code>, the first two groups supply two. These addresses feed a cooperative warp load whose results are distributed across the warp.</p>
+<pre class="code">__device__ __forceinline__ void ldmatrix_x4(
+    uint32_t (&amp;dst)[4], const __half* src) {
+  const uint32_t addr = smem_addr(src);
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 "
+      "{%0, %1, %2, %3}, [%4];\n"
+      : "=r"(dst[0]), "=r"(dst[1]), "=r"(dst[2]), "=r"(dst[3])
+      : "r"(addr)
+      : "memory");
+}
+
+__device__ __forceinline__ void ldmatrix_x2_trans(
+    uint32_t (&amp;dst)[2], const __half* src) {
+  const uint32_t addr = smem_addr(src);
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
+      "{%0, %1}, [%2];\n"
+      : "=r"(dst[0]), "=r"(dst[1])
+      : "r"(addr)
+      : "memory");
+}
+
+__device__ __forceinline__ void mma_m16n8k16(
+    float (&amp;acc)[4], const uint32_t (&amp;a)[4], const uint32_t (&amp;b)[2]) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+      "{%0, %1, %2, %3}, "
+      "{%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+      : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+        "r"(b[0]), "r"(b[1]));
+}
+</pre>
+<p>Store A in shared memory as row-major \(16\times K\), and B as row-major \(K\times8\). The following complete K-reduction fragment belongs inside a GEMM kernel: its surrounding code has already populated A/B and synchronized the relevant threads, \(K\) is a positive multiple of 16, the bases are 16-byte aligned, and all 32 lanes execute uniformly. Global staging and final accumulator stores are outside this fragment.</p>
+<pre class="code">// All 32 lanes execute this loop uniformly.
+// a_smem: row-major [16, K], b_smem: row-major [K, 8].
+const int lane = threadIdx.x &amp; 31;
+float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+for (int k0 = 0; k0 &lt; K; k0 += 16) {
+  const int a_row = lane &amp; 15;
+  const int a_col = k0 + (lane &gt;&gt; 4) * 8;
+  const int b_row = k0 + (lane &amp; 15);
+
+  uint32_t a_frag[4];
+  uint32_t b_frag[2];
+  ldmatrix_x4(a_frag, &amp;a_smem[a_row * K + a_col]);
+  ldmatrix_x2_trans(b_frag, &amp;b_smem[b_row * 8]);
+  mma_m16n8k16(acc, a_frag, b_frag);
+}
+</pre>
+<p>A's lane addresses cover the top-left, bottom-left, top-right, and bottom-right \(8\times8\) quadrants in that order. <code>lane &amp; 15</code> selects a row, and <code>(lane &gt;&gt; 4) * 8</code> selects half of the K tile. B's first 16 lanes supply rows for its upper and lower \(8\times8\) submatrices; <code>.trans</code> produces the fragment required by the <code>row.col</code> MMA. <code>"+f"(acc[i])</code> declares that each MMA reads and replaces its accumulator, matching the K loop's recurrence.</p>
+<p>These mappings can be checked against the <a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-16816-float" target="_blank" rel="noopener">PTX m16n8k16 fragment diagrams</a> and <a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#warp-level-matrix-instructions-ldmatrix" target="_blank" rel="noopener">ldmatrix row-address rules</a>. A swizzled shared layout requires corresponding address changes. Bank-conflict avoidance and accumulator stores must preserve the same element mapping. CUTLASS or CuTe can manage those responsibilities as layouts become more involved.</p>
+
+<h3 id="en-tma">5.3 TMA and mbarrier: two completion conditions for a stage</h3>
+<p>Hopper's TMA uses a tensor-map descriptor to encode the global tensor's shape, strides, element type, and tile layout. One issuing thread supplies coordinates, and hardware transfers a complete two-dimensional tile. Although one thread can submit each copy, all consumers still need to know when the tile has arrived and when its old contents may be overwritten.</p>
+<p>Place one <code>mbarrier</code> beside each of the two shared stages. It is a 64-bit shared-memory object with 8-byte alignment, tracking a phase, an arrival count, and a transaction count. Only thread 0 performs one <code>arrive.expect_tx</code> per stage use, so its initial arrival count is 1. Other threads only wait and contribute no arrivals. Thread 0 also registers <code>TileBytes</code> expected bytes, which TMA's <code>complete_tx</code> subtracts on completion. The phase completes once both the arrival and byte conditions are satisfied.</p>
+<p>The wrappers use the <code>.shared::cluster</code> destination available in PTX 8.0 / <code>sm_90</code>, with both destination and barrier in the current CTA. After initialization, <code>fence.mbarrier_init.release.cluster</code> and a CTA synchronization publish the initialized state, following the composition documented by <a href="https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/include/cutlass/arch/barrier.h#L709-L722" target="_blank" rel="noopener">CUTLASS's barrier-init fence</a>. The wait wrapper explicitly uses <code>.acquire.cta</code>.</p>
+<pre class="code">__device__ __forceinline__ void mbarrier_init(uint64_t* bar) {
+  const uint32_t addr = smem_addr(bar);
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n"
+               :: "r"(addr) : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_init_fence() {
+  asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+}
+
+__device__ __forceinline__ void mbarrier_arrive_expect_tx(
+    uint64_t* bar, uint32_t bytes) {
+  const uint32_t addr = smem_addr(bar);
+  asm volatile(
+      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 "
+      "_, [%0], %1;\n"
+      :: "r"(addr), "r"(bytes) : "memory");
+}
+
+__device__ __forceinline__ void tma_load_2d(
+    void* dst_smem, const CUtensorMap* map, int32_t x, int32_t y,
+    uint64_t* bar) {
+  const uint32_t dst = smem_addr(dst_smem);
+  const uint32_t mbar = smem_addr(bar);
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global."
+      "mbarrier::complete_tx::bytes.tile "
+      "[%0], [%1, {%2, %3}], [%4];\n"
+      :: "r"(dst), "l"(map), "r"(x), "r"(y), "r"(mbar)
+      : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_wait(
+    uint64_t* bar, uint32_t phase) {
+  const uint32_t addr = smem_addr(bar);
+  asm volatile(
+      "{\n\t"
+      ".reg .pred done;\n"
+      "WAIT:\n\t"
+      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 done, [%0], %1;\n\t"
+      "@done bra DONE;\n\t"
+      "bra WAIT;\n"
+      "DONE:\n\t"
+      "}\n"
+      :: "r"(addr), "r"(phase) : "memory");
+}
+</pre>
+<p>Submit tile 0 first. At the start of each iteration, submit the next tile to the other stage, then wait for and read the current stage. Each thread keeps separate phase parities for the two barriers, both initially 0. After a successful wait, it toggles only the parity just used. The final CTA synchronization ensures readers have left before that stage is filled again.</p>
+<pre class="code">template &lt;int TileRows, int TileCols&gt;
+__global__ void tma_consumer_loop(
+    const __grid_constant__ CUtensorMap tensor_map,
+    float* partial, int tiles) {
+  static_assert(TileRows &gt; 0 &amp;&amp; TileCols &gt; 0);
+  constexpr int TileElems = TileRows * TileCols;
+  constexpr uint32_t TileBytes = TileElems * sizeof(__half);
+
+  static_assert(TileBytes % 128 == 0);  // both stage bases remain aligned
+
+  __shared__ __align__(128) __half stage[2][TileElems];
+  __shared__ __align__(8) uint64_t full[2];
+
+  if (threadIdx.x == 0) {
+    mbarrier_init(&amp;full[0]);
+    mbarrier_init(&amp;full[1]);
+    mbarrier_init_fence();
+  }
+  __syncthreads();
+  if (tiles &lt;= 0) return;
+
+  uint32_t phase[2] = {0, 0};
+  if (threadIdx.x == 0) {
+    mbarrier_arrive_expect_tx(&amp;full[0], TileBytes);
+    const int32_t y = blockIdx.x * tiles * TileRows;
+    tma_load_2d(stage[0], &amp;tensor_map, 0, y, &amp;full[0]);
+  }
+
+  for (int tile = 0; tile &lt; tiles; ++tile) {
+    const int read_stage = tile &amp; 1;
+    const int write_stage = read_stage ^ 1;
+
+    if (threadIdx.x == 0 &amp;&amp; tile + 1 &lt; tiles) {
+      mbarrier_arrive_expect_tx(&amp;full[write_stage], TileBytes);
+      const int32_t y =
+          (blockIdx.x * tiles + tile + 1) * TileRows;
+      tma_load_2d(stage[write_stage], &amp;tensor_map, 0, y,
+                  &amp;full[write_stage]);
+    }
+
+    mbarrier_wait(&amp;full[read_stage], phase[read_stage]);
+    phase[read_stage] ^= 1;
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i &lt; TileElems; i += blockDim.x) {
+      sum += __half2float(stage[read_stage][i]);
+    }
+    partial[(size_t(blockIdx.x) * tiles + tile) * blockDim.x + threadIdx.x] = sum;
+
+    __syncthreads();
+  }
+}
+</pre>
+<p>For tiles 0, 1, 2, and 3, the waits are <code>full[0]/phase 0</code>, <code>full[1]/phase 0</code>, <code>full[0]/phase 1</code>, and <code>full[1]/phase 1</code>. Each reuse still requires one arrival because waiting threads never add an arrival. <code>partial</code> stores each thread's local sum for the tile; a later reduction can combine them.</p>
+<p>The kernel needs a host-created two-dimensional FP16 tensor map whose global row/column layout agrees with coordinates <code>{x, y}</code>. Box dimensions are <code>{TileCols, TileRows}</code>, both element strides are 1, and interleave and swizzle are disabled. Global strides and addresses must satisfy <a href="https://docs.nvidia.com/cuda/archive/13.1.1/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html" target="_blank" rel="noopener"><code>cuTensorMapEncodeTiled</code></a>. A full-tile case such as <code>TileRows=16, TileCols=64</code> is a useful starting point: keep every request inside the input and allocate at least <code>gridDim.x * tiles * blockDim.x</code> floats for <code>partial</code>. The code uses a one-dimensional grid and block, and coordinate arithmetic must stay within int32 range. <code>TileBytes % 128 == 0</code> keeps both stage bases aligned.</p>
+<p>Observing TMA completion makes the copied data visible to consumers through an implicit async/generic proxy fence, as specified by the <a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#async-proxy" target="_blank" rel="noopener">PTX async-proxy completion rules</a>. These consumers only read shared memory. Changing the operation to thread-written shared data followed by a TMA shared-to-global store requires the appropriate <code>fence.proxy.async.shared::cta</code> before handoff and a bulk async-group completion protocol. That direction needs a different protocol, beyond exchanging the pointers.</p>
+
+<h2 id="en-verify">6. Decide whether to keep the wrapper from results and generated code</h2>
+<p>The AArch64 record traces an extra move to fixed clobbers. The GPU loops expose work beyond the asm boundary: copy completion, lane layouts, and stage reuse. Those conditions must hold before execution times become meaningful to compare.</p>
+<p>When reproducing the AArch64 example, compare the value and pointer results, then exercise pointed-memory changes after inlining into a caller and inspect generated assembly at different optimization levels. For the GPU paths, use a C++ reference to verify every scaled float4, the complete GEMM output, and each TMA thread's partial sum. Cover at least 0, 1, 2, and multiple tiles so that warm-up, stage reuse, and draining all occur. The existing successful Neoverse V2 run covers only its stated inputs.</p>
+<p>Use <code>nvcc -keep -Xptxas=-v</code> to retain PTX and resource reports, then inspect final instructions with <code>cuobjdump --dump-sass</code> or <code>nvdisasm</code>. Compute Sanitizer's memcheck, racecheck, and synccheck can help locate bounds and synchronization errors; retain numerical references and a protocol argument as well. After changes, fix inputs, launch configuration, and timing conditions, then compare runtime, register pressure, shared memory, and <a href="gpu-occupancy-resource-limits.html">occupancy</a>.</p>
+<p>When an intrinsic or library interface expresses the required semantics, let the compiler keep visibility into the surrounding computation and loop. Where asm remains useful, keep it inside a small instruction wrapper and document architecture, layout, and completion requirements beside its call site. A future maintainer can then identify which loop needs revalidation when one of those conditions changes.</p>
+<h2 id="en-gnu">Appendix A: Syntax and constraints for writing wrappers</h2>
+
+<p><a href="https://gcc.gnu.org/onlinedocs/gcc-15.1.0/gcc/Extended-Asm.html" target="_blank" rel="noopener">GNU extended asm</a> places assembly text and C/C++ dataflow in one statement. The non-<code>asm goto</code> extended form appears below.</p>
+
+<pre class="code">asm asm_qualifiers (
+    "assembler template"
+    : output_operands
+    : input_operands
+    : clobbers);
+</pre>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Field</th><th>Meaning</th><th>Syntactic requirement</th><th>Semantic requirement</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>asm_qualifiers</code></td><td>Qualifiers such as <code>volatile</code> or <code>inline</code></td><td>Optional</td><td><code>volatile</code> is generally required when outputs cannot represent the side effect</td></tr>
+    <tr><td><code>assembler template</code></td><td>The instruction template passed to the assembler</td><td>Required</td><td>Operand references in the template must agree with the following three fields</td></tr>
+    <tr><td><code>output_operands</code></td><td>C lvalues written by the assembly</td><td>May be empty</td><td>Every value produced or modified by the assembly and later visible to C must be listed</td></tr>
+    <tr><td><code>input_operands</code></td><td>C expressions read by the assembly</td><td>May be empty</td><td>Every C value passed into the template must be listed</td></tr>
+    <tr><td><code>clobbers</code></td><td>Registers changed beyond explicit outputs and other template side effects</td><td>May be empty; an empty trailing field may be omitted</td><td>Fixed temporaries, condition flags, and memory effects not modeled explicitly must be declared</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>All three colon-delimited fields may be empty, but the colons remain through the last nonempty field. The template-only <code>asm volatile("nop")</code> with no colons is basic asm. An input without an output requires two consecutive colons, while a clobber-only statement requires three. In the following lines, <code>instruction</code> is only a template placeholder used to show the four syntactic forms.</p>
+
+<pre class="code">asm volatile("nop");                         // template only
+asm("instruction %0" : "=r"(out));          // output only
+asm("instruction %0" :: "r"(in));           // input, no output
+asm volatile("instruction" ::: "memory");   // clobber only
+</pre>
+
+<h3 id="en-gnu-constraints">GNU operands and clobbers</h3>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Form</th><th>Contract</th><th>Typical use</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>"=r"(out)</code></td><td>Write-only output carried in a general register</td><td>A value produced by the assembly</td></tr>
+    <tr><td><code>"+r"(x)</code></td><td>Read-write operand; the same C lvalue is both input and output</td><td>Loop pointer, counter, or accumulator</td></tr>
+    <tr><td><code>"=&amp;r"(tmp)</code></td><td>Early-clobber output that may be written before all inputs are consumed</td><td>Temporary output in a multi-instruction template</td></tr>
+    <tr><td><code>"0"(x)</code></td><td>Input shares the location of output operand 0</td><td>An explicit tied operand</td></tr>
+    <tr><td><code>"r"(x)</code> / <code>"m"(x)</code></td><td>Input in a general register or addressable memory</td><td>Scalar input or direct memory operand</td></tr>
+    <tr><td><code>"w"(x)</code></td><td>AArch64 FP/SIMD/SVE register class</td><td>Floating-point and vector values</td></tr>
+    <tr><td><code>"i"(k)</code></td><td>Compile-time immediate</td><td>Shift, instruction mode, or constant size</td></tr>
+    <tr><td><code>"cc"</code></td><td>The template changes condition flags</td><td><code>subs</code>, <code>cmp</code>, and related instructions</td></tr>
+    <tr><td><code>"memory"</code></td><td>The template accesses memory not fully listed as operands</td><td>Indirect pointer access, synchronization, and device I/O</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>For a multi-instruction template, check whether any output is written before the last input is consumed; that output needs the early-clobber modifier <code>&amp;</code>. An output operand must be a writable C lvalue, and its constraint begins with <code>=</code> or <code>+</code>. An input operand may be a general C expression, but the template may not modify an input-only operand. Clobbers cover fixed registers that the compiler did not allocate through outputs and other implicit state. Registers allocated to operands through constraints should not also appear in the clobber list.</p>
+
+<h3 id="en-ptx-constraints">PTX operand constraints</h3>
+
+<p>CUDA inline PTX retains the colon-separated shape of extended asm, but its operand constraints map to PTX register types rather than the full CPU constraint language defined by GCC. Common mappings are:</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Constraint</th><th>PTX register type</th><th>Common C++ carrier</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>"h"</code></td><td><code>.u16</code></td><td><code>uint16_t</code></td></tr>
+    <tr><td><code>"r"</code></td><td><code>.u32</code></td><td><code>uint32_t</code>, shared-memory address</td></tr>
+    <tr><td><code>"l"</code></td><td><code>.u64</code></td><td><code>uint64_t</code>, 64-bit generic pointer</td></tr>
+    <tr><td><code>"q"</code></td><td><code>.u128</code></td><td>Platforms supporting <code>__int128</code></td></tr>
+    <tr><td><code>"f"</code></td><td><code>.f32</code></td><td><code>float</code></td></tr>
+    <tr><td><code>"d"</code></td><td><code>.f64</code></td><td><code>double</code></td></tr>
+    <tr><td><code>"n"</code></td><td>Compile-time integer immediate</td><td>Template parameter or constant expression</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Examples of numbered operands are available at fixed commits in <a href="https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/include/cutlass/fast_math.h#L926" target="_blank" rel="noopener">CUTLASS fast_math.h</a> and <a href="https://github.com/flashinfer-ai/flashinfer/blob/971b0a6b9563be2af10048ce33dffe0d4bce6c8a/csrc/mhc/mhc_post.cu#L49-L57" target="_blank" rel="noopener">FlashInfer mhc_post.cu</a>. They provide concrete wrappers for checking template indices against operand lists.</p><h2 id="en-gcc-record">Appendix B: Complete GCC source, commands, and annotated assembly</h2><p>The experimental <code>add_f32.c</code> uses named operands while retaining the function name <code>add_f32</code>. Both functions and the original assembly below correspond to the 2026-09-03 environment listed in the main text.</p><pre class="code">float add_f32(float lhs, float rhs) {
+  float out;
+  asm(
+      "fadd %s[out], %s[lhs], %s[rhs]"
+      : [out] "=w"(out)
+      : [lhs] "w"(lhs), [rhs] "w"(rhs));
+  return out;
+}
+
+float add_f32_from_memory(const float* lhs, const float* rhs) {
+  float out;
+  asm(
+      "ldr s0, [%[lhs_ptr]]\n\t"
+      "ldr s1, [%[rhs_ptr]]\n\t"
+      "fadd %s[out], s0, s1"
+      : [out] "=w"(out)
+      : [lhs_ptr] "r"(lhs), [rhs_ptr] "r"(rhs)
+      : "v0", "v1", "memory");
+  return out;
+}
+</pre><pre class="code">gcc -std=gnu11 -E -P add_f32.c -o add_f32.i
+
+gcc -std=gnu11 -O2 -mcpu=neoverse-v2 \
+    -fverbose-asm -S add_f32.c -o add_f32.s
+
+gcc -std=gnu11 -O2 -mcpu=neoverse-v2 \
+    -c add_f32.c -o add_f32.o
+</pre><p>A source file passes through preprocessing, compilation, and assembly before it becomes executable instructions. <code>gcc -E</code> expands headers and macros into a preprocessed file; the asm template remains intact and register allocation has not yet occurred. <code>gcc -S</code> generates the textual assembly file, and <code>gcc -c</code> subsequently invokes the assembler to produce an object file.</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Stage</th><th>Command</th><th>Artifact</th><th>Change in this example</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Preprocessing</td><td><code>gcc -E -P add_f32.c -o add_f32.i</code></td><td><code>add_f32.i</code></td><td>The source has no macros or headers, so both asm statements remain unchanged</td></tr>
+    <tr><td>Compilation</td><td><code>gcc -O2 -S ...</code></td><td><code>add_f32.s</code></td><td>Constraints are interpreted, registers are allocated, and the assembler template is expanded</td></tr>
+    <tr><td>Assembly</td><td><code>gcc -O2 -c ...</code></td><td><code>add_f32.o</code></td><td>GNU assembler encodes the AArch64 text instructions in an ELF object</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p><code>-fverbose-asm</code> records source locations, operand names, and effective options; comments vary between GCC builds. The block preserves every original line of <code>add_f32.s</code>, inserting <code>// [note]</code> explanations before the relevant lines. These annotations do not change instructions or directives.</p><pre class="code">// [note] ISA baseline and extensions selected by -mcpu=neoverse-v2; the assembler validates instructions against them.
+	.arch armv9-a+crc+profile+rng+memtag+sve2-bitperm+i8mm+bf16
+// [note] Registers the source filename for diagnostics and debug information.
+	.file	"add_f32.c"
+// [note] The next two -fverbose-asm lines record the compiler and supporting-library versions.
+// GNU C11 (Ubuntu 13.3.0-6ubuntu2~24.04.1) version 13.3.0 (aarch64-linux-gnu)
+//	compiled by GNU C version 13.3.0, GMP version 6.3.0, MPFR version 4.2.1, MPC version 1.3.1, isl version isl-0.26-GMP
+
+// [note] These are also verbose comments: GCC's internal parameters and effective compiler options.
+// GGC heuristics: --param ggc-min-expand=100 --param ggc-min-heapsize=131072
+// options passed: -mcpu=neoverse-v2 -mlittle-endian -mabi=lp64 -O2 -std=gnu11 -fasynchronous-unwind-tables -fstack-protector-strong -fstack-clash-protection
+// [note] Switches subsequent output to the executable code section.
+	.text
+// [note] A 2^2 = 4-byte alignment, matching the width of an AArch64 instruction.
+	.align	2
+// [note] Attempts 2^5 = 32-byte function alignment; the assembler skips it if more than 15 bytes of padding are required.
+	.p2align 5,,15
+// [note] Exports add_f32 to the linker and marks the ELF symbol as a function.
+	.global	add_f32
+	.type	add_f32, %function
+// [note] Externally visible function-entry label.
+add_f32:
+// [note] GCC's local function-begin label; symbols beginning with .L are not exported.
+.LFB0:
+// [note] Starts the Call Frame Information range used for stack unwinding.
+	.cfi_startproc
+// [note] Maps the following code to source line 3; #APP marks the beginning of inline asm.
+// add_f32.c:3:   asm(
+#APP
+// [note] Source-location marker for the asm text; the final number is a GCC line-marker flag.
+// 3 "add_f32.c" 1
+// [note] Computes s0 = s0 + s1. GCC coalesces the output with the first input, already satisfying the ABI return location.
+// [note] out, tmp97, and tmp98 are -fverbose-asm operand names, not architectural register names.
+	fadd s0, s0, s1	// out, tmp97, tmp98
+// [note] Ends the asm source mapping; #NO_APP closes the inline-asm region.
+// 0 "" 2
+// add_f32.c:8: }
+#NO_APP
+// [note] Equivalent to the default ret x30. The link register holds the caller address, and the FP32 result remains in s0.
+	ret
+// [note] Ends this function's Call Frame Information range.
+	.cfi_endproc
+// [note] GCC's local function-end label.
+.LFE0:
+// [note] Records the symbol size as the current location minus the add_f32 entry.
+	.size	add_f32, .-add_f32
+
+// [note] Repeats alignment, ELF symbol attributes, and an entry label for the second function.
+	.align	2
+	.p2align 5,,15
+	.global	add_f32_from_memory
+	.type	add_f32_from_memory, %function
+add_f32_from_memory:
+.LFB1:
+	.cfi_startproc
+// [note] Maps the second inline asm statement to source line 12.
+// add_f32.c:12:   asm(
+#APP
+// 12 "add_f32.c" 1
+// [note] AAPCS64 places the lhs and rhs pointer arguments in x0 and x1; brackets denote base-register addressing.
+	ldr s0, [x0]	// tmp97
+	ldr s1, [x1]	// tmp98
+// [note] Computes s2 = s0 + s1. Because v0 and v1 are clobbers, GCC allocates the output to the FP32 view s2 of v2.
+	fadd s2, s0, s1	// out
+// [note] Ends the second asm source mapping and inline-asm region.
+// 0 "" 2
+// add_f32.c:20: }
+#NO_APP
+// [note] Moves s2 into the ABI-defined FP32 return register s0; this is not a numeric type conversion.
+	fmov	s0, s2	//, out
+// [note] Returns to the caller with the result in s0.
+	ret
+// [note] Closes the unwind range and records the function-end label and symbol size.
+	.cfi_endproc
+.LFE1:
+	.size	add_f32_from_memory, .-add_f32_from_memory
+// [note] Places compiler identification in object metadata.
+	.ident	"GCC: (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0"
+// [note] Emits the GNU stack note; empty flags mean that this object does not request an executable stack.
+	.section	.note.GNU-stack,"",@progbits
+</pre><p>Neither function has prologue instructions such as <code>sub sp</code> or <code>stp</code>: these compiled leaf functions need no stack frame or saved callee-saved registers. The <code>.cfi_*</code> directives still record unwind metadata. The GNU assembler references below define the padding rules for <code>.align</code> and <code>.p2align</code>.</p><h2 id="en-isa-versions">Appendix C: ISA and target versions</h2><p><code>cp.async</code> and <code>mma.sync.m16n8k16</code> target <code>sm_80+</code> from PTX 7.0. <code>ldmatrix</code> itself starts with PTX 6.5 and <code>sm_75+</code>. The TMA tensor copy and explicit barrier-init fence here use PTX 8.0 / <code>sm_90+</code> capabilities. The newer <code>.shared::cta</code> TMA destination is a PTX 8.6 extension; adopting it also changes the declared minimum PTX version. Source references are pinned to commits, and NVIDIA documentation to CUDA 13.1.1.</p><h2 id="en-refs">References</h2>
+
+<ul>
+  <li><a href="https://gcc.gnu.org/onlinedocs/gcc-15.1.0/gcc/Extended-Asm.html" target="_blank" rel="noopener">GCC 15.1: Extended Asm</a></li>
+  <li><a href="https://gcc.gnu.org/onlinedocs/gcc-15.1.0/gcc/Machine-Constraints.html" target="_blank" rel="noopener">GCC 15.1: Machine Constraints (AArch64)</a></li>
+  <li><a href="https://github.com/ARM-software/abi-aa/blob/2025Q1/aapcs64/aapcs64.rst" target="_blank" rel="noopener">Arm AAPCS64 2025Q1: Parameter Passing and Result Return</a></li>
+  <li><a href="https://sourceware.org/binutils/docs/as/Align.html" target="_blank" rel="noopener">GNU assembler: <code>.align</code></a></li>
+  <li><a href="https://sourceware.org/binutils/docs/as/P2align.html" target="_blank" rel="noopener">GNU assembler: <code>.p2align</code></a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/inline-ptx-assembly/index.html" target="_blank" rel="noopener">NVIDIA: Using Inline PTX Assembly in CUDA</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async" target="_blank" rel="noopener">PTX ISA: <code>cp.async</code>, commit group, and wait group</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#warp-level-matrix-instructions-ldmatrix" target="_blank" rel="noopener">PTX ISA: <code>ldmatrix</code></a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-16816-float" target="_blank" rel="noopener">PTX ISA: <code>mma.m16n8k16</code> matrix fragments</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-tensor" target="_blank" rel="noopener">PTX ISA: <code>cp.async.bulk.tensor</code></a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/cuda-programming-guide/04-special-topics/async-copies.html" target="_blank" rel="noopener">CUDA Programming Guide: Asynchronous Data Copies and TMA</a></li>
+  <li><a href="https://github.com/NVIDIA/cutlass/blob/59e3a3338d516ca6ce0e073af8da65289678a35c/include/cutlass/arch/barrier.h" target="_blank" rel="noopener">CUTLASS: SM90 transaction barrier inline PTX wrappers</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html" target="_blank" rel="noopener">CUDA Driver API 13.1.1: cuTensorMapEncodeTiled</a></li>
+  <li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-test-wait-try-wait" target="_blank" rel="noopener">PTX ISA: mbarrier phase, acquire wait</a></li>
+</ul>
+</div>
+</main>
+</div>
+<script>
+(function () {
+  const contents = document.querySelector('.article-toc');
+  const compact = window.matchMedia('(max-width: 1099px)');
+  function fitContents() { contents.open = !compact.matches; }
+  fitContents();
+  compact.addEventListener('change', fitContents);
+  contents.addEventListener('click', function (event) {
+    if (compact.matches && event.target.closest('a[href^="#"]')) contents.open = false;
+  });
+})();
+</script>
+</body>
+</html>

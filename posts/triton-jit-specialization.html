@@ -10,10 +10,10 @@
 <meta name="post:date"            content="2026-08-25">
 <meta name="post:tags"            content="Triton, JIT, Specialization, Kernel DSL">
 <meta name="post:tags_en"         content="Triton, JIT, Specialization, Kernel DSL">
-<meta name="post:reading"         content="14 分钟">
-<meta name="post:reading_en"      content="14 min">
-<meta name="post:summary"         content="Triton JIT specialization 按参数类型、constexpr、对齐属性和编译选项划分等价类，同一 key 复用 kernel。固定版本源码表明 Tensor shape 不随普通 pointer 进入 key，两级 cache 与 autotune 共同决定变体数。">
-<meta name="post:summary_en"      content="Triton JIT specialization partitions calls into compilation-equivalence classes keyed by argument types, constexpr values, alignment properties, and compilation options. The pinned implementation shows why ordinary tensor shapes do not automatically enter pointer keys, how in-process and persistent caches are queried, and how specialization combines with autotune to determine variant count.">
+<meta name="post:reading"         content="23 分钟">
+<meta name="post:reading_en"      content="23 min">
+<meta name="post:summary"         content="Triton JIT specialization 按参数类型、constexpr、对齐属性和编译选项划分编译等价类；autotune key 则决定何时重新测量候选配置。固定版本源码、两级缓存路径与 pointer 对齐实验共同说明进程内 miss、persistent cache miss、autotune miss 和 JIT variant 之间的关系。">
+<meta name="post:summary_en"      content="Triton JIT specialization partitions calls into compilation-equivalence classes using argument types, constexpr values, alignment properties, and compilation options, while the autotune key determines when candidate configurations are benchmarked again. Pinned source, the two cache paths, and a pointer-alignment experiment distinguish in-process misses, persistent-cache misses, autotune misses, and JIT variants.">
 <meta name="post:series"          content="kernel-dsl">
 <meta name="post:series_title"    content="Kernel DSL">
 <meta name="post:series_title_en" content="Kernel DSL">
@@ -136,8 +136,8 @@
       <li><a href="#zh-runtime">4. 运行时隐式特化</a></li>
       <li><a href="#zh-cache">5. 两级缓存</a></li>
       <li><a href="#zh-control">6. 控制变体数量</a></li>
-      <li><a href="#zh-autotune">7. 与 autotune 的关系</a></li>
-      <li><a href="#zh-inspect">8. 定位重复编译</a></li>
+      <li><a href="#zh-autotune">7. Autotune key 与触发条件</a></li>
+      <li><a href="#zh-inspect">8. 追踪 specialization 与 cache miss</a></li>
       <li><a href="#zh-refs">参考资料</a></li>
     </ul>
     </div>
@@ -150,8 +150,8 @@
       <li><a href="#en-runtime">4. Implicit specialization</a></li>
       <li><a href="#en-cache">5. Two cache levels</a></li>
       <li><a href="#en-control">6. Controlling variants</a></li>
-      <li><a href="#en-autotune">7. Relationship to autotune</a></li>
-      <li><a href="#en-inspect">8. Diagnosing recompilation</a></li>
+      <li><a href="#en-autotune">7. Autotune keys and triggers</a></li>
+      <li><a href="#en-inspect">8. Tracing specialization and cache misses</a></li>
       <li><a href="#en-refs">References</a></li>
     </ul>
     </div>
@@ -450,24 +450,109 @@ def dynamic_kernel(x, y, n, BLOCK: tl.constexpr):
   <p>关闭 specialization 不会改变 kernel 的数学语义，但会减少编译器可用的静态信息。变体数量下降以后，某些形状可能失去向量化或无 mask 路径。它是编译时间、代码体积和运行性能之间的取舍。</p>
 </div>
 
-<h2 id="zh-autotune">7. Specialization 与 autotune</h2>
+<h2 id="zh-autotune">7. Autotune key 与触发条件</h2>
 
-<p><code>@triton.autotune</code> 是在若干 <code>triton.Config</code> 之间测量并选择配置的搜索机制；specialization JIT 则把到达 launch 路径的参数与配置编译成可执行 kernel。Autotune 决定“选哪个配置”，specialization 决定“需要哪些编译变体”。</p>
+<p><code>@triton.autotune</code> 是按运行时输入选择 <code>triton.Config</code> 的测量机制。它为一个 tuning key 运行候选配置、记录耗时并保存胜出的 config。Specialization JIT 随后负责为候选配置与参数属性生成可执行 kernel。前者的缓存单位是“输入对应的最佳配置”，后者的缓存单位是“可复用的编译变体”。</p>
+
+<h3>Key 的声明与运行时组成</h3>
+
+<p><code>key</code> 接收 kernel 形参名列表。官方 matrix multiplication tutorial 以 <code>M</code>、<code>N</code>、<code>K</code> 划分调优输入域；任一维度取值改变，都会得到另一个 tuning key。参数名与示例可在固定版本的 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/tutorials/03-matrix-multiplication.py#L223-L248">matmul autotune decorator</a> 中核对。</p>
 
 <pre class="code">@triton.autotune(
     configs=[
-        triton.Config({"BLOCK": 128}, num_warps=4),
-        triton.Config({"BLOCK": 256}, num_warps=8),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=8,
+        ),
     ],
-    key=["n"],
+    key=["M", "N", "K"],
 )
 @triton.jit
-def kernel(x, y, n, BLOCK: tl.constexpr):
+def matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
     ...</pre>
 
-<p>这里至少有两个 JIT 变体，因为 <code>BLOCK</code> 和 <code>num_warps</code> 都不同。autotune 的 <code>key=["n"]</code> 表示不同 <code>n</code> 可以分别选择胜出的 config；它不等于把 <code>n</code> 自动声明成 <code>tl.constexpr</code>。最终编译数量取决于候选 config、参数 specialization 和实际到达的输入组合。</p>
+<p>在本文固定的 Triton revision 中，运行时先按 <code>key</code> 声明的顺序读取参数值，随后追加所有带 <code>dtype</code> 属性的 kernel argument 类型。对于上面的调用，tuning key 可以表示为：</p>
 
-<h2 id="zh-inspect">8. 定位重复编译</h2>
+<pre class="code">tuning_key = (
+    M, N, K,
+    str(a.dtype), str(b.dtype), str(c.dtype),
+)</pre>
+
+<p>这段构造逻辑位于 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py#L217-L228"><code>Autotuner.run()</code></a>。Tensor 地址和 pointer alignment 不会自动进入 tuning key；它们属于 JIT specialization。实践中通常选择 shape、stride、模式标志或显式 bucket 等能够改变最佳 config 的标量参数，而不把 pointer 参数列入 <code>key</code>。</p>
+
+<h3>新 key 的调优路径</h3>
+
+<p><code>Autotuner</code> 首先查询进程内的 <code>self.cache</code>。miss 后，候选集先经过 <code>early_config_prune</code> 和 performance model；剩余多个配置时才执行 benchmark。固定版本的 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py#L217-L272">运行路径</a>可以简化为以下伪代码：</p>
+
+<pre class="code">tuning_key = selected_argument_values + tensor_dtypes
+
+if tuning_key not in process_cache:
+    candidates = prune(configs)
+
+    if len(candidates) == 1:
+        best = candidates[0]
+    elif disk_result_exists(tuning_key, candidates):
+        best = restore_best_config()
+    else:
+        timings = benchmark_each(candidates)
+        best = argmin(timings)
+
+    process_cache[tuning_key] = best
+
+launch(process_cache[tuning_key])</pre>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>调用条件</th><th>进程内 tuning key</th><th>行为</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>首次调用 <code>M=N=K=1024</code>、FP16</td><td>miss</td><td>Prune 后测量候选配置并保存最佳 config。</td></tr>
+    <tr><td>再次调用相同 shape 与 dtype</td><td>hit</td><td>直接复用最佳 config，不再 benchmark。</td></tr>
+    <tr><td><code>M</code> 改为 2048</td><td>miss</td><td>形成新 key；重新选择该输入的最佳 config。</td></tr>
+    <tr><td>Shape 相同，输入改为 BF16</td><td>miss</td><td>Tensor dtype 是 key 的组成部分，因此重新选择。</td></tr>
+    <tr><td>新进程，默认 <code>cache_results=False</code></td><td>miss</td><td>进程内 cache 为空；仍有多个候选时再次 benchmark。</td></tr>
+    <tr><td>新进程，<code>cache_results=True</code> 且 disk hit</td><td>miss 后恢复</td><td>从磁盘读取 timing，恢复最佳 config，不执行 benchmark。</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>新的 tuning key 在两个条件同时满足时触发 benchmark：disk cache 没有恢复已有结果，并且 prune 后仍有多个候选。若只剩一个 config，运行时直接选中它。<code>cache_results</code> 默认关闭；开启后，磁盘 key 还包含 Triton cache identity、target backend、kernel source hash、cache-invalidating 环境变量和候选配置集合，具体字段见 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py#L175-L215"><code>check_disk_cache()</code></a>。</p>
+
+<h3>Autotune miss 与 JIT miss</h3>
+
+<p>一次 autotune miss 会运行候选 config，但每次候选 launch 仍独立查询 JIT cache。新的 tuning key 因而表示“需要重新测量”，不必然表示“所有候选都要重新编译”。JIT miss 也可以出现在 autotune hit 路径上：pointer alignment 改变可能产生新的 specialization，而 shape 与 dtype 对应的 tuning key 仍然命中，此时 Triton 沿用此前选出的 config，只编译缺失的 variant。</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>变化</th><th>Autotune cache</th><th>JIT cache</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>M/N/K</code> 中的 key value 改变</td><td>miss，重新测量或从 disk 恢复</td><td>每个候选分别查询，可能 hit 也可能 miss</td></tr>
+    <tr><td>Key 相同，pointer 从 16-byte aligned 变为 misaligned</td><td>hit，沿用最佳 config</td><td>specialization attribute 改变，产生新 variant</td></tr>
+    <tr><td>Key 与 specialization 都不变</td><td>hit</td><td>hit</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>输入长度高度离散时，直接把原始长度放入 <code>key</code> 会让调优次数随取值数量增长。若一段长度区间共享相近的性能特征，可以在 wrapper 中计算 bucket，并把 bucket 作为显式 kernel argument 和 autotune key；这种合并需要用 benchmark 验证，避免把最佳配置不同的输入压入同一条目。</p>
+
+<div class="note-box warn">
+  <p>Autotune 会为同一个 key 多次执行 kernel。Kernel 修改输出、计数器或其他持久状态时，需要使用 <code>reset_to_zero</code>、<code>restore_value</code> 或 hook 在候选之间恢复状态。<a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py#L409-L473"><code>triton.autotune</code> 的固定版本文档</a>同时给出了这些接口；<code>TRITON_PRINT_AUTOTUNING=1</code> 可打印实际发生的调优及胜出配置。</p>
+</div>
+
+<h2 id="zh-inspect">8. 追踪 Specialization 与 Cache Miss</h2>
 
 <p>出现首次迭代很慢或 cache 目录快速增长时，可以先检查三个位置：</p>
 
@@ -479,16 +564,227 @@ def kernel(x, y, n, BLOCK: tl.constexpr):
 
 <p><code>TRITON_CACHE_DIR</code> 可以指定 persistent cache 位置。<code>TRITON_KERNEL_DUMP=1</code> 会把各阶段 IR 写入 <code>TRITON_DUMP_DIR</code>，适合比较两个 specialization 的 TTIR 或 PTX。调试缓存命中时还可以使用 <code>TRITON_ALWAYS_COMPILE=1</code> 强制重编译；这些环境变量的当前定义在 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/knobs.py#L343-L363"><code>knobs.py</code></a> 中。</p>
 
-<p>实际排查时，可以记录每次调用的 dtype、constexpr、<code>num_warps</code>，再检查参与 shape 或 stride 计算的整数对 16 的余数。这些信息通常能解释大部分重复编译。Tensor shape 本身不是普通 pointer 参数的 key；进入 key 的通常是显式传入的 shape 标量及其整除属性。</p>
+<h3>两个 Hook 对应两级 Cache</h3>
+
+<p><code>knobs.runtime.jit_cache_hook</code> 是进程内 JIT cache miss 的观察点。<code>JITFunction._do_compile()</code> 在构造 <code>ASTSource</code> 之前调用它，并通过 <code>specialization_data</code> 提供 signature、constexpr、argument attributes、options、runtime key 和 target。该事件说明当前进程尚未保存这个 specialization；后续 persistent cache 是否命中，要等编译器完成查询才能确定。hook 的字段和调用位置见固定版本的 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/knobs.py#L442-L490"><code>JITHook</code> protocol</a>、<a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L379-L394"><code>serialize_specialization_data()</code></a> 和 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L640-L686"><code>_call_hook()</code></a>。</p>
+
+<p><code>knobs.compilation.listener</code> 位于 <code>compile()</code> 的 persistent cache 路径。metadata group 恢复成功时，listener 收到 <code>cache_hit=True</code>；完整 lowering 与产物写回结束后，listener 收到 <code>cache_hit=False</code>。Triton 的 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/test/unit/runtime/test_compilation_listener.py#L20-L66">compilation listener 单元测试</a>也覆盖了这两种状态。因此，一条 JIT specialization 事件紧接着 <code>disk_cache_hit=false</code>，才表示该 specialization 进入编译器后又发生 persistent cache miss。</p>
+
+<div class="note-box warn">
+  <p>这两个 hook 是 Triton 固定版本中的进程级 instrumentation knob，并非稳定的公共 API。回调签名和 payload 需要随安装版本核对。<code>jit_cache_hook</code> 应返回 <code>False</code> 或 <code>None</code>；返回 <code>True</code> 会让 <code>_do_compile()</code> 提前返回，正常编译和 kernel launch 都会被跳过。</p>
+</div>
+
+<h3>可复现实验：Pointer 地址对齐产生两个变体</h3>
+
+<p>Pointer alignment 展示了一个只改变地址、不改变 dtype、shape、<code>BLOCK</code> 或 launch options 的 specialization。固定版本的 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/src/specialize.cc#L330-L396"><code>native_specialize_impl</code></a> 对 Tensor 调用 <code>data_ptr()</code>；当地址满足 16-byte 对齐时，它返回内部 descriptor <code>"D"</code>。随后 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/backends/compiler.py#L74-L92"><code>BaseBackend.parse_attr()</code></a> 把 <code>"D"</code> 转成 <code>[["tt.divisibility", 16]]</code>。其语义等价于：</p>
+
+<pre class="code">if ValuesA.data_ptr() % 16 == 0:
+    attrs["ValuesA"] = [["tt.divisibility", 16]]
+else:
+    attrs["ValuesA"] = []</pre>
+
+<p>真实实现不会直接用参数名写入 <code>attrs</code>。它先按参数位置保存 descriptor，再在 <code>_pack_args()</code> 中生成 attribute path；下面的日志函数把这些 path 还原为 <code>ValuesA</code>、<code>Out</code> 等参数名，便于比较。</p>
+
+<pre class="code"># trace_specialization.py
+import json
+import os
+import time
+
+import torch
+import triton
+import triton.language as tl
+from triton import knobs
+
+
+def _rank():
+    return os.environ.get("RANK", "unknown")
+
+
+def _named_path_map(keys, values, signature):
+    parameter_names = list(signature)
+    result = {}
+    for path, value in zip(keys, values):
+        if path and isinstance(path[0], int) and path[0] &lt; len(parameter_names):
+            label = parameter_names[path[0]]
+            label += "".join(f"[{index}]" for index in path[1:])
+        else:
+            label = str(path)
+        result[label] = value
+    return result
+
+
+def _jit_specialization(**event):
+    compile_info = event["compile"]
+    specialization = json.loads(compile_info["specialization_data"])
+    signature = specialization["signature"]
+
+    print(
+        json.dumps(
+            {
+                "event": "TRITON_JIT_SPECIALIZATION",
+                "time_ns": time.monotonic_ns(),
+                "rank": _rank(),
+                "pid": os.getpid(),
+                "kernel": specialization["name"],
+                "signature": signature,
+                "constants": _named_path_map(
+                    specialization["constant_keys"],
+                    specialization["constant_vals"],
+                    signature,
+                ),
+                "attrs": _named_path_map(
+                    specialization["attrs_keys"],
+                    specialization["attrs_vals"],
+                    signature,
+                ),
+                "options": specialization["options"],
+                "target": specialization["target"],
+                "runtime_key": event["key"],
+                "manual_warmup": event["is_manual_warmup"],
+            },
+            default=str,
+        ),
+        flush=True,
+    )
+
+    # A truthy return value skips normal compilation and launch.
+    return False
+
+
+def _compilation_result(*, src, metadata, metadata_group, times, cache_hit):
+    print(
+        json.dumps(
+            {
+                "event": "TRITON_COMPILE_RESULT",
+                "time_ns": time.monotonic_ns(),
+                "rank": _rank(),
+                "pid": os.getpid(),
+                "kernel": getattr(src, "name", "unknown"),
+                "compiler_hash": metadata.get("hash"),
+                "disk_cache_hit": cache_hit,
+                "compiler_path_ms": times.total / 1000.0,
+                "lowering_ms": times.total_lowering / 1000.0,
+            }
+        ),
+        flush=True,
+    )
+
+
+@triton.jit
+def copy_kernel(ValuesA, Out, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.store(Out + offsets, tl.load(ValuesA + offsets))
+
+
+def _aligned_view(storage, size):
+    byte_offset = (-storage.data_ptr()) % 16
+    assert byte_offset % storage.element_size() == 0
+    element_offset = byte_offset // storage.element_size()
+    return storage[element_offset : element_offset + size]
+
+
+def main():
+    if not hasattr(knobs.runtime, "jit_cache_hook"):
+        raise RuntimeError(f"Triton {triton.__version__} lacks jit_cache_hook")
+    if not hasattr(knobs.compilation, "listener"):
+        raise RuntimeError(f"Triton {triton.__version__} lacks compilation.listener")
+
+    block = 256
+    input_storage = torch.arange(block + 4, device="cuda", dtype=torch.float32)
+    output_storage = torch.empty(block + 4, device="cuda", dtype=torch.float32)
+    aligned = _aligned_view(input_storage, block)
+    misaligned = aligned.as_strided((block,), (1,), storage_offset=aligned.storage_offset() + 1)
+    out = _aligned_view(output_storage, block)
+
+    assert aligned.data_ptr() % 16 == 0
+    assert misaligned.data_ptr() % 16 == aligned.element_size()
+    assert out.data_ptr() % 16 == 0
+
+    old_jit_hook = knobs.runtime.jit_cache_hook
+    old_listener = knobs.compilation.listener
+    knobs.runtime.jit_cache_hook = _jit_specialization
+    knobs.compilation.listener = _compilation_result
+
+    print(
+        json.dumps(
+            {
+                "event": "TRITON_JIT_TRACKING_ENABLED",
+                "version": triton.__version__,
+                "cache_dir": os.environ.get("TRITON_CACHE_DIR"),
+            }
+        ),
+        flush=True,
+    )
+
+    try:
+        for label, values in (
+            ("aligned-1", aligned),
+            ("aligned-2", aligned),
+            ("misaligned-1", misaligned),
+            ("misaligned-2", misaligned),
+        ):
+            print(
+                json.dumps(
+                    {
+                        "event": "TRITON_CALL",
+                        "label": label,
+                        "ValuesA_ptr_mod_16": values.data_ptr() % 16,
+                    }
+                ),
+                flush=True,
+            )
+            copy_kernel[(1,)](values, out, BLOCK=block)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(out, values)
+    finally:
+        knobs.runtime.jit_cache_hook = old_jit_hook
+        knobs.compilation.listener = old_listener
+
+
+if __name__ == "__main__":
+    main()</pre>
+
+<p>实验需要带 CUDA backend 的 Triton 和 PyTorch。使用同一个空目录连续启动两个 Python 进程：</p>
+
+<pre class="code">CACHE_DIR=$(mktemp -d)
+
+TRITON_CACHE_DIR="$CACHE_DIR" python trace_specialization.py \
+    | tee first-process.jsonl
+
+TRITON_CACHE_DIR="$CACHE_DIR" python trace_specialization.py \
+    | tee second-process.jsonl</pre>
+
+<p>第一个进程的 <code>aligned-1</code> 与 <code>misaligned-1</code> 都会产生 JIT 事件和 <code>disk_cache_hit=false</code> 的 compilation 事件；同一 specialization 的第二次调用直接命中进程内 cache，因此没有这两类事件。第二个进程重新建立进程内 cache，所以两个首次调用仍会触发 JIT hook，但相同 persistent key 已经写入指定目录，compilation listener 应报告 <code>disk_cache_hit=true</code>。</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>调用</th><th><code>ValuesA</code> attribute</th><th>第一个进程</th><th>第二个进程</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>aligned-1</code></td><td><code>[["tt.divisibility", 16]]</code></td><td>JIT miss；disk miss</td><td>JIT miss；disk hit</td></tr>
+    <tr><td><code>aligned-2</code></td><td>同上</td><td>进程内 hit</td><td>进程内 hit</td></tr>
+    <tr><td><code>misaligned-1</code></td><td><code>[]</code></td><td>JIT miss；disk miss</td><td>JIT miss；disk hit</td></tr>
+    <tr><td><code>misaligned-2</code></td><td>同上</td><td>进程内 hit</td><td>进程内 hit</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>两份 JIT 日志中的 dtype、shape、<code>BLOCK</code>、options 和 target 相同，<code>ValuesA</code> 的 attribute 是唯一变化项，由此可以把第二个变体归因于 pointer alignment。若 specialization 字段完全一致而 <code>compiler_hash</code> 发生变化，排查范围应转向 kernel source、传递依赖、cache-invalidating 环境变量或编译器版本，而不是继续增加 shape 日志。</p>
 
 <h2 id="zh-refs">参考资料</h2>
 
 <ul>
   <li><a href="https://triton-lang.org/main/python-api/generated/triton.jit.html">Triton <code>triton.jit</code> API</a></li>
+  <li><a href="https://triton-lang.org/main/python-api/generated/triton.autotune.html">Triton <code>triton.autotune</code> API</a></li>
   <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py">Triton runtime JIT implementation</a></li>
+  <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py">Triton runtime autotuner implementation</a></li>
+  <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/tutorials/03-matrix-multiplication.py">Triton matrix multiplication tutorial</a></li>
   <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/test/unit/runtime/test_specialize.py">Triton specialization tests</a></li>
+  <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/test/unit/runtime/test_compilation_listener.py">Triton compilation listener tests</a></li>
   <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/compiler/compiler.py">Triton compiler and persistent cache path</a></li>
   <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/backends/compiler.py">Triton backend specialization attributes</a></li>
+  <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/src/specialize.cc">Triton native argument specialization</a></li>
 </ul>
 
 </div>
@@ -784,24 +1080,109 @@ def dynamic_kernel(x, y, n, BLOCK: tl.constexpr):
   <p>Disabling specialization does not alter the kernel's mathematical semantics, but it removes static information from the compiler. Fewer variants may cost some shapes their vectorized or mask-free path. The setting trades compilation time and code size against runtime performance.</p>
 </div>
 
-<h2 id="en-autotune">7. Specialization and Autotune</h2>
+<h2 id="en-autotune">7. Autotune Keys and Trigger Conditions</h2>
 
-<p><code>@triton.autotune</code> is a search mechanism that benchmarks and selects among several <code>triton.Config</code> candidates. Specialization JIT compiles the argument and configuration combinations that reach the launch path. Autotune decides which configuration wins; specialization determines which compiled variants are required.</p>
+<p><code>@triton.autotune</code> is a measurement mechanism that selects a <code>triton.Config</code> for a runtime input. For one tuning key, it runs candidate configurations, records their timings, and caches the winner. Specialization JIT then produces executable kernels for the candidate configurations and argument properties that reach the launch path. The autotune cache stores “the best configuration for an input,” while the JIT cache stores reusable compiled variants.</p>
+
+<h3>Key Declaration and Runtime Composition</h3>
+
+<p>The <code>key</code> parameter is a list of names from the kernel signature. Triton's matrix multiplication tutorial partitions the tuning domain by <code>M</code>, <code>N</code>, and <code>K</code>; changing any dimension produces another tuning key. The declaration appears in the pinned <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/tutorials/03-matrix-multiplication.py#L223-L248">matmul autotune decorator</a>.</p>
 
 <pre class="code">@triton.autotune(
     configs=[
-        triton.Config({"BLOCK": 128}, num_warps=4),
-        triton.Config({"BLOCK": 256}, num_warps=8),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32},
+            num_warps=8,
+        ),
     ],
-    key=["n"],
+    key=["M", "N", "K"],
 )
 @triton.jit
-def kernel(x, y, n, BLOCK: tl.constexpr):
+def matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
     ...</pre>
 
-<p>This example has at least two JIT variants because both <code>BLOCK</code> and <code>num_warps</code> differ. The autotune setting <code>key=["n"]</code> lets different <code>n</code> values choose different winning configurations; it does not automatically declare <code>n</code> as <code>tl.constexpr</code>. The final compilation count depends on candidate configurations, argument specialization, and the combinations that actually reach the kernel.</p>
+<p>In the Triton revision pinned by this article, the runtime first reads the declared argument values in key order and then appends the type of every kernel argument that exposes a <code>dtype</code> attribute. For the call above, the tuning key can be represented as:</p>
 
-<h2 id="en-inspect">8. Diagnosing Repeated Compilation</h2>
+<pre class="code">tuning_key = (
+    M, N, K,
+    str(a.dtype), str(b.dtype), str(c.dtype),
+)</pre>
+
+<p>The construction is implemented in <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py#L217-L228"><code>Autotuner.run()</code></a>. Tensor addresses and pointer-alignment attributes are not added to the tuning key automatically; they belong to JIT specialization. Useful keys are scalar shape, stride, mode, or explicit-bucket arguments that can change the winning configuration, rather than pointer arguments.</p>
+
+<h3>The Path Taken by a New Key</h3>
+
+<p><code>Autotuner</code> first queries its in-process <code>self.cache</code>. After a miss, <code>early_config_prune</code> and the performance model reduce the candidate set; benchmarking is required only when multiple candidates remain. The pinned <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py#L217-L272">runtime path</a> can be reduced to the following pseudocode:</p>
+
+<pre class="code">tuning_key = selected_argument_values + tensor_dtypes
+
+if tuning_key not in process_cache:
+    candidates = prune(configs)
+
+    if len(candidates) == 1:
+        best = candidates[0]
+    elif disk_result_exists(tuning_key, candidates):
+        best = restore_best_config()
+    else:
+        timings = benchmark_each(candidates)
+        best = argmin(timings)
+
+    process_cache[tuning_key] = best
+
+launch(process_cache[tuning_key])</pre>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Call condition</th><th>In-process tuning key</th><th>Behavior</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>First call with <code>M=N=K=1024</code>, FP16</td><td>Miss</td><td>Benchmark the candidates left after pruning and save the winning config.</td></tr>
+    <tr><td>Same shape and dtype again</td><td>Hit</td><td>Reuse the winner without benchmarking.</td></tr>
+    <tr><td><code>M</code> changes to 2048</td><td>Miss</td><td>Form a new key and select the best config for that input.</td></tr>
+    <tr><td>Same shape, inputs change to BF16</td><td>Miss</td><td>Tensor dtype is part of the key, so selection runs again.</td></tr>
+    <tr><td>New process with the default <code>cache_results=False</code></td><td>Miss</td><td>The process cache starts empty; benchmarking runs again if multiple candidates remain.</td></tr>
+    <tr><td>New process with <code>cache_results=True</code> and a disk hit</td><td>Restore after miss</td><td>Load timings and recover the winner without benchmarking.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>A new tuning key triggers benchmarking when two conditions hold: the disk cache does not restore a prior result, and pruning leaves more than one candidate. A single remaining config is selected directly. <code>cache_results</code> is disabled by default. When enabled, the disk key also contains Triton's cache identity, the target backend, kernel source hash, cache-invalidating environment variables, and the candidate-config set; the exact fields are in <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py#L175-L215"><code>check_disk_cache()</code></a>.</p>
+
+<h3>Autotune Misses and JIT Misses</h3>
+
+<p>An autotune miss runs candidate configurations, but every candidate launch still queries the JIT cache independently. A new tuning key therefore means “measure again,” not necessarily “compile every candidate again.” A JIT miss can also occur on an autotune-hit path: a pointer-alignment change may create a new specialization while the shape-and-dtype tuning key remains a hit. Triton then keeps the previously selected config and compiles only the missing variant.</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Change</th><th>Autotune cache</th><th>JIT cache</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>A key value among <code>M/N/K</code> changes</td><td>Miss; benchmark or restore from disk</td><td>Each candidate queries it separately and may hit or miss</td></tr>
+    <tr><td>Same key; pointer changes from 16-byte aligned to misaligned</td><td>Hit; reuse the winning config</td><td>Specialization attribute changes and creates a new variant</td></tr>
+    <tr><td>Neither key nor specialization changes</td><td>Hit</td><td>Hit</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Using every raw length as a key value makes tuning frequency grow with the number of distinct lengths. If a range of lengths has similar performance characteristics, a wrapper can compute a bucket and pass it as an explicit kernel argument and autotune key. Such coalescing should be validated by benchmarks because inputs with different optimal configurations must remain in separate entries.</p>
+
+<div class="note-box warn">
+  <p>Autotune executes the kernel multiple times for one key. A kernel that modifies outputs, counters, or other persistent state must use <code>reset_to_zero</code>, <code>restore_value</code>, or hooks to restore state between candidates. The pinned <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py#L409-L473"><code>triton.autotune</code> documentation</a> defines these interfaces. <code>TRITON_PRINT_AUTOTUNING=1</code> prints each actual tuning event and its winning config.</p>
+</div>
+
+<h2 id="en-inspect">8. Tracing Specialization and Cache Misses</h2>
 
 <p>When the first iteration is slow or the cache directory grows quickly, inspect three areas:</p>
 
@@ -813,16 +1194,227 @@ def kernel(x, y, n, BLOCK: tl.constexpr):
 
 <p><code>TRITON_CACHE_DIR</code> selects the persistent-cache location. <code>TRITON_KERNEL_DUMP=1</code> writes each IR stage under <code>TRITON_DUMP_DIR</code>, which is useful when comparing the TTIR or PTX of two specializations. <code>TRITON_ALWAYS_COMPILE=1</code> forces recompilation while debugging cache hits. The current definitions of these environment variables are in <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/knobs.py#L343-L363"><code>knobs.py</code></a>.</p>
 
-<p>A practical first step is to record dtype, constexpr values, and <code>num_warps</code> for each call, then inspect the remainder modulo 16 for integers used in shape or stride calculations. Those values usually explain most repeated compilation. The shape of a tensor is not itself part of the key for an ordinary pointer argument; explicit shape scalars and their divisibility properties are more often responsible.</p>
+<h3>Two Hooks Observe Two Cache Levels</h3>
+
+<p><code>knobs.runtime.jit_cache_hook</code> is an observation point for an in-process JIT cache miss. <code>JITFunction._do_compile()</code> calls it before constructing an <code>ASTSource</code>, and <code>specialization_data</code> carries the signature, constexpr values, argument attributes, options, runtime key, and target. The event establishes that the current process does not hold this specialization; persistent-cache status is known only after the compiler performs its lookup. The fixed-revision definitions are in the <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/knobs.py#L442-L490"><code>JITHook</code> protocol</a>, <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L379-L394"><code>serialize_specialization_data()</code></a>, and <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L640-L686"><code>_call_hook()</code></a>.</p>
+
+<p><code>knobs.compilation.listener</code> runs inside the persistent-cache path of <code>compile()</code>. It receives <code>cache_hit=True</code> when a metadata group restores a compiled kernel and <code>cache_hit=False</code> after full lowering and artifact writeback. Triton's <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/test/unit/runtime/test_compilation_listener.py#L20-L66">compilation-listener test</a> covers both states. A JIT specialization event followed by <code>disk_cache_hit=false</code> therefore identifies a specialization that missed both the process-local and persistent caches.</p>
+
+<div class="note-box warn">
+  <p>These hooks are process-wide instrumentation knobs in the pinned Triton revision, not a stable public API. Their callback signatures and payloads must be checked against the installed version. A <code>jit_cache_hook</code> should return <code>False</code> or <code>None</code>; returning <code>True</code> makes <code>_do_compile()</code> return early, skipping normal compilation and the kernel launch.</p>
+</div>
+
+<h3>Reproducible Experiment: Pointer Alignment Creates Two Variants</h3>
+
+<p>Pointer alignment supplies a specialization where the address changes while dtype, shape, <code>BLOCK</code>, and launch options remain fixed. In the pinned <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/src/specialize.cc#L330-L396"><code>native_specialize_impl</code></a>, Triton calls <code>data_ptr()</code> on a tensor and returns the internal descriptor <code>"D"</code> for a 16-byte-aligned address. <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/backends/compiler.py#L74-L92"><code>BaseBackend.parse_attr()</code></a> then converts <code>"D"</code> into <code>[["tt.divisibility", 16]]</code>. The behavior is equivalent to:</p>
+
+<pre class="code">if ValuesA.data_ptr() % 16 == 0:
+    attrs["ValuesA"] = [["tt.divisibility", 16]]
+else:
+    attrs["ValuesA"] = []</pre>
+
+<p>The implementation does not write directly to an <code>attrs</code> dictionary keyed by argument name. It first records a descriptor by argument position, then <code>_pack_args()</code> creates attribute paths. The logger below maps those paths back to names such as <code>ValuesA</code> and <code>Out</code>.</p>
+
+<pre class="code"># trace_specialization.py
+import json
+import os
+import time
+
+import torch
+import triton
+import triton.language as tl
+from triton import knobs
+
+
+def _rank():
+    return os.environ.get("RANK", "unknown")
+
+
+def _named_path_map(keys, values, signature):
+    parameter_names = list(signature)
+    result = {}
+    for path, value in zip(keys, values):
+        if path and isinstance(path[0], int) and path[0] &lt; len(parameter_names):
+            label = parameter_names[path[0]]
+            label += "".join(f"[{index}]" for index in path[1:])
+        else:
+            label = str(path)
+        result[label] = value
+    return result
+
+
+def _jit_specialization(**event):
+    compile_info = event["compile"]
+    specialization = json.loads(compile_info["specialization_data"])
+    signature = specialization["signature"]
+
+    print(
+        json.dumps(
+            {
+                "event": "TRITON_JIT_SPECIALIZATION",
+                "time_ns": time.monotonic_ns(),
+                "rank": _rank(),
+                "pid": os.getpid(),
+                "kernel": specialization["name"],
+                "signature": signature,
+                "constants": _named_path_map(
+                    specialization["constant_keys"],
+                    specialization["constant_vals"],
+                    signature,
+                ),
+                "attrs": _named_path_map(
+                    specialization["attrs_keys"],
+                    specialization["attrs_vals"],
+                    signature,
+                ),
+                "options": specialization["options"],
+                "target": specialization["target"],
+                "runtime_key": event["key"],
+                "manual_warmup": event["is_manual_warmup"],
+            },
+            default=str,
+        ),
+        flush=True,
+    )
+
+    # A truthy return value skips normal compilation and launch.
+    return False
+
+
+def _compilation_result(*, src, metadata, metadata_group, times, cache_hit):
+    print(
+        json.dumps(
+            {
+                "event": "TRITON_COMPILE_RESULT",
+                "time_ns": time.monotonic_ns(),
+                "rank": _rank(),
+                "pid": os.getpid(),
+                "kernel": getattr(src, "name", "unknown"),
+                "compiler_hash": metadata.get("hash"),
+                "disk_cache_hit": cache_hit,
+                "compiler_path_ms": times.total / 1000.0,
+                "lowering_ms": times.total_lowering / 1000.0,
+            }
+        ),
+        flush=True,
+    )
+
+
+@triton.jit
+def copy_kernel(ValuesA, Out, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    tl.store(Out + offsets, tl.load(ValuesA + offsets))
+
+
+def _aligned_view(storage, size):
+    byte_offset = (-storage.data_ptr()) % 16
+    assert byte_offset % storage.element_size() == 0
+    element_offset = byte_offset // storage.element_size()
+    return storage[element_offset : element_offset + size]
+
+
+def main():
+    if not hasattr(knobs.runtime, "jit_cache_hook"):
+        raise RuntimeError(f"Triton {triton.__version__} lacks jit_cache_hook")
+    if not hasattr(knobs.compilation, "listener"):
+        raise RuntimeError(f"Triton {triton.__version__} lacks compilation.listener")
+
+    block = 256
+    input_storage = torch.arange(block + 4, device="cuda", dtype=torch.float32)
+    output_storage = torch.empty(block + 4, device="cuda", dtype=torch.float32)
+    aligned = _aligned_view(input_storage, block)
+    misaligned = aligned.as_strided((block,), (1,), storage_offset=aligned.storage_offset() + 1)
+    out = _aligned_view(output_storage, block)
+
+    assert aligned.data_ptr() % 16 == 0
+    assert misaligned.data_ptr() % 16 == aligned.element_size()
+    assert out.data_ptr() % 16 == 0
+
+    old_jit_hook = knobs.runtime.jit_cache_hook
+    old_listener = knobs.compilation.listener
+    knobs.runtime.jit_cache_hook = _jit_specialization
+    knobs.compilation.listener = _compilation_result
+
+    print(
+        json.dumps(
+            {
+                "event": "TRITON_JIT_TRACKING_ENABLED",
+                "version": triton.__version__,
+                "cache_dir": os.environ.get("TRITON_CACHE_DIR"),
+            }
+        ),
+        flush=True,
+    )
+
+    try:
+        for label, values in (
+            ("aligned-1", aligned),
+            ("aligned-2", aligned),
+            ("misaligned-1", misaligned),
+            ("misaligned-2", misaligned),
+        ):
+            print(
+                json.dumps(
+                    {
+                        "event": "TRITON_CALL",
+                        "label": label,
+                        "ValuesA_ptr_mod_16": values.data_ptr() % 16,
+                    }
+                ),
+                flush=True,
+            )
+            copy_kernel[(1,)](values, out, BLOCK=block)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(out, values)
+    finally:
+        knobs.runtime.jit_cache_hook = old_jit_hook
+        knobs.compilation.listener = old_listener
+
+
+if __name__ == "__main__":
+    main()</pre>
+
+<p>The experiment requires Triton with a CUDA backend and PyTorch. Run the same file in two Python processes with one initially empty cache directory:</p>
+
+<pre class="code">CACHE_DIR=$(mktemp -d)
+
+TRITON_CACHE_DIR="$CACHE_DIR" python trace_specialization.py \
+    | tee first-process.jsonl
+
+TRITON_CACHE_DIR="$CACHE_DIR" python trace_specialization.py \
+    | tee second-process.jsonl</pre>
+
+<p>In the first process, <code>aligned-1</code> and <code>misaligned-1</code> each produce a JIT event followed by a compilation event with <code>disk_cache_hit=false</code>. The second call for each specialization hits the process-local cache and emits neither event. The second process rebuilds its process-local cache, so both first calls still invoke the JIT hook; their persistent keys already exist under the shared directory, and the compilation listener should report <code>disk_cache_hit=true</code>.</p>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr><th>Call</th><th><code>ValuesA</code> attribute</th><th>First process</th><th>Second process</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>aligned-1</code></td><td><code>[["tt.divisibility", 16]]</code></td><td>JIT miss; disk miss</td><td>JIT miss; disk hit</td></tr>
+    <tr><td><code>aligned-2</code></td><td>Same as above</td><td>Process-local hit</td><td>Process-local hit</td></tr>
+    <tr><td><code>misaligned-1</code></td><td><code>[]</code></td><td>JIT miss; disk miss</td><td>JIT miss; disk hit</td></tr>
+    <tr><td><code>misaligned-2</code></td><td>Same as above</td><td>Process-local hit</td><td>Process-local hit</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>The dtype, shape, <code>BLOCK</code>, options, and target are identical in the two JIT records. The <code>ValuesA</code> attribute is the only changed field, which attributes the second variant to pointer alignment. If all specialization fields remain equal while <code>compiler_hash</code> changes, the investigation should move to kernel source, transitive dependencies, cache-invalidating environment variables, or the compiler version rather than collecting more shape logs.</p>
 
 <h2 id="en-refs">References</h2>
 
 <ul>
   <li><a href="https://triton-lang.org/main/python-api/generated/triton.jit.html">Triton <code>triton.jit</code> API</a></li>
+  <li><a href="https://triton-lang.org/main/python-api/generated/triton.autotune.html">Triton <code>triton.autotune</code> API</a></li>
   <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py">Triton runtime JIT implementation</a></li>
+  <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py">Triton runtime autotuner implementation</a></li>
+  <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/tutorials/03-matrix-multiplication.py">Triton matrix multiplication tutorial</a></li>
   <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/test/unit/runtime/test_specialize.py">Triton specialization tests</a></li>
+  <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/test/unit/runtime/test_compilation_listener.py">Triton compilation listener tests</a></li>
   <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/compiler/compiler.py">Triton compiler and persistent cache path</a></li>
   <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/backends/compiler.py">Triton backend specialization properties</a></li>
+  <li><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/src/specialize.cc">Triton native argument specialization</a></li>
 </ul>
 
 </div>

@@ -10,10 +10,10 @@
 <meta name="post:date"            content="2026-08-28">
 <meta name="post:tags"            content="GPU, CUDA, Nsight Compute, Memory Hierarchy, L1TEX, L2 Cache">
 <meta name="post:tags_en"         content="GPU, CUDA, Nsight Compute, Memory Hierarchy, L1TEX, L2 Cache">
-<meta name="post:reading"         content="14 分钟">
-<meta name="post:reading_en"      content="14 min">
-<meta name="post:summary"         content="NCU Memory Chart 用 request、sector 与 wavefront 表示 global load 经 LSU、L1TEX、L2 到显存分区的路径。层级计数定位流量放大与 cache miss，GNIC、LRC、FBPA 等仅按公开证据解释。">
-<meta name="post:summary_en"      content="Nsight Compute's Memory Chart represents an ordinary global load through LSU, L1TEX, L2, and memory-side partitions using requests, sectors, wavefronts, and throughput metrics. Comparing adjacent levels localizes traffic amplification and cache misses, while interpretations of GNIC, LRC, FBPA, and related units remain bounded by public definitions, metric direction, and cited patent embodiments.">
+<meta name="post:reading"         content="16 分钟">
+<meta name="post:reading_en"      content="16 min">
+<meta name="post:summary"         content="同样读取 32 个 float，连续访问需要 4 个 sector，跨步访问需要 32 个。沿这个算例追踪 L1TEX、L2 和显存流量，区分请求放大、缓存命中与实际性能瓶颈。">
+<meta name="post:summary_en"      content="A warp reading 32 floats can request 4 sectors or 32, depending on layout. Follow this worked example through L1TEX, L2, and device memory to distinguish traffic amplification, cache reuse, and a measured bottleneck.">
 <meta name="post:series"          content="gpu-programming-basics">
 <meta name="post:series_title"    content="GPU Programming Basics">
 <meta name="post:series_title_en" content="GPU Programming Basics">
@@ -44,7 +44,7 @@
   }
   table.note-table {
     width: 100%;
-    min-width: 820px;
+    min-width: 700px;
     border-collapse: collapse;
     font-size: 13.5px;
   }
@@ -134,725 +134,367 @@
     .lead { font-size: 16px; }
     .diagram-frame { padding: 12px; }
   }
+  .reading-guide { margin: 20px 0 28px; padding: 12px 16px; border-left: 3px solid var(--accent); background: var(--accent-tint); }
+  .reading-guide p { margin: 5px 0; }
+
+  .post-page main.content h2[id], .post-page main.content h3[id], .post-page main.content h4[id], .post-page main.content .legacy-anchor, .post-page main.content li[id] { scroll-margin-top: 80px; }
+  .article-toc > summary { display: none; }
+  .post-page aside.toc ul ul { padding-left: 12px; margin: 3px 0 6px; }
+  .post-page aside.toc ul ul a { font-size: 12px; }
+  .post-page main.content .reading-guide p { font-size: 15px; line-height: 1.75; }
+  @media (max-width: 1099px) {
+    .post-page main.content .article-toc { margin: 0 0 24px; }
+    .article-toc > summary { display: list-item; cursor: pointer; padding: 10px 0; color: var(--fg-muted); font-size: 15px; }
+    .article-toc > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+    .post-page .article-toc aside.toc { margin: 6px 0 0 !important; }
+    .post-page .article-toc aside.toc ul ul { columns: 1; }
+  }
 </style>
 </head>
 <body>
 <div class="layout">
-  <aside class="toc">
-    <div class="toc-title">目录 · TOC</div>
-    <div class="lang-zh">
-    <ul>
-      <li><a href="#zh-scope">1. NCU Memory Chart 的表达边界</a></li>
-      <li><a href="#zh-units">2. 单元角色与证据层级</a></li>
-      <li><a href="#zh-global-path">3. Global load 主路径</a></li>
-      <li><a href="#zh-granularity">4. 请求的逐级展开</a></li>
-      <li><a href="#zh-other-paths">5. Shared、store 与远端内存</a></li>
-      <li><a href="#zh-metrics">6. 用 NCU 观察各段通路</a></li>
-      <li><a href="#zh-diagnosis">7. 从现象定位瓶颈</a></li>
-      <li><a href="#zh-refs">参考资料</a></li>
-    </ul>
-    </div>
-    <div class="lang-en">
-    <ul>
-      <li><a href="#en-scope">1. Scope of the NCU Memory Chart</a></li>
-      <li><a href="#en-units">2. Unit roles and evidence levels</a></li>
-      <li><a href="#en-global-path">3. Global load path</a></li>
-      <li><a href="#en-granularity">4. Request granularity by level</a></li>
-      <li><a href="#en-other-paths">5. Shared, stores, and remote memory</a></li>
-      <li><a href="#en-metrics">6. Observing the path with NCU</a></li>
-      <li><a href="#en-diagnosis">7. Locating bottlenecks</a></li>
-      <li><a href="#en-refs">References</a></li>
-    </ul>
-    </div>
-  </aside>
 
 <main class="content">
-
+<details class="article-toc" open>
+<summary><span class="lang-zh">目录与系列</span><span class="lang-en">Contents and series</span></summary>
+<aside class="toc"><div class="toc-title">目录 · TOC</div>
+<div class="lang-zh"><ul>
+<li><a href="#zh-scope">1. 从一个 warp 的读取开始</a></li>
+<li><a href="#zh-granularity">2. 一条指令为什么会请求 4 个或 32 个 sector</a></li>
+<li><a href="#zh-global-path">3. 从 L1TEX 向下追踪一次读取</a></li>
+<li><a href="#zh-diagnosis">4. 把布局改动变成可验证的实验</a></li>
+<li><a href="#zh-other-paths">5. 其他访存操作需要换哪些判断</a></li>
+<li><a href="#zh-conclusion">6. 从 sector 算例回到 kernel</a></li>
+<li><a href="#zh-units">附录 A：Memory Chart 周边的单元缩写</a></li>
+<li><a href="#zh-metrics">附录 B：采集入口与计数单位</a></li>
+<li><a href="#zh-refs">参考资料</a></li>
+</ul></div>
+<div class="lang-en"><ul>
+<li><a href="#en-scope">1. Start with one warp's load</a></li>
+<li><a href="#en-granularity">2. How one instruction requests 4 or 32 sectors</a></li>
+<li><a href="#en-global-path">3. Follow the read beyond L1TEX</a></li>
+<li><a href="#en-diagnosis">4. Turn the layout change into a testable experiment</a></li>
+<li><a href="#en-other-paths">5. What changes for other memory operations</a></li>
+<li><a href="#en-conclusion">6. Bring the sector calculation back to the kernel</a></li>
+<li><a href="#en-units">Appendix A: Units around the Memory Chart</a></li>
+<li><a href="#en-metrics">Appendix B: Collection entry points and units</a></li>
+<li><a href="#en-refs">References</a></li>
+</ul></div>
+</aside>
+</details>
 <div class="lang-zh">
 
 <h1>NVIDIA GPU 访存层级与 Nsight Compute 数据通路模型</h1>
-
-<p class="lead">一条 ordinary device-memory global load 从 warp 发射后，先由 load/store 单元处理，再由 L1TEX 查询目标数据。L1 miss 继续进入 L2，L2 miss 才会到达显存侧分区。Nsight Compute 把 scheduler 状态、cache 流量、片上接口和显存控制指标放在同一份报告中，但这些名称描述的是不同阶段和抽象层级。沿着请求与返回过程梳理各单元的角色和证据等级，才能建立可复核的数据通路模型。</p>
-
-<h2 id="zh-scope">1. NCU Memory Chart 的表达边界</h2>
-
-<p>Nsight Compute 的 Memory Chart 是一张逻辑性能图。它把指令数、请求数、sector、缓存命中率和链路吞吐量放在同一视图中，用相邻层级的计数变化表示流量在哪里被合并、命中或放大。图中的节点和连线服务于性能归因，其精度不等同于 NVIDIA GPU 的 RTL 框图，也不承诺不同架构采用相同的内部连接。</p>
-
-<p>阅读这张图时，需要先区分三种观察层级：</p>
-
-<ul>
-  <li><strong>执行和发射路径：</strong>例如 LSU、MIO、MIOC。</li>
-  <li><strong>缓存与片上网络：</strong>例如 L1TEX、GNIC、LRC、LTC/LTS。</li>
-  <li><strong>显存侧分区：</strong>例如 FBP/FBPA、MCC 和 DRAM。</li>
-</ul>
-
-<p>三个层级回答的问题不同：SM 侧指标说明指令能否发射以及依赖是否完成；cache 与片上接口指标说明 request 和 sector 在何处被处理；显存侧指标说明穿透 L2 的流量如何到达 device memory。把观察层级分开后，单元名称才有明确的位置，来自公开文档、metric 语义和专利实施例的关系也可以分别标注。</p>
-
-<h2 id="zh-units">2. 单元角色与证据层级</h2>
-
-<p>沿着上述三个层级，下面的单元共同构成从指令发射到本地显存的观察框架。表中的“公开定义与作用”说明单元能够由资料确认的职责，“与主路径的关系”则限定它在 ordinary global load 模型中的位置。</p>
-
-<div class="table-scroll">
-<table class="note-table">
-  <thead>
-    <tr><th>名称</th><th>层级</th><th>公开定义与作用</th><th>与主路径的关系</th></tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><code>LSU</code></td>
-      <td>SM 发射</td>
-      <td>Load/Store Unit，负责发射 global、local、shared 的 load、store、atomic 和 reduction 指令。</td>
-      <td>普通 global load 从这里进入 L1TEX；它描述发射端，不是 cache 层级。</td>
-    </tr>
-    <tr>
-      <td><code>L1TEX</code></td>
-      <td>SM/GPC cache</td>
-      <td>组合的 L1/Texture 单元，包含 tag、miss 和 data 阶段；其物理存储资源也用于 shared memory。</td>
-      <td>Global load 在这里形成 L1 request 并查询所需 sector；miss 流量继续前往 L2。</td>
-    </tr>
-    <tr>
-      <td><code>GNIC</code></td>
-      <td>片上网络端点</td>
-      <td>NVIDIA 公开专利将其展开为 Generic Network Interface Controller，并展示请求、返回和 multicast packet 接口。</td>
-      <td>只在暴露相关 metric 或符合相应专利实施例时作为架构相关端点，不作为所有 GPU 的固定单元。</td>
-    </tr>
-    <tr>
-      <td><code>LRC</code></td>
-      <td>L2 前端</td>
-      <td>L2 Request Coalescer，尝试合并进入 L2 的读请求，处理 programmatic multicast，并通过 ILC 支持写压缩和读数据解压。</td>
-      <td>处理来自上游单元的 L2 request，再把请求转交 L2 cache。</td>
-    </tr>
-    <tr>
-      <td><code>LTC</code></td>
-      <td>L2</td>
-      <td>Level 2 cache 的整体逻辑单元；<code>ltcfabric</code> 是 L2 分区之间的通信 fabric。</td>
-      <td>表示共享 L2 层级；具体流量通常由各 <code>LTS</code> 的 metric 统计。</td>
-    </tr>
-    <tr>
-      <td><code>LTS</code></td>
-      <td>L2 slice</td>
-      <td>一个 L2 cache slice/subpartition，包含 tag、miss 和 data 阶段。</td>
-      <td>承接进入 L2 的 request；L2 miss 才继续到 device-memory aperture。</td>
-    </tr>
-    <tr>
-      <td><code>FBP / FBPA</code></td>
-      <td>显存分区</td>
-      <td>FBP 是 frame buffer partition；NCU 将 FBPA 定义为位于 LTC 与 DRAM 之间的 memory controller。</td>
-      <td>表示 L2 与本地 DRAM 之间的显存侧分区，不等同于 DRAM 芯片。</td>
-    </tr>
-    <tr>
-      <td><code>MCC</code></td>
-      <td>显存控制</td>
-      <td>Memory Controller Channel，包含 row sorter/arbiter 和 DRAM controller。</td>
-      <td>负责把显存侧请求落实为 DRAM 操作；与 FBPA 的内部边界随架构变化。</td>
-    </tr>
-    <tr>
-      <td><code>MIO / MIOC</code></td>
-      <td>SM 发射与 metric 单元</td>
-      <td>MIO 展开为 Memory Input/Output；NCU 将 shared-memory、部分 special math 和 dynamic branch 的队列压力与依赖归入 MIO。公开 Metrics Decoder 只给出 MIOC 的名称展开，尚不足以确定它与 MIO 的拓扑关系。</td>
-      <td>MIO 属于 scheduler 可见的发射和依赖归因层级。主路径不放置职责尚未公开的 MIOC。</td>
-    </tr>
-  </tbody>
-</table>
+<p class="lead">处理矩阵的一列和一行，可能执行同样数量的 load，运行时间却差很多。区别往往从 warp 内的地址分布开始：线程各要一个 float，硬件实际搬运的数据按 sector 组织；这些请求随后还要经过缓存。有的流量止于 L1，有的穿过 L2 才到显存。要解释一段 kernel 的访存成本，需要把这几步连起来看。</p>
+<div class="reading-guide">
+<p><strong>快速索引</strong> · <a href="#zh-granularity">4 个与 32 个 sector 的算例</a> · <a href="#zh-global-path">请求经过哪些层级</a> · <a href="#zh-diagnosis">在 NCU 中验证改动</a> · <a href="#zh-units">硬件缩写速查</a></p>
+<p>阅读前只需了解 thread、warp 和 global/shared memory。正文围绕一次 global load 展开；shared、atomic 和远端内存的差异放在后半篇。</p>
 </div>
 
-<h3>2.1 公开定义、metric 语义与专利实施例</h3>
+<h2 id="zh-scope">1. 从一个 warp 的读取开始</h2>
+<p>假设一个 warp 的 32 个 lane 都参与执行，每个 lane 读取一个 32-bit float，数据来自 GPU 本地显存中的数组。我们比较同一组逻辑值的两种存放方式：连续布局把相邻值放在相邻地址；跨步布局把相邻值隔开 8 个 float。这样的差别常见于矩阵的行、列访问，也可能来自一个较大结构体中同一字段的读取。[<a href="#zh-ref-cuda">5</a>]</p>
+<p>下面的代码只表达地址关系，是教学伪代码。<code>lane</code> 在 0 到 31 之间，<code>s</code> 是以 float 为单位的间隔。两种布局事先装入相同的逻辑数据；直接改真实程序里的 <code>s</code> 会改变读取内容，还需要相应的数据布局转换。</p>
+<pre><code class="language-cpp">// One warp; all 32 lanes are active.
+// x_s[s * lane] contains logical_value[lane].
+float value = x_s[s * lane];   // s = 1 or s = 8
+consume(value);               // Keep the loaded value live.</code></pre>
+<p>先固定一个便于计算的执行条件：编译结果是一条每线程读取 4 byte 的 warp 级 global-load 指令，基址按 128 byte 对齐，采用允许查询 L1 的普通缓存策略。后文使用 Nsight Compute 2026.2 对 Volta 及更新 GPU 的简化 L1TEX 模型：这类 LSU 指令向 L1TEX 发出一个 request，request 中包含参与线程的地址。特殊指令、缓存策略与架构差异需要另行核对。[<a href="#zh-ref-ncu">1</a>]</p>
 
-<p>NCU Metrics Decoder 直接定义 LSU、L1TEX、LRC、LTC/LTS、FBPA 和 MCC 的职责，也规定接口名采用 <code>sender2receiver</code>。因此，某代 GPU 上出现的 <code>gnic2l1tex</code> 可以说明该 metric 记录 GNIC 向 L1TEX 的传输方向，但 metric 名称本身不能给出队列深度、端口数量或完整物理路由。</p>
+<h2 id="zh-granularity">2. 一条指令为什么会请求 4 个或 32 个 sector</h2>
+<p><strong>Sector 是对齐的 32-byte 数据区域。</strong> L1TEX 依据线程地址，把落在同一 sector 的读取合并处理。因此，线程要的有效数据量相同，涉及的 sector 数仍可能相差很大。</p>
+<p>设数组基址为 \(B\)，lane 编号为 \(\ell\)，取值 0 到 31，间隔为 \(s\)。该 lane 的字节地址和相对 sector 编号为：</p>
+\[
+\begin{aligned}
+ a_\ell &amp;= B+4s\ell, \\
+ k_\ell &amp;= \left\lfloor\frac{a_\ell-B}{32}\right\rfloor.
+\end{aligned}
+\]
+<p>连续访问时，\(k_\ell=\lfloor\ell/8\rfloor\)：每 8 个 lane 恰好填满一个 sector，共 4 个。间隔为 8 时，\(k_\ell=\ell\)：每个 lane 落到一个不同的 sector，共 32 个，每个 sector 只用到 4 byte。</p>
+<div class="table-scroll"><table class="note-table">
+<thead><tr><th>该 warp 的这一次 load</th><th>连续布局：s = 1</th><th>跨步布局：s = 8</th></tr></thead>
+<tbody>
+<tr><td>Warp 级指令 / L1TEX request</td><td>1 / 1</td><td>1 / 1</td></tr>
+<tr><td>程序读取的有效字节</td><td>32 × 4 = 128 B</td><td>32 × 4 = 128 B</td></tr>
+<tr><td>涉及的 32-B sector</td><td>4</td><td>32</td></tr>
+<tr><td>L1TEX 请求的 sector 字节数</td><td>4 × 32 = 128 B</td><td>32 × 32 = 1024 B</td></tr>
+<tr><td>有效字节 / 请求字节</td><td>100%</td><td>12.5%</td></tr>
+</tbody></table></div>
+<p>这给出了一个具体的优化方向：如果相邻 lane 能改读相邻元素，这条指令覆盖的 sector 数可以从 32 降到 4。这里的 8 倍是<strong>地址分布造成的请求覆盖量之比</strong>。表中还没有缓存命中、其他 warp 对同一数据的复用，也没有 DRAM 事务或耗时测量。</p>
 
-<p>NVIDIA 公开专利给出 GNIC 的全称，并在示例实现中展示 <code>tex2gnic</code>、<code>gnic2tex</code> packet interface。这能支持 GNIC 作为一种片上网络端点的工作模型，不能证明每代量产 GPU 都采用相同单元、连线或仲裁顺序。主图用不同线型保留这三种证据等级；这条边界也决定了数据通路能够画到什么精度。</p>
+<h3 id="zh-wavefront">Request、sector 与 wavefront 各自在数什么</h3>
+<p>Request 是送入一个硬件单元的一项请求；sector 描述它涉及的数据区域；<strong>wavefront 是该单元一次能并行处理的工作包</strong>。如果一个 request 的工作装不进一个包，就要拆成多个依次处理的 wavefront。三个量回答的是请求数量、数据覆盖范围和内部服务工作量。[<a href="#zh-ref-ncu">1</a>]</p>
+<p>Wavefront 的划分还受 cache line、memory space 等处理限制影响。NCU 文档明确给出：一个涉及 4 个 sector 的 request，可能用一个 wavefront，也可能用两个或更多。因此，上面的地址计算能确定 sector 数，不能据此填出 wavefront 数；后者要查目标 GPU 上的实际值与理想值。</p>
+<p>同样，4 sectors/request 只适用于本例的全 warp、连续、不同地址且对齐的 32-bit 访问。NCU 表中同类 64-bit 和 128-bit 访问的理想值分别是 8 和 16；只有部分 lane 活跃、多个 lane 读取相同地址时，数值还会更小。判定访问效率时，要把访问宽度与活跃线程一起带入。</p>
 
-<h3>2.2 L1TEX 与 LRC 的合并层级</h3>
+<h2 id="zh-global-path">3. 从 L1TEX 向下追踪一次读取</h2>
+<p>两种布局在进入 L1TEX 时已经形成不同的 sector 需求，但显存未必承担全部流量。允许使用 L1 的普通 global load 会先查询 L1TEX；未命中的部分向 L2 请求，L2 仍未命中的部分才需要访问对应的后备内存。本例的后备内存是本地 device memory。[<a href="#zh-ref-chart">2</a>]</p>
+<figure class="diagram-frame">
+<figcaption class="diagram-title">图 1 · 普通本地 global load 的逻辑请求与返回</figcaption>
+<svg class="diagram-svg" viewBox="0 0 840 220" role="img" aria-labelledby="zh-path-title zh-path-desc">
+<title id="zh-path-title">图 1 · 普通本地 global load 的逻辑请求与返回</title><desc id="zh-path-desc">LSU 发出读取请求，L1 miss 向 L2 请求，L2 miss 访问本地显存。命中层或显存返回数据；箭头表示逻辑流向，不代表物理网络。</desc>
+<defs><marker id="zh-path-req" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#be185d"/></marker><marker id="zh-path-ret" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#2563eb"/></marker></defs>
+<rect x="12" y="60" width="125" height="72" rx="8" class="box sm-box"/><rect x="223" y="60" width="125" height="72" rx="8" class="box cache-box"/><rect x="434" y="60" width="125" height="72" rx="8" class="box cache-box"/><rect x="645" y="60" width="182" height="72" rx="8" class="box memory-box"/>
+<g font-size="16" text-anchor="middle"><text x="74" y="101">SM / LSU</text><text x="285" y="101">L1TEX</text><text x="496" y="101">L2 cache</text><text x="736" y="101">本地显存</text></g>
+<g class="request" marker-end="url(#zh-path-req)"><path d="M137 78H219"/><path d="M348 78H430"/><path d="M559 78H641"/></g>
+<g class="response" marker-end="url(#zh-path-ret)"><path d="M223 114H141"/><path d="M434 114H352"/><path d="M645 114H563"/></g>
+<g font-size="12" text-anchor="middle"><text x="180" y="48">读取请求</text><text x="391" y="48">L1 miss</text><text x="602" y="48">L2 miss</text><text x="180" y="155">数据返回</text><text x="391" y="155">数据返回</text><text x="602" y="155">数据返回</text></g>
+<text x="420" y="201" font-size="13" text-anchor="middle" class="muted">命中层服务数据；只有未命中的部分继续向右请求。</text>
+</svg></figure>
+<p>L1 命中需要目标 tag 存在且对应 sector 的数据有效。只有 tag、缺少目标 sector 的情况仍然算 miss。L1 与 L2 的命中率通常按 sector 统计，所以一个 request 可以同时包含命中和未命中的部分。把整个 request 简化成一次全中或全失，会丢掉这层信息。</p>
+<p>沿图向右看的是缺失数据的请求，向左看的是数据返回。缓存可以减少向下一级发出的流量，后续请求也可能继续被合并；相邻层级的 request 数并不守恒。比较层级时，先对齐读写方向、来源和统计单位，再讨论哪部分流量穿透了缓存。</p>
+<p>例如，跨步版本请求 32 个 L1 sector，其中已有 28 个在 L1，向下查询的只剩未命中的 4 个 sector。这个假设说明了为什么“L1 请求多”不一定对应“DRAM 字节多”，它不是一份实测结果。反过来，若工作集很大、复用很少，跨步访问产生的额外 sector 更可能传递到后端，此时还要检查 L2 命中和实际显存流量。</p>
+<p>NCU Memory Chart 把这些逻辑层级和流量放在一张图里。它适合回答流量在哪里产生、被缓存吸收或继续向下传播。GNIC、LRC 等更细的接口名称见<a href="#zh-units">附录 A</a>；它们的物理连接随实现而变，不影响先按缓存层级分析这个案例。</p>
 
-<p>在公开资料能够连接的路径中，<code>coalescing</code> 出现在两个不同位置。一次 warp load 先在 L1TEX 侧按线程地址和 cache line 组织 L1 request，未命中的部分再进入片上网络。靠近 L2 的 LRC 面对来自多个上游单元的 L2 request，并可能再次合并 read request。因此，两级合并处理的对象和范围并不相同：</p>
+<h2 id="zh-diagnosis">4. 把布局改动变成可验证的实验</h2>
+<p>现在把真实 kernel 的两个版本记为 A（跨步）与 B（连续）。实验首先保证它们产生相同结果、处理相同数量的逻辑元素，随后检查“sector 变少”这一预测是否发生，再追踪它是否带来时间收益。这样即使 B 没有变快，也能知道是哪一步没有兑现。</p>
 
-<pre class="code">warp/L1TEX coalescing: thread addresses → L1 requests and sectors
-LRC coalescing:         incoming L2 requests → fewer L2 transactions when possible</pre>
+<h3 id="zh-profile">4.1 先确认指令与 L1 请求</h3>
+<p>在 Source/SASS 视图中找到目标 load，确认访问宽度、谓词和参与线程，与算例假设一致。编译器可能把源代码合并为向量访问，也可能消去未使用的 load；两种情况都会改变计数基准。接着在 Memory Workload Analysis 的 L1/TEX 表中查看 global-load 对应的 Instructions、Requests、Sectors/Req 和 Bytes。[<a href="#zh-ref-tables">3</a>]</p>
+<p>如果目标访问混在许多别的 load 中，整张表的平均 Sectors/Req 不会精确等于 32 或 4。此时用源码定位、指令级指标或保持其他访问不变的对照，确认这部分访问的变化。L1 表的 Bytes 是 sector 数乘以 32，统计的是此处请求的数据覆盖量。</p>
 
-<p>这两级合并解释了 request 数量为何会在层级之间变化。明确它们的边界之后，ordinary global load 的主路径就可以按 request、cache lookup 和 miss traffic 的顺序展开。</p>
+<h3 id="zh-downstream">4.2 检查流量是否继续传到 L2 和显存</h3>
+<p>沿 global-load 的来源，查看 L1 miss 之后的 L2 sector、L2 hit/miss，以及 device-memory read bytes。先核对所选表格行和 aperture，避免把 writeback、atomic、系统内存或另一条访问路径混进来。显存吞吐量需要同时看 bytes 与执行时间：少量数据也可能在很短的时间内跑到高带宽。</p>
+<p>两个版本必须使用相同的 profiling 设置。NCU 为收集指标可能重放 kernel，默认会在 kernel replay 的各 pass 前清理 GPU cache。若你关注重复执行后的热缓存表现，须选择并记录相应的 cache-control 设置，且给两个版本相同的预热条件。小 kernel 还容易受到其他 GPU 工作对 L2、DRAM 计数的影响。[<a href="#zh-ref-replay">4</a>]</p>
 
-<h2 id="zh-global-path">3. Global load 的请求与返回路径</h2>
+<h3 id="zh-results">4.3 用结果决定下一步</h3>
+<div class="table-scroll"><table class="note-table">
+<thead><tr><th>A → B 后观察到的结果</th><th>目前能成立的判断</th><th>后续动作</th></tr></thead>
+<tbody>
+<tr><td>目标 load 的 sector 减少，DRAM bytes 与耗时都下降</td><td>布局减少了实际后端流量，也改善了这个 workload 的性能</td><td>扩大到真实输入分布，并计入布局转换成本</td></tr>
+<tr><td>L1 sector 减少，DRAM bytes 接近原值</td><td>L1 请求的减少尚未表现为可辨识的 DRAM 字节变化；缓存或后续合并是待验证的解释</td><td>核对 L2 misses，并检查 L1TEX 服务工作量和耗时</td></tr>
+<tr><td>DRAM bytes 减少，耗时接近原值</td><td>少搬了数据，但当前运行时间没有明显收益</td><td>继续查依赖链、其他 pipe、同步与调度；同时检查计时噪声</td></tr>
+<tr><td>Sectors/Req 没按预期下降</td><td>真实访问没有满足算例条件，或汇总指标稀释了变化</td><td>回到 SASS、地址对齐、活跃 lane 和表格过滤条件</td></tr>
+</tbody></table></div>
+<p>在 NCU 之外独立重复测量运行时间，例如充分预热后用 CUDA events 包住目标工作区间。这样得到的是正常执行的耗时，避免混入 profiling 与 replay 的影响。布局转换若属于产品流程，就应纳入端到端计时。</p>
+<p>当时间没有改善时，Memory Chart 仍能帮助缩小范围。若某单元吞吐接近上限，再结合上游 backpressure 和 scheduler 发射情况判断它是否限制 kernel；若计算端在等待返回值，则到<a href="gpu-warp-stall-nsight-compute.html#zh-causal-chain">Warp Stall 的依赖定位案例</a>继续追踪对应 load。图中的单条链路也可能与其他链路共享端口，单条百分比偏低并不自动表示共享端口空闲。</p>
 
-<p>下图同时保留路径和证据两类信息：节点排列表示 request 经过的观察层级，颜色区分请求与返回方向，线型区分官方文档直接描述的关系与 metric 方向支持的推断。这样可以在阅读主路径时保留每条连接的证据强度。</p>
+<h2 id="zh-other-paths">5. 其他访存操作需要换哪些判断</h2>
+<h3 id="zh-shared">5.1 Shared memory：看 bank 与服务工作量</h3>
+<p>普通 CTA 内的 shared-memory 访问由 SM 侧资源服务，不经过本例的 L2、显存读取路径。此时地址分布关注的是 bank：同一请求对同一个 bank 中不同位置的访问可能需要拆开服务。宽 shared 指令本来就可能需要多个 wavefront，应比较实际 wavefront 与该指令的理想值，再判断 bank conflict 带来的额外工作。[<a href="#zh-ref-tables">3</a>]</p>
+<p>如果报告同时出现 MIO Throttle，还要区分输入侧队列拥塞与消费者等待返回值。减少 shared 指令数量、处理 bank conflict 和改善依赖距离分别改变不同环节，具体代码对照见<a href="gpu-mio-throttle-nsight-compute.html">MIO Throttle 篇</a>。Cluster 的 distributed shared memory 和异步搬运有额外路径与同步规则，不能套用普通 CTA shared load 的全部假设。</p>
+<h3 id="zh-store-atomic">5.2 Store 与 atomic：方向和语义也会改变</h3>
+<p>Global store 的有效写入字节同样可能分布到多个 sector，但写策略、合并、写回以及完成确认改变了后续流量。分析时切换到 store 对应的表格行，不能把上面的 load 命中与返回模型直接反向使用。</p>
+<p>Atomic 还要完成对目标位置的原子更新。同一地址上的大量竞争会造成串行化，即使 DRAM 带宽不高也可能很慢；带返回值的指令还会给消费者建立依赖。修改 atomic 前须先保留所需的 scope 和 memory order，详见<a href="gpu-atomic-memory-ordering.html">GPU Atomic 与内存顺序</a>。</p>
+<h3 id="zh-remote">5.3 Global 地址可以指向系统或 peer 内存</h3>
+<p>Global memory 是地址空间概念。一个 global 地址可以映射到本地 device memory，也可以映射到系统内存或另一块 GPU 的可访问内存。NCU 中的 <code>aperture_device</code>、<code>aperture_sysmem</code>、<code>aperture_peer</code> 区分这些目的地。[<a href="#zh-ref-ncu">1</a>]</p>
+<p>如果目标属于后两者，应跟踪对应 aperture 和互连流量。本地 DRAM bytes 偏低只描述本地显存这一路，无法代表整个访存过程的成本。</p>
 
-<div class="diagram-frame">
-  <div class="diagram-title">普通 device-memory global load 的逻辑模型；颜色表示方向，线型表示证据等级</div>
-  <svg class="diagram-svg" viewBox="0 0 1180 520" role="img" aria-labelledby="memory-path-title memory-path-desc">
-    <title id="memory-path-title">NVIDIA GPU global load 数据通路</title>
-    <desc id="memory-path-desc">请求从 warp 经过 LSU、L1TEX、架构相关的片上网络接口、LRC、LTS/LTC、显存分区到达 HBM。实线表示官方文档直接描述的逻辑关系，点线表示依据 metric 接口方向形成的推断。返回方向用一条粗粒度箭头表示数据朝请求方移动，不给出逐单元物理路由。</desc>
-    <defs>
-      <marker id="request-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-        <path d="M0,0 L8,4 L0,8 Z" fill="#be185d"></path>
-      </marker>
-      <marker id="response-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-        <path d="M0,0 L8,4 L0,8 Z" fill="#2563eb"></path>
-      </marker>
-      <marker id="local-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-        <path d="M0,0 L8,4 L0,8 Z" fill="#059669"></path>
-      </marker>
-    </defs>
+<h2 id="zh-conclusion">6. 从 sector 算例回到 kernel</h2>
+<p>在这个 32-lane 算例中，问题起于数据布局：跨步访问让同样的 128 B 有效数据覆盖 32 个 sector，连续布局只覆盖 4 个。L1TEX 之后的缓存命中与请求处理决定了多少额外流量继续向后传，scheduler 和其他工作则共同决定运行时间。</p>
+<p>这也是布局优化值得采用的验证顺序：先把地址到 sector 的预测算清楚，再确认编译结果和各层计数，最后测实际耗时。若转换布局本身的成本已经超过节省的时间，可以考虑调整 tile、复用现有布局，或把转换合并进已有的数据处理步骤。下一次遇到低效访存时，起点是线程在读哪些地址，以及这些地址让硬件多处理了什么。</p>
 
-    <text x="36" y="32" font-size="12" font-weight="600" fill="#be185d">REQUEST</text>
-    <text x="36" y="496" font-size="12" font-weight="600" fill="#2563eb">RETURN DATA</text>
+<h2 id="zh-units">附录 A：Memory Chart 周边的单元缩写</h2>
+<p>NCU 的 metric 名称比主图更细。以下定义来自 2026.2 Metrics Guide；GNIC 一项另外引用 NVIDIA 的公开专利实施例。它们适合解释指标所属位置，具体 GPU 是否暴露某项计数仍需用本机 NCU 查询。</p>
+<div class="table-scroll"><table class="note-table">
+<thead><tr><th>名称</th><th>公开资料中的职责</th><th>阅读时的用途</th></tr></thead><tbody>
+<tr><td>LSU / L1TEX</td><td>Load/Store unit；处理 local、global、texture、surface、shared 等访问的 L1/texture 单元</td><td>从指令请求连接到 cache 与 shared 工作量；其不同访问类型有不同路径</td></tr>
+<tr><td>MIO / MIOC</td><td>Memory input/output / Memory input/output control</td><td>SM 内访存相关发射与控制的子单元名称，不是 DRAM 控制器</td></tr>
+<tr><td>GNIC</td><td>专利中的 Generic Network Interface Controller，处理所述请求、返回与 multicast packet 接口</td><td>帮助理解接口指标的端点；专利连接图属于所述实施例</td></tr>
+<tr><td>LRC</td><td>L2 Request Coalescer：处理入站 L2 请求，尝试合并 read request；还支持所述 multicast 与写压缩功能</td><td>这是送往 L2 的请求合并，与 L1TEX 内按 warp 地址合并 sector 分属不同阶段</td></tr>
+<tr><td>LTC / LTS</td><td>L2 cache / L2 cache slice；LTS 是 L2 的子分区</td><td>观察 L2 请求、命中与后续流量</td></tr>
+<tr><td>FBPA</td><td>位于 L2 与 DRAM 之间的 FrameBuffer Partition memory controller</td><td>解释相关架构的显存分区计数；数量随 GPU 改变</td></tr>
+<tr><td>MCC</td><td>Memory Subsystem 的 controller channel，包括 row sorter/arbiter 与 DRAM controller</td><td>解释暴露这些指标的内存子系统；不额外假定它与 FBPA 构成固定串联层级</td></tr>
+<tr><td>DRAM</td><td>Device main memory</td><td>观察本地显存读写字节与吞吐量</td></tr>
+</tbody></table></div>
+<p>接口修饰符采用 <code>sender2receiver</code> 形式，指明发送端与接收端。例如，在目标上存在的 <code>gnic2l1tex</code> 指标描述朝向 L1TEX 的接口方向。方向只限定该接口的流向，完整语义还要读对应 metric 的说明。[<a href="#zh-ref-ncu">1</a>][<a href="#zh-ref-patent">6</a>]</p>
 
-    <rect class="box sm-box" x="34" y="72" width="176" height="118" rx="5"></rect>
-    <text x="122" y="108" text-anchor="middle" font-size="17" font-weight="600">Warp / SMSP</text>
-    <text class="mono muted" x="122" y="136" text-anchor="middle" font-size="12">LDG / LDL</text>
-    <text class="muted" x="122" y="163" text-anchor="middle" font-size="12">dependency tracking</text>
+<h2 id="zh-metrics">附录 B：采集入口与计数单位</h2>
+<pre><code class="language-bash"># Inspect metrics and sections available on the profiling machine.
+ncu --query-metrics
+ncu --list-sections
 
-    <rect class="box sm-box" x="248" y="72" width="146" height="118" rx="5"></rect>
-    <text x="321" y="108" text-anchor="middle" font-size="17" font-weight="600">LSU</text>
-    <text class="muted" x="321" y="136" text-anchor="middle" font-size="12">load / store issue</text>
-    <text class="muted" x="321" y="163" text-anchor="middle" font-size="12">address requests</text>
+# Profile an application that selects its own case/input.
+ncu --section MemoryWorkloadAnalysis \
+    --section SchedulerStats \
+    --section WarpStateStats \
+    -o memory-case ./app
 
-    <rect class="box cache-box" x="432" y="72" width="168" height="118" rx="5"></rect>
-    <text x="516" y="108" text-anchor="middle" font-size="17" font-weight="600">L1TEX</text>
-    <text class="mono muted" x="516" y="136" text-anchor="middle" font-size="12">tag / miss / data</text>
-    <text class="muted" x="516" y="163" text-anchor="middle" font-size="12">L1 hit returns here</text>
-
-    <rect class="box network-box" x="638" y="72" width="170" height="118" rx="5"></rect>
-    <text x="723" y="108" text-anchor="middle" font-size="17" font-weight="600">On-chip network</text>
-    <text class="muted" x="723" y="136" text-anchor="middle" font-size="12">XBAR / architecture specific</text>
-    <text class="mono muted" x="723" y="163" text-anchor="middle" font-size="11">GNIC in cited embodiment</text>
-
-    <rect class="box network-box" x="846" y="72" width="128" height="118" rx="5"></rect>
-    <text x="910" y="108" text-anchor="middle" font-size="17" font-weight="600">LRC</text>
-    <text class="muted" x="910" y="136" text-anchor="middle" font-size="12">read coalescing</text>
-    <text class="muted" x="910" y="163" text-anchor="middle" font-size="12">multicast / ILC</text>
-
-    <rect class="box cache-box" x="1012" y="72" width="134" height="118" rx="5"></rect>
-    <text x="1079" y="108" text-anchor="middle" font-size="17" font-weight="600">LTS / LTC</text>
-    <text class="muted" x="1079" y="136" text-anchor="middle" font-size="12">L2 slice / L2</text>
-    <text class="muted" x="1079" y="163" text-anchor="middle" font-size="12">L2 hit returns here</text>
-
-    <path class="request" d="M210 112 L242 112" marker-end="url(#request-arrow)"></path>
-    <path class="request" d="M394 112 L426 112" marker-end="url(#request-arrow)"></path>
-    <path class="request" d="M600 112 L632 112" marker-end="url(#request-arrow)"></path>
-    <path class="request evidence-metric" d="M808 112 L840 112" marker-end="url(#request-arrow)"></path>
-    <path class="request" d="M974 112 L1006 112" marker-end="url(#request-arrow)"></path>
-
-    <rect class="box memory-box" x="846" y="280" width="300" height="112" rx="5"></rect>
-    <text x="996" y="313" text-anchor="middle" font-size="17" font-weight="600">FBP memory-side partition</text>
-    <text class="mono muted" x="996" y="342" text-anchor="middle" font-size="12">FBPA / MCC</text>
-    <text class="muted" x="996" y="369" text-anchor="middle" font-size="12">arbitration, row scheduling, DRAM control</text>
-
-    <rect class="box memory-box" x="638" y="280" width="170" height="112" rx="5"></rect>
-    <text x="723" y="318" text-anchor="middle" font-size="17" font-weight="600">HBM / DRAM</text>
-    <text class="muted" x="723" y="348" text-anchor="middle" font-size="12">device memory</text>
-
-    <path class="request" d="M1079 190 L1079 238 Q1079 250 1067 250 L1008 250 Q996 250 996 274" marker-end="url(#request-arrow)"></path>
-    <path class="request" d="M846 320 L814 320" marker-end="url(#request-arrow)"></path>
-    <text class="mono" x="1092" y="231" font-size="11" fill="#be185d">L2 miss</text>
-
-    <path class="response" d="M1100 430 L210 430" marker-end="url(#response-arrow)"></path>
-    <text class="mono" x="655" y="458" text-anchor="middle" font-size="11" fill="#2563eb">fill data returns toward the requester; per-unit routing is omitted</text>
-
-    <rect class="box sm-box" x="34" y="280" width="360" height="112" rx="5"></rect>
-    <text x="214" y="313" text-anchor="middle" font-size="17" font-weight="600">MIO attribution</text>
-    <text class="muted" x="214" y="342" text-anchor="middle" font-size="12">shared memory, special math, dynamic branch</text>
-    <text class="muted" x="214" y="369" text-anchor="middle" font-size="12">SM-side queue/control; paths diverge after issue</text>
-    <path class="local evidence-metric" d="M214 280 L214 232 Q214 220 226 220 L504 220 Q516 220 516 196" marker-end="url(#local-arrow)"></path>
-    <text class="mono" x="362" y="213" text-anchor="middle" font-size="10" fill="#059669">shared-memory accounting only</text>
-  </svg>
-  <div class="evidence-legend" aria-label="图中关系的证据等级">
-    <span><i></i>官方文档直接描述的逻辑关系</span>
-    <span><i class="metric"></i>metric 接口语义支持的方向推断</span>
-  </div>
-</div>
-
-<p>若暂时去掉证据标记，只保留 ordinary global load 的请求分支，主路径可以压缩为下面的文本形式。这个版本便于随后逐级对照 profiler 的 request、sector 与 wavefront 计数：</p>
-
-<pre class="code">Warp → LSU → L1TEX
-                   ├─ L1 hit → register
-                   └─ L1 miss → on-chip network interface / XBAR → LRC → LTS/LTC
-                                                               ├─ L2 hit → return
-                                                               └─ L2 miss → FBP memory side → HBM</pre>
-
-<p>Load 的返回阶段把命中数据或 fill data 送回发起请求的 SM，并解除目标寄存器上的依赖。NCU 的公开模型给出了 XBAR 到 L1 的 return path，部分架构还暴露 <code>gnic2l1tex</code> 一类返回方向的接口名；这些资料足以说明返回方向，却不足以还原一条跨架构通用的逐单元物理回程。依赖解除后 consumer 才能继续发射，此前的等待通常归入 <code>long_scoreboard</code>。</p>
-
-<div class="note-box warn">
-  <p>图中把 FBPA 和 MCC 放在同一个显存侧分区中。NCU 公开文档分别说明了它们的职责，但没有为所有架构给出可复用的精确串联关系。不能仅凭 metric 前缀断言某代 GPU 的内部端口和仲裁顺序。</p>
-</div>
-
-<h2 id="zh-granularity">4. 指令到 request、sector 与 wavefront 的逐级展开</h2>
-
-<p>主路径说明了请求经过哪些层级，profiler 数值还取决于每一级采用什么计数单位。同一条 SASS memory instruction 会沿途展开为 request、sector 和 wavefront：</p>
-
-<ol>
-  <li><strong>Instruction：</strong>一个 warp 执行一条 load/store 指令。</li>
-  <li><strong>Request：</strong>指令进入某个硬件单元后生成的工作请求；一条指令可能产生零个或多个 request。</li>
-  <li><strong>Sector：</strong>L1 和 L2 的最小统计传输块为 32 B；一个 128 B cache line 包含四个 sector。</li>
-  <li><strong>Wavefront：</strong>硬件单元一次能够并行处理的 work package。一个 request 若无法一次处理完，会被拆成多个 wavefront 串行执行。</li>
-</ol>
-
-<p>这些计数的关系必须放回具体层级理解。<a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#quantities" target="_blank" rel="noopener">Nsight Compute 13.3 Profiling Guide</a> 说明，在 Volta 及更新架构上，一条 global/local LSU 指令会生成一个 L1 request；线程地址分散主要增加该 request 涉及的 tag、sector 或 wavefront，并可能在下游形成更多 L2 request。NCU 对 instruction 的通用定义仍允许零个或多个 request，因为它覆盖其他指令类别和硬件单元。Shared-memory bank conflict 则主要放大 wavefront。分析时应沿层级比较相邻计数，而不是只看最终 DRAM bytes。</p>
-
-<h2 id="zh-other-paths">5. Shared memory、store 与远端内存的路径差异</h2>
-
-<p>前面的模型以 ordinary device-memory global load 为中心，因为它同时经过 scheduler、cache 和显存侧层级。Shared memory、store、atomic 以及映射到远端的 global address 会在不同位置分流；识别分流点可以避免把主图机械套用到另一类访问。</p>
-
-<h3>5.1 Shared memory</h3>
-
-<p>普通 CTA shared-memory 访问在 SM 内完成，不经过 L2 和本地 HBM。NCU 把 shared-memory 指令的队列压力和结果依赖归入 MIO，同时又在 L1TEX 的 shared pipe 中统计 request、wavefront 和 bank conflict。这是两个观察层级：</p>
-
-<ul>
-  <li><code>mio_throttle</code>、<code>short_scoreboard</code> 描述 scheduler 看到的队列或依赖状态。</li>
-  <li><code>l1tex__data_pipe_lsu_wavefronts_mem_shared...</code> 描述 shared-memory 数据路径实际处理的工作。</li>
-</ul>
-
-<p>这两个观察层级需要联合解释：<a href="gpu-mio-throttle-nsight-compute.html">GPU MIO Throttle：队列反压、成因与诊断</a>给出了 queue 与 shared pipe 指标的组合方法，<a href="gpu-scoreboard-dependency-mechanism.html">GPU Scoreboard 依赖机制</a>则说明 short/long scoreboard 如何等待 producer 完成。</p>
-
-<h3>5.2 Store、atomic 与 reduction</h3>
-
-<p>Store 把数据写入内存，不产生需要写回目标寄存器的 load result；内存系统仍要维护写入的顺序、可见性和未完成状态。NCU 文档说明，完整覆盖的 128 B write 可能由 GXC 压缩，LRC 内的 ILC 也支持 write compression，但没有给出适用于所有架构的单一 store acknowledgement 通路。Atomic 与 reduction 会绕过 L1 的普通数据服务并继续交给 L2 侧处理，其应答语义也不同于 ordinary load。因此，主图可以解释 load latency，却不能直接推导所有 store 与 atomic 时序。</p>
-
-<h3>5.3 System memory 与 peer memory</h3>
-
-<p>Global address space 可以映射到本地 device memory、pinned system memory 或 peer memory。后两者在 L2 miss 后不会进入本地 FBP/HBM，而会走 system/peer aperture、SysL2、NVLink、C2C 或 PCIe 等路径。NCU 的 L2 表会分别统计 <code>Sector Misses to Device</code>、<code>System</code> 和 <code>Peer</code>。</p>
-
-<h2 id="zh-metrics">6. 用 NCU 观察各段通路</h2>
-
-<p>把层级模型用于实际诊断时，需要在同一份报告中比较相邻位置的计数，而不是先假定某个内部单元存在。Memory Workload Analysis 提供入口，随后再根据目标 GPU 的报告和可用 metric 下钻：</p>
-
-<pre class="code">ncu --set full -o memory-report ./app
-
-# 在当前 GPU 上查询可用名称
-ncu --query-metrics | rg 'l1tex|lts|fbpa|dram|gnic|lrc'</pre>
-
-<div class="table-scroll">
-<table class="note-table">
-  <thead>
-    <tr><th>通路位置</th><th>优先观察</th><th>可回答的问题</th></tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>Warp → L1TEX</td>
-      <td>global/local instruction、L1 request、sector、wavefront、L1 hit rate</td>
-      <td>线程地址是否放大请求；L1 是否承接了复用；L1 pipe 是否拥塞。</td>
-    </tr>
-    <tr>
-      <td>L1TEX → L2</td>
-      <td>L1 miss sectors、接口 active/stalled、L2 incoming sectors</td>
-      <td>有多少流量穿过片上网络；接收端是否形成反压。</td>
-    </tr>
-    <tr>
-      <td>LTS / LTC</td>
-      <td><code>lts__t</code>、<code>lts__m</code>、<code>lts__d</code>，L2 hit rate 与 throughput</td>
-      <td>L2 tag、miss、data 哪一级繁忙；L2 是否挡住了 DRAM 流量。</td>
-    </tr>
-    <tr>
-      <td>L2 → device memory</td>
-      <td>L2 sector misses to device、FBPA/DRAM throughput、read/write bytes</td>
-      <td>瓶颈位于 cache miss latency，还是显存控制器和 HBM bandwidth。</td>
-    </tr>
-    <tr>
-      <td>Scheduler</td>
-      <td><code>long_scoreboard</code>、<code>lg_throttle</code>、eligible warp 与 issue slot</td>
-      <td>访存延迟是否暴露到 warp；请求队列是否在发射前被压满。</td>
-    </tr>
-  </tbody>
-</table>
-</div>
-
-<p>PerfWorks metric 的接口部分采用 <code>sender2receiver</code> 命名。例如某代 GPU 上出现的 <code>gnic2l1tex</code> 表示 GNIC 向 L1TEX 发送数据，而不是 L1TEX 发出请求。metric 集合随架构和 NCU 版本变化，实际分析应以报告 tooltip 和 <code>--query-metrics</code> 为准。</p>
-
-<h2 id="zh-diagnosis">7. 从现象定位通路上的瓶颈</h2>
-
-<p>相邻层级的计数能够把 scheduler 等待与 cache、片上接口和显存侧流量连接起来。下面几组常见现象展示了这种对应关系，也给出了每种现象需要优先排查的位置。</p>
-
-<div class="table-scroll">
-<table class="note-table">
-  <thead>
-    <tr><th>观察结果</th><th>优先检查的位置</th><th>解释</th></tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>L1 request/sector 很多，DRAM 流量不高</td>
-      <td>L1TEX、地址合并与 L2 hit</td>
-      <td>请求可能在 L1/L2 被吸收；此时 DRAM bandwidth 不是主要限制。</td>
-    </tr>
-    <tr>
-      <td>L2 miss sectors 与 DRAM bytes 同时很高</td>
-      <td>数据局部性、tile 大小、FBPA/DRAM throughput</td>
-      <td>工作集穿透了 L2，需要区分 latency-bound 与 bandwidth-bound。</td>
-    </tr>
-    <tr>
-      <td><code>long_scoreboard</code> 高，但 DRAM throughput 低</td>
-      <td>访问合并、cache miss latency、并行请求数量</td>
-      <td>低带宽不代表低延迟；随机、稀疏访问可能等待很久，却无法填满 HBM。</td>
-    </tr>
-    <tr>
-      <td><code>mio_throttle</code> 高</td>
-      <td>Shared-memory、MUFU 或动态分支</td>
-      <td>这是 SM 侧 MIO instruction queue 反压，不能直接归因到 L2 或 HBM。</td>
-    </tr>
-    <tr>
-      <td>Shared wavefront 远高于 request</td>
-      <td>Bank conflict 与 shared layout</td>
-      <td>问题位于 SM 内 shared-memory 服务过程，不在 FBP。</td>
-    </tr>
-  </tbody>
-</table>
-</div>
-
-<p>实际归因可以从 scheduler 的暴露等待出发，找到对应 SASS，再沿 Memory Chart 检查相邻层级的流量变化。高利用率说明单元承担了较多工作；当吞吐接近上限，并伴随上游反压或下游等待时，它才成为有完整证据链的瓶颈候选。</p>
+# A smaller collection for the logical chart alone.
+ncu --section MemoryWorkloadAnalysis_Chart ./app</code></pre>
+<div class="table-scroll"><table class="note-table">
+<thead><tr><th>量</th><th>统计对象</th><th>本例如何使用</th></tr></thead><tbody>
+<tr><td>Instructions</td><td>Warp 级 SASS 执行；确认具体行的定义</td><td>确认两版目标 load 的数量、宽度和谓词</td></tr>
+<tr><td>Requests</td><td>进入所选单元的请求</td><td>普通 Volta+ LSU load 在本例中是每指令一个 L1TEX request</td></tr>
+<tr><td>Sectors / Sectors per request</td><td>32-B 区域数及每请求平均值</td><td>验证布局产生的 32 → 4 sector 预测</td></tr>
+<tr><td>Wavefronts / ideal / excessive</td><td>实际、理想及额外服务工作包；字段按目标支持情况显示</td><td>检查内部服务工作量，特别是 shared 访问</td></tr>
+<tr><td>L1/L2 hit rate</td><td>所选流量的 sector 命中比例</td><td>解释多少数据需求被各层缓存吸收</td></tr>
+<tr><td>DRAM bytes / throughput</td><td>本地显存端流量与速率</td><td>验证流量是否传到后端，结合时间判断带宽压力</td></tr>
+</tbody></table></div>
+<p>记录 GPU、驱动、CUDA 与 NCU 版本，以及输入规模、布局和 cache-control 设置。指标是否存在、名称后缀和峰值归一化基准随目标而变，应从本机查询结果中选择，避免把另一架构的完整 metric 字符串直接当作通用命令。</p>
 
 <h2 id="zh-refs">参考资料</h2>
-
-<ul>
-  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#metrics-guide" target="_blank" rel="noopener">NVIDIA Nsight Compute 13.3 Profiling Guide: Metrics Guide</a></li>
-  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#memory-chart" target="_blank" rel="noopener">NVIDIA Nsight Compute 13.3 Profiling Guide: Memory Chart</a></li>
-  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#memory-tables" target="_blank" rel="noopener">NVIDIA Nsight Compute 13.3 Profiling Guide: Memory Tables</a></li>
-  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#warp-stall-reasons" target="_blank" rel="noopener">NVIDIA Nsight Compute 13.3 Profiling Guide: Warp Stall Reasons</a></li>
-  <li><a href="https://docs.nvidia.com/cuda/archive/13.0.0/cuda-c-programming-guide/index.html#device-memory-accesses" target="_blank" rel="noopener">CUDA C++ Programming Guide 13.0: Device Memory Accesses</a></li>
-  <li><a href="https://patents.google.com/patent/US20230289215A1/en" target="_blank" rel="noopener">NVIDIA Cooperative Group Arrays Patent: GNIC and on-chip packet interfaces</a></li>
-</ul>
+<ol>
+<li id="zh-ref-ncu"><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#metrics-guide" target="_blank" rel="noopener">Nsight Compute 2026.2 Profiling Guide: Metrics Guide and Quantities</a></li>
+<li id="zh-ref-chart"><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#memory-chart" target="_blank" rel="noopener">Nsight Compute 2026.2: Memory Chart</a></li>
+<li id="zh-ref-tables"><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#memory-tables" target="_blank" rel="noopener">Nsight Compute 2026.2: Memory Tables</a></li>
+<li id="zh-ref-replay"><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#cache-control" target="_blank" rel="noopener">Nsight Compute 2026.2: Cache Control and Profiling Considerations</a></li>
+<li id="zh-ref-cuda"><a href="https://docs.nvidia.com/cuda/archive/13.0.0/cuda-c-programming-guide/index.html#device-memory-accesses" target="_blank" rel="noopener">CUDA C++ Programming Guide 13.0: Device Memory Accesses</a></li>
+<li id="zh-ref-patent"><a href="https://patents.google.com/patent/US20230289215A1/en" target="_blank" rel="noopener">NVIDIA patent US20230289215A1: Cooperative group arrays (GNIC embodiment)</a></li>
+</ol>
 
 </div>
-
 <div class="lang-en">
 
 <h1>NVIDIA GPU Memory Hierarchy and the Nsight Compute Data-Path Model</h1>
-
-<p class="lead">After an ordinary device-memory global load issues from a warp, a load/store unit handles the instruction and L1TEX looks up the target data. An L1 miss proceeds to L2, and only an L2 miss reaches a device-memory partition. Nsight Compute places scheduler state, cache traffic, on-chip interfaces, and memory-control metrics in one report, even though those names describe different stages and abstraction levels. Following the request and return path while separating unit roles from evidence levels produces a reviewable data-path model.</p>
-
-<h2 id="en-scope">1. Scope of the NCU Memory Chart</h2>
-
-<p>The Nsight Compute Memory Chart is a logical performance model. It places instruction counts, requests, sectors, cache hit rates, and link throughput in one view, using changes between adjacent levels to show where traffic is merged, served, or amplified. Its nodes and links support performance attribution; their precision is not that of an NVIDIA GPU RTL diagram, and they do not promise identical internal connections across architectures.</p>
-
-<p>Reading the chart requires three observation levels to be separated:</p>
-
-<ul>
-  <li><strong>Execution and issue paths:</strong> LSU, MIO, and MIOC.</li>
-  <li><strong>Caches and on-chip networking:</strong> L1TEX, GNIC, LRC, and LTC/LTS.</li>
-  <li><strong>Memory-side partitions:</strong> FBP/FBPA, MCC, and DRAM.</li>
-</ul>
-
-<p>The three levels answer different questions. SM-side metrics describe whether an instruction can issue and whether its dependency has completed. Cache and interface metrics describe where requests and sectors are processed. Memory-side metrics describe how traffic that misses L2 reaches device memory. Once the observation levels are separate, each unit has a clear position and relationships from public documentation, metric semantics, and patent embodiments can be marked independently.</p>
-
-<h2 id="en-units">2. Unit roles and evidence levels</h2>
-
-<p>Across those three levels, the units below form an observation framework from instruction issue to local device memory. The public-role column records responsibilities established by the sources, while the final column limits each unit's position in the ordinary-global-load model.</p>
-
-<div class="table-scroll">
-<table class="note-table">
-  <thead>
-    <tr><th>Name</th><th>Level</th><th>Public definition and role</th><th>Relationship to the main path</th></tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><code>LSU</code></td>
-      <td>SM issue</td>
-      <td>The Load/Store Unit issues global, local, and shared loads, stores, atomics, and reduction instructions.</td>
-      <td>An ordinary global load enters L1TEX from this unit. LSU describes the issue endpoint, not a cache level.</td>
-    </tr>
-    <tr>
-      <td><code>L1TEX</code></td>
-      <td>SM/GPC cache</td>
-      <td>The combined L1/Texture unit contains tag, miss, and data stages. Its physical storage resources are also used for shared memory.</td>
-      <td>A global load forms an L1 request and looks up the required sectors here; miss traffic continues toward L2.</td>
-    </tr>
-    <tr>
-      <td><code>GNIC</code></td>
-      <td>On-chip network endpoint</td>
-      <td>An NVIDIA public patent expands the name as Generic Network Interface Controller and shows request, return, and multicast packet interfaces.</td>
-      <td>It is used as an architecture-dependent endpoint only where exposed metrics or the cited patent embodiment support it, not as a fixed unit on every GPU.</td>
-    </tr>
-    <tr>
-      <td><code>LRC</code></td>
-      <td>L2 front end</td>
-      <td>The L2 Request Coalescer attempts to merge reads entering L2, handles programmatic multicast, and supports write compression and read-data decompression through ILC.</td>
-      <td>It processes L2 requests from upstream clients before forwarding them to the L2 cache.</td>
-    </tr>
-    <tr>
-      <td><code>LTC</code></td>
-      <td>L2</td>
-      <td>The logical Level 2 cache as a whole. <code>ltcfabric</code> is the communication fabric between L2 partitions.</td>
-      <td>It denotes the shared L2 level; concrete traffic is generally counted by metrics on individual <code>LTS</code> units.</td>
-    </tr>
-    <tr>
-      <td><code>LTS</code></td>
-      <td>L2 slice</td>
-      <td>An L2 cache slice or subpartition containing tag, miss, and data stages.</td>
-      <td>It handles requests entering L2; only an L2 miss proceeds to a device-memory aperture.</td>
-    </tr>
-    <tr>
-      <td><code>FBP / FBPA</code></td>
-      <td>Memory partition</td>
-      <td>FBP means frame buffer partition. NCU defines FBPA as a memory controller between LTC and DRAM.</td>
-      <td>It represents the memory-side partition between L2 and local DRAM, not the DRAM device itself.</td>
-    </tr>
-    <tr>
-      <td><code>MCC</code></td>
-      <td>Memory control</td>
-      <td>A Memory Controller Channel includes the row sorter/arbiter and DRAM controller.</td>
-      <td>It turns memory-side requests into DRAM operations; its internal boundary with FBPA is architecture-dependent.</td>
-    </tr>
-    <tr>
-      <td><code>MIO / MIOC</code></td>
-      <td>SM issue and metric units</td>
-      <td>MIO expands to Memory Input/Output. NCU attributes queue pressure and dependencies from shared memory, some special-math operations, and dynamic branches to MIO. The public Metrics Decoder expands the MIOC name but does not provide enough information to establish its topology relative to MIO.</td>
-      <td>MIO belongs to the scheduler-visible issue and dependency-attribution level. The main path does not place MIOC because its public role is not specified.</td>
-    </tr>
-  </tbody>
-</table>
+<p class="lead">Reading a matrix column and reading a row can execute the same number of loads yet take very different amounts of time. The difference often starts with the addresses inside each warp: every thread wants one float, but hardware handles the data in sectors. Those requests then pass through caches. Some traffic stops at L1; some reaches device memory after missing in L2. Explaining a kernel's memory cost means connecting those steps.</p>
+<div class="reading-guide">
+<p><strong>Quick links</strong> · <a href="#en-granularity">The 4-sector versus 32-sector example</a> · <a href="#en-global-path">Following a request</a> · <a href="#en-diagnosis">Testing a change in NCU</a> · <a href="#en-units">Hardware abbreviations</a></p>
+<p>This article assumes familiarity with threads, warps, and global/shared memory. The main example follows one global load; shared memory, atomics, and remote memory are covered afterward.</p>
 </div>
 
-<h3>2.1 Public definitions, metric semantics, and patent embodiments</h3>
+<h2 id="en-scope">1. Start with one warp's load</h2>
+<p>Suppose all 32 lanes of a warp participate, each loading one 32-bit float from an array in local GPU device memory. Compare two layouts of the same logical values: a contiguous layout places neighboring values at neighboring addresses; a strided layout separates them by 8 floats. Matrix row and column accesses can produce this difference, as can reading one field from an array of larger structures.[<a href="#en-ref-cuda">5</a>]</p>
+<p>The following teaching pseudocode expresses only the address relationship. <code>lane</code> ranges from 0 to 31, and <code>s</code> is the spacing in floats. Both layouts have been populated with the same logical data. Changing <code>s</code> in a real program also changes the values read unless the data layout is changed accordingly.</p>
+<pre><code class="language-cpp">// One warp; all 32 lanes are active.
+// x_s[s * lane] contains logical_value[lane].
+float value = x_s[s * lane];   // s = 1 or s = 8
+consume(value);               // Keep the loaded value live.</code></pre>
+<p>Use a specific execution model for the calculation: the compiler emits one warp-level global-load instruction that reads 4 bytes per thread, the base address is 128-byte aligned, and ordinary caching permits an L1 lookup. Nsight Compute 2026.2 describes a simplified L1TEX model for Volta and newer GPUs in which this LSU instruction sends one request containing the participating threads' addresses to L1TEX. Specialized instructions, cache policies, and architecture differences require their own checks.[<a href="#en-ref-ncu">1</a>]</p>
 
-<p>The NCU Metrics Decoder directly defines the roles of LSU, L1TEX, LRC, LTC/LTS, FBPA, and MCC, and specifies <code>sender2receiver</code> interface names. A metric such as <code>gnic2l1tex</code> on a particular GPU therefore establishes the recorded transfer direction from GNIC to L1TEX, but the name alone does not disclose queue depth, port count, or a complete physical route.</p>
+<h2 id="en-granularity">2. How one instruction requests 4 or 32 sectors</h2>
+<p><strong>A sector is an aligned 32-byte data region.</strong> L1TEX combines accesses to the same sector using the threads' addresses. The same number of useful bytes can therefore cover very different numbers of sectors.</p>
+<p>Let \(B\) be the array's base address, \(\ell\) the lane index from 0 to 31, and \(s\) the spacing. The byte address and relative sector index for that lane are:</p>
+\[
+\begin{aligned}
+ a_\ell &amp;= B+4s\ell, \\
+ k_\ell &amp;= \left\lfloor\frac{a_\ell-B}{32}\right\rfloor.
+\end{aligned}
+\]
+<p>For contiguous access, \(k_\ell=\lfloor\ell/8\rfloor\): each group of 8 lanes fills one sector, for 4 sectors in total. At stride 8, \(k_\ell=\ell\): every lane touches a separate sector, for 32 sectors, using only 4 bytes from each.</p>
+<div class="table-scroll"><table class="note-table">
+<thead><tr><th>This load by this warp</th><th>Contiguous: s = 1</th><th>Strided: s = 8</th></tr></thead><tbody>
+<tr><td>Warp-level instructions / L1TEX requests</td><td>1 / 1</td><td>1 / 1</td></tr>
+<tr><td>Useful bytes read by the program</td><td>32 × 4 = 128 B</td><td>32 × 4 = 128 B</td></tr>
+<tr><td>32-B sectors touched</td><td>4</td><td>32</td></tr>
+<tr><td>Sector bytes requested at L1TEX</td><td>4 × 32 = 128 B</td><td>32 × 32 = 1024 B</td></tr>
+<tr><td>Useful bytes / requested bytes</td><td>100%</td><td>12.5%</td></tr>
+</tbody></table></div>
+<p>This suggests a specific optimization: arranging for adjacent lanes to read adjacent elements can reduce this instruction's sector footprint from 32 to 4. The factor of 8 is a <strong>ratio of requested coverage caused by the address layout</strong>. The table does not yet include cache hits, reuse by other warps, DRAM transactions, or timing measurements.</p>
 
-<p>An NVIDIA public patent expands GNIC and shows <code>tex2gnic</code> and <code>gnic2tex</code> packet interfaces in an example embodiment. This supports a working model of GNIC as one type of on-chip network endpoint. It does not establish the same unit, wiring, or arbitration order for every shipping GPU. The main diagram uses separate line styles for these three evidence levels; this boundary also determines how precisely the data path can be drawn.</p>
+<h3 id="en-wavefront">What requests, sectors, and wavefronts count</h3>
+<p>A request is a command sent into a hardware unit. Sectors describe the data regions it touches. A <strong>wavefront is a work package that the unit can process in parallel</strong>. If a request's work does not fit in one package, it is split into multiple wavefronts processed serially. These quantities describe the number of requests, the data footprint, and the internal service work.[<a href="#en-ref-ncu">1</a>]</p>
+<p>Wavefront formation also depends on processing limits involving cache lines, memory spaces, and other constraints. The NCU guide explicitly allows a request for 4 sectors to require one wavefront, two, or more. The address calculation above determines sectors; the target GPU's actual and ideal wavefront counts must be checked separately.</p>
+<p>Likewise, 4 sectors per request applies to this example's full-warp, contiguous, distinct-address, aligned 32-bit access. The corresponding ideal values in NCU's table are 8 for 64-bit accesses and 16 for 128-bit accesses. Partial participation or overlapping addresses can produce smaller values. Access width and active lanes belong in any assessment of access efficiency.</p>
 
-<h3>2.2 Coalescing at the L1TEX and LRC levels</h3>
+<h2 id="en-global-path">3. Follow the read beyond L1TEX</h2>
+<p>The two layouts already create different sector demands on entry to L1TEX, but device memory may not service all of that traffic. An ordinary global load permitted to use L1 first queries L1TEX. Missing data is requested from L2; data that also misses there must be fetched from the relevant backing memory. In this example, that backing memory is local device memory.[<a href="#en-ref-chart">2</a>]</p>
+<figure class="diagram-frame">
+<figcaption class="diagram-title">Figure 1 · Logical requests and returns for a local global load</figcaption>
+<svg class="diagram-svg" viewBox="0 0 840 220" role="img" aria-labelledby="en-path-title en-path-desc">
+<title id="en-path-title">Figure 1 · Logical requests and returns for a local global load</title><desc id="en-path-desc">The LSU issues a read. L1 misses request L2, and L2 misses access local device memory. The hit level or device memory returns data. Arrows show logical flows, not a physical network.</desc>
+<defs><marker id="en-path-req" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#be185d"/></marker><marker id="en-path-ret" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#2563eb"/></marker></defs>
+<rect x="12" y="60" width="125" height="72" rx="8" class="box sm-box"/><rect x="223" y="60" width="125" height="72" rx="8" class="box cache-box"/><rect x="434" y="60" width="125" height="72" rx="8" class="box cache-box"/><rect x="645" y="60" width="182" height="72" rx="8" class="box memory-box"/>
+<g font-size="16" text-anchor="middle"><text x="74" y="101">SM / LSU</text><text x="285" y="101">L1TEX</text><text x="496" y="101">L2 cache</text><text x="736" y="101">Local device memory</text></g>
+<g class="request" marker-end="url(#en-path-req)"><path d="M137 78H219"/><path d="M348 78H430"/><path d="M559 78H641"/></g>
+<g class="response" marker-end="url(#en-path-ret)"><path d="M223 114H141"/><path d="M434 114H352"/><path d="M645 114H563"/></g>
+<g font-size="12" text-anchor="middle"><text x="180" y="48">Read request</text><text x="391" y="48">L1 miss</text><text x="602" y="48">L2 miss</text><text x="180" y="155">Data returns</text><text x="391" y="155">Data returns</text><text x="602" y="155">Data returns</text></g>
+<text x="420" y="201" font-size="13" text-anchor="middle" class="muted">The hit level serves the data; only missing data is requested farther right.</text>
+</svg></figure>
+<p>An L1 hit requires both a matching tag and valid data for the requested sector. A present tag with missing sector data still counts as a miss. L1 and L2 hit rates are commonly sector-based, so one request may contain both hits and misses. Treating the entire request as a single hit or miss loses that distinction.</p>
+<p>Following the diagram to the right traces requests for missing data; following it left traces returning data. Caches reduce traffic sent downstream, and later requests may also be combined. Request counts are therefore not conserved between adjacent levels. Before comparing levels, match the read/write direction, source, and counting unit.</p>
+<p>For example, if 28 of the strided version's 32 requested sectors are already present in L1, only the 4 missing sectors need a downstream lookup. This hypothetical state explains how a large L1 demand can coexist with modest DRAM traffic; it is not a measurement. Conversely, with a large working set and little reuse, extra sectors from strided access are more likely to reach the backend. L2 hits and measured device-memory traffic establish how far they actually travel.</p>
+<p>The NCU Memory Chart places these logical levels and their traffic in one view. It helps locate where demand originates, where caches absorb it, and where it continues downstream. More detailed interface names such as GNIC and LRC are covered in <a href="#en-units">Appendix A</a>. Their physical connections vary by implementation; the cache-level analysis of this example does not depend on a specific internal network.</p>
 
-<p>Within the publicly connected path, <code>coalescing</code> appears at two distinct locations. A warp load first organizes thread addresses into L1 requests and cache lines on the L1TEX side, and only the missed portion proceeds into the on-chip network. LRC sits closer to L2, receives L2 requests from multiple upstream units, and may merge reads again. The two stages therefore operate on different objects and scopes:</p>
+<h2 id="en-diagnosis">4. Turn the layout change into a testable experiment</h2>
+<p>Call the real kernel's strided version A and its contiguous version B. First ensure that both produce the same results and process the same number of logical elements. Then test the predicted sector reduction and follow its effect on execution time. If B does not become faster, this sequence identifies where the expected benefit stopped.</p>
 
-<pre class="code">warp/L1TEX coalescing: thread addresses → L1 requests and sectors
-LRC coalescing:         incoming L2 requests → fewer L2 transactions when possible</pre>
+<h3 id="en-profile">4.1 Confirm the instruction and L1 requests</h3>
+<p>Locate the target load in the Source/SASS view and check its access width, predicate, and participating threads against the example's assumptions. The compiler may combine source operations into a vector load or eliminate an unused load; either changes the counting baseline. Next, inspect the global-load Instructions, Requests, Sectors/Req, and Bytes in the L1/TEX table of Memory Workload Analysis.[<a href="#en-ref-tables">3</a>]</p>
+<p>If many other loads contribute to the table, its average Sectors/Req will not be exactly 32 or 4. Source attribution, instruction-level metrics, or a comparison that keeps other accesses unchanged can help isolate the change. Bytes in the L1 table is sectors multiplied by 32: the data coverage requested at that level.</p>
 
-<p>These two coalescing stages explain why request counts can change between levels. With their scopes established, the ordinary-global-load path can be followed in the order of request formation, cache lookup, and miss traffic.</p>
+<h3 id="en-downstream">4.2 Check whether the traffic reaches L2 and device memory</h3>
+<p>Follow the global-load source through L2 sectors after L1 misses, L2 hits and misses, and device-memory read bytes. Check the selected table row and aperture before combining counters, so that writebacks, atomics, system memory, or another path do not enter the comparison. Evaluate device-memory bytes together with execution time: a small transfer can still reach high bandwidth over a short interval.</p>
+<p>Both versions need the same profiling settings. NCU may replay a kernel to collect metrics and, by default, flushes GPU caches before each kernel-replay pass. If the question concerns warm-cache behavior after repeated execution, select and record suitable cache-control settings and apply the same warm-up conditions to both versions. Other GPU activity can also affect L2 and DRAM counters, particularly for small kernels.[<a href="#en-ref-replay">4</a>]</p>
 
-<h2 id="en-global-path">3. Global load request and return path</h2>
+<h3 id="en-results">4.3 Let the result determine the next step</h3>
+<div class="table-scroll"><table class="note-table">
+<thead><tr><th>Observed after changing A to B</th><th>Supported interpretation</th><th>Next step</th></tr></thead><tbody>
+<tr><td>Target-load sectors, DRAM bytes, and time all decrease</td><td>The layout reduces backend traffic and improves this workload</td><td>Test the real input distribution and include layout-conversion cost</td></tr>
+<tr><td>L1 sectors decrease; DRAM bytes remain similar</td><td>The L1 request reduction has not produced a discernible change in DRAM bytes; caches or later combining are possible explanations</td><td>Check L2 misses, L1TEX service work, and execution time</td></tr>
+<tr><td>DRAM bytes decrease; time remains similar</td><td>Less data moved, with no clear timing benefit in this run</td><td>Inspect dependencies, other pipes, synchronization, scheduling, and timing noise</td></tr>
+<tr><td>Sectors/Req does not fall as expected</td><td>The actual access differs from the model, or aggregation dilutes the change</td><td>Recheck SASS, alignment, active lanes, and table filters</td></tr>
+</tbody></table></div>
+<p>Measure execution time independently outside NCU, repeating a stable measurement such as CUDA events around the intended work after sufficient warm-up. This measures normal execution without profiling and replay effects. Include layout conversion in end-to-end timing when it is part of the production path.</p>
+<p>Even when time does not improve, the Memory Chart can narrow the search. If a unit approaches its throughput limit, combine that observation with upstream backpressure and scheduler issue behavior to assess whether it limits the kernel. If computation is waiting for a returned value, continue at the <a href="gpu-warp-stall-nsight-compute.html#en-causal-chain">Warp Stall dependency example</a> to identify the load. Individual chart links may also share a port: low utilization on one link does not establish that the shared port is idle.</p>
 
-<p>The diagram retains both path and evidence information. Node order shows the observation levels traversed by a request, color separates request and return directions, and line style distinguishes relationships stated directly in official documentation from inferences supported by metric direction. The main path can therefore be read together with the strength of each connection.</p>
+<h2 id="en-other-paths">5. What changes for other memory operations</h2>
+<h3 id="en-shared">5.1 Shared memory: banks and service work</h3>
+<p>Ordinary shared-memory accesses within a CTA are served by SM-side resources, without following this example's L2 and device-memory read path. The relevant address mapping is to banks: accesses within one request to different locations in the same bank may require separate service. A wide shared instruction can inherently need multiple wavefronts. Compare actual wavefronts with the instruction's ideal count to identify extra work from bank conflicts.[<a href="#en-ref-tables">3</a>]</p>
+<p>If the report also shows MIO Throttle, distinguish congestion at the input queue from a consumer waiting for a result. Reducing shared instructions, addressing bank conflicts, and increasing dependency distance affect different stages; the <a href="gpu-mio-throttle-nsight-compute.html">MIO Throttle article</a> develops the code comparison. Cluster distributed shared memory and asynchronous transfers add paths and synchronization rules beyond ordinary CTA shared loads.</p>
+<h3 id="en-store-atomic">5.2 Stores and atomics: direction and semantics</h3>
+<p>A global store's useful bytes can also span multiple sectors, but write policies, combining, writeback, and completion acknowledgments affect the subsequent traffic. Select the store rows when analyzing these operations; the load hit-and-return model cannot simply be run backward.</p>
+<p>An atomic must also perform an indivisible update at its target. Heavy contention on one address can serialize work and make a kernel slow without saturating DRAM bandwidth. A returning instruction can additionally establish a dependency for its consumer. Preserve the required scope and memory order when changing atomics; see <a href="gpu-atomic-memory-ordering.html">GPU Atomics and Memory Ordering</a>.</p>
+<h3 id="en-remote">5.3 Global addresses can target system or peer memory</h3>
+<p>Global memory names an address space. A global address can map to local device memory, system memory, or accessible memory on another GPU. NCU distinguishes those destinations with <code>aperture_device</code>, <code>aperture_sysmem</code>, and <code>aperture_peer</code>.[<a href="#en-ref-ncu">1</a>]</p>
+<p>For the latter two, follow the relevant aperture and interconnect traffic. Low local DRAM bytes describe only the local device-memory path, not the cost of the entire access.</p>
 
-<div class="diagram-frame">
-  <div class="diagram-title">Logical model for an ordinary device-memory global load; color shows direction and line style shows evidence level</div>
-  <svg class="diagram-svg" viewBox="0 0 1180 520" role="img" aria-labelledby="en-memory-path-title en-memory-path-desc">
-    <title id="en-memory-path-title">NVIDIA GPU global-load data path</title>
-    <desc id="en-memory-path-desc">A request travels from a warp through the LSU, L1TEX, an architecture-dependent on-chip network interface, LRC, LTS/LTC, and a memory partition to HBM. Solid lines denote logical relationships directly described by official documentation, and dotted lines denote inferences from metric-interface direction. One coarse return arrow shows data moving toward the requester without asserting a per-unit physical route.</desc>
-    <defs>
-      <marker id="en-request-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-        <path d="M0,0 L8,4 L0,8 Z" fill="#be185d"></path>
-      </marker>
-      <marker id="en-response-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-        <path d="M0,0 L8,4 L0,8 Z" fill="#2563eb"></path>
-      </marker>
-      <marker id="en-local-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-        <path d="M0,0 L8,4 L0,8 Z" fill="#059669"></path>
-      </marker>
-    </defs>
+<h2 id="en-conclusion">6. Bring the sector calculation back to the kernel</h2>
+<p>The problem in this 32-lane example begins with layout: strided access spreads the same 128 useful bytes across 32 sectors, while the contiguous layout covers 4. Cache hits and request handling beyond L1TEX determine how much extra traffic propagates downstream. Scheduling and the kernel's other work then contribute to the execution time.</p>
+<p>This gives a useful order for validating a layout optimization: calculate the predicted sector footprint, confirm the generated instructions and counters at each level, then measure time. If converting the layout costs more than it saves, consider changing the tile, reusing the existing layout, or folding conversion into another data-processing step. The starting point for the next inefficient access is the addresses the threads read and the extra work those addresses impose on hardware.</p>
 
-    <text x="36" y="32" font-size="12" font-weight="600" fill="#be185d">REQUEST</text>
-    <text x="36" y="496" font-size="12" font-weight="600" fill="#2563eb">RETURN DATA</text>
+<h2 id="en-units">Appendix A: Units around the Memory Chart</h2>
+<p>NCU metric names expose finer detail than the main diagram. The definitions below come from the 2026.2 Metrics Guide, with GNIC additionally grounded in a public NVIDIA patent embodiment. They help identify where a metric belongs; query the local NCU installation to see which counters the target GPU exposes.</p>
+<div class="table-scroll"><table class="note-table">
+<thead><tr><th>Name</th><th>Role in public documentation</th><th>Use when reading metrics</th></tr></thead><tbody>
+<tr><td>LSU / L1TEX</td><td>Load/Store unit; the L1/texture unit handles local, global, texture, surface, and shared accesses</td><td>Connect instructions to cache and shared service work; different access types take different paths</td></tr>
+<tr><td>MIO / MIOC</td><td>Memory input/output / Memory input/output control</td><td>SM-side memory-related issue and control names, distinct from the DRAM controller</td></tr>
+<tr><td>GNIC</td><td>Generic Network Interface Controller handling the described request, return, and multicast packet interfaces in the patent</td><td>Interpret interface endpoints within the scope of the described embodiment</td></tr>
+<tr><td>LRC</td><td>L2 Request Coalescer: handles incoming L2 requests and attempts to coalesce reads; also supports the described multicast and write-compression functions</td><td>Read combining before L2 is a separate stage from L1TEX combining accesses within a warp into sectors</td></tr>
+<tr><td>LTC / LTS</td><td>L2 cache / L2 cache slice; an LTS is an L2 sub-partition</td><td>Inspect L2 requests, hits, and subsequent traffic</td></tr>
+<tr><td>FBPA</td><td>FrameBuffer Partition memory controller between L2 and DRAM</td><td>Interpret memory-partition counters on relevant architectures; the number varies by GPU</td></tr>
+<tr><td>MCC</td><td>A Memory Subsystem controller channel, including a row sorter/arbiter and DRAM controllers</td><td>Interpret targets exposing these metrics without assuming a fixed serial relationship with FBPA</td></tr>
+<tr><td>DRAM</td><td>Device main memory</td><td>Inspect local device-memory read/write bytes and throughput</td></tr>
+</tbody></table></div>
+<p>Interface qualifiers use <code>sender2receiver</code> to identify the source and destination. For example, a <code>gnic2l1tex</code> metric, where exposed, names a direction toward L1TEX. Direction identifies the interface flow; the metric's description supplies its full meaning.[<a href="#en-ref-ncu">1</a>][<a href="#en-ref-patent">6</a>]</p>
 
-    <rect class="box sm-box" x="34" y="72" width="176" height="118" rx="5"></rect>
-    <text x="122" y="108" text-anchor="middle" font-size="17" font-weight="600">Warp / SMSP</text>
-    <text class="mono muted" x="122" y="136" text-anchor="middle" font-size="12">LDG / LDL</text>
-    <text class="muted" x="122" y="163" text-anchor="middle" font-size="12">dependency tracking</text>
+<h2 id="en-metrics">Appendix B: Collection entry points and units</h2>
+<pre><code class="language-bash"># Inspect metrics and sections available on the profiling machine.
+ncu --query-metrics
+ncu --list-sections
 
-    <rect class="box sm-box" x="248" y="72" width="146" height="118" rx="5"></rect>
-    <text x="321" y="108" text-anchor="middle" font-size="17" font-weight="600">LSU</text>
-    <text class="muted" x="321" y="136" text-anchor="middle" font-size="12">load / store issue</text>
-    <text class="muted" x="321" y="163" text-anchor="middle" font-size="12">address requests</text>
+# Profile an application that selects its own case/input.
+ncu --section MemoryWorkloadAnalysis \
+    --section SchedulerStats \
+    --section WarpStateStats \
+    -o memory-case ./app
 
-    <rect class="box cache-box" x="432" y="72" width="168" height="118" rx="5"></rect>
-    <text x="516" y="108" text-anchor="middle" font-size="17" font-weight="600">L1TEX</text>
-    <text class="mono muted" x="516" y="136" text-anchor="middle" font-size="12">tag / miss / data</text>
-    <text class="muted" x="516" y="163" text-anchor="middle" font-size="12">L1 hit returns here</text>
-
-    <rect class="box network-box" x="638" y="72" width="170" height="118" rx="5"></rect>
-    <text x="723" y="108" text-anchor="middle" font-size="17" font-weight="600">On-chip network</text>
-    <text class="muted" x="723" y="136" text-anchor="middle" font-size="12">XBAR / architecture specific</text>
-    <text class="mono muted" x="723" y="163" text-anchor="middle" font-size="11">GNIC in cited embodiment</text>
-
-    <rect class="box network-box" x="846" y="72" width="128" height="118" rx="5"></rect>
-    <text x="910" y="108" text-anchor="middle" font-size="17" font-weight="600">LRC</text>
-    <text class="muted" x="910" y="136" text-anchor="middle" font-size="12">read coalescing</text>
-    <text class="muted" x="910" y="163" text-anchor="middle" font-size="12">multicast / ILC</text>
-
-    <rect class="box cache-box" x="1012" y="72" width="134" height="118" rx="5"></rect>
-    <text x="1079" y="108" text-anchor="middle" font-size="17" font-weight="600">LTS / LTC</text>
-    <text class="muted" x="1079" y="136" text-anchor="middle" font-size="12">L2 slice / L2</text>
-    <text class="muted" x="1079" y="163" text-anchor="middle" font-size="12">L2 hit returns here</text>
-
-    <path class="request" d="M210 112 L242 112" marker-end="url(#en-request-arrow)"></path>
-    <path class="request" d="M394 112 L426 112" marker-end="url(#en-request-arrow)"></path>
-    <path class="request" d="M600 112 L632 112" marker-end="url(#en-request-arrow)"></path>
-    <path class="request evidence-metric" d="M808 112 L840 112" marker-end="url(#en-request-arrow)"></path>
-    <path class="request" d="M974 112 L1006 112" marker-end="url(#en-request-arrow)"></path>
-
-    <rect class="box memory-box" x="846" y="280" width="300" height="112" rx="5"></rect>
-    <text x="996" y="313" text-anchor="middle" font-size="17" font-weight="600">FBP memory-side partition</text>
-    <text class="mono muted" x="996" y="342" text-anchor="middle" font-size="12">FBPA / MCC</text>
-    <text class="muted" x="996" y="369" text-anchor="middle" font-size="12">arbitration, row scheduling, DRAM control</text>
-
-    <rect class="box memory-box" x="638" y="280" width="170" height="112" rx="5"></rect>
-    <text x="723" y="318" text-anchor="middle" font-size="17" font-weight="600">HBM / DRAM</text>
-    <text class="muted" x="723" y="348" text-anchor="middle" font-size="12">device memory</text>
-
-    <path class="request" d="M1079 190 L1079 238 Q1079 250 1067 250 L1008 250 Q996 250 996 274" marker-end="url(#en-request-arrow)"></path>
-    <path class="request" d="M846 320 L814 320" marker-end="url(#en-request-arrow)"></path>
-    <text class="mono" x="1092" y="231" font-size="11" fill="#be185d">L2 miss</text>
-
-    <path class="response" d="M1100 430 L210 430" marker-end="url(#en-response-arrow)"></path>
-    <text class="mono" x="655" y="458" text-anchor="middle" font-size="11" fill="#2563eb">fill data returns toward the requester; per-unit routing is omitted</text>
-
-    <rect class="box sm-box" x="34" y="280" width="360" height="112" rx="5"></rect>
-    <text x="214" y="313" text-anchor="middle" font-size="17" font-weight="600">MIO attribution</text>
-    <text class="muted" x="214" y="342" text-anchor="middle" font-size="12">shared memory, special math, dynamic branch</text>
-    <text class="muted" x="214" y="369" text-anchor="middle" font-size="12">SM-side queue/control; paths diverge after issue</text>
-    <path class="local evidence-metric" d="M214 280 L214 232 Q214 220 226 220 L504 220 Q516 220 516 196" marker-end="url(#en-local-arrow)"></path>
-    <text class="mono" x="362" y="213" text-anchor="middle" font-size="10" fill="#059669">shared-memory accounting only</text>
-  </svg>
-  <div class="evidence-legend" aria-label="Evidence levels for relationships in the diagram">
-    <span><i></i>Logical relationship directly described by official documentation</span>
-    <span><i class="metric"></i>Direction inferred from metric-interface semantics</span>
-  </div>
-</div>
-
-<p>Removing the evidence annotations and retaining only the ordinary-global-load request branches gives the compact text form below. This version is convenient when matching each level to subsequent request, sector, and wavefront counters:</p>
-
-<pre class="code">Warp → LSU → L1TEX
-                   ├─ L1 hit → register
-                   └─ L1 miss → on-chip network interface / XBAR → LRC → LTS/LTC
-                                                               ├─ L2 hit → return
-                                                               └─ L2 miss → FBP memory side → HBM</pre>
-
-<p>The return stage carries hit or fill data back to the requesting SM and clears the dependency on the destination register. NCU's public model exposes an XBAR-to-L1 return path, and some architectures expose return-facing interfaces such as <code>gnic2l1tex</code>. This evidence establishes the return direction without defining one per-unit physical route shared by every architecture. The consumer can issue after the dependency clears; until then, NCU normally attributes the wait to <code>long_scoreboard</code>.</p>
-
-<div class="note-box warn">
-  <p>The diagram places FBPA and MCC inside one memory-side partition. Public NCU documentation describes their responsibilities separately, but it does not publish one precise serial relationship that applies to every architecture. Metric prefixes alone cannot establish a GPU generation's internal ports or arbitration order.</p>
-</div>
-
-<h2 id="en-granularity">4. Expansion from instructions to requests, sectors, and wavefronts</h2>
-
-<p>The main path identifies the levels traversed by a request; profiler values also depend on the counting unit used at each level. One SASS memory instruction expands into requests, sectors, and wavefronts along the path:</p>
-
-<ol>
-  <li><strong>Instruction:</strong> a warp executes one load or store instruction.</li>
-  <li><strong>Request:</strong> work generated when the instruction enters a hardware unit; one instruction may generate zero or more requests.</li>
-  <li><strong>Sector:</strong> the minimum transfer unit counted at L1 and L2 is 32 bytes. One 128-byte cache line contains four sectors.</li>
-  <li><strong>Wavefront:</strong> a work package that a hardware unit can process concurrently. A request that cannot be handled at once is split into multiple wavefronts and processed serially.</li>
-</ol>
-
-<p>These counters must be interpreted at the level where NCU records them. The <a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#quantities" target="_blank" rel="noopener">Nsight Compute 13.3 Profiling Guide</a> states that, on Volta and newer architectures, one global or local LSU instruction generates one L1 request. Scattered thread addresses mainly increase the tags, sectors, or wavefronts covered by that request and may create more downstream L2 requests. NCU's generic instruction definition still permits zero or more requests because it spans other instruction classes and hardware units. Shared-memory bank conflicts primarily increase wavefronts. Analysis should compare adjacent counters along the hierarchy rather than looking only at final DRAM bytes.</p>
-
-<h2 id="en-other-paths">5. Path differences for shared memory, stores, and remote memory</h2>
-
-<p>The preceding model centers on an ordinary device-memory global load because it spans scheduler, cache, and memory-side levels. Shared memory, stores, atomics, and global addresses mapped to remote memory diverge at different points. Identifying each divergence keeps the main diagram from being applied mechanically to another access class.</p>
-
-<h3>5.1 Shared memory</h3>
-
-<p>Ordinary CTA shared-memory accesses complete inside the SM and do not traverse L2 or local HBM. NCU attributes shared-memory instruction queue pressure and result dependencies to MIO, while counting requests, wavefronts, and bank conflicts in the L1TEX shared pipe. These are two observation levels:</p>
-
-<ul>
-  <li><code>mio_throttle</code> and <code>short_scoreboard</code> describe queue or dependency states observed by the scheduler.</li>
-  <li><code>l1tex__data_pipe_lsu_wavefronts_mem_shared...</code> describes work processed by the shared-memory data path.</li>
-</ul>
-
-<p>The two observation levels need to be interpreted together. <a href="gpu-mio-throttle-nsight-compute.html">GPU MIO Throttle: Queue Backpressure, Causes, and Diagnosis</a> combines queue and shared-pipe metrics, while <a href="gpu-scoreboard-dependency-mechanism.html">GPU Scoreboard Dependencies</a> explains how short and long scoreboards wait for producers to complete.</p>
-
-<h3>5.2 Stores, atomics, and reductions</h3>
-
-<p>A store writes data to memory and produces no load result for a destination register; the memory system still maintains ordering, visibility, and outstanding state for the write. NCU documents that GXC may compress a fully covered 128-byte write and that ILC inside LRC supports write compression, but it does not publish one store-acknowledgement route for every architecture. Atomics and reductions bypass ordinary L1 data service and continue to the L2 side, and their response semantics differ from an ordinary load. The main diagram can therefore explain load latency without establishing every store or atomic timing path.</p>
-
-<h3>5.3 System and peer memory</h3>
-
-<p>The global address space can map to local device memory, pinned system memory, or peer memory. After an L2 miss, the latter two do not enter the local FBP/HBM path. They use system or peer apertures and may pass through SysL2, NVLink, C2C, or PCIe. The NCU L2 table counts <code>Sector Misses to Device</code>, <code>System</code>, and <code>Peer</code> separately.</p>
-
-<h2 id="en-metrics">6. Observing each segment with NCU</h2>
-
-<p>Applying the hierarchy to a real diagnosis requires adjacent counters to be compared in the same report, without assuming that a particular internal unit exists. Memory Workload Analysis provides the entry point; further inspection should use the metrics available on the target GPU:</p>
-
-<pre class="code">ncu --set full -o memory-report ./app
-
-# Query the names available on the current GPU
-ncu --query-metrics | rg 'l1tex|lts|fbpa|dram|gnic|lrc'</pre>
-
-<div class="table-scroll">
-<table class="note-table">
-  <thead>
-    <tr><th>Path segment</th><th>Inspect first</th><th>Questions it can answer</th></tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>Warp → L1TEX</td>
-      <td>Global/local instructions, L1 requests, sectors, wavefronts, and L1 hit rate</td>
-      <td>Whether thread addresses amplify requests, whether L1 captures reuse, and whether the L1 pipe is congested.</td>
-    </tr>
-    <tr>
-      <td>L1TEX → L2</td>
-      <td>L1 miss sectors, interface active/stalled, and incoming L2 sectors</td>
-      <td>How much traffic crosses the on-chip network and whether the receiver applies backpressure.</td>
-    </tr>
-    <tr>
-      <td>LTS / LTC</td>
-      <td><code>lts__t</code>, <code>lts__m</code>, <code>lts__d</code>, L2 hit rate, and throughput</td>
-      <td>Whether the L2 tag, miss, or data stage is busy and whether L2 absorbs DRAM traffic.</td>
-    </tr>
-    <tr>
-      <td>L2 → device memory</td>
-      <td>L2 sector misses to device, FBPA/DRAM throughput, and read/write bytes</td>
-      <td>Whether the limiting factor is cache-miss latency or memory-controller and HBM bandwidth.</td>
-    </tr>
-    <tr>
-      <td>Scheduler</td>
-      <td><code>long_scoreboard</code>, <code>lg_throttle</code>, eligible warps, and issue slots</td>
-      <td>Whether memory latency is exposed to warps and whether a request queue is full before issue.</td>
-    </tr>
-  </tbody>
-</table>
-</div>
-
-<p>PerfWorks interface metrics use <code>sender2receiver</code> names. For example, <code>gnic2l1tex</code> on a particular GPU counts data sent from GNIC to L1TEX, not requests issued by L1TEX. Metric sets change with architecture and NCU version, so use report tooltips and <code>--query-metrics</code> for the target system.</p>
-
-<h2 id="en-diagnosis">7. Locating bottlenecks from observed symptoms</h2>
-
-<p>Adjacent-level counters connect scheduler-visible waits to traffic in caches, on-chip interfaces, and memory-side partitions. The following patterns illustrate those relationships and identify the first location to inspect for each observation.</p>
-
-<div class="table-scroll">
-<table class="note-table">
-  <thead>
-    <tr><th>Observation</th><th>Inspect first</th><th>Interpretation</th></tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>Many L1 requests/sectors but little DRAM traffic</td>
-      <td>L1TEX, address coalescing, and L2 hits</td>
-      <td>Requests may be absorbed by L1 or L2; DRAM bandwidth is not the main limit in that case.</td>
-    </tr>
-    <tr>
-      <td>High L2 miss sectors and DRAM bytes</td>
-      <td>Data locality, tile size, and FBPA/DRAM throughput</td>
-      <td>The working set passes through L2. Separate latency-bound behavior from bandwidth-bound behavior.</td>
-    </tr>
-    <tr>
-      <td>High <code>long_scoreboard</code> with low DRAM throughput</td>
-      <td>Access coalescing, cache-miss latency, and memory-level parallelism</td>
-      <td>Low bandwidth does not imply low latency. Random or sparse accesses may wait a long time without filling HBM.</td>
-    </tr>
-    <tr>
-      <td>High <code>mio_throttle</code></td>
-      <td>Shared memory, MUFU, or dynamic branches</td>
-      <td>This is backpressure in the SM-side MIO instruction queue, not direct evidence of an L2 or HBM bottleneck.</td>
-    </tr>
-    <tr>
-      <td>Shared wavefronts far exceed requests</td>
-      <td>Bank conflicts and shared-memory layout</td>
-      <td>The issue is in shared-memory service inside the SM, not in FBP.</td>
-    </tr>
-  </tbody>
-</table>
-</div>
-
-<p>Attribution can begin with a scheduler-visible wait, locate the corresponding SASS, and then follow traffic changes between adjacent levels in the Memory Chart. High utilization shows that a unit is carrying substantial work. It becomes a bottleneck candidate with a complete evidence chain when throughput approaches a limit and upstream backpressure or downstream waiting is also visible.</p>
+# A smaller collection for the logical chart alone.
+ncu --section MemoryWorkloadAnalysis_Chart ./app</code></pre>
+<div class="table-scroll"><table class="note-table">
+<thead><tr><th>Quantity</th><th>What it counts</th><th>Use in this example</th></tr></thead><tbody>
+<tr><td>Instructions</td><td>Warp-level SASS execution; check the selected row's definition</td><td>Confirm target-load counts, width, and predicates in both versions</td></tr>
+<tr><td>Requests</td><td>Commands entering the selected unit</td><td>One L1TEX request per ordinary Volta+ LSU load instruction under this example's assumptions</td></tr>
+<tr><td>Sectors / Sectors per request</td><td>32-B regions and their per-request average</td><td>Test the predicted reduction from 32 sectors to 4</td></tr>
+<tr><td>Wavefronts / ideal / excessive</td><td>Actual, ideal, and extra service packages, where those fields are supported</td><td>Inspect internal service work, particularly for shared accesses</td></tr>
+<tr><td>L1/L2 hit rate</td><td>Sector hit proportion for the selected traffic</td><td>Explain how much data demand each cache absorbs</td></tr>
+<tr><td>DRAM bytes / throughput</td><td>Local device-memory traffic and its rate</td><td>Check backend traffic and assess bandwidth pressure together with time</td></tr>
+</tbody></table></div>
+<p>Record GPU, driver, CUDA and NCU versions, input size, layout, and cache-control settings. Metric availability, suffixes, and peak normalization vary by target. Select metrics from the local query results rather than treating another architecture's complete metric strings as universal commands.</p>
 
 <h2 id="en-refs">References</h2>
-
-<ul>
-  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#metrics-guide" target="_blank" rel="noopener">NVIDIA Nsight Compute 13.3 Profiling Guide: Metrics Guide</a></li>
-  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#memory-chart" target="_blank" rel="noopener">NVIDIA Nsight Compute 13.3 Profiling Guide: Memory Chart</a></li>
-  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#memory-tables" target="_blank" rel="noopener">NVIDIA Nsight Compute 13.3 Profiling Guide: Memory Tables</a></li>
-  <li><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#warp-stall-reasons" target="_blank" rel="noopener">NVIDIA Nsight Compute 13.3 Profiling Guide: Warp Stall Reasons</a></li>
-  <li><a href="https://docs.nvidia.com/cuda/archive/13.0.0/cuda-c-programming-guide/index.html#device-memory-accesses" target="_blank" rel="noopener">CUDA C++ Programming Guide 13.0: Device Memory Accesses</a></li>
-  <li><a href="https://patents.google.com/patent/US20230289215A1/en" target="_blank" rel="noopener">NVIDIA Cooperative Group Arrays Patent: GNIC and on-chip packet interfaces</a></li>
-</ul>
+<ol>
+<li id="en-ref-ncu"><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#metrics-guide" target="_blank" rel="noopener">Nsight Compute 2026.2 Profiling Guide: Metrics Guide and Quantities</a></li>
+<li id="en-ref-chart"><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#memory-chart" target="_blank" rel="noopener">Nsight Compute 2026.2: Memory Chart</a></li>
+<li id="en-ref-tables"><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#memory-tables" target="_blank" rel="noopener">Nsight Compute 2026.2: Memory Tables</a></li>
+<li id="en-ref-replay"><a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#cache-control" target="_blank" rel="noopener">Nsight Compute 2026.2: Cache Control and Profiling Considerations</a></li>
+<li id="en-ref-cuda"><a href="https://docs.nvidia.com/cuda/archive/13.0.0/cuda-c-programming-guide/index.html#device-memory-accesses" target="_blank" rel="noopener">CUDA C++ Programming Guide 13.0: Device Memory Accesses</a></li>
+<li id="en-ref-patent"><a href="https://patents.google.com/patent/US20230289215A1/en" target="_blank" rel="noopener">NVIDIA patent US20230289215A1: Cooperative group arrays (GNIC embodiment)</a></li>
+</ol>
 
 </div>
-
 </main>
 </div>
+<script>
+(function () {
+  const contents = document.querySelector('.article-toc');
+  const compact = window.matchMedia('(max-width: 1099px)');
+  function fitContents() { contents.open = !compact.matches; }
+  fitContents();
+  compact.addEventListener('change', fitContents);
+  contents.addEventListener('click', function (event) {
+    if (compact.matches && event.target.closest('a[href^="#"]')) contents.open = false;
+  });
+})();
+</script>
 </body>
 </html>
