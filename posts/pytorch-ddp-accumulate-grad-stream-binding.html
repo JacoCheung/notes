@@ -1,0 +1,685 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PyTorch DDP AccumulateGrad 的 Stream 绑定机制</title>
+<meta name="post:title"           content="PyTorch DDP AccumulateGrad 的 Stream 绑定机制">
+<meta name="post:title_en"        content="Stream Binding of AccumulateGrad in PyTorch DDP">
+<meta name="post:slug"            content="pytorch-ddp-accumulate-grad-stream-binding">
+<meta name="post:date"            content="2026-10-08">
+<meta name="post:tags"            content="PyTorch, DDP, Autograd, AccumulateGrad, CUDA Stream">
+<meta name="post:tags_en"         content="PyTorch, DDP, Autograd, AccumulateGrad, CUDA Stream">
+<meta name="post:reading"         content="15 分钟">
+<meta name="post:reading_en"      content="15 min">
+<meta name="post:summary"         content="DDP 构造 Reducer 时会取得并持有叶子参数的 AccumulateGrad；节点若在此时创建，其 InputMetadata 会记录当前 CUDA stream。backward 执行节点和 Reducer hook 前，autograd Engine 恢复该 stream，并在梯度来自其他 stream 时插入 event 依赖。CUDA Graph capture 还可通过 InputBuffer 临时覆盖 stale stream，而不修改节点原有的 stream metadata。">
+<meta name="post:summary_en"      content="During Reducer construction, DDP obtains and retains each leaf parameter's AccumulateGrad node. When the node is created at this point, its InputMetadata records the current CUDA stream. Before running the node and its Reducer hook in backward, the autograd Engine restores that stream and inserts event dependencies when the incoming gradient was produced elsewhere. During CUDA Graph capture, InputBuffer can temporarily override a stale stream without mutating the node's original stream metadata.">
+<meta name="post:series"          content="pytorch-internals">
+<meta name="post:series_title"    content="PyTorch 内部机制">
+<meta name="post:series_title_en" content="PyTorch Internals">
+<meta name="post:series_order"    content="8">
+<script src="../lang-toggle.js" defer></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<style>
+  main.content { max-width: 1060px; min-width: 0; padding: 56px 32px 96px; letter-spacing: 0; }
+  main.content h1,
+  main.content h2,
+  main.content h3 { letter-spacing: 0; }
+  @media (max-width: 960px) {
+    main.content { width: 100%; max-width: 100%; padding: 48px 20px 80px; }
+  }
+  .lead {
+    font-size: 17px;
+    line-height: 1.8;
+    color: var(--fg-muted);
+    margin: -6px 0 30px;
+    max-width: 82ch;
+  }
+  .note-box {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-tint);
+    padding: 12px 16px;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    margin: 18px 0 24px;
+  }
+  .note-box.warn {
+    border-left-color: #d97706;
+    background: rgba(217, 119, 6, 0.08);
+  }
+  .note-box p { margin: 6px 0; }
+  .table-scroll { overflow-x: auto; margin: 18px 0 26px; }
+  table.note-table {
+    width: 100%;
+    min-width: 820px;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  table.note-table th,
+  table.note-table td {
+    border: 1px solid var(--border);
+    padding: 9px 12px;
+    text-align: left;
+    vertical-align: top;
+  }
+  table.note-table th { background: var(--bg-elevated); font-weight: 600; }
+  .diagram-frame {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    padding: 14px 16px;
+    margin: 18px 0 28px;
+    max-width: 100%;
+    box-sizing: border-box;
+    overflow-x: auto;
+  }
+  .diagram-title {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--fg-subtle);
+    letter-spacing: 0;
+    margin-bottom: 10px;
+  }
+  .diagram-svg { display: block; min-width: 920px; width: 100%; height: auto; }
+  .diagram-svg text { font-family: var(--font-sans); fill: var(--fg); letter-spacing: 0; }
+  .diagram-svg .mono { font-family: var(--font-mono); }
+  .diagram-svg .muted { fill: var(--fg-muted); }
+  .diagram-svg .subtle { fill: var(--fg-subtle); }
+  .diagram-svg .lane { fill: var(--bg); stroke: var(--border); stroke-width: 1; }
+  .diagram-svg .construct { fill: rgba(16, 185, 129, 0.14); stroke: #059669; stroke-width: 1.4; }
+  .diagram-svg .autograd { fill: rgba(244, 114, 182, 0.17); stroke: #be185d; stroke-width: 1.4; }
+  .diagram-svg .sync { fill: rgba(245, 158, 11, 0.15); stroke: #d97706; stroke-width: 1.4; }
+  .diagram-svg .comm { fill: rgba(37, 99, 235, 0.13); stroke: #2563eb; stroke-width: 1.4; }
+  .diagram-svg .edge { stroke: var(--fg-muted); stroke-width: 1.5; fill: none; }
+  .diagram-svg .dash { stroke-dasharray: 6 5; }
+  .diagram-svg .phase { stroke: var(--border-strong); stroke-width: 1; stroke-dasharray: 5 5; }
+  .source-path {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--fg-subtle);
+    margin: -10px 0 22px;
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc">
+    <div class="toc-title">目录 · TOC</div>
+    <div class="lang-zh">
+      <ul>
+        <li><a href="#zh-scope">执行范围与术语</a></li>
+        <li><a href="#zh-create">DDP 构造 AccumulateGrad</a></li>
+        <li><a href="#zh-bind">创建时记录 current stream</a></li>
+        <li><a href="#zh-execute">backward 恢复节点 stream</a></li>
+        <li><a href="#zh-nccl">Reducer hook 与 NCCL stream</a></li>
+        <li><a href="#zh-placement">device placement 先于 wrapper</a></li>
+        <li><a href="#zh-practice">初始化方式与诊断</a></li>
+        <li><a href="#zh-capture-override">CUDA Graph stream override</a></li>
+        <li><a href="#zh-refs">参考资料</a></li>
+      </ul>
+    </div>
+    <div class="lang-en">
+      <ul>
+        <li><a href="#en-scope">Scope and terminology</a></li>
+        <li><a href="#en-create">DDP obtains AccumulateGrad</a></li>
+        <li><a href="#en-bind">Capturing the current stream</a></li>
+        <li><a href="#en-execute">Restoring the node stream</a></li>
+        <li><a href="#en-nccl">Reducer hooks and NCCL streams</a></li>
+        <li><a href="#en-placement">Device placement before wrapping</a></li>
+        <li><a href="#en-practice">Initialization and diagnostics</a></li>
+        <li><a href="#en-capture-override">CUDA Graph stream override</a></li>
+        <li><a href="#en-refs">References</a></li>
+      </ul>
+    </div>
+  </aside>
+
+<main class="content">
+
+<div class="lang-zh">
+
+<h1>PyTorch DDP AccumulateGrad 的 Stream 绑定机制</h1>
+
+<p class="lead">单进程单 GPU 的 DDP 训练通常按固定顺序初始化：选择本地 CUDA device，把模型参数放到该 device，再用 <code>DistributedDataParallel</code> 包装模型。这个顺序还会确定 autograd 的执行 stream。DDP 在构造期间取得叶子参数的 <code>AccumulateGrad</code>；节点若在此时创建，便会记录当时的 CUDA current stream。以后梯度到达参数时，autograd Engine 会切换到该 stream，执行梯度累加和 DDP 注册的 hook。默认 stream 训练很少显露这项机制，自定义 stream 和 CUDA Graph capture 则会直接受到它的约束。</p>
+
+<h2 id="zh-scope">执行范围与术语</h2>
+
+<p>本文分析标准 <code>torch.nn.parallel.DistributedDataParallel</code> 的 CUDA eager 路径，PyTorch 源码固定在 commit <a href="https://github.com/pytorch/pytorch/tree/867370d4524f58659d8f030a1d9a6f92169d3019"><code>867370d</code></a>。TorchRec 与 Megatron-Core 只作为公开工程用法的旁证；两者的 wrapper 还包含分片、专用梯度 buffer 等额外机制。</p>
+
+<p><strong>节点 stream</strong> 是 autograd Node 的第一个 accelerator input 在创建 Node 时记录的 stream。<a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/node.h#L243-L265"><code>Node::stream()</code></a> 从 input metadata 返回它，Engine 把它当作执行该 Node 的 canonical consumer stream。对叶子参数而言，承担梯度写入职责的 Node 是 <code>AccumulateGrad</code>。叶子 Tensor 本身仍满足 <code>param.grad_fn is None</code>；这个关系可与 <a href="./pytorch-autograd-grad-fn-next-functions.html">PyTorch Autograd 反向图模型</a> 一文配合阅读。</p>
+
+<div class="note-box">
+  <p><code>AccumulateGrad</code> 绑定 stream 的时刻是<strong>节点创建</strong>，而不是每次 hook 调用。DDP 构造通常触发这次创建，但若节点已经存在且仍被持有，Reducer 会复用原节点及其原有 stream。</p>
+</div>
+
+<h2 id="zh-create">DDP 构造期间取得并持有 <code>AccumulateGrad</code></h2>
+
+<p>DDP 的 Python 构造函数建立 bucket 后创建 <code>Reducer</code>。官方 <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/docs/source/notes/ddp.md#L84-L125">DDP design note</a> 将这一步描述为：Reducer 在构造期间为每个参数注册 autograd hook，参数梯度就绪后由 hook 启动规约。Python 入口也把“registering the grad hooks”列为 <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/nn/parallel/distributed.py#L1387-L1451"><code>_ddp_init_helper()</code></a> 的职责。</p>
+
+<p>具体工作发生在 Reducer 构造函数。它依次处理每个可训练参数：</p>
+
+<pre class="code">// 语义化摘录：torch/csrc/distributed/c10d/reducer.cpp
+auto grad_accumulator = torch::autograd::impl::grad_accumulator(variable);
+
+hooks_.emplace_back(
+    grad_accumulator-&gt;add_post_hook(/* Reducer::autograd_hook */),
+    grad_accumulator);
+
+// 参数的 autograd metadata 只保存 weak_ptr；Reducer 保存强引用。
+grad_accumulators_[variable_index] = std::move(grad_accumulator);</pre>
+
+<p class="source-path">固定版本源码：<a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/distributed/c10d/reducer.cpp#L173-L237">reducer.cpp, lines 173–237</a></p>
+
+<p><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/variable.cpp#L288-L324"><code>grad_accumulator(variable)</code></a> 先检查叶子参数的 weak reference。已有节点会被直接返回；没有节点时，它构造新的 <code>AccumulateGrad</code>。Reducer 再保存强引用，使节点跨 iteration 存活。由此，DDP wrapper 的构造时间通常也就是这些叶子累加节点的创建时间。</p>
+
+<p>普通 eager autograd 的生命周期有所不同。叶子的 autograd metadata 只缓存 <code>AccumulateGrad</code> 的 weak reference；当前计算图仍引用该节点时，它保持存活，计算图及其他强引用释放后，节点便可以销毁。下一张计算图再次为这个叶子请求 gradient edge 时，失效的 weak reference 无法返回旧节点，<code>grad_accumulator()</code> 会在届时的 current stream 下重新创建节点。固定版本源码也明确把“旧计算图及其累加节点在 iteration 之间释放”作为常规生命周期。</p>
+
+<p>DDP 的 Reducer 改变了这个生命周期。<code>grad_accumulators_</code> 中的强引用独立于单次 forward/backward 图，因此释放 loss 和原计算图并不会销毁这些节点。节点创建时写入的 stream metadata 也随 Reducer 一直保留；仅把下一次 forward 移到 capture stream 不会让它重新绑定。自定义 stream 或 CUDA Graph 训练需要在目标 stream 中构造 DDP，或者显式重建持有这些节点的 wrapper。</p>
+
+<h2 id="zh-bind">创建节点时记录 CUDA current stream</h2>
+
+<p><code>AccumulateGrad</code> 构造函数只有两项主要动作：保存叶子变量，并调用 <code>add_input_metadata(variable)</code>。<a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/functions/accumulate_grad.cpp#L82-L89">对应源码</a>如下：</p>
+
+<pre class="code">AccumulateGrad::AccumulateGrad(Variable variable_)
+    : Node(/*sequence_nr=*/UINT64_MAX), variable(std::move(variable_)) {
+  add_input_metadata(variable);
+}</pre>
+
+<p><code>InputMetadata</code> 根据参数的 device type 取得该 device 当前的 stream，并把结果存入 <code>stream_</code>：</p>
+
+<pre class="code">// torch/csrc/autograd/input_metadata.cpp
+auto device_ = options.device();
+stream_ = c10::impl::getDeviceGuardImpl(device_.type())-&gt;getStream(device_);</pre>
+
+<p class="source-path">固定版本源码：<a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/input_metadata.cpp#L28-L42">input_metadata.cpp, lines 28–42</a></p>
+
+<p>因此，GPU 参数所在的 device 决定查询哪个 CUDA device，而 DDP 构造时的 current stream 决定记录哪个 stream。<code>model.cuda(device)</code> 负责参数放置；<code>with torch.cuda.stream(stream): DDP(...)</code> 才直接决定新建 <code>AccumulateGrad</code> 的 stream metadata。两者承担不同职责。</p>
+
+<h2 id="zh-execute">backward 执行前恢复节点 stream</h2>
+
+<p>backward kernel 可以在另一个 stream 上产生传给参数的梯度。梯度进入 <code>AccumulateGrad</code> 的 input buffer 后，Engine 读取节点 stream，构造 <code>OptionalStreamGuard</code>，并在调用 Node 及其 post hooks 前把它设为当前 stream。固定版本的 <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/engine.cpp#L1168-L1204"><code>Engine::evaluate_function()</code></a> 还会检查 incoming gradient 的 producer stream；两者不同时，consumer stream 等待 producer event。</p>
+
+<pre class="code">auto opt_parent_stream = inputs.opt_overridden_consumer_stream.has_value()
+    ? inputs.opt_overridden_consumer_stream
+    : func-&gt;stream();
+
+c10::OptionalStreamGuard parent_stream_guard{opt_parent_stream};
+
+if (*opt_parent_stream != *opt_ready_stream) {
+  opt_parent_stream-&gt;wait(opt_ready_event.value());
+}
+
+// 随后在 guard 覆盖的 current stream 下执行 Node 和 post hooks。</pre>
+
+<p>这里的“hook 在该 stream 上执行”需要区分 CPU 与 GPU 两层。hook 的 C++/Python 回调代码由 autograd worker thread 调用；<code>OptionalStreamGuard</code> 使回调期间的 CUDA current stream 指向节点 stream，所以回调发起的 CUDA operation 会入队到这个 stream。CPU 回调本身并不会变成 GPU kernel。</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">DDP 构造时的 stream capture 与 backward 时的 stream restoration</div>
+  <svg class="diagram-svg" viewBox="0 0 1120 570" role="img" aria-labelledby="zh-ddp-stream-title zh-ddp-stream-desc">
+    <title id="zh-ddp-stream-title">AccumulateGrad 的 stream 绑定与执行时序</title>
+    <desc id="zh-ddp-stream-desc">图中展示常见路径：DDP 构造阶段创建并持有 AccumulateGrad，节点记录 current stream S0。backward 在 S1 产生梯度后通过 event 让 S0 等待，再在 S0 执行 AccumulateGrad 和 Reducer hook；NCCL collective 使用 ProcessGroup 管理的通信 stream。</desc>
+    <defs>
+      <marker id="zh-ddp-stream-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#71717a"></path>
+      </marker>
+    </defs>
+
+    <text x="160" y="36" text-anchor="middle" font-size="13" font-weight="600">构造阶段</text>
+    <text x="745" y="36" text-anchor="middle" font-size="13" font-weight="600">backward 阶段</text>
+    <line class="phase" x1="435" y1="18" x2="435" y2="535"></line>
+
+    <rect class="lane" x="145" y="65" width="930" height="115" rx="7"></rect>
+    <rect class="lane" x="145" y="215" width="930" height="115" rx="7"></rect>
+    <rect class="lane" x="145" y="365" width="930" height="115" rx="7"></rect>
+    <text x="125" y="110" text-anchor="end" font-size="14" font-weight="600">CUDA stream S0</text>
+    <text class="muted" x="125" y="132" text-anchor="end" font-size="11">DDP / consumer</text>
+    <text x="125" y="260" text-anchor="end" font-size="14" font-weight="600">CUDA stream S1</text>
+    <text class="muted" x="125" y="282" text-anchor="end" font-size="11">gradient producer</text>
+    <text x="125" y="410" text-anchor="end" font-size="14" font-weight="600">NCCL stream</text>
+    <text class="muted" x="125" y="432" text-anchor="end" font-size="11">ProcessGroupNCCL</text>
+
+    <rect class="construct" x="180" y="92" width="205" height="62" rx="7"></rect>
+    <text x="282" y="116" text-anchor="middle" font-size="13" font-weight="600">DDP(model)</text>
+    <text class="mono muted" x="282" y="138" text-anchor="middle" font-size="11">AccumulateGrad.stream = S0</text>
+
+    <rect class="autograd" x="500" y="242" width="190" height="62" rx="7"></rect>
+    <text x="595" y="266" text-anchor="middle" font-size="13" font-weight="600">backward kernel</text>
+    <text class="mono muted" x="595" y="288" text-anchor="middle" font-size="11">produce incoming grad</text>
+
+    <rect class="sync" x="735" y="92" width="150" height="62" rx="7"></rect>
+    <text x="810" y="116" text-anchor="middle" font-size="13" font-weight="600">S0 waits event</text>
+    <text class="mono muted" x="810" y="138" text-anchor="middle" font-size="11">producer: S1</text>
+
+    <rect class="autograd" x="915" y="82" width="135" height="82" rx="7"></rect>
+    <text x="982" y="108" text-anchor="middle" font-size="13" font-weight="600">AccumulateGrad</text>
+    <text class="mono muted" x="982" y="130" text-anchor="middle" font-size="11">update param.grad</text>
+    <text class="mono muted" x="982" y="148" text-anchor="middle" font-size="11">Reducer post hook</text>
+
+    <rect class="comm" x="915" y="392" width="135" height="62" rx="7"></rect>
+    <text x="982" y="416" text-anchor="middle" font-size="13" font-weight="600">AllReduce</text>
+    <text class="mono muted" x="982" y="438" text-anchor="middle" font-size="11">bucket ready</text>
+
+    <path class="edge" marker-end="url(#zh-ddp-stream-arrow)" d="M 690 273 C 745 273, 758 185, 792 155"></path>
+    <path class="edge" marker-end="url(#zh-ddp-stream-arrow)" d="M 885 123 L 915 123"></path>
+    <path class="edge dash" marker-end="url(#zh-ddp-stream-arrow)" d="M 982 164 L 982 392"></path>
+    <text class="subtle" x="740" y="252" font-size="11">record / wait event</text>
+    <text class="subtle" x="995" y="278" font-size="11">bucket ready</text>
+  </svg>
+</div>
+
+<p>这张图表达的是公开源码中的逻辑关系，并未假定 event pool、队列深度或 GPU 内部调度结构。若 producer 与 consumer 恰好是同一个 stream，stream 内顺序已经满足依赖，额外的跨 stream wait 不再需要。</p>
+
+<h2 id="zh-nccl">Reducer hook 与 NCCL stream 属于两个执行层次</h2>
+
+<p><code>AccumulateGrad</code> 更新 <code>param.grad</code> 后，Reducer post hook 把参数标记为 ready；bucket 收齐后，Reducer 才进入 collective 路径。<a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp#L166-L185">ProcessGroupNCCL 的 stream 同步代码</a>说明，异步 NCCL 通信通常使用其管理的 <code>ncclStream</code>，并通过 event 等待调用时的 current stream。<a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp#L3809-L3816">collective dispatch</a> 在 async 模式选择独立 NCCL stream，在同步模式选择 current stream。</p>
+
+<p>因此，<code>AccumulateGrad.stream == S0</code> 表示梯度累加和 Reducer hook 在 S0 的 current-stream context 中运行；它并不把 NCCL kernel 永久绑定到 S0。两者之间由 ProcessGroup 建立所需的 stream dependency。bucket 如何触发 collective，可继续参见 <a href="./pytorch-ddp-gradient-reduction.html">PyTorch DDP 梯度规约机制</a>。</p>
+
+<h2 id="zh-placement">GPU 参数放置先于 DDP wrapper</h2>
+
+<p>DDP 构造时需要遍历最终参数集合、检查 device、建立 bucket，并为参数取得梯度累加节点。官方 <a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html"><code>DistributedDataParallel</code> 手册</a>规定，单 device CUDA module 的 <code>device_ids</code> 指向该 module 已经驻留的 device；当 <code>device_ids=None</code> 时，module 与输入同样需要由调用方放到正确 device。固定版本源码中的 <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/nn/parallel/distributed.py#L674-L691">参数说明</a>给出了同一约束。</p>
+
+<p>官方 DDP 教程采用最直接的顺序：</p>
+
+<pre class="code"># PyTorch official DDP tutorial
+model = ToyModel().to(rank)
+ddp_model = DDP(model, device_ids=[rank])</pre>
+
+<p class="source-path">官方教程：<a href="https://docs.pytorch.org/tutorials/intermediate/ddp_tutorial.html">Getting Started with Distributed Data Parallel</a>；固定版本源文件：<a href="https://github.com/pytorch/tutorials/blob/c80a43460c838fa28efa55e5680f3e97781e288e/intermediate_source/ddp_tutorial.rst#L133-L147">lines 133–147</a></p>
+
+<p><code>.cuda(device)</code> 与 <code>.to(device)</code> 在这里承担相同的 device placement 角色。DDP wrapper 不负责把一个普通 CPU module 自动迁移到 <code>device_ids[0]</code>。此外，官方手册明确要求 wrapper 构造后不要替换参数，因为 DDP 已经为构造时看到的参数集合注册梯度规约函数；参见 <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/nn/parallel/distributed.py#L660-L668">DDP parameter warning</a>。</p>
+
+<h3>TorchRec：先设 device、放置模型，再构造 DDP</h3>
+
+<p>TorchRec 的公开 BERT4Rec 示例先根据 <code>LOCAL_RANK</code> 调用 <code>torch.cuda.set_device(device)</code>，随后用 <code>BERT4Rec(...).to(device)</code> 完成参数放置，最后才选择标准 <code>DDP(model_bert4rec, device_ids=device_ids)</code> 或 TorchRec DMP。对应顺序可见 commit <a href="https://github.com/pytorch/torchrec/tree/561502d82877cbe732c1b6c2edde1635fbcd4ee0"><code>561502d</code></a> 的 <a href="https://github.com/pytorch/torchrec/blob/561502d82877cbe732c1b6c2edde1635fbcd4ee0/examples/bert4rec/bert4rec_main.py#L439-L449">device 初始化</a>、<a href="https://github.com/pytorch/torchrec/blob/561502d82877cbe732c1b6c2edde1635fbcd4ee0/examples/bert4rec/bert4rec_main.py#L485-L503">模型放置</a>和 <a href="https://github.com/pytorch/torchrec/blob/561502d82877cbe732c1b6c2edde1635fbcd4ee0/examples/bert4rec/bert4rec_main.py#L512-L543">DDP 构造</a>。</p>
+
+<h3>Megatron-Core：同时处理 device placement 与自定义 stream</h3>
+
+<p>Megatron-Core 的模型构造路径同样先执行 <code>model_module.cuda(torch.cuda.current_device())</code>，再进入 DDP wrapper；meta-device 路径也会在 wrapper 前物化参数。固定版本代码位于 <a href="https://github.com/NVIDIA/Megatron-LM/blob/159b443c3e1a23ff68321973b936fef810bb3c61/megatron/training/models/dist_utils.py#L186-L217"><code>dist_utils.py</code></a>。</p>
+
+<p>它还显式处理了本文讨论的 stream 约束。全 iteration CUDA Graph 模式选择共享 capture stream，并写明 DDP 初始化必须在该 stream 上进行，以免被保留的 <code>AccumulateGrad</code> 指向另一个 non-capturing stream；随后代码进入 <code>with torch.cuda.stream(ddp_stream)</code> 构造 wrapper。参见同一 commit 的 <a href="https://github.com/NVIDIA/Megatron-LM/blob/159b443c3e1a23ff68321973b936fef810bb3c61/megatron/training/models/dist_utils.py#L349-L365">stream selection</a>。Megatron 自定义 DDP 随后通过临时 view 找到 <code>AccumulateGrad</code>、注册 hook 并保存强引用，见 <a href="https://github.com/NVIDIA/Megatron-LM/blob/159b443c3e1a23ff68321973b936fef810bb3c61/megatron/core/distributed/distributed_data_parallel.py#L462-L503">hook registration</a>。</p>
+
+<h2 id="zh-practice">初始化方式与 stream mismatch 诊断</h2>
+
+<p>普通 DDP 训练使用每个 device 的默认 stream，初始化代码可以保持简洁：</p>
+
+<pre class="code">local_rank = int(os.environ["LOCAL_RANK"])
+device = torch.device("cuda", local_rank)
+
+torch.cuda.set_device(device)
+dist.init_process_group("nccl", device_id=device)
+
+model = Model().to(device)  # 或 Model().cuda(local_rank)
+ddp = DDP(model, device_ids=[local_rank])
+
+# forward/backward 也在该 device 的默认 current stream 上执行。</pre>
+
+<p>训练若固定使用自定义 stream，应让参数放置、DDP 构造和后续 iteration 使用同一个 stream context：</p>
+
+<pre class="code">torch.cuda.set_device(device)
+train_stream = torch.cuda.Stream(device=device)
+
+with torch.cuda.stream(train_stream):
+    model = Model().to(device)
+    ddp = DDP(model, device_ids=[local_rank])
+
+with torch.cuda.stream(train_stream):
+    output = ddp(batch.to(device, non_blocking=True))
+    loss = loss_fn(output, target)
+    loss.backward()</pre>
+
+<p>多个计算 stream 都可能向同一参数产生梯度时，单个 <code>AccumulateGrad</code> 仍只有一个 canonical consumer stream。autograd 用 event 依赖保证正确性；stream 数量增加时，跨 stream 同步也可能增加。这是性能和 CUDA Graph capture 问题，不会让符合依赖规则的 eager backward 得到错误梯度。</p>
+
+<p>固定版本 PyTorch 提供 <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/autograd/graph.py#L647-L651"><code>torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch()</code></a>。开启后，若 incoming gradient 的 producer stream 与 <code>AccumulateGrad</code> stream 不同，Engine 会给出一次警告。诊断文字直接列出 DDP 持有旧节点这一来源，并建议在后续 forward 所用的同一 stream 中初始化 DDP，参见 <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/input_buffer.cpp#L425-L463">InputBuffer mismatch handling</a>。</p>
+
+<pre class="code">torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(True)
+
+with torch.cuda.stream(init_stream):
+    ddp = DDP(model, device_ids=[local_rank])
+
+with torch.cuda.stream(train_stream):
+    ddp(input).sum().backward()
+    # init_stream != train_stream 时，可观察到 AccumulateGrad stream mismatch 警告。</pre>
+
+<h3 id="zh-capture-override">CUDA Graph capture 的临时 stream override</h3>
+
+<p>CUDA Graph capture 会把 stream 集合及其依赖一起记录下来。假设 DDP 在 non-capturing stream <code>S0</code> 上构造，Reducer 因而长期持有 <code>stream=S0</code> 的 <code>AccumulateGrad</code>；之后 forward/backward 改在 capture stream <code>S_capture</code> 上执行。此时 incoming gradient 的 producer 正在 capture，而节点的 canonical consumer stream 仍指向 capture 之外的 <code>S0</code>。若 Engine 直接让 <code>S0</code> 等待 <code>S_capture</code> 的 event，这条依赖会跨越 capture boundary。</p>
+
+<p><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/autograd/graph.py#L654-L692"><code>torch.autograd.graph.set_override_stale_capture_stream(True)</code></a> 为这个场景启用临时替代。<a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/input_buffer.cpp#L425-L445"><code>InputBuffer::add()</code></a> 检测到 “capturing producer + stale non-capturing consumer” 后，把 producer 的 <code>S_capture</code> 写入 <code>opt_overridden_consumer_stream</code>。<code>Engine::evaluate_function()</code> 随后优先使用这个值，而不是 <code>func-&gt;stream()</code>，所以 <code>AccumulateGrad</code> 及其 Reducer hook 在本次 capture 中以 <code>S_capture</code> 为 current stream。</p>
+
+<pre class="code"># 机制示意：静态 input/output buffer 与 warmup 代码省略
+capture_stream = torch.cuda.Stream(device=device)
+graph = torch.cuda.CUDAGraph()
+
+torch.autograd.graph.set_override_stale_capture_stream(True)
+try:
+    with torch.cuda.graph(graph, stream=capture_stream):
+        loss = ddp(static_input).sum()
+        loss.backward()
+finally:
+    # 该设置是 process-global，并非 thread-local。
+    torch.autograd.graph.set_override_stale_capture_stream(False)</pre>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr>
+      <th>节点状态</th>
+      <th>override 关闭</th>
+      <th>override 开启</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>stale stream 是 default stream 0</td>
+      <td>PyTorch 抛出 <code>RuntimeError</code>，避免 default-stream wait 把 non-capturing stream 拉入 capture。</td>
+      <td>本次 <code>InputBuffer</code> 使用 producer 的 capturing stream。</td>
+    </tr>
+    <tr>
+      <td>stale stream 是 non-default stream</td>
+      <td>保留原 stream；调用方已把它 join 到 capture 时可以继续，否则由 CUDA runtime 报错。</td>
+      <td>同样临时替换为 producer 的 capturing stream。</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/input_buffer.h#L80-L94"><code>InputBuffer</code> 的字段定义</a>说明了这项替代的生命周期：override 保存在当前 input buffer 中，供该 buffer 的后续 producer 和 Engine 执行共同使用；没有触发 override 时，Engine 仍回退到节点的 <code>func-&gt;stream()</code>。实现没有修改 <code>AccumulateGrad</code> 的 <code>InputMetadata.stream_</code>。capture 结束后，节点仍绑定原来的 <code>S0</code>，下一次符合条件的 capture 会再次临时替代。</p>
+
+<p>这个开关还会跳过一种跨 capture boundary 的 end-of-backward leaf sync，适用于 incoming gradients 全部 undefined、无法在 <code>InputBuffer</code> 阶段完成 stream reconciliation 的特殊路径。它是 process-global 的 capture 兼容选项，不是一般的 stream 重绑定接口。能够控制初始化时机时，让 warmup、DDP 构造与 capture 采用一致的 stream 仍然更直接；override 适合处理 DDP 等长期持有的 stale 节点。</p>
+
+<p>归纳起来，device 与 stream 需要分别确定：先用 <code>set_device</code> 和 <code>.to(device)</code>/<code>.cuda(device)</code> 固定参数设备，再在训练所采用的 current stream 中构造 DDP。这样，Reducer 所持有的 <code>AccumulateGrad</code> 从创建开始就与后续 backward 的执行环境一致。</p>
+
+<h2 id="zh-refs">参考资料</h2>
+
+<ul>
+  <li><a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html">PyTorch <code>DistributedDataParallel</code> API</a></li>
+  <li><a href="https://docs.pytorch.org/tutorials/intermediate/ddp_tutorial.html">PyTorch: Getting Started with Distributed Data Parallel</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/docs/source/notes/ddp.md">PyTorch DDP design note, commit <code>867370d</code></a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/distributed/c10d/reducer.cpp">PyTorch Reducer source, commit <code>867370d</code></a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/input_metadata.cpp">PyTorch InputMetadata source, commit <code>867370d</code></a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/input_buffer.cpp">PyTorch InputBuffer stream reconciliation, commit <code>867370d</code></a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/autograd/graph.py#L654-L692"><code>set_override_stale_capture_stream</code>, commit <code>867370d</code></a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/engine.cpp">PyTorch autograd Engine source, commit <code>867370d</code></a></li>
+  <li><a href="https://github.com/pytorch/torchrec/blob/561502d82877cbe732c1b6c2edde1635fbcd4ee0/examples/bert4rec/bert4rec_main.py">TorchRec BERT4Rec training example, commit <code>561502d</code></a></li>
+  <li><a href="https://github.com/NVIDIA/Megatron-LM/blob/159b443c3e1a23ff68321973b936fef810bb3c61/megatron/training/models/dist_utils.py">Megatron-Core distributed model setup, commit <code>159b443</code></a></li>
+</ul>
+
+</div>
+
+<div class="lang-en">
+
+<h1>Stream Binding of AccumulateGrad in PyTorch DDP</h1>
+
+<p class="lead">Single-process, single-GPU DDP training usually follows a fixed initialization order: select the local CUDA device, place the model parameters on that device, and then wrap the model with <code>DistributedDataParallel</code>. This order also establishes an autograd execution stream. During construction, DDP obtains each leaf parameter's <code>AccumulateGrad</code> node. If the node is created at that point, it records the current CUDA stream. When a gradient later reaches the parameter, the autograd Engine switches to the recorded stream before running gradient accumulation and the DDP hook. Default-stream training rarely exposes this behavior; custom streams and CUDA Graph capture make it an explicit constraint.</p>
+
+<h2 id="en-scope">Scope and terminology</h2>
+
+<p>This article follows the CUDA eager path of standard <code>torch.nn.parallel.DistributedDataParallel</code>, with PyTorch pinned to commit <a href="https://github.com/pytorch/pytorch/tree/867370d4524f58659d8f030a1d9a6f92169d3019"><code>867370d</code></a>. TorchRec and Megatron-Core are used as public engineering examples, not as definitions of stock DDP behavior; their wrappers also implement sharding and dedicated gradient buffers.</p>
+
+<p>A <strong>node stream</strong> is the stream recorded for the first accelerator input when an autograd Node is created. <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/node.h#L243-L265"><code>Node::stream()</code></a> returns it from the input metadata, and the Engine treats it as the Node's canonical consumer stream. For a leaf parameter, the Node responsible for writing the gradient is <code>AccumulateGrad</code>. The leaf Tensor itself still has <code>param.grad_fn is None</code>; the relationship is developed in more detail in <a href="./pytorch-autograd-grad-fn-next-functions.html">The PyTorch Autograd Reverse Graph</a>.</p>
+
+<div class="note-box">
+  <p><code>AccumulateGrad</code> binds its stream when the <strong>node is created</strong>, not on every hook invocation. DDP construction normally triggers that creation, but if a retained node already exists, the Reducer reuses the node and its original stream.</p>
+</div>
+
+<h2 id="en-create">DDP obtains and retains <code>AccumulateGrad</code></h2>
+
+<p>After building its buckets, the DDP Python constructor creates a <code>Reducer</code>. The official <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/docs/source/notes/ddp.md#L84-L125">DDP design note</a> describes this construction step as registering one autograd hook per parameter; a hook starts the reduction path when its parameter gradient becomes ready. The Python entry point likewise lists gradient-hook registration among the responsibilities of <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/nn/parallel/distributed.py#L1387-L1451"><code>_ddp_init_helper()</code></a>.</p>
+
+<p>The Reducer constructor performs the concrete work for every trainable parameter:</p>
+
+<pre class="code">// Semantic excerpt: torch/csrc/distributed/c10d/reducer.cpp
+auto grad_accumulator = torch::autograd::impl::grad_accumulator(variable);
+
+hooks_.emplace_back(
+    grad_accumulator-&gt;add_post_hook(/* Reducer::autograd_hook */),
+    grad_accumulator);
+
+// Autograd metadata holds only a weak_ptr; Reducer retains a strong reference.
+grad_accumulators_[variable_index] = std::move(grad_accumulator);</pre>
+
+<p class="source-path">Pinned source: <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/distributed/c10d/reducer.cpp#L173-L237">reducer.cpp, lines 173–237</a></p>
+
+<p><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/variable.cpp#L288-L324"><code>grad_accumulator(variable)</code></a> first checks the leaf parameter's weak reference. It returns an existing node or constructs a new <code>AccumulateGrad</code>. The Reducer then keeps a strong reference, allowing the node to survive across iterations. In the usual DDP lifecycle, wrapper construction is therefore also when the leaf accumulation nodes are created.</p>
+
+<p>Ordinary eager autograd has a different lifetime. A leaf's autograd metadata caches only a weak reference to <code>AccumulateGrad</code>. The node remains alive while the current graph or another owner still references it, but it can be destroyed after those strong references are released. When a later graph requests the leaf's gradient edge, an expired weak reference cannot return the old node, so <code>grad_accumulator()</code> creates a new one under the current stream at that time. The pinned source explicitly describes releasing the old graph and its accumulation node between iterations as the normal lifecycle.</p>
+
+<p>The DDP Reducer changes that lifetime. Its strong reference in <code>grad_accumulators_</code> is independent of any one forward/backward graph, so releasing the loss and the old graph does not destroy these nodes. Their creation-time stream metadata remains in place for as long as the Reducer retains them. Moving only the next forward onto a capture stream therefore does not rebind them. Custom-stream or CUDA Graph training must construct DDP under the intended stream, or explicitly rebuild the wrapper that owns the nodes.</p>
+
+<h2 id="en-bind">The current CUDA stream is captured at node creation</h2>
+
+<p>The <code>AccumulateGrad</code> constructor stores its leaf variable and calls <code>add_input_metadata(variable)</code>. The <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/functions/accumulate_grad.cpp#L82-L89">pinned implementation</a> is short:</p>
+
+<pre class="code">AccumulateGrad::AccumulateGrad(Variable variable_)
+    : Node(/*sequence_nr=*/UINT64_MAX), variable(std::move(variable_)) {
+  add_input_metadata(variable);
+}</pre>
+
+<p><code>InputMetadata</code> uses the parameter's device type to query that device's current stream, then stores the result in <code>stream_</code>:</p>
+
+<pre class="code">// torch/csrc/autograd/input_metadata.cpp
+auto device_ = options.device();
+stream_ = c10::impl::getDeviceGuardImpl(device_.type())-&gt;getStream(device_);</pre>
+
+<p class="source-path">Pinned source: <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/input_metadata.cpp#L28-L42">input_metadata.cpp, lines 28–42</a></p>
+
+<p>The GPU parameter selects which CUDA device is queried, while the current stream during DDP construction determines which stream is recorded. <code>model.cuda(device)</code> handles parameter placement; <code>with torch.cuda.stream(stream): DDP(...)</code> directly controls the stream metadata of newly created <code>AccumulateGrad</code> nodes. These operations solve separate parts of initialization.</p>
+
+<h2 id="en-execute">The Engine restores the node stream during backward</h2>
+
+<p>A backward kernel may produce the incoming parameter gradient on another stream. Once the gradient enters the <code>AccumulateGrad</code> input buffer, the Engine reads the node stream and installs an <code>OptionalStreamGuard</code> before invoking the Node and its post hooks. The pinned <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/engine.cpp#L1168-L1204"><code>Engine::evaluate_function()</code></a> also checks the incoming gradient's producer stream. When producer and consumer differ, the consumer stream waits on the producer event.</p>
+
+<pre class="code">auto opt_parent_stream = inputs.opt_overridden_consumer_stream.has_value()
+    ? inputs.opt_overridden_consumer_stream
+    : func-&gt;stream();
+
+c10::OptionalStreamGuard parent_stream_guard{opt_parent_stream};
+
+if (*opt_parent_stream != *opt_ready_stream) {
+  opt_parent_stream-&gt;wait(opt_ready_event.value());
+}
+
+// The Node and its post hooks now run under this current-stream context.</pre>
+
+<p>Saying that the hook runs on this stream spans two execution layers. An autograd worker thread invokes the C++ or Python callback on the CPU. The <code>OptionalStreamGuard</code> makes the node stream current during that callback, so CUDA operations launched by the callback are enqueued there. The CPU callback itself does not become a GPU kernel.</p>
+
+<div class="diagram-frame">
+  <div class="diagram-title">Stream capture during DDP construction and stream restoration during backward</div>
+  <svg class="diagram-svg" viewBox="0 0 1120 570" role="img" aria-labelledby="en-ddp-stream-title en-ddp-stream-desc">
+    <title id="en-ddp-stream-title">AccumulateGrad stream binding and execution timeline</title>
+    <desc id="en-ddp-stream-desc">The diagram shows the common path: DDP construction creates and retains AccumulateGrad, which records current stream S0. After backward produces a gradient on S1, S0 waits on an event, then runs AccumulateGrad and the Reducer hook. The NCCL collective uses a communication stream managed by ProcessGroupNCCL.</desc>
+    <defs>
+      <marker id="en-ddp-stream-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#71717a"></path>
+      </marker>
+    </defs>
+
+    <text x="160" y="36" text-anchor="middle" font-size="13" font-weight="600">construction</text>
+    <text x="745" y="36" text-anchor="middle" font-size="13" font-weight="600">backward</text>
+    <line class="phase" x1="435" y1="18" x2="435" y2="535"></line>
+
+    <rect class="lane" x="145" y="65" width="930" height="115" rx="7"></rect>
+    <rect class="lane" x="145" y="215" width="930" height="115" rx="7"></rect>
+    <rect class="lane" x="145" y="365" width="930" height="115" rx="7"></rect>
+    <text x="125" y="110" text-anchor="end" font-size="14" font-weight="600">CUDA stream S0</text>
+    <text class="muted" x="125" y="132" text-anchor="end" font-size="11">DDP / consumer</text>
+    <text x="125" y="260" text-anchor="end" font-size="14" font-weight="600">CUDA stream S1</text>
+    <text class="muted" x="125" y="282" text-anchor="end" font-size="11">gradient producer</text>
+    <text x="125" y="410" text-anchor="end" font-size="14" font-weight="600">NCCL stream</text>
+    <text class="muted" x="125" y="432" text-anchor="end" font-size="11">ProcessGroupNCCL</text>
+
+    <rect class="construct" x="180" y="92" width="205" height="62" rx="7"></rect>
+    <text x="282" y="116" text-anchor="middle" font-size="13" font-weight="600">DDP(model)</text>
+    <text class="mono muted" x="282" y="138" text-anchor="middle" font-size="11">AccumulateGrad.stream = S0</text>
+
+    <rect class="autograd" x="500" y="242" width="190" height="62" rx="7"></rect>
+    <text x="595" y="266" text-anchor="middle" font-size="13" font-weight="600">backward kernel</text>
+    <text class="mono muted" x="595" y="288" text-anchor="middle" font-size="11">produce incoming grad</text>
+
+    <rect class="sync" x="735" y="92" width="150" height="62" rx="7"></rect>
+    <text x="810" y="116" text-anchor="middle" font-size="13" font-weight="600">S0 waits event</text>
+    <text class="mono muted" x="810" y="138" text-anchor="middle" font-size="11">producer: S1</text>
+
+    <rect class="autograd" x="915" y="82" width="135" height="82" rx="7"></rect>
+    <text x="982" y="108" text-anchor="middle" font-size="13" font-weight="600">AccumulateGrad</text>
+    <text class="mono muted" x="982" y="130" text-anchor="middle" font-size="11">update param.grad</text>
+    <text class="mono muted" x="982" y="148" text-anchor="middle" font-size="11">Reducer post hook</text>
+
+    <rect class="comm" x="915" y="392" width="135" height="62" rx="7"></rect>
+    <text x="982" y="416" text-anchor="middle" font-size="13" font-weight="600">AllReduce</text>
+    <text class="mono muted" x="982" y="438" text-anchor="middle" font-size="11">bucket ready</text>
+
+    <path class="edge" marker-end="url(#en-ddp-stream-arrow)" d="M 690 273 C 745 273, 758 185, 792 155"></path>
+    <path class="edge" marker-end="url(#en-ddp-stream-arrow)" d="M 885 123 L 915 123"></path>
+    <path class="edge dash" marker-end="url(#en-ddp-stream-arrow)" d="M 982 164 L 982 392"></path>
+    <text class="subtle" x="740" y="252" font-size="11">record / wait event</text>
+    <text class="subtle" x="995" y="278" font-size="11">bucket ready</text>
+  </svg>
+</div>
+
+<p>The figure presents the logical relationships established by public source code; it makes no claim about event-pool organization, queue depth, or internal GPU scheduling. When producer and consumer are already the same stream, stream ordering satisfies the dependency and no cross-stream wait is required.</p>
+
+<h2 id="en-nccl">Reducer hooks and NCCL streams are separate execution layers</h2>
+
+<p>After <code>AccumulateGrad</code> updates <code>param.grad</code>, the Reducer post hook marks the parameter ready. The collective path begins only when its bucket is complete. <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp#L166-L185">ProcessGroupNCCL stream synchronization</a> shows that asynchronous NCCL communication normally uses a managed <code>ncclStream</code>, with an event making it wait for the caller's current stream. The <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp#L3809-L3816">collective dispatch</a> selects a separate NCCL stream in asynchronous mode and the current stream in synchronous mode.</p>
+
+<p>Consequently, <code>AccumulateGrad.stream == S0</code> means that gradient accumulation and the Reducer hook run under S0's current-stream context. It does not permanently bind the NCCL kernel to S0. ProcessGroup establishes the required dependency between those execution layers. Bucket readiness and collective launch are covered in <a href="./pytorch-ddp-gradient-reduction.html">PyTorch DDP Gradient Reduction</a>.</p>
+
+<h2 id="en-placement">GPU parameter placement precedes the DDP wrapper</h2>
+
+<p>DDP construction needs the final parameter set and device placement so it can validate devices, build buckets, and obtain each parameter's gradient accumulator. The official <a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html"><code>DistributedDataParallel</code> reference</a> states that a single-device CUDA module already resides on the sole device named by <code>device_ids</code>. With <code>device_ids=None</code>, the caller must place both the module and its inputs on the correct device. The pinned <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/nn/parallel/distributed.py#L674-L691">argument documentation</a> contains the same contract.</p>
+
+<p>The official DDP tutorial uses the direct ordering:</p>
+
+<pre class="code"># PyTorch official DDP tutorial
+model = ToyModel().to(rank)
+ddp_model = DDP(model, device_ids=[rank])</pre>
+
+<p class="source-path">Official tutorial: <a href="https://docs.pytorch.org/tutorials/intermediate/ddp_tutorial.html">Getting Started with Distributed Data Parallel</a>; pinned tutorial source: <a href="https://github.com/pytorch/tutorials/blob/c80a43460c838fa28efa55e5680f3e97781e288e/intermediate_source/ddp_tutorial.rst#L133-L147">lines 133–147</a></p>
+
+<p><code>.cuda(device)</code> and <code>.to(device)</code> serve the same placement role here. The DDP wrapper does not move an ordinary CPU module to <code>device_ids[0]</code> on the caller's behalf. The official reference also warns against replacing parameters after wrapper construction: DDP has already registered reduction functions for the parameter set observed at that time. See the pinned <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/nn/parallel/distributed.py#L660-L668">DDP parameter warning</a>.</p>
+
+<h3>TorchRec: select the device, place the model, then construct DDP</h3>
+
+<p>TorchRec's public BERT4Rec example obtains a device from <code>LOCAL_RANK</code> and calls <code>torch.cuda.set_device(device)</code>. It then places the model with <code>BERT4Rec(...).to(device)</code> before choosing either standard <code>DDP(model_bert4rec, device_ids=device_ids)</code> or TorchRec DMP. The sequence is visible in commit <a href="https://github.com/pytorch/torchrec/tree/561502d82877cbe732c1b6c2edde1635fbcd4ee0"><code>561502d</code></a>: <a href="https://github.com/pytorch/torchrec/blob/561502d82877cbe732c1b6c2edde1635fbcd4ee0/examples/bert4rec/bert4rec_main.py#L439-L449">device initialization</a>, <a href="https://github.com/pytorch/torchrec/blob/561502d82877cbe732c1b6c2edde1635fbcd4ee0/examples/bert4rec/bert4rec_main.py#L485-L503">model placement</a>, and <a href="https://github.com/pytorch/torchrec/blob/561502d82877cbe732c1b6c2edde1635fbcd4ee0/examples/bert4rec/bert4rec_main.py#L512-L543">DDP construction</a>.</p>
+
+<h3>Megatron-Core: device placement and custom-stream construction</h3>
+
+<p>Megatron-Core likewise executes <code>model_module.cuda(torch.cuda.current_device())</code> before entering its DDP wrapper path; its meta-device path materializes parameters before wrapping as well. The pinned implementation appears in <a href="https://github.com/NVIDIA/Megatron-LM/blob/159b443c3e1a23ff68321973b936fef810bb3c61/megatron/training/models/dist_utils.py#L186-L217"><code>dist_utils.py</code></a>.</p>
+
+<p>It also handles the stream constraint directly. Full-iteration CUDA Graph mode selects the shared capture stream and comments that DDP initialization must use that stream so retained <code>AccumulateGrad</code> nodes do not reference a different non-capturing stream. The code then constructs the wrapper inside <code>with torch.cuda.stream(ddp_stream)</code>; see the pinned <a href="https://github.com/NVIDIA/Megatron-LM/blob/159b443c3e1a23ff68321973b936fef810bb3c61/megatron/training/models/dist_utils.py#L349-L365">stream selection</a>. Megatron's custom DDP later reaches <code>AccumulateGrad</code> through a temporary view, attaches a hook, and retains the node, as shown in its <a href="https://github.com/NVIDIA/Megatron-LM/blob/159b443c3e1a23ff68321973b936fef810bb3c61/megatron/core/distributed/distributed_data_parallel.py#L462-L503">hook registration</a>.</p>
+
+<h2 id="en-practice">Initialization patterns and stream-mismatch diagnostics</h2>
+
+<p>Ordinary DDP training uses the default stream of each device, so initialization can remain simple:</p>
+
+<pre class="code">local_rank = int(os.environ["LOCAL_RANK"])
+device = torch.device("cuda", local_rank)
+
+torch.cuda.set_device(device)
+dist.init_process_group("nccl", device_id=device)
+
+model = Model().to(device)  # or Model().cuda(local_rank)
+ddp = DDP(model, device_ids=[local_rank])
+
+# Forward and backward also use this device's default current stream.</pre>
+
+<p>If training consistently uses a custom stream, parameter placement, DDP construction, and subsequent iterations should share that stream context:</p>
+
+<pre class="code">torch.cuda.set_device(device)
+train_stream = torch.cuda.Stream(device=device)
+
+with torch.cuda.stream(train_stream):
+    model = Model().to(device)
+    ddp = DDP(model, device_ids=[local_rank])
+
+with torch.cuda.stream(train_stream):
+    output = ddp(batch.to(device, non_blocking=True))
+    loss = loss_fn(output, target)
+    loss.backward()</pre>
+
+<p>When several compute streams produce contributions for one parameter, its single <code>AccumulateGrad</code> still has one canonical consumer stream. Autograd preserves correctness with event dependencies; more producer streams can therefore introduce more cross-stream synchronization. This affects performance and CUDA Graph capture, not the gradient value of an eager backward that follows the dependency rules.</p>
+
+<p>The pinned PyTorch version provides <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/autograd/graph.py#L647-L651"><code>torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch()</code></a>. When enabled, the Engine warns once if an incoming gradient's producer stream differs from the <code>AccumulateGrad</code> stream. The diagnostic names DDP's retained node as one source and recommends initializing DDP under the stream used by later forwards; see the pinned <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/input_buffer.cpp#L425-L463">InputBuffer mismatch handling</a>.</p>
+
+<pre class="code">torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(True)
+
+with torch.cuda.stream(init_stream):
+    ddp = DDP(model, device_ids=[local_rank])
+
+with torch.cuda.stream(train_stream):
+    ddp(input).sum().backward()
+    # A mismatch warning is observable when init_stream != train_stream.</pre>
+
+<h3 id="en-capture-override">Temporary stream override during CUDA Graph capture</h3>
+
+<p>CUDA Graph capture records a set of streams and their dependencies. Suppose DDP was constructed on a non-capturing stream <code>S0</code>, leaving the Reducer with a long-lived <code>AccumulateGrad</code> whose stream is <code>S0</code>. Forward and backward later run on capture stream <code>S_capture</code>. The incoming gradient producer is now capturing, while the node's canonical consumer still points to <code>S0</code> outside the capture. Making <code>S0</code> wait on an event from <code>S_capture</code> would introduce a dependency across the capture boundary.</p>
+
+<p><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/autograd/graph.py#L654-L692"><code>torch.autograd.graph.set_override_stale_capture_stream(True)</code></a> enables a temporary substitution for this case. After <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/input_buffer.cpp#L425-L445"><code>InputBuffer::add()</code></a> detects a capturing producer and a stale non-capturing consumer, it stores the producer's <code>S_capture</code> in <code>opt_overridden_consumer_stream</code>. <code>Engine::evaluate_function()</code> then prefers that value over <code>func-&gt;stream()</code>, so <code>AccumulateGrad</code> and its Reducer hook run with <code>S_capture</code> current for this capture.</p>
+
+<pre class="code"># Mechanism sketch; static buffers and warmup are omitted.
+capture_stream = torch.cuda.Stream(device=device)
+graph = torch.cuda.CUDAGraph()
+
+torch.autograd.graph.set_override_stale_capture_stream(True)
+try:
+    with torch.cuda.graph(graph, stream=capture_stream):
+        loss = ddp(static_input).sum()
+        loss.backward()
+finally:
+    # This setting is process-global, not thread-local.
+    torch.autograd.graph.set_override_stale_capture_stream(False)</pre>
+
+<div class="table-scroll">
+<table class="note-table">
+  <thead>
+    <tr>
+      <th>Node state</th>
+      <th>Override disabled</th>
+      <th>Override enabled</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>The stale stream is default stream 0</td>
+      <td>PyTorch raises <code>RuntimeError</code> before a default-stream wait pulls a non-capturing stream into the capture.</td>
+      <td>The current <code>InputBuffer</code> uses the producer's capturing stream.</td>
+    </tr>
+    <tr>
+      <td>The stale stream is a non-default stream</td>
+      <td>The original stream remains. Capture can proceed if the caller joined it; otherwise the CUDA runtime reports the failure.</td>
+      <td>The producer's capturing stream temporarily replaces it as well.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p>The <a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/input_buffer.h#L80-L94"><code>InputBuffer</code> field definition</a> establishes the lifetime of this substitution. The override belongs to the current input buffer and is shared by later producers feeding that buffer and by the Engine invocation. When no override fires, the Engine still falls back to <code>func-&gt;stream()</code>. The implementation does not mutate <code>AccumulateGrad</code>'s <code>InputMetadata.stream_</code>. After capture, the node remains bound to <code>S0</code>; a later qualifying capture performs the temporary override again.</p>
+
+<p>The flag also skips one end-of-backward leaf synchronization that would cross the capture boundary. This applies to a special path in which all incoming gradients are undefined and stream reconciliation cannot occur in <code>InputBuffer</code>. The flag is a process-global capture compatibility option, not a general stream-rebinding API. When initialization is controllable, one coherent stream design for warmup, DDP construction, and capture remains the direct setup; the override is useful for stale nodes retained by DDP and similar owners.</p>
+
+<p>Device and stream must therefore be established separately: use <code>set_device</code> and <code>.to(device)</code>/<code>.cuda(device)</code> to fix parameter placement, then construct DDP under the current stream used by training. The <code>AccumulateGrad</code> nodes retained by the Reducer will then agree with the backward execution environment from the moment they are created.</p>
+
+<h2 id="en-refs">References</h2>
+
+<ul>
+  <li><a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html">PyTorch <code>DistributedDataParallel</code> API</a></li>
+  <li><a href="https://docs.pytorch.org/tutorials/intermediate/ddp_tutorial.html">PyTorch: Getting Started with Distributed Data Parallel</a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/docs/source/notes/ddp.md">PyTorch DDP design note, commit <code>867370d</code></a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/distributed/c10d/reducer.cpp">PyTorch Reducer source, commit <code>867370d</code></a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/input_metadata.cpp">PyTorch InputMetadata source, commit <code>867370d</code></a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/input_buffer.cpp">PyTorch InputBuffer stream reconciliation, commit <code>867370d</code></a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/autograd/graph.py#L654-L692"><code>set_override_stale_capture_stream</code>, commit <code>867370d</code></a></li>
+  <li><a href="https://github.com/pytorch/pytorch/blob/867370d4524f58659d8f030a1d9a6f92169d3019/torch/csrc/autograd/engine.cpp">PyTorch autograd Engine source, commit <code>867370d</code></a></li>
+  <li><a href="https://github.com/pytorch/torchrec/blob/561502d82877cbe732c1b6c2edde1635fbcd4ee0/examples/bert4rec/bert4rec_main.py">TorchRec BERT4Rec training example, commit <code>561502d</code></a></li>
+  <li><a href="https://github.com/NVIDIA/Megatron-LM/blob/159b443c3e1a23ff68321973b936fef810bb3c61/megatron/training/models/dist_utils.py">Megatron-Core distributed model setup, commit <code>159b443</code></a></li>
+</ul>
+
+</div>
+
+</main>
+</div>
+</body>
+</html>
