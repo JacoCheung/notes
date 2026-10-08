@@ -10,14 +10,14 @@
 <meta name="post:date"            content="2026-07-20">
 <meta name="post:tags"            content="PyTorch, cuBLAS, Linear, GEMM">
 <meta name="post:tags_en"         content="PyTorch, cuBLAS, Linear, GEMM">
-<meta name="post:reading"         content="4 分钟">
-<meta name="post:reading_en"      content="4 min">
-<meta name="post:summary"         content="row-major Tensor 与 cuBLAS column-major 接口会把同一缓冲区解释为转置矩阵，profiler 的 TN、NT、NN 不能直接按 Linear 公式读取。该变换确定前向、wgrad、dgrad 的操作数与规约轴；结论限于二维连续布局，不代表 ATen 的 backend 选择。">
-<meta name="post:summary_en"      content="PyTorch Linear's row-major tensors and the cuBLAS column-major interface interpret the same buffer as transposed matrix views, so profiler labels such as TN, NT, and NN cannot be read directly from model equations. The view transformation determines operand order, transpose modes, and reduction axes for forward, wgrad, and dgrad under contiguous two-dimensional assumptions, independent of ATen's backend choice.">
-<meta name="post:series"          content="pytorch-internals">
-<meta name="post:series_title"    content="PyTorch 内部机制">
-<meta name="post:series_title_en" content="PyTorch Internals">
-<meta name="post:series_order"    content="5">
+<meta name="post:reading"         content="5 分钟">
+<meta name="post:reading_en"      content="5 min">
+<meta name="post:summary"         content="PyTorch 的 row-major Tensor 与 cuBLAS column-major 接口会把同一缓冲区解释为转置矩阵，因此 profiler 中的 TN、NT、NN 需要结合操作数顺序读取。两个输入共有、但没有保留在输出 shape 中的维度就是 GEMM 的规约轴；这条规则同样适用于 Linear 与 attention backward。">
+<meta name="post:summary_en"      content="PyTorch row-major tensors and the cuBLAS column-major interface interpret the same buffer as transposed matrix views, so profiler labels such as TN, NT, and NN must be read together with operand order. The GEMM reduction axis is the shared input dimension absent from the output shape, a rule that applies to both Linear and attention backward.">
+<meta name="post:series"          content="llm-training">
+<meta name="post:series_title"    content="LLM 训练系统">
+<meta name="post:series_title_en" content="LLM Training Systems">
+<meta name="post:series_order"    content="4">
 <script>
   window.MathJax = {
     tex: { inlineMath: [['\\(','\\)'], ['$','$']], displayMath: [['\\[','\\]'], ['$$','$$']] },
@@ -34,14 +34,16 @@
   main.content { max-width: 960px; padding: 56px 32px 96px; }
   @media (max-width: 920px) { main.content { padding: 48px 20px 80px; } }
   .note-card {
-    background: #e8f4ff;
-    border-radius: 6px;
+    background: var(--accent-tint);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
     padding: 14px 18px;
     margin: 18px 0 28px;
-    color: #222;
+    color: var(--fg);
     font-size: 15px;
     line-height: 1.65;
   }
+  .note-card p { margin: 0.55em 0; }
   .note-card strong { font-weight: 700; }
   .table-scroll {
     overflow-x: auto;
@@ -156,6 +158,12 @@
 
 <p>transpose mode 描述交换操作数之后，cuBLAS 如何解释 <code>A</code> 与 <code>B</code>。以 wgrad 为例，PyTorch 计算 \(\mathrm{d}W=\mathrm{d}Y^{\mathsf T}X\)，同一输出缓冲区的 column-major 视图则保存 \(\widehat{\mathrm{d}W}=X^{\mathsf T}\mathrm{d}Y\)。调用顺序由此变为 <code>A=x</code>、<code>B=dy</code>，mode 为 <code>NT</code>；乘积沿 flattened batch 维 \(m\) 求和。</p>
 
+<div class="note-card">
+  <p><strong>GEMM 的规约维度是两个输入共有、但没有保留在输出 shape 中的维度。</strong>矩阵乘法沿这个维度执行乘加，因而可以直接比较输入与输出 shape 来确定 reduction axis。</p>
+  <p>Linear wgrad 中，\(X^{\mathsf T}\in\mathbb{R}^{k\times m}\) 与 \(\mathrm{d}Y\in\mathbb{R}^{m\times n}\) 相乘，得到 \(\widehat{\mathrm{d}W}\in\mathbb{R}^{k\times n}\)，即 <code>[input_dim, output_dim]</code> 的 cuBLAS 视图。输出中消失的 \(m\) 是 flattened batch dimension，因此 wgrad 沿 batch 规约。PyTorch 仍将物理输出缓冲区解释为 \(\mathrm{d}W\in\mathbb{R}^{n\times k}\)，即 <code>[output_dim, input_dim]</code>；两种 shape 是同一缓冲区的转置视图。</p>
+  <p>Attention backward 遵循同一规则。设 \(Q\in\mathbb{R}^{S_Q\times d}\)、\(K\in\mathbb{R}^{S_K\times d}\)、\(V\in\mathbb{R}^{S_K\times d_v}\)、\(\mathrm{d}O\in\mathbb{R}^{S_Q\times d_v}\)，并令 \(P,\mathrm{d}S\in\mathbb{R}^{S_Q\times S_K}\)。于是 \(\mathrm{d}Q=\mathrm{d}S K\) 沿 \(S_K\)，也就是 <code>seq_K</code> 规约；\(\mathrm{d}K=\mathrm{d}S^{\mathsf T}Q\) 与 \(\mathrm{d}V=P^{\mathsf T}\mathrm{d}O\) 则沿 \(S_Q\)，也就是 <code>seq_Q</code> 规约。这里省略了 batch、head 和 attention scale 等不改变规约轴的维度与因子。</p>
+</div>
+
 <p>这张表是一组布局假设下的代数映射，不证明某次 PyTorch 运行选择了特定 GEMM backend 或 kernel。ATen 可以根据 dtype、shape、stride 和平台选择 cuBLASLt 或其他实现；非 contiguous 输入也可能先产生副本或采用不同 leading dimension。cuBLASLt 可以通过 matrix layout descriptor 明确指定 row-major 布局，此时不需要套用这里的操作数交换。</p>
 
 <h2 id="zh-refs">参考资料</h2>
@@ -229,6 +237,12 @@
 </div>
 
 <p>The transpose mode describes how cuBLAS interprets <code>A</code> and <code>B</code> after the operands have been swapped. For wgrad, PyTorch computes \(\mathrm{d}W=\mathrm{d}Y^{\mathsf T}X\), while the column-major view of the same output buffer stores \(\widehat{\mathrm{d}W}=X^{\mathsf T}\mathrm{d}Y\). The call consequently uses <code>A=x</code>, <code>B=dy</code>, and mode <code>NT</code>, with reduction over the flattened batch dimension \(m\).</p>
+
+<div class="note-card">
+  <p><strong>The GEMM reduction dimension is the dimension shared by both inputs but absent from the output shape.</strong>Multiplication and accumulation take place along this dimension, so comparing the operand shapes with the result identifies the reduction axis directly.</p>
+  <p>For Linear wgrad, \(X^{\mathsf T}\in\mathbb{R}^{k\times m}\) multiplies \(\mathrm{d}Y\in\mathbb{R}^{m\times n}\) to produce \(\widehat{\mathrm{d}W}\in\mathbb{R}^{k\times n}\), the <code>[input_dim, output_dim]</code> cuBLAS view. The missing dimension \(m\) is the flattened batch dimension, so wgrad reduces over the batch. PyTorch still interprets the physical output buffer as \(\mathrm{d}W\in\mathbb{R}^{n\times k}\), or <code>[output_dim, input_dim]</code>; the two shapes are transposed views of the same storage.</p>
+  <p>Attention backward follows the same rule. Let \(Q\in\mathbb{R}^{S_Q\times d}\), \(K\in\mathbb{R}^{S_K\times d}\), \(V\in\mathbb{R}^{S_K\times d_v}\), \(\mathrm{d}O\in\mathbb{R}^{S_Q\times d_v}\), and \(P,\mathrm{d}S\in\mathbb{R}^{S_Q\times S_K}\). Then \(\mathrm{d}Q=\mathrm{d}S K\) reduces over \(S_K\), or <code>seq_K</code>, whereas \(\mathrm{d}K=\mathrm{d}S^{\mathsf T}Q\) and \(\mathrm{d}V=P^{\mathsf T}\mathrm{d}O\) reduce over \(S_Q\), or <code>seq_Q</code>. Batch, head, and attention-scale terms are omitted because they do not change these reduction axes.</p>
+</div>
 
 <p>This table is an algebraic mapping under explicit layout assumptions. It does not establish which GEMM backend or kernel a particular PyTorch run selects. ATen may choose cuBLASLt or another implementation according to dtype, shape, stride, and platform; non-contiguous inputs may also require a copy or different leading dimensions. cuBLASLt can describe row-major matrices directly, so its calls do not require this operand swap.</p>
 
