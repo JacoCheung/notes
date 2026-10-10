@@ -69,7 +69,7 @@
 <div class="lang-zh">
 
 <h1>CUDA Graph 与 autocast：backward 应在 context 之外执行</h1>
-<p class="lead">Autocast 应只包住 forward 和 loss 计算，backward 应在启用的 autocast context 之外执行。这条规则也适用于 CUDA Graph capture：即使训练循环中的 <code>loss.backward()</code> 已经移到 context 外，<code>make_graphed_callables()</code> 内部仍可能在 autocast 开启时执行并捕获 backward。它带来两个不同层面的副作用：一是重新 cast backward 的操作数，改变梯度计算的精度；二是在 autograd worker 上意外启用 cast cache，使 graph 依赖一个可能在 replay 前失效的张量地址。</p>
+<p class="lead">Autocast 应只包住 forward 和 loss 计算，backward 应在启用的 autocast context 之外执行。这条规则也适用于 CUDA Graph capture。<code>make_graphed_callables()</code> 内部也会执行 backward。若调用这个 API 时 autocast 开着，backward 就可能在错误的精度环境下被捕获；之后即使在 autocast 外调用 <code>loss.backward()</code>，仍会重放这张已经捕获的图。在 autocast 下执行 backward 会带来两个不同层面的副作用：一是重新 cast backward 的操作数，改变梯度计算的精度；二是在 autograd worker 上意外启用 cast cache，使 graph 依赖一个可能在 replay 前失效的张量地址。</p>
 
 <h2 id="zh-rule">规则：forward 决定精度路径，backward 沿图执行</h2>
 <p>PyTorch 的 <a href="https://docs.pytorch.org/docs/2.12/amp.html#torch.autocast">AMP 文档</a>建议只对 forward 和 loss 开启 autocast。常规写法的边界非常明确：</p>
@@ -302,7 +302,7 @@ with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
 
 <div class="lang-en">
 <h1>CUDA Graphs and Autocast: Backward Should Run Outside the Context</h1>
-<p class="lead">Autocast should cover forward and loss computation; backward should run outside an enabled autocast context. The same boundary matters during CUDA Graph capture. Moving the training loop's <code>loss.backward()</code> outside autocast is insufficient if <code>make_graphed_callables()</code> already executed and captured backward with autocast enabled. Two effects can follow: backward operands are cast again, changing gradient precision; and an autograd worker can unexpectedly enable the cast cache, leaving the graph dependent on storage that may expire before replay.</p>
+<p class="lead">Autocast should cover forward and loss computation; backward should run outside an enabled autocast context. The same boundary matters during CUDA Graph capture. <code>make_graphed_callables()</code> also executes backward internally. If autocast is enabled when this API is called, backward may be captured under the wrong precision settings. A later <code>loss.backward()</code> outside autocast still replays that captured graph. Running backward under autocast can have two effects: backward operands are cast again, changing gradient precision; and an autograd worker can unexpectedly enable the cast cache, leaving the graph dependent on storage that may expire before replay.</p>
 
 <h2 id="en-rule">Forward establishes the precision path</h2>
 <p>The <a href="https://docs.pytorch.org/docs/2.12/amp.html#torch.autocast">PyTorch AMP documentation</a> recommends limiting autocast to forward and loss computation:</p>
