@@ -198,6 +198,8 @@
     const series = meta('series');
     const toc = document.querySelector('aside.toc, nav.toc, #toc');
     if (!series || !toc) return;
+    // Generated posts already include bilingual links, available without fetch.
+    if (toc.querySelector('.post-series-nav[data-static-series]')) return;
 
     try {
       const response = await fetch(new URL('../posts.json', window.location.href));

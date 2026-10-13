@@ -1,0 +1,256 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1600" height="2019" viewBox="0 0 1600 2019" role="group" aria-labelledby="title desc">
+<title id="title">Pipeline rewrite and per-batch handoff</title><desc id="desc">Only eligible sharded-module calls are rewritten; state stays attached to its batch. Solid bars: logical execution/access scopes; hollow dashed bars: unconsumed requests. Blue H2D, red D2H/host sync, purple AllToAll, amber request wait, green stream dependency. Trace eligible inputs; replace forward with a runtime wrapper  start_sparse_data_dist(batch): create_context + input_dist Submit split-size AllToAll; compatible metadata requests may be fused by process group. Store module contexts and split requests  Fuse compatible split metadata by process group  wait_sparse_data_dist: first wait -&gt; tensors requests First wait reads received CUDA split sizes on the host, then launches separate lengths and ID AllToAll payloads. The two variants below are alternatives for consuming this state, not consecutive stages.  Ordinary sparse pipeline  PipelinedForward pops tensors request + module context  Second wait on data_dist stream; train stream joins Consumes payload and reconstructs the KJT; uncached, nonempty CUDA lengths in the fixed-stride path require D2H and current-stream synchronization. compute_and_output_dist(context, distributed input)  Prefetch pipeline  _prefetch: second wait -&gt; module.prefetch -&gt; post-prefetch state  PrefetchPipelinedForward pops ready input + saved context  Train stream joins prefetch stream  compute_and_output_dist(context, distributed input) </desc>
+<style>text{font-family:Arial,Helvetica,sans-serif}a{cursor:pointer}a:hover text,a:focus text{text-decoration:underline}.source-link text{text-decoration:underline;text-underline-offset:2px}.activation,.pending-request{pointer-events:none}.message-link:hover .message-bg,.message-link:focus .message-bg{stroke:#93c5fd;fill:#eff6ff}</style><defs>
+<marker id="call" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="#475569"/></marker>
+<marker id="return" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="#64748b"/></marker>
+<marker id="comm" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="#7c3aed"/></marker>
+<marker id="h2d" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="#2563eb"/></marker>
+<marker id="host" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="#dc2626"/></marker>
+<marker id="wait" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="#a16207"/></marker>
+<marker id="dep" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="#087f68"/></marker>
+<marker id="boundary" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="#b91c1c"/></marker>
+</defs><rect width="100%" height="100%" fill="#fff"/>
+<text x="40" y="38" font-size="24" font-weight="700" fill="#0f172a">Pipeline rewrite and per-batch handoff</text>
+<text x="40" y="66" font-size="14" fill="#64748b">Only eligible sharded-module calls are rewritten; state stays attached to its batch.</text>
+<rect x="40" y="84" width="28" height="20" rx="3" fill="#eff6ff" stroke="#2563eb"/><text x="79" y="99" font-size="14" fill="#334155">H2D</text>
+<rect x="255" y="84" width="28" height="20" rx="3" fill="#fef2f2" stroke="#dc2626"/><text x="294" y="99" font-size="14" fill="#334155">D2H / host sync</text>
+<rect x="590" y="84" width="28" height="20" rx="3" fill="#f5f3ff" stroke="#7c3aed"/><text x="629" y="99" font-size="14" fill="#334155">AllToAll</text>
+<rect x="845" y="84" width="28" height="20" rx="3" fill="#fffbeb" stroke="#a16207"/><text x="884" y="99" font-size="14" fill="#334155">Request wait</text>
+<rect x="1170" y="84" width="28" height="20" rx="3" fill="#ecfdf5" stroke="#087f68"/><text x="1209" y="99" font-size="14" fill="#334155">Stream dependency</text>
+<rect x="40" y="120" width="14" height="23" fill="#dbeafe" stroke="#2563eb"/><text x="66" y="137" font-size="13" fill="#475569">Activation / access scope; nested bars = self-calls</text>
+<rect x="530" y="120" width="12" height="23" fill="#faf5ff" stroke="#7c3aed" stroke-dasharray="4 3"/><text x="555" y="137" font-size="13" fill="#475569">Pending request, not GPU duration</text>
+<text x="1010" y="137" font-size="13" fill="#1d4ed8">Click messages or file:line links to open TorchRec ↗</text>
+<text x="40" y="164" font-size="12" fill="#64748b">Host submission order and logical dependencies; bar lengths are not measured execution times.</text>
+<g class="background-layer">
+<rect x="288.0" y="182" width="318.0" height="1771" fill="#f1f5f9" fill-opacity=".55" stroke="#cbd5e1"/>
+<rect x="606.0" y="182" width="318.0" height="1771" fill="#f8fafc" fill-opacity=".55" stroke="#cbd5e1"/>
+<rect x="924.0" y="182" width="318.0" height="1771" fill="#f1f5f9" fill-opacity=".55" stroke="#cbd5e1"/>
+<rect x="1242.0" y="182" width="318.0" height="1771" fill="#f8fafc" fill-opacity=".55" stroke="#cbd5e1"/>
+<line x1="48" y1="379" x2="1552" y2="379" stroke="#e2e8f0"/>
+<line x1="48" y1="508" x2="1552" y2="508" stroke="#e2e8f0"/>
+<line x1="48" y1="618" x2="1552" y2="618" stroke="#e2e8f0"/>
+<line x1="48" y1="742" x2="1552" y2="742" stroke="#e2e8f0"/>
+<rect class="highlight highlight-host" data-kind="host" x="48" y="746" width="1504" height="138" rx="6" fill="#fef2f2" stroke="#dc2626" stroke-opacity=".45"/>
+<rect class="note-bg" x="48" y="890" width="1504" height="42" rx="4" fill="#f8fafc"/>
+<rect class="phase-bg" x="48" y="936" width="1504" height="42" rx="4" fill="#e2e8f0"/>
+<line x1="48" y1="1103" x2="1552" y2="1103" stroke="#e2e8f0"/>
+<rect class="highlight highlight-wait" data-kind="wait" x="48" y="1107" width="1504" height="172" rx="6" fill="#fffbeb" stroke="#a16207" stroke-opacity=".45"/>
+<line x1="48" y1="1406" x2="1552" y2="1406" stroke="#e2e8f0"/>
+<rect class="phase-bg" x="48" y="1409" width="1504" height="42" rx="4" fill="#e2e8f0"/>
+<rect class="highlight highlight-wait" data-kind="wait" x="48" y="1456" width="1504" height="135" rx="6" fill="#fffbeb" stroke="#a16207" stroke-opacity=".45"/>
+<line x1="48" y1="1718" x2="1552" y2="1718" stroke="#e2e8f0"/>
+<rect class="highlight highlight-dep" data-kind="dep" x="48" y="1722" width="1504" height="103" rx="6" fill="#ecfdf5" stroke="#087f68" stroke-opacity=".45"/>
+<line x1="48" y1="1952" x2="1552" y2="1952" stroke="#e2e8f0"/>
+</g><g class="lifeline-layer">
+<line class="lifeline" x1="447.0" y1="249" x2="447.0" y2="1953" stroke="#94a3b8" stroke-dasharray="5 6"/>
+<rect x="294.0" y="189" width="306.0" height="60" rx="5" fill="#f8fafc" stroke="#64748b"/>
+<text x="447.0" y="216" text-anchor="middle" font-size="14.0" font-weight="700" fill="#0f172a">Pipeline scheduler</text>
+<text x="447.0" y="239" text-anchor="middle" font-size="11.5" fill="#64748b">host / runtime</text>
+<line class="lifeline" x1="765.0" y1="249" x2="765.0" y2="1953" stroke="#94a3b8" stroke-dasharray="5 6"/>
+<rect x="612.0" y="189" width="306.0" height="60" rx="5" fill="#f8fafc" stroke="#64748b"/>
+<text x="765.0" y="216" text-anchor="middle" font-size="14.0" font-weight="700" fill="#0f172a">Batch context</text>
+<text x="765.0" y="239" text-anchor="middle" font-size="11.5" fill="#64748b">host / runtime</text>
+<line class="lifeline" x1="1083.0" y1="249" x2="1083.0" y2="1953" stroke="#94a3b8" stroke-dasharray="5 6"/>
+<rect x="930.0" y="189" width="306.0" height="60" rx="5" fill="#f8fafc" stroke="#64748b"/>
+<text x="1083.0" y="216" text-anchor="middle" font-size="14.0" font-weight="700" fill="#0f172a">Runtime forward</text>
+<text x="1083.0" y="239" text-anchor="middle" font-size="11.5" fill="#64748b">host / runtime</text>
+<line class="lifeline" x1="1401.0" y1="249" x2="1401.0" y2="1953" stroke="#94a3b8" stroke-dasharray="5 6"/>
+<rect x="1248.0" y="189" width="306.0" height="60" rx="5" fill="#f8fafc" stroke="#64748b"/>
+<text x="1401.0" y="216" text-anchor="middle" font-size="14.0" font-weight="700" fill="#0f172a">Sharded module</text>
+<text x="1401.0" y="239" text-anchor="middle" font-size="11.5" fill="#64748b">host / runtime</text>
+</g><g class="activation-layer">
+<rect class="activation" data-actor="0" data-start="1" data-end="5" x="439.0" y="305" width="16" height="505" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"><title>Pipeline scheduler: scope 1–5</title></rect>
+<rect class="activation" data-actor="0" data-start="9" data-end="9" x="439.0" y="1524" width="16" height="32" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"><title>Pipeline scheduler: scope 9–9</title></rect>
+<rect class="activation" data-actor="1" data-start="3" data-end="5" x="757.0" y="544" width="16" height="266" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"><title>Batch context: scope 3–5</title></rect>
+<rect class="activation" data-actor="1" data-start="6" data-end="6" x="757.0" y="1033" width="16" height="32" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"><title>Batch context: scope 6–6</title></rect>
+<rect class="activation" data-actor="1" data-start="9" data-end="10" x="757.0" y="1524" width="16" height="156" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"><title>Batch context: scope 9–10</title></rect>
+<rect class="activation" data-actor="2" data-start="6" data-end="8" x="1075.0" y="1033" width="16" height="335" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"><title>Runtime forward: scope 6–8</title></rect>
+<rect class="activation" data-actor="2" data-start="10" data-end="12" x="1075.0" y="1648" width="16" height="266" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"><title>Runtime forward: scope 10–12</title></rect>
+<rect class="activation" data-actor="3" data-start="1" data-end="1" x="1393.0" y="305" width="16" height="32" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"><title>Sharded module: scope 1–1</title></rect>
+<rect class="activation" data-actor="3" data-start="2" data-end="3" x="1393.0" y="415" width="16" height="161" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"><title>Sharded module: scope 2–3</title></rect>
+<rect class="activation" data-actor="3" data-start="8" data-end="8" x="1393.0" y="1336" width="16" height="32" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"><title>Sharded module: scope 8–8</title></rect>
+<rect class="activation" data-actor="3" data-start="9" data-end="9" x="1393.0" y="1524" width="16" height="32" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"><title>Sharded module: scope 9–9</title></rect>
+<rect class="activation" data-actor="3" data-start="12" data-end="12" x="1393.0" y="1882" width="16" height="32" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"><title>Sharded module: scope 12–12</title></rect>
+<rect class="activation nested" x="1083.0" y="1160" width="16" height="23" fill="#dbeafe" stroke="#2563eb"/>
+<rect class="activation nested" x="1083.0" y="1757" width="16" height="23" fill="#dbeafe" stroke="#2563eb"/>
+</g><g class="message-layer">
+<g class="row-content" data-top="270" data-bottom="380">
+<text x="62" y="295" font-size="12" fill="#94a3b8">01</text>
+<g class="message" data-step="1" data-kind="call">
+<a class="message-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L426-L458" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L426-L458" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="Trace eligible inputs; replace forward with a runtime wrapper"><title>Trace eligible inputs; replace forward with a runtime wrapper</title>
+<rect class="annotation-bg message-bg" x="477.0" y="281" width="520.5999999999999" height="18" rx="2" fill="#ffffff"/><text x="479.0" y="295" font-size="13.5" font-weight="600" fill="#475569">Trace eligible inputs; replace forward with a runtime wrapper ↗</text>
+<path d="M455.0 313 H1393.0" stroke="#475569" stroke-width="1.7" fill="none" marker-end="url(#call)"/></a>
+<a class="source-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L426-L458" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L426-L458" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="TorchRec distributed/train_pipeline/utils.py#L426-L458"><title>TorchRec distributed/train_pipeline/utils.py#L426-L458</title>
+<rect class="annotation-bg source-bg" x="477.0" y="335" width="139.8" height="17" rx="2" fill="#ffffff"/>
+<text x="479.0" y="347" font-size="11.5" fill="#1d4ed8">utils.py:426–458 ↗</text>
+</a>
+<a class="source-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L500-L556" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L500-L556" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="TorchRec distributed/train_pipeline/utils.py#L500-L556"><title>TorchRec distributed/train_pipeline/utils.py#L500-L556</title>
+<rect class="annotation-bg source-bg" x="624.8" y="335" width="139.8" height="17" rx="2" fill="#ffffff"/>
+<text x="626.8" y="347" font-size="11.5" fill="#1d4ed8">utils.py:500–556 ↗</text>
+</a>
+</g></g>
+<g class="row-content" data-top="380" data-bottom="509">
+<text x="62" y="405" font-size="12" fill="#94a3b8">02</text>
+<g class="message" data-step="2" data-kind="call">
+<a class="message-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L276-L287" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L276-L287" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="start_sparse_data_dist(batch): create_context + input_dist"><title>start_sparse_data_dist(batch): create_context + input_dist</title>
+<rect class="annotation-bg message-bg" x="477.0" y="391" width="495.99999999999994" height="18" rx="2" fill="#ffffff"/><text x="479.0" y="405" font-size="13.5" font-weight="600" fill="#475569">start_sparse_data_dist(batch): create_context + input_dist ↗</text>
+<path d="M455.0 423 H1393.0" stroke="#475569" stroke-width="1.7" fill="none" marker-end="url(#call)"/></a>
+<rect class="annotation-bg" x="477.0" y="445" width="613" height="15" fill="#ffffff"/><text x="479.0" y="457" font-size="12" fill="#475569">Submit split-size AllToAll; compatible metadata requests may be fused by process group.</text>
+<a class="source-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L276-L287" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L276-L287" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="TorchRec distributed/train_pipeline/utils.py#L276-L287"><title>TorchRec distributed/train_pipeline/utils.py#L276-L287</title>
+<rect class="annotation-bg source-bg" x="477.0" y="468" width="139.8" height="17" rx="2" fill="#ffffff"/>
+<text x="479.0" y="480" font-size="11.5" fill="#1d4ed8">utils.py:276–287 ↗</text>
+</a>
+</g></g>
+<g class="row-content" data-top="509" data-bottom="619">
+<text x="62" y="534" font-size="12" fill="#94a3b8">03</text>
+<g class="message" data-step="3" data-kind="call">
+<a class="message-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L279-L287" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L279-L287" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="Store module contexts and split requests"><title>Store module contexts and split requests</title>
+<rect class="annotation-bg message-bg" x="795.0" y="520" width="348.4" height="18" rx="2" fill="#ffffff"/><text x="797.0" y="534" font-size="13.5" font-weight="600" fill="#475569">Store module contexts and split requests ↗</text>
+<path d="M1393.0 552 H773.0" stroke="#475569" stroke-width="1.7" fill="none" marker-end="url(#call)"/></a>
+<a class="source-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L279-L287" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L279-L287" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="TorchRec distributed/train_pipeline/utils.py#L279-L287"><title>TorchRec distributed/train_pipeline/utils.py#L279-L287</title>
+<rect class="annotation-bg source-bg" x="795.0" y="574" width="139.8" height="17" rx="2" fill="#ffffff"/>
+<text x="797.0" y="586" font-size="11.5" fill="#1d4ed8">utils.py:279–287 ↗</text>
+</a>
+</g></g>
+<g class="row-content" data-top="619" data-bottom="743">
+<text x="62" y="644" font-size="12" fill="#94a3b8">04</text>
+<g class="message" data-step="4" data-kind="call">
+<a class="message-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L318-L354" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L318-L354" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="Fuse compatible split metadata by process group"><title>Fuse compatible split metadata by process group</title>
+<rect class="annotation-bg message-bg" x="477.0" y="630" width="249.99999999999997" height="18" rx="2" fill="#ffffff"/><text x="479.0" y="644" font-size="13.5" font-weight="600" fill="#475569">Fuse compatible split metadata</text>
+<rect class="annotation-bg message-bg" x="477.0" y="648" width="151.6" height="18" rx="2" fill="#ffffff"/><text x="479.0" y="662" font-size="13.5" font-weight="600" fill="#475569">by process group ↗</text>
+<path d="M455.0 680 H757.0" stroke="#475569" stroke-width="1.7" fill="none" marker-end="url(#call)"/></a>
+<a class="source-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L318-L354" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L318-L354" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="TorchRec distributed/train_pipeline/utils.py#L318-L354"><title>TorchRec distributed/train_pipeline/utils.py#L318-L354</title>
+<rect class="annotation-bg source-bg" x="477.0" y="702" width="139.8" height="17" rx="2" fill="#ffffff"/>
+<text x="479.0" y="714" font-size="11.5" fill="#1d4ed8">utils.py:318–354 ↗</text>
+</a>
+</g></g>
+<g class="row-content" data-top="743" data-bottom="888">
+<rect x="56" y="755" width="34" height="21" rx="3" fill="#dc2626"/><text x="73" y="770" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">D1</text>
+<text x="99" y="770" font-size="11.5" font-weight="700" fill="#dc2626">D2H / HOST SYNC</text>
+<text x="99" y="790" font-size="11.5" fill="#dc2626">CPU needs CUDA values</text>
+<rect class="highlight highlight-comm" data-kind="comm" x="58" y="812" width="208" height="37" rx="3" fill="#f5f3ff" stroke="#7c3aed"/><text x="67" y="827" font-size="11" font-weight="700" fill="#7c3aed">THEN ALLTOALL</text><text x="67" y="841" font-size="11" fill="#7c3aed">lengths + ID payloads</text>
+<g class="message" data-step="5" data-kind="host">
+<a class="message-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L1146-L1161" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L1146-L1161" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="wait_sparse_data_dist: first wait -&gt; tensors requests"><title>wait_sparse_data_dist: first wait -&gt; tensors requests</title>
+<rect class="annotation-bg message-bg" x="795.0" y="754" width="454.99999999999994" height="18" rx="2" fill="#fef2f2"/><text x="797.0" y="768" font-size="13.5" font-weight="600" fill="#dc2626">wait_sparse_data_dist: first wait -&gt; tensors requests ↗</text>
+<path d="M455.0 786 H757.0" stroke="#dc2626" stroke-width="1.7" fill="none" marker-end="url(#host)"/></a>
+<rect class="annotation-bg" x="795.0" y="808" width="718" height="15" fill="#fef2f2"/><text x="797.0" y="820" font-size="12" fill="#475569">First wait reads received CUDA split sizes on the host, then launches separate lengths and ID AllToAll</text>
+<rect class="annotation-bg" x="795.0" y="824" width="67" height="15" fill="#fef2f2"/><text x="797.0" y="836" font-size="12" fill="#475569">payloads.</text>
+<a class="source-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L1146-L1161" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L1146-L1161" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="TorchRec distributed/train_pipeline/train_pipelines.py#L1146-L1161"><title>TorchRec distributed/train_pipeline/train_pipelines.py#L1146-L1161</title>
+<rect class="annotation-bg source-bg" x="795.0" y="847" width="225.0" height="17" rx="2" fill="#fef2f2"/>
+<text x="797.0" y="859" font-size="11.5" fill="#1d4ed8">train_pipelines.py:1146–1161 ↗</text>
+</a>
+<a class="source-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L593-L597" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L593-L597" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="TorchRec distributed/dist_data.py#L593-L597"><title>TorchRec distributed/dist_data.py#L593-L597</title>
+<rect class="annotation-bg source-bg" x="1028.0" y="847" width="168.2" height="17" rx="2" fill="#fef2f2"/>
+<text x="1030.0" y="859" font-size="11.5" fill="#1d4ed8">dist_data.py:593–597 ↗</text>
+</a>
+<a class="source-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L812-L826" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L812-L826" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="TorchRec distributed/dist_data.py#L812-L826"><title>TorchRec distributed/dist_data.py#L812-L826</title>
+<rect class="annotation-bg source-bg" x="1204.2" y="847" width="168.2" height="17" rx="2" fill="#fef2f2"/>
+<text x="1206.2" y="859" font-size="11.5" fill="#1d4ed8">dist_data.py:812–826 ↗</text>
+</a>
+</g></g>
+<g class="row-content" data-top="888" data-bottom="934">
+<text x="300" y="912" font-size="14" font-weight="400" fill="#334155">The two variants below are alternatives for consuming this state, not consecutive stages.</text>
+</g>
+<g class="row-content" data-top="934" data-bottom="980">
+<text x="60" y="958" font-size="14" font-weight="600" fill="#334155">Ordinary sparse pipeline</text>
+</g>
+<g class="row-content" data-top="980" data-bottom="1104">
+<text x="62" y="1005" font-size="12" fill="#94a3b8">06</text>
+<g class="message" data-step="6" data-kind="call">
+<a class="message-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L106-L123" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L106-L123" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="PipelinedForward pops tensors request + module context"><title>PipelinedForward pops tensors request + module context</title>
+<rect class="annotation-bg message-bg" x="795.0" y="991" width="241.79999999999998" height="18" rx="2" fill="#ffffff"/><text x="797.0" y="1005" font-size="13.5" font-weight="600" fill="#475569">PipelinedForward pops tensors</text>
+<rect class="annotation-bg message-bg" x="795.0" y="1009" width="217.2" height="18" rx="2" fill="#ffffff"/><text x="797.0" y="1023" font-size="13.5" font-weight="600" fill="#475569">request + module context ↗</text>
+<path d="M1075.0 1041 H773.0" stroke="#475569" stroke-width="1.7" fill="none" marker-end="url(#call)"/></a>
+<a class="source-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L106-L123" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L106-L123" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="TorchRec distributed/train_pipeline/runtime_forwards.py#L106-L123"><title>TorchRec distributed/train_pipeline/runtime_forwards.py#L106-L123</title>
+<rect class="annotation-bg source-bg" x="795.0" y="1063" width="217.89999999999998" height="17" rx="2" fill="#ffffff"/>
+<text x="797.0" y="1075" font-size="11.5" fill="#1d4ed8">runtime_forwards.py:106–123 ↗</text>
+</a>
+</g></g>
+<g class="row-content" data-top="1104" data-bottom="1283">
+<rect x="56" y="1116" width="34" height="21" rx="3" fill="#a16207"/><text x="73" y="1131" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">W1</text>
+<text x="99" y="1131" font-size="11.5" font-weight="700" fill="#a16207">WAIT</text>
+<text x="99" y="1151" font-size="11.5" fill="#a16207">consume request; not a</text>
+<text x="99" y="1167" font-size="11.5" fill="#a16207">blanket host barrier</text>
+<g class="message" data-step="7" data-kind="wait">
+<a class="message-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L108-L136" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L108-L136" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="Second wait on data_dist stream; train stream joins"><title>Second wait on data_dist stream; train stream joins</title>
+<rect class="annotation-bg message-bg" x="1113.0" y="1115" width="372.99999999999994" height="18" rx="2" fill="#fffbeb"/><text x="1115.0" y="1129" font-size="13.5" font-weight="600" fill="#a16207">Second wait on data_dist stream; train stream</text>
+<rect class="annotation-bg message-bg" x="1113.0" y="1133" width="61.39999999999999" height="18" rx="2" fill="#fffbeb"/><text x="1115.0" y="1147" font-size="13.5" font-weight="600" fill="#a16207">joins ↗</text>
+<path d="M1091.0 1165 H1125.0 V1181 H1099.0" stroke="#a16207" stroke-width="1.7" fill="none" marker-end="url(#wait)"/></a>
+<rect class="annotation-bg" x="1113.0" y="1187" width="368" height="15" fill="#fffbeb"/><text x="1115.0" y="1199" font-size="12" fill="#475569">Consumes payload and reconstructs the KJT; uncached,</text>
+<rect class="annotation-bg" x="1113.0" y="1203" width="410" height="15" fill="#fffbeb"/><text x="1115.0" y="1215" font-size="12" fill="#475569">nonempty CUDA lengths in the fixed-stride path require D2H</text>
+<rect class="annotation-bg" x="1113.0" y="1219" width="249" height="15" fill="#fffbeb"/><text x="1115.0" y="1231" font-size="12" fill="#475569">and current-stream synchronization.</text>
+<a class="source-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L108-L136" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L108-L136" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="TorchRec distributed/train_pipeline/runtime_forwards.py#L108-L136"><title>TorchRec distributed/train_pipeline/runtime_forwards.py#L108-L136</title>
+<rect class="annotation-bg source-bg" x="1113.0" y="1242" width="217.89999999999998" height="17" rx="2" fill="#fffbeb"/>
+<text x="1115.0" y="1254" font-size="11.5" fill="#1d4ed8">runtime_forwards.py:108–136 ↗</text>
+</a>
+</g></g>
+<g class="row-content" data-top="1283" data-bottom="1407">
+<text x="62" y="1308" font-size="12" fill="#94a3b8">08</text>
+<g class="message" data-step="8" data-kind="call">
+<a class="message-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L136" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L136" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="compute_and_output_dist(context, distributed input)"><title>compute_and_output_dist(context, distributed input)</title>
+<rect class="annotation-bg message-bg" x="1113.0" y="1294" width="249.99999999999997" height="18" rx="2" fill="#ffffff"/><text x="1115.0" y="1308" font-size="13.5" font-weight="600" fill="#475569">compute_and_output_dist(contex</text>
+<rect class="annotation-bg message-bg" x="1113.0" y="1312" width="192.6" height="18" rx="2" fill="#ffffff"/><text x="1115.0" y="1326" font-size="13.5" font-weight="600" fill="#475569">t, distributed input) ↗</text>
+<path d="M1091.0 1344 H1393.0" stroke="#475569" stroke-width="1.7" fill="none" marker-end="url(#call)"/></a>
+<a class="source-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L136" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L136" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="TorchRec distributed/train_pipeline/runtime_forwards.py#L136"><title>TorchRec distributed/train_pipeline/runtime_forwards.py#L136</title>
+<rect class="annotation-bg source-bg" x="1113.0" y="1366" width="189.5" height="17" rx="2" fill="#ffffff"/>
+<text x="1115.0" y="1378" font-size="11.5" fill="#1d4ed8">runtime_forwards.py:136 ↗</text>
+</a>
+</g></g>
+<g class="row-content" data-top="1407" data-bottom="1453">
+<text x="60" y="1431" font-size="14" font-weight="600" fill="#334155">Prefetch pipeline</text>
+</g>
+<g class="row-content" data-top="1453" data-bottom="1595">
+<rect x="56" y="1465" width="34" height="21" rx="3" fill="#a16207"/><text x="73" y="1480" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">W2</text>
+<text x="99" y="1480" font-size="11.5" font-weight="700" fill="#a16207">WAIT</text>
+<text x="99" y="1500" font-size="11.5" fill="#a16207">consume request; not a</text>
+<text x="99" y="1516" font-size="11.5" fill="#a16207">blanket host barrier</text>
+<g class="message" data-step="9" data-kind="wait">
+<a class="message-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L780-L817" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L780-L817" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="_prefetch: second wait -&gt; module.prefetch -&gt; post-prefetch state"><title>_prefetch: second wait -&gt; module.prefetch -&gt; post-prefetch state</title>
+<rect class="annotation-bg message-bg" x="477.0" y="1464" width="208.99999999999997" height="18" rx="2" fill="#fffbeb"/><text x="479.0" y="1478" font-size="13.5" font-weight="600" fill="#a16207">_prefetch: second wait -&gt;</text>
+<rect class="annotation-bg message-bg" x="477.0" y="1482" width="151.6" height="18" rx="2" fill="#fffbeb"/><text x="479.0" y="1496" font-size="13.5" font-weight="600" fill="#a16207">module.prefetch -&gt;</text>
+<rect class="annotation-bg message-bg" x="477.0" y="1500" width="176.2" height="18" rx="2" fill="#fffbeb"/><text x="479.0" y="1514" font-size="13.5" font-weight="600" fill="#a16207">post-prefetch state ↗</text>
+<path d="M455.0 1532 H757.0" stroke="#a16207" stroke-width="1.7" fill="none" marker-end="url(#wait)"/></a>
+<a class="source-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L780-L817" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L780-L817" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="TorchRec distributed/train_pipeline/utils.py#L780-L817"><title>TorchRec distributed/train_pipeline/utils.py#L780-L817</title>
+<rect class="annotation-bg source-bg" x="477.0" y="1554" width="139.8" height="17" rx="2" fill="#fffbeb"/>
+<text x="479.0" y="1566" font-size="11.5" fill="#1d4ed8">utils.py:780–817 ↗</text>
+</a>
+</g></g>
+<g class="row-content" data-top="1595" data-bottom="1719">
+<text x="62" y="1620" font-size="12" fill="#94a3b8">10</text>
+<g class="message" data-step="10" data-kind="call">
+<a class="message-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L313-L319" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L313-L319" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="PrefetchPipelinedForward pops ready input + saved context"><title>PrefetchPipelinedForward pops ready input + saved context</title>
+<rect class="annotation-bg message-bg" x="795.0" y="1606" width="241.79999999999998" height="18" rx="2" fill="#ffffff"/><text x="797.0" y="1620" font-size="13.5" font-weight="600" fill="#475569">PrefetchPipelinedForward pops</text>
+<rect class="annotation-bg message-bg" x="795.0" y="1624" width="241.79999999999998" height="18" rx="2" fill="#ffffff"/><text x="797.0" y="1638" font-size="13.5" font-weight="600" fill="#475569">ready input + saved context ↗</text>
+<path d="M1075.0 1656 H773.0" stroke="#475569" stroke-width="1.7" fill="none" marker-end="url(#call)"/></a>
+<a class="source-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L313-L319" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L313-L319" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="TorchRec distributed/train_pipeline/runtime_forwards.py#L313-L319"><title>TorchRec distributed/train_pipeline/runtime_forwards.py#L313-L319</title>
+<rect class="annotation-bg source-bg" x="795.0" y="1678" width="217.89999999999998" height="17" rx="2" fill="#ffffff"/>
+<text x="797.0" y="1690" font-size="11.5" fill="#1d4ed8">runtime_forwards.py:313–319 ↗</text>
+</a>
+</g></g>
+<g class="row-content" data-top="1719" data-bottom="1829">
+<rect x="56" y="1731" width="34" height="21" rx="3" fill="#087f68"/><text x="73" y="1746" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">S1</text>
+<text x="99" y="1746" font-size="11.5" font-weight="700" fill="#087f68">STREAM DEPENDENCY</text>
+<text x="99" y="1766" font-size="11.5" fill="#087f68">GPU ordering</text>
+<g class="message" data-step="11" data-kind="dep">
+<a class="message-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L321-L332" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L321-L332" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="Train stream joins prefetch stream"><title>Train stream joins prefetch stream</title>
+<rect class="annotation-bg message-bg" x="1113.0" y="1730" width="299.2" height="18" rx="2" fill="#ecfdf5"/><text x="1115.0" y="1744" font-size="13.5" font-weight="600" fill="#087f68">Train stream joins prefetch stream ↗</text>
+<path d="M1091.0 1762 H1125.0 V1778 H1099.0" stroke="#087f68" stroke-width="1.7" fill="none" marker-end="url(#dep)"/></a>
+<a class="source-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L321-L332" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L321-L332" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="TorchRec distributed/train_pipeline/runtime_forwards.py#L321-L332"><title>TorchRec distributed/train_pipeline/runtime_forwards.py#L321-L332</title>
+<rect class="annotation-bg source-bg" x="1113.0" y="1784" width="217.89999999999998" height="17" rx="2" fill="#ecfdf5"/>
+<text x="1115.0" y="1796" font-size="11.5" fill="#1d4ed8">runtime_forwards.py:321–332 ↗</text>
+</a>
+</g></g>
+<g class="row-content" data-top="1829" data-bottom="1953">
+<text x="62" y="1854" font-size="12" fill="#94a3b8">12</text>
+<g class="message" data-step="12" data-kind="call">
+<a class="message-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L332" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L332" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="compute_and_output_dist(context, distributed input)"><title>compute_and_output_dist(context, distributed input)</title>
+<rect class="annotation-bg message-bg" x="1113.0" y="1840" width="249.99999999999997" height="18" rx="2" fill="#ffffff"/><text x="1115.0" y="1854" font-size="13.5" font-weight="600" fill="#475569">compute_and_output_dist(contex</text>
+<rect class="annotation-bg message-bg" x="1113.0" y="1858" width="192.6" height="18" rx="2" fill="#ffffff"/><text x="1115.0" y="1872" font-size="13.5" font-weight="600" fill="#475569">t, distributed input) ↗</text>
+<path d="M1091.0 1890 H1393.0" stroke="#475569" stroke-width="1.7" fill="none" marker-end="url(#call)"/></a>
+<a class="source-link" href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L332" xlink:href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L332" target="_blank" rel="noopener noreferrer" tabindex="0" aria-label="TorchRec distributed/train_pipeline/runtime_forwards.py#L332"><title>TorchRec distributed/train_pipeline/runtime_forwards.py#L332</title>
+<rect class="annotation-bg source-bg" x="1113.0" y="1912" width="189.5" height="17" rx="2" fill="#ffffff"/>
+<text x="1115.0" y="1924" font-size="11.5" fill="#1d4ed8">runtime_forwards.py:332 ↗</text>
+</a>
+</g></g>
+</g>
+<text x="40" y="2004" font-size="11" fill="#64748b">TorchRec 1d87b8f79b7b · logical scopes, not measured durations · blue H2D / red host sync / purple AllToAll</text></svg>

@@ -1,0 +1,2861 @@
+{
+  "revision": "1d87b8f79b7bb1671cb8be3e646e99e835cce610",
+  "description": "Twelve original TorchRec row-wise diagrams, preserving message/actor/trace detail; three pipeline diagrams. Trace activity numbers and sizes are sample observations, not source guarantees. render-torchrec-diagrams.py adds source-grounded transfer/synchronization detail.",
+  "diagrams": [
+    {
+      "slug": "01-native-forward",
+      "original": "00_module_overview.svg",
+      "origin": "https://jacocheung.github.io/visualization/recsys-examples/embedding_collection_rowwise/index.html",
+      "title": "Row-wise ShardedEmbeddingCollection: module topology",
+      "subtitle": "Forward per row-wise group: input 3 + output 1 = 4 AllToAll calls (multi-rank, fixed-stride, unweighted KJT).",
+      "actors": [
+        {
+          "name": "ShardedEmbeddingCollection",
+          "type": "nn.Module"
+        },
+        {
+          "name": "RwSparseFeaturesDist",
+          "type": "nn.Module"
+        },
+        {
+          "name": "KJTAllToAll",
+          "type": "nn.Module"
+        },
+        {
+          "name": "GroupedEmbeddingsLookup",
+          "type": "nn.Module"
+        },
+        {
+          "name": "RwSequenceEmbeddingDist",
+          "type": "nn.Module"
+        },
+        {
+          "name": "EmbeddingCollectionAwaitable",
+          "type": "LazyAwaitable (not Module)"
+        }
+      ],
+      "rows": [
+        {
+          "a": 0,
+          "b": 0,
+          "kind": "call",
+          "original_step": 1,
+          "label": "input_dist(ctx, KJT)",
+          "detail": "feature reorder + optional unique",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding.py#L1566"
+          ]
+        },
+        {
+          "a": 0,
+          "b": 1,
+          "kind": "call",
+          "original_step": 2,
+          "label": "_input_dists[row_wise](features)",
+          "detail": "bucketize rows by owner rank",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/sharding/rw_sharding.py#L491"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 2,
+          "kind": "comm",
+          "original_step": 3,
+          "label": "_dist(bucketized_features)",
+          "detail": "Input stage totals 3 AllToAll calls: splits now; lengths + ID values at the first wait below.",
+          "tag": "IN",
+          "tag_heading": "INPUT DIST",
+          "tag_detail": "3 AllToAll calls: splits + lengths + ID values",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L1215-L1249",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L525-L539",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L766-L824"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 0,
+          "kind": "wait",
+          "original_step": 4,
+          "label": "wait().wait() -> received KJT",
+          "detail": "First wait: read receive sizes, launch lengths + ID values AllToAll. Second wait: consume payload and recat the KJT.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L1215-L1249",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L3243-L3342"
+          ]
+        },
+        {
+          "a": 0,
+          "b": 3,
+          "kind": "call",
+          "original_step": 5,
+          "label": "_lookups[row_wise](received KJT)",
+          "detail": "BatchedFusedEmbedding -> FBGEMM TBE",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding_lookup.py#L408"
+          ]
+        },
+        {
+          "a": 0,
+          "b": 4,
+          "kind": "comm",
+          "original_step": 6,
+          "label": "_output_dists[row_wise](embeddings)",
+          "detail": "1 AllToAll call: return embedding vectors to requesting ranks via SequenceEmbeddingsAllToAll.",
+          "tag": "OUT",
+          "tag_heading": "OUTPUT DIST",
+          "tag_detail": "1 AllToAll call: embedding vectors",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/sharding/rw_sequence_sharding.py#L93",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L1993-L2002"
+          ]
+        },
+        {
+          "a": 4,
+          "b": 5,
+          "kind": "return",
+          "original_step": 7,
+          "label": "return SequenceEmbeddingsAwaitable",
+          "detail": "wrapped by EmbeddingCollectionAwaitable",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding.py#L371"
+          ]
+        },
+        {
+          "a": 5,
+          "b": 5,
+          "kind": "wait",
+          "original_step": 8,
+          "label": "wait()",
+          "detail": "unbucketize unique rows; then reverse_indices restores duplicates",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/modules/utils.py#L260"
+          ]
+        }
+      ],
+      "notes": [
+        "IN and OUT summarize module stages. Count per rank, per row-wise group: 3 input + 1 output = 4 forward AllToAll collective calls.",
+        "The input total spans _dist() and the first wait. Backward gradient communication is separate. Weights or variable stride add payload tensors.",
+        "Counts refer to PyTorch collective calls using the NCCL backend; they do not count NCCL send/recv primitives or GPU kernels.",
+        "Nested lookup modules not compressed here: GroupedEmbeddingsLookup -> BatchedFusedEmbedding -> SplitTableBatchedEmbeddingBagsCodegen.",
+        "KJTAllToAllSplitsAwaitable and KJTAllToAllTensorsAwaitable are Awaitable objects, not nn.Module instances.",
+        "Activity IDs, sizes, kernel names and optimizer details illustrate one execution configuration; they are not fixed for every run."
+      ],
+      "trace": true,
+      "activations": [
+        [
+          0,
+          1,
+          7,
+          "call"
+        ],
+        [
+          1,
+          2,
+          3,
+          "call"
+        ],
+        [
+          2,
+          3,
+          4,
+          "call"
+        ],
+        [
+          3,
+          5,
+          5,
+          "call"
+        ],
+        [
+          4,
+          6,
+          7,
+          "call"
+        ],
+        [
+          5,
+          8,
+          8,
+          "call"
+        ]
+      ]
+    },
+    {
+      "slug": "02-input-prepare",
+      "original": "01_input_prepare_unique.svg",
+      "origin": "https://jacocheung.github.io/visualization/recsys-examples/embedding_collection_rowwise/index.html",
+      "title": "Index calculation",
+      "subtitle": "GPU activities [1-45].",
+      "actors": [
+        {
+          "name": "Application",
+          "type": "module caller"
+        },
+        {
+          "name": "ShardedEmbeddingCollection",
+          "type": "nn.Module"
+        },
+        {
+          "name": "KeyedJaggedTensor",
+          "type": "data object"
+        },
+        {
+          "name": "FBGEMM operators",
+          "type": "torch.ops.fbgemm"
+        },
+        {
+          "name": "CUDA / CUB",
+          "type": "kernel implementation"
+        }
+      ],
+      "rows": [
+        {
+          "a": 0,
+          "b": 1,
+          "kind": "call",
+          "original_step": 1,
+          "label": "forward(features)",
+          "detail": "ShardedModule creates EC context",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/types.py#L1278"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 2,
+          "kind": "call",
+          "original_step": 2,
+          "label": "features.permute(_features_order)",
+          "detail": "align input key order with sharding plan",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding.py#L1566"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 3,
+          "kind": "call",
+          "original_step": 3,
+          "label": "permute_2D_sparse_data",
+          "detail": "permute lengths and values",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L2899"
+          ]
+        },
+        {
+          "a": 3,
+          "b": 4,
+          "kind": "call",
+          "original_step": 4,
+          "label": "activities [1-7]",
+          "detail": "permute lengths/data + CUB scans",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L2899"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 3,
+          "kind": "call",
+          "original_step": 5,
+          "label": "jagged_unique_indices",
+          "detail": "unique is local and happens before row bucketize; optional use_index_dedup",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding.py#L1421"
+          ]
+        },
+        {
+          "a": 3,
+          "b": 4,
+          "kind": "call",
+          "original_step": 6,
+          "label": "activities [8-45]",
+          "detail": "offset cumsum -> linearize -> sort/unique -> delinearize",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding.py#L1421"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 1,
+          "kind": "call",
+          "original_step": 7,
+          "label": "save ctx.reverse_indices",
+          "detail": "original position -> local unique position",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding.py#L1421"
+          ]
+        }
+      ],
+      "notes": [
+        "reverse_indices is not used yet; it is consumed only after output AllToAll and unbucketization.",
+        "Activities [8-10] build input offsets; the sort/scan kernels that follow are implementation children of fbgemm.jagged_unique_indices.",
+        "Activity IDs, sizes, kernel names and optimizer details illustrate one execution configuration; they are not fixed for every run."
+      ],
+      "trace": true,
+      "activations": [
+        [
+          0,
+          1,
+          7,
+          "call"
+        ],
+        [
+          1,
+          1,
+          7,
+          "call"
+        ],
+        [
+          2,
+          2,
+          4,
+          "call"
+        ],
+        [
+          3,
+          3,
+          4,
+          "call"
+        ],
+        [
+          3,
+          5,
+          6,
+          "call"
+        ],
+        [
+          4,
+          4,
+          4,
+          "call"
+        ],
+        [
+          4,
+          6,
+          6,
+          "call"
+        ]
+      ]
+    },
+    {
+      "slug": "03-input-distribution",
+      "original": "02_input_dist.svg",
+      "origin": "https://jacocheung.github.io/visualization/recsys-examples/embedding_collection_rowwise/index.html",
+      "title": "Row-wise sparse input distribution",
+      "subtitle": "Input distribution: H2D staging, host reads, and each payload collective.",
+      "actors": [
+        {
+          "name": "ShardedEmbeddingCollection",
+          "type": "nn.Module"
+        },
+        {
+          "name": "RwSparseFeaturesDist",
+          "type": "nn.Module"
+        },
+        {
+          "name": "KJTAllToAll",
+          "type": "nn.Module"
+        },
+        {
+          "name": "SplitsAllToAllAwaitable",
+          "type": "Awaitable"
+        },
+        {
+          "name": "KJTAllToAllTensorsAwaitable",
+          "type": "Awaitable"
+        },
+        {
+          "name": "ProcessGroupNCCL",
+          "type": "collective backend"
+        }
+      ],
+      "rows": [
+        {
+          "a": 0,
+          "b": 1,
+          "kind": "call",
+          "original_step": 1,
+          "label": "_input_dists[row_wise](unique KJT)",
+          "detail": "dispatch under KJT_SPLITS_DIST",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/sharding/rw_sharding.py#L491"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 1,
+          "kind": "call",
+          "original_step": 2,
+          "label": "block_bucketize_sparse_features",
+          "detail": "owner = id // block; local_id = id % block; equal contiguous shards in this example",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding_sharding.py#L312"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 2,
+          "kind": "call",
+          "original_step": 3,
+          "label": "KJTAllToAll(bucketized KJT)",
+          "detail": "activities [46-54] compute tensor splits",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/sharding/rw_sharding.py#L491"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 2,
+          "label": "dist_splits → length_per_key → _safe_tolist",
+          "detail": "If uncached and nonempty CUDA lengths: sum → D2H → current_stream.synchronize() → Python list",
+          "kind": "host",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L3201-L3210",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L1383-L1397",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L68-L98"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 2,
+          "label": "torch.tensor(splits, device=cuda)",
+          "detail": "Stage per-peer lengths / values split lists; also stage stride metadata for fixed stride.",
+          "kind": "h2d",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L941-L947"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 3,
+          "kind": "call",
+          "original_step": 4,
+          "label": "construct split metadata",
+          "detail": "activities [55-58] stack/stage per-peer counts; torch.stack(...).flatten()",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L525"
+          ]
+        },
+        {
+          "a": 3,
+          "b": 5,
+          "kind": "comm",
+          "original_step": 5,
+          "label": "AllToAll #1: splits",
+          "detail": "activity [59] ncclDevKernel_SendRecv",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L525"
+          ]
+        },
+        {
+          "a": 0,
+          "b": 3,
+          "label": "First wait: consume the split-size request",
+          "detail": "KJTAllToAllSplitsAwaitable delegates to SplitsAllToAllAwaitable.wait().",
+          "kind": "wait",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L982-L996"
+          ]
+        },
+        {
+          "a": 3,
+          "b": 5,
+          "label": "splits Work.wait()",
+          "detail": "Establish readiness for the following metadata read; host readback is a separate step below.",
+          "kind": "wait",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L588-L594"
+          ]
+        },
+        {
+          "a": 3,
+          "b": 3,
+          "label": "_safe_tolist_2d(received CUDA splits)",
+          "detail": "D2H + current_stream.synchronize(): CPU needs receive sizes before allocating payload buffers.",
+          "kind": "host",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L593-L597",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L68-L98"
+          ]
+        },
+        {
+          "a": 3,
+          "b": 4,
+          "kind": "call",
+          "original_step": 6,
+          "label": "wait() -> allocate receive tensors",
+          "detail": "Sample [60-61] D2H/H2D metadata is expanded above and below; allocate from known receive sizes.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L1024-L1036",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L812-L826"
+          ]
+        },
+        {
+          "a": 4,
+          "b": 4,
+          "label": "_get_recat: Python permutation → CUDA tensor",
+          "detail": "Fixed/equal stride: torch.tensor(recat, device=cuda, dtype=int32); uneven batches use extra offset tensors.",
+          "kind": "h2d",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L750-L757",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L332-L367"
+          ]
+        },
+        {
+          "a": 4,
+          "b": 5,
+          "kind": "comm",
+          "original_step": 7,
+          "label": "AllToAll #2: KJT lengths",
+          "detail": "Example execution [62]; one all_to_all_single for the lengths tensor.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L812-L829"
+          ]
+        },
+        {
+          "a": 4,
+          "b": 5,
+          "kind": "comm",
+          "original_step": 7,
+          "label": "AllToAll #3: KJT ID values",
+          "detail": "Example execution [63]; a separate all_to_all_single for ID values; optional fields add calls.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L812-L829"
+          ]
+        },
+        {
+          "a": 0,
+          "b": 4,
+          "label": "Second wait: consume payload Work handles",
+          "detail": "Lengths and values must be usable before recat / local KJT reconstruction.",
+          "kind": "wait",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L851-L874"
+          ]
+        },
+        {
+          "a": 4,
+          "b": 4,
+          "kind": "call",
+          "original_step": 8,
+          "label": "KeyedJaggedTensor.dist_init(recat)",
+          "detail": "activities [64-72] restore feature-major KJT",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L3322"
+          ]
+        },
+        {
+          "a": 4,
+          "b": 4,
+          "label": "dist_init(...).sync() → length_per_key",
+          "detail": "Fixed-stride path, uncached nonempty CUDA lengths: D2H + stream synchronization to rebuild host metadata.",
+          "kind": "host",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L3330-L3379",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L1359-L1410",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L68-L98"
+          ]
+        },
+        {
+          "a": 4,
+          "b": 0,
+          "kind": "return",
+          "original_step": 9,
+          "label": "received local-shard KJT",
+          "detail": "input_dist outer wait().wait() completes",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L3322"
+          ]
+        }
+      ],
+      "notes": [
+        "D1 / D2 / D3 mark distinct host-read sites, not a fixed count of runtime stalls; cached / empty paths may skip work.",
+        "The three input collectives are distinct: one fixed-size metadata exchange, then lengths and values payload exchanges.",
+        "unbucketize_permute is retained in SequenceShardingContext for the output-side restore.",
+        "Activity IDs, sizes, kernel names and optimizer details illustrate one execution configuration; they are not fixed for every run."
+      ],
+      "trace": true,
+      "activations": [
+        [
+          0,
+          1,
+          7,
+          "call"
+        ],
+        [
+          0,
+          8,
+          14,
+          "call"
+        ],
+        [
+          0,
+          15,
+          18,
+          "call"
+        ],
+        [
+          1,
+          1,
+          7,
+          "call"
+        ],
+        [
+          2,
+          3,
+          7,
+          "call"
+        ],
+        [
+          3,
+          6,
+          7,
+          "call"
+        ],
+        [
+          3,
+          8,
+          14,
+          "wait"
+        ],
+        [
+          4,
+          11,
+          14,
+          "call"
+        ],
+        [
+          4,
+          15,
+          18,
+          "wait"
+        ],
+        [
+          5,
+          7,
+          7,
+          "comm"
+        ],
+        [
+          5,
+          9,
+          9,
+          "wait"
+        ],
+        [
+          5,
+          13,
+          14,
+          "comm"
+        ],
+        [
+          5,
+          15,
+          15,
+          "wait"
+        ]
+      ],
+      "pending": [
+        [
+          5,
+          7,
+          9,
+          0,
+          "Split-size request"
+        ],
+        [
+          5,
+          13,
+          15,
+          0,
+          "Lengths request"
+        ],
+        [
+          5,
+          14,
+          15,
+          1,
+          "ID values request"
+        ]
+      ]
+    },
+    {
+      "slug": "04-local-lookup",
+      "original": "03_fbgemm_lookup.svg",
+      "origin": "https://jacocheung.github.io/visualization/recsys-examples/embedding_collection_rowwise/index.html",
+      "title": "FBGEMM row-wise embedding lookup",
+      "subtitle": "GPU activities [73-79]; one physical lookup kernel after offset/bounds preparation.",
+      "actors": [
+        {
+          "name": "ShardedEmbeddingCollection",
+          "type": "nn.Module"
+        },
+        {
+          "name": "GroupedEmbeddingsLookup",
+          "type": "nn.Module"
+        },
+        {
+          "name": "BatchedFusedEmbedding",
+          "type": "nn.Module"
+        },
+        {
+          "name": "SplitTableBatchedEmbeddingBagsCodegen",
+          "type": "nn.Module (FBGEMM)"
+        },
+        {
+          "name": "FBGEMM CUDA",
+          "type": "kernel implementation"
+        }
+      ],
+      "rows": [
+        {
+          "a": 0,
+          "b": 1,
+          "kind": "call",
+          "original_step": 1,
+          "label": "lookup(received KJT)",
+          "detail": "_lookups[row_wise]",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding_lookup.py#L408"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 1,
+          "kind": "call",
+          "original_step": 2,
+          "label": "split by grouped config",
+          "detail": "one KJT slice per embedding kernel group",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding_lookup.py#L408"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 2,
+          "kind": "call",
+          "original_step": 3,
+          "label": "emb_op(features)",
+          "detail": "BatchedFusedEmbedding inherits BaseBatchedEmbedding.forward",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/batched_embedding_kernel.py#L1834"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 2,
+          "kind": "call",
+          "original_step": 4,
+          "label": "features.offsets() + bounds check",
+          "detail": "activities [73-78] cumsum/fill/bounds",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/batched_embedding_kernel.py#L1834"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 3,
+          "kind": "call",
+          "original_step": 5,
+          "label": "emb_module(indices, offsets)",
+          "detail": "PoolingMode.NONE: sequence embeddings",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/batched_embedding_kernel.py#L1834"
+          ]
+        },
+        {
+          "a": 3,
+          "b": 4,
+          "kind": "call",
+          "original_step": 6,
+          "label": "activity [79]",
+          "detail": "split_embedding_nobag_codegen_forward_unweighted_kernel",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/batched_embedding_kernel.py#L2565"
+          ]
+        },
+        {
+          "a": 4,
+          "b": 0,
+          "kind": "return",
+          "original_step": 7,
+          "label": "local unique embeddings [N_local, D]",
+          "detail": "GroupedEmbeddingsLookup flattens/concatenates groups",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding_lookup.py#L408"
+          ]
+        }
+      ],
+      "notes": [
+        "The table is row-sharded: each rank looks up only IDs received for the rows it owns.",
+        "CUB offset scans are preparation children; activity [79] is the actual embedding load kernel.",
+        "Activity IDs, sizes, kernel names and optimizer details illustrate one execution configuration; they are not fixed for every run."
+      ],
+      "trace": true,
+      "activations": [
+        [
+          0,
+          1,
+          7,
+          "call"
+        ],
+        [
+          1,
+          1,
+          7,
+          "call"
+        ],
+        [
+          2,
+          3,
+          7,
+          "call"
+        ],
+        [
+          3,
+          5,
+          7,
+          "call"
+        ],
+        [
+          4,
+          6,
+          7,
+          "call"
+        ]
+      ]
+    },
+    {
+      "slug": "05-output-distribution",
+      "original": "04_output_dist.svg",
+      "origin": "https://jacocheung.github.io/visualization/recsys-examples/embedding_collection_rowwise/index.html",
+      "title": "Sequence embedding output distribution",
+      "subtitle": "GPU activities [80-92]: prepare and launch embedding AllToAll.",
+      "actors": [
+        {
+          "name": "ShardedEmbeddingCollection",
+          "type": "nn.Module"
+        },
+        {
+          "name": "RwSequenceEmbeddingDist",
+          "type": "nn.Module"
+        },
+        {
+          "name": "SequenceEmbeddingsAllToAll",
+          "type": "nn.Module"
+        },
+        {
+          "name": "All2All_Seq_Req",
+          "type": "autograd.Function"
+        },
+        {
+          "name": "QuantizedCommCodec",
+          "type": "codec interface"
+        },
+        {
+          "name": "ProcessGroupNCCL",
+          "type": "collective backend"
+        }
+      ],
+      "rows": [
+        {
+          "a": 0,
+          "b": 1,
+          "kind": "call",
+          "original_step": 1,
+          "label": "odist(local unique embeddings)",
+          "detail": "_output_dists[row_wise]",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/sharding/rw_sequence_sharding.py#L93"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 2,
+          "kind": "call",
+          "original_step": 2,
+          "label": "SequenceEmbeddingsAllToAll.forward",
+          "detail": "uses input_dist split metadata",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/sharding/rw_sequence_sharding.py#L93"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 2,
+          "kind": "call",
+          "original_step": 3,
+          "label": "invert sparse recat",
+          "detail": "activities [80-82] invert + scale lengths by D",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L2075"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 3,
+          "kind": "call",
+          "original_step": 4,
+          "label": "alltoall_sequence -> All2All_Seq_Req",
+          "detail": "creates asynchronous Request",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L1940"
+          ]
+        },
+        {
+          "a": 3,
+          "b": 3,
+          "kind": "call",
+          "original_step": 5,
+          "label": "permute_2D_sparse_data",
+          "detail": "activities [83-89] destination-rank payload order",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L1940"
+          ]
+        },
+        {
+          "a": 3,
+          "b": 4,
+          "kind": "call",
+          "original_step": 6,
+          "label": "Optional forward.encode(FP32 → FP16 in sample)",
+          "detail": "activities [90-91] copy + clamp",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L1970"
+          ]
+        },
+        {
+          "a": 3,
+          "b": 5,
+          "kind": "comm",
+          "original_step": 7,
+          "label": "AllToAll #4: embeddings",
+          "detail": "activity [92] ncclDevKernel_SendRecv",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L1993"
+          ]
+        },
+        {
+          "a": 3,
+          "b": 0,
+          "kind": "return",
+          "original_step": 8,
+          "label": "return lazy awaitable immediately",
+          "detail": "communication continues asynchronously",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L1993"
+          ]
+        }
+      ],
+      "notes": [
+        "This overlap is expected: output_dist returns before ProcessGroupNCCL completes.",
+        "Activity IDs, sizes, kernel names and optimizer details illustrate one execution configuration; they are not fixed for every run."
+      ],
+      "trace": true,
+      "activations": [
+        [
+          0,
+          1,
+          8,
+          "call"
+        ],
+        [
+          1,
+          1,
+          8,
+          "call"
+        ],
+        [
+          2,
+          2,
+          8,
+          "call"
+        ],
+        [
+          3,
+          4,
+          8,
+          "call"
+        ],
+        [
+          4,
+          6,
+          6,
+          "call"
+        ],
+        [
+          5,
+          7,
+          7,
+          "call"
+        ]
+      ],
+      "pending": [
+        [
+          5,
+          7,
+          null,
+          0,
+          "Forward embedding request; consumed in the next diagram"
+        ]
+      ]
+    },
+    {
+      "slug": "06-output-postprocess",
+      "original": "05_postprocess.svg",
+      "origin": "https://jacocheung.github.io/visualization/recsys-examples/embedding_collection_rowwise/index.html",
+      "title": "Output wait, unbucketize and reverse-index expansion",
+      "subtitle": "GPU activities [93-103]; two permutations restore two different orders.",
+      "actors": [
+        {
+          "name": "Caller",
+          "type": "consumes lazy output"
+        },
+        {
+          "name": "EmbeddingCollectionAwaitable",
+          "type": "LazyAwaitable"
+        },
+        {
+          "name": "SequenceEmbeddingsAwaitable",
+          "type": "Awaitable"
+        },
+        {
+          "name": "All2All_Seq_Req_Wait",
+          "type": "autograd.Function"
+        },
+        {
+          "name": "ATen / CUDA",
+          "type": "tensor operations"
+        },
+        {
+          "name": "construct_jagged_tensors",
+          "type": "function (not Module)"
+        }
+      ],
+      "rows": [
+        {
+          "a": 0,
+          "b": 1,
+          "kind": "call",
+          "original_step": 1,
+          "label": "lazy output is materialized",
+          "detail": "EmbeddingCollectionAwaitable._wait_impl",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding.py#L371"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 2,
+          "kind": "call",
+          "original_step": 2,
+          "label": "w.wait()",
+          "detail": "OUTPUT_DIST_WAIT annotation",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding.py#L371"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 3,
+          "kind": "wait",
+          "original_step": 3,
+          "label": "Request.wait()",
+          "detail": "wait for output AllToAll",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2061"
+          ]
+        },
+        {
+          "a": 3,
+          "b": 4,
+          "kind": "call",
+          "original_step": 4,
+          "label": "Optional qcomm decode FP16 → FP32 (sample)",
+          "detail": "activity [93] copy kernel",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2061"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 4,
+          "kind": "call",
+          "original_step": 5,
+          "label": "index_select(unbucketize_permute)",
+          "detail": "activity [94]: bucketized unique -> local unique order",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L1962"
+          ]
+        },
+        {
+          "a": 4,
+          "b": 1,
+          "kind": "return",
+          "original_step": 6,
+          "label": "unique embeddings in pre-bucket order",
+          "detail": "first restore is complete",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L1962"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 5,
+          "kind": "call",
+          "original_step": 7,
+          "label": "construct_jagged_tensors(... reverse_indices)",
+          "detail": "activity [95] index conversion",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/modules/utils.py#L260"
+          ]
+        },
+        {
+          "a": 5,
+          "b": 4,
+          "kind": "call",
+          "original_step": 8,
+          "label": "gather/index_select(reverse_indices)",
+          "detail": "activities [96-103]: unique -> original duplicate positions; only when dedup is enabled",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/modules/utils.py#L260"
+          ]
+        },
+        {
+          "a": 5,
+          "b": 0,
+          "kind": "return",
+          "original_step": 9,
+          "label": "Dict[str, JaggedTensor]",
+          "detail": "original key/order/cardinality restored",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/modules/utils.py#L260"
+          ]
+        }
+      ],
+      "notes": [
+        "unbucketize_permute reverses row-wise communication order; reverse_indices reverses deduplication. They are not interchangeable.",
+        "The eight gather launches [96-103] are tiles of one logical reverse-index gather over the large embedding tensor.",
+        "Activity IDs, sizes, kernel names and optimizer details illustrate one execution configuration; they are not fixed for every run."
+      ],
+      "trace": true,
+      "activations": [
+        [
+          0,
+          1,
+          9,
+          "call"
+        ],
+        [
+          1,
+          1,
+          9,
+          "call"
+        ],
+        [
+          2,
+          2,
+          6,
+          "call"
+        ],
+        [
+          3,
+          3,
+          4,
+          "call"
+        ],
+        [
+          4,
+          4,
+          6,
+          "call"
+        ],
+        [
+          4,
+          8,
+          8,
+          "call"
+        ],
+        [
+          5,
+          7,
+          9,
+          "call"
+        ]
+      ]
+    },
+    {
+      "slug": "07-backward-overview",
+      "original": "00_backward_overview.svg",
+      "origin": "https://jacocheung.github.io/visualization/recsys-examples/embedding_collection_rowwise/backward.html",
+      "title": "Row-wise ShardedEmbeddingCollection: backward topology",
+      "subtitle": "Autograd traverses graph nodes saved by forward; nn.Module.backward is not called.",
+      "actors": [
+        {
+          "name": "PyTorch autograd engine",
+          "type": "runtime"
+        },
+        {
+          "name": "Split + IndexSelect backward",
+          "type": "autograd nodes"
+        },
+        {
+          "name": "All2All_Seq_Req_WaitBackward",
+          "type": "autograd.Function"
+        },
+        {
+          "name": "ProcessGroupNCCL",
+          "type": "collective backend"
+        },
+        {
+          "name": "All2All_Seq_ReqBackward",
+          "type": "autograd.Function"
+        },
+        {
+          "name": "SplitTableBatchedEmbeddingBagsCodegen",
+          "type": "FBGEMM nn.Module"
+        },
+        {
+          "name": "KJT input path",
+          "type": "no gradient"
+        }
+      ],
+      "rows": [
+        {
+          "a": 0,
+          "b": 1,
+          "kind": "call",
+          "original_step": 1,
+          "label": "backward(JaggedTensor.values)",
+          "detail": "activities [1-14] reassemble torch.split gradients with D2D copies",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/modules/utils.py#L281"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 1,
+          "kind": "call",
+          "original_step": 2,
+          "label": "reverse the two index_select operations",
+          "detail": "activities [15-18] restore deduplication and row order",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/modules/utils.py#L260"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 2,
+          "kind": "call",
+          "original_step": 3,
+          "label": "gradient in output-rank order",
+          "detail": "dedup restore first, then unbucketize restore",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L1962"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 3,
+          "kind": "comm",
+          "original_step": 4,
+          "label": "launch reverse AllToAll",
+          "detail": "All2All_Seq_Req_Wait.backward is asynchronous",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2122"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 4,
+          "kind": "call",
+          "original_step": 5,
+          "label": "dummy-tensor edge schedules predecessor",
+          "detail": "autograd now enters All2All_Seq_Req.backward",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2093"
+          ]
+        },
+        {
+          "a": 4,
+          "b": 3,
+          "kind": "wait",
+          "original_step": 6,
+          "label": "req.wait() + receive",
+          "detail": "wait for the reverse AllToAll, then decode",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2017"
+          ]
+        },
+        {
+          "a": 4,
+          "b": 5,
+          "kind": "call",
+          "original_step": 7,
+          "label": "gradient in local lookup order",
+          "detail": "backward recat restores the TBE input layout",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2038"
+          ]
+        },
+        {
+          "a": 5,
+          "b": 5,
+          "kind": "call",
+          "original_step": 8,
+          "label": "generated sparse backward",
+          "detail": "reduce repeated rows and update the local shard",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/batched_embedding_kernel.py#L2587"
+          ]
+        },
+        {
+          "a": 5,
+          "b": 6,
+          "kind": "boundary",
+          "original_step": 9,
+          "label": "stop at integer sparse inputs",
+          "detail": "input distribution was created under torch.no_grad",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding.py#L1559"
+          ]
+        }
+      ],
+      "notes": [
+        "Forward owner chain: GroupedEmbeddingsLookup -> BatchedFusedEmbedding -> SplitTableBatchedEmbeddingBagsCodegen.",
+        "Only the TBE autograd node executes backward; the two TorchRec wrapper Modules do not receive backward calls.",
+        "Activity IDs, sizes, kernel names and optimizer details illustrate one execution configuration; they are not fixed for every run."
+      ],
+      "trace": true,
+      "activations": [
+        [
+          0,
+          1,
+          9,
+          "call"
+        ],
+        [
+          1,
+          1,
+          3,
+          "call"
+        ],
+        [
+          2,
+          3,
+          5,
+          "call"
+        ],
+        [
+          3,
+          4,
+          4,
+          "call"
+        ],
+        [
+          3,
+          6,
+          6,
+          "call"
+        ],
+        [
+          4,
+          5,
+          7,
+          "call"
+        ],
+        [
+          5,
+          7,
+          9,
+          "call"
+        ]
+      ],
+      "pending": [
+        [
+          3,
+          4,
+          6,
+          0,
+          "Reverse embedding request"
+        ]
+      ]
+    },
+    {
+      "slug": "08-gradient-restore",
+      "original": "01_backward_gradient_restore.svg",
+      "origin": "https://jacocheung.github.io/visualization/recsys-examples/embedding_collection_rowwise/backward.html",
+      "title": "Gradient restoration",
+      "subtitle": "Activities [1-18]: reassemble split gradients, reverse deduplication, then reverse row-wise unbucketization.",
+      "actors": [
+        {
+          "name": "PyTorch autograd engine",
+          "type": "runtime"
+        },
+        {
+          "name": "SplitWithSizesBackward0",
+          "type": "autograd node"
+        },
+        {
+          "name": "aten::cat",
+          "type": "ATen operator"
+        },
+        {
+          "name": "IndexSelectBackward0",
+          "type": "reverse_indices node (optional)"
+        },
+        {
+          "name": "IndexSelectBackward0",
+          "type": "unbucketize node"
+        },
+        {
+          "name": "All2All_Seq_Req_WaitBackward",
+          "type": "next autograd node"
+        }
+      ],
+      "rows": [
+        {
+          "a": 0,
+          "b": 1,
+          "kind": "call",
+          "original_step": 1,
+          "label": "execute backward(split output gradients)",
+          "detail": "construct_jagged_tensors created this node with torch.split",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/modules/utils.py#L281"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 2,
+          "kind": "call",
+          "original_step": 2,
+          "label": "aten::cat(grad_splits)",
+          "detail": "activities [1-14] copy each contributing gradient D2D",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/modules/utils.py#L281"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 1,
+          "kind": "return",
+          "original_step": 3,
+          "label": "reconstructed embedding-buffer gradient",
+          "detail": "the representative trace has three 5.12 GiB and eleven 2 MiB copies",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/modules/utils.py#L281"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 3,
+          "kind": "return",
+          "original_step": 4,
+          "label": "follow reverse_indices graph edge",
+          "detail": "continue with the first saved index_select",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/modules/utils.py#L260"
+          ]
+        },
+        {
+          "a": 3,
+          "b": 3,
+          "kind": "call",
+          "original_step": 5,
+          "label": "index_select backward(reverse_indices)",
+          "detail": "activities [15-16] zero + ReduceAdd",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/modules/utils.py#L260"
+          ]
+        },
+        {
+          "a": 3,
+          "b": 4,
+          "kind": "return",
+          "original_step": 6,
+          "label": "gradient for local unique rows",
+          "detail": "duplicate occurrences are summed",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/modules/utils.py#L260"
+          ]
+        },
+        {
+          "a": 4,
+          "b": 4,
+          "kind": "call",
+          "original_step": 7,
+          "label": "index_select backward(unbucketize_permute)",
+          "detail": "activities [17-18] zero + ReduceAdd",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L1962"
+          ]
+        },
+        {
+          "a": 4,
+          "b": 5,
+          "kind": "return",
+          "original_step": 8,
+          "label": "gradient in bucketized receive order",
+          "detail": "ready for the reverse embedding AllToAll",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L1962"
+          ]
+        }
+      ],
+      "notes": [
+        "torch.split backward runs first: aten::cat reassembles the per-key gradients with one D2D copy per contributing tensor.",
+        "construct_jagged_tensors and SequenceEmbeddingsAwaitable are forward owners; backward executes their saved autograd nodes, not their Python bodies.",
+        "The remaining order is the exact reverse of forward: reverse_indices first, unbucketize_permute second.",
+        "If index deduplication is disabled, the first IndexSelectBackward0 branch is absent.",
+        "Activity IDs, sizes, kernel names and optimizer details illustrate one execution configuration; they are not fixed for every run."
+      ],
+      "trace": true,
+      "activations": [
+        [
+          0,
+          1,
+          8,
+          "call"
+        ],
+        [
+          1,
+          1,
+          4,
+          "call"
+        ],
+        [
+          2,
+          2,
+          3,
+          "call"
+        ],
+        [
+          3,
+          4,
+          6,
+          "call"
+        ],
+        [
+          4,
+          6,
+          8,
+          "call"
+        ],
+        [
+          5,
+          8,
+          8,
+          "call"
+        ]
+      ]
+    },
+    {
+      "slug": "09-backward-launch",
+      "original": "02_backward_a2a_launch.svg",
+      "origin": "https://jacocheung.github.io/visualization/recsys-examples/embedding_collection_rowwise/backward.html",
+      "title": "Reverse sequence AllToAll: launch",
+      "subtitle": "Activities [19-21]: optional codec encode, then asynchronous NCCL AllToAll.",
+      "actors": [
+        {
+          "name": "PyTorch autograd engine",
+          "type": "runtime"
+        },
+        {
+          "name": "All2All_Seq_Req_WaitBackward",
+          "type": "autograd.Function"
+        },
+        {
+          "name": "QuantizedCommCodec",
+          "type": "optional codec"
+        },
+        {
+          "name": "ProcessGroupNCCL",
+          "type": "collective backend"
+        },
+        {
+          "name": "Request[Tensor]",
+          "type": "shared state"
+        }
+      ],
+      "rows": [
+        {
+          "a": 0,
+          "b": 1,
+          "kind": "call",
+          "original_step": 1,
+          "label": "backward(sharded_grad_output)",
+          "detail": "input_splits and output_splits are swapped",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2093"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 2,
+          "kind": "call",
+          "original_step": 2,
+          "label": "backward.encode(gradient)",
+          "detail": "activities [19-20] use FP16 in the representative sample",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2100"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 1,
+          "kind": "return",
+          "original_step": 3,
+          "label": "encoded payload + quantized splits",
+          "detail": "this step is absent when codecs is None",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2100"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 3,
+          "kind": "comm",
+          "original_step": 4,
+          "label": "dist.all_to_all_single(async_op=True)",
+          "detail": "activity [21] ncclDevKernel_SendRecv",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2122"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 4,
+          "kind": "call",
+          "original_step": 5,
+          "label": "store req, tensor and codec context",
+          "detail": "defer wait/decode/recat to the predecessor node",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2122"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 0,
+          "kind": "return",
+          "original_step": 6,
+          "label": "return dummy-tensor gradient",
+          "detail": "schedules All2All_Seq_ReqBackward",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2093"
+          ]
+        }
+      ],
+      "notes": [
+        "The codec branch is optional. Without qcomm, the gradient payload is sent in its current dtype.",
+        "Activity IDs, sizes, kernel names and optimizer details illustrate one execution configuration; they are not fixed for every run."
+      ],
+      "trace": true,
+      "activations": [
+        [
+          0,
+          1,
+          6,
+          "call"
+        ],
+        [
+          1,
+          1,
+          6,
+          "call"
+        ],
+        [
+          2,
+          2,
+          3,
+          "call"
+        ],
+        [
+          3,
+          4,
+          4,
+          "call"
+        ],
+        [
+          4,
+          5,
+          5,
+          "call"
+        ]
+      ],
+      "pending": [
+        [
+          4,
+          5,
+          null,
+          0,
+          "Reverse request; consumed by Req.backward in the next diagram"
+        ]
+      ]
+    },
+    {
+      "slug": "10-backward-finalize",
+      "original": "03_backward_a2a_finalize.svg",
+      "origin": "https://jacocheung.github.io/visualization/recsys-examples/embedding_collection_rowwise/backward.html",
+      "title": "Reverse sequence AllToAll: finalize",
+      "subtitle": "Activities [22-30]: wait, optional decode, backward recat and optional gradient division.",
+      "actors": [
+        {
+          "name": "PyTorch autograd engine",
+          "type": "runtime"
+        },
+        {
+          "name": "All2All_Seq_ReqBackward",
+          "type": "autograd.Function"
+        },
+        {
+          "name": "Request[Tensor]",
+          "type": "shared state"
+        },
+        {
+          "name": "QuantizedCommCodec",
+          "type": "optional codec"
+        },
+        {
+          "name": "fbgemm.permute_2D_sparse_data",
+          "type": "operator"
+        },
+        {
+          "name": "TBE autograd node",
+          "type": "next node"
+        }
+      ],
+      "rows": [
+        {
+          "a": 0,
+          "b": 1,
+          "kind": "call",
+          "original_step": 1,
+          "label": "execute predecessor backward",
+          "detail": "triggered by the dummy-tensor edge",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2017"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 2,
+          "kind": "wait",
+          "original_step": 2,
+          "label": "req.wait()",
+          "detail": "wait for the reverse AllToAll",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2017"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 3,
+          "kind": "call",
+          "original_step": 3,
+          "label": "backward.decode(received gradient)",
+          "detail": "activity [22] converts the sample FP16 payload to FP32",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2029"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 4,
+          "kind": "call",
+          "original_step": 4,
+          "label": "permute with backward_recat_tensor",
+          "detail": "activities [23-29] lengths, scans and data permute",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2038"
+          ]
+        },
+        {
+          "a": 4,
+          "b": 1,
+          "kind": "return",
+          "original_step": 5,
+          "label": "gradient in local lookup order",
+          "detail": "shape is restored to [N_local, D]",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2038"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 1,
+          "kind": "call",
+          "original_step": 6,
+          "label": "optional GRADIENT_DIVISION",
+          "detail": "activity [30] divides by process-group size",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2056"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 5,
+          "kind": "return",
+          "original_step": 7,
+          "label": "sharded_grad_input",
+          "detail": "now aligned with the local TBE forward output",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/comm_ops.py#L2017"
+          ]
+        }
+      ],
+      "notes": [
+        "All2All_Seq_ReqBackward owns the wait and backward recat; WaitBackward owns the launch.",
+        "Activity IDs, sizes, kernel names and optimizer details illustrate one execution configuration; they are not fixed for every run."
+      ],
+      "trace": true,
+      "activations": [
+        [
+          0,
+          1,
+          7,
+          "call"
+        ],
+        [
+          1,
+          1,
+          7,
+          "call"
+        ],
+        [
+          2,
+          2,
+          2,
+          "call"
+        ],
+        [
+          3,
+          3,
+          3,
+          "call"
+        ],
+        [
+          4,
+          4,
+          5,
+          "call"
+        ],
+        [
+          5,
+          7,
+          7,
+          "call"
+        ]
+      ]
+    },
+    {
+      "slug": "11-fused-backward",
+      "original": "04_backward_fbgemm.svg",
+      "origin": "https://jacocheung.github.io/visualization/recsys-examples/embedding_collection_rowwise/backward.html",
+      "title": "FBGEMM TBE backward and fused update",
+      "subtitle": "Activities [31-57]: sparse row grouping, gradient reduction and optimizer-specific shard update.",
+      "actors": [
+        {
+          "name": "PyTorch autograd engine",
+          "type": "runtime"
+        },
+        {
+          "name": "SplitTableBatchedEmbeddingBagsCodegen",
+          "type": "FBGEMM nn.Module"
+        },
+        {
+          "name": "FBGEMM sparse preprocessing",
+          "type": "generated CUDA"
+        },
+        {
+          "name": "CUB sort / reduce / scan",
+          "type": "CUDA primitives"
+        },
+        {
+          "name": "Generated update kernels",
+          "type": "optimizer-specific"
+        },
+        {
+          "name": "Local weight shard + state",
+          "type": "fused optimizer storage"
+        }
+      ],
+      "rows": [
+        {
+          "a": 0,
+          "b": 1,
+          "kind": "call",
+          "original_step": 1,
+          "label": "TBE autograd backward(local gradient)",
+          "detail": "forward call created the generated sparse autograd node",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/batched_embedding_kernel.py#L1847"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 2,
+          "kind": "call",
+          "original_step": 2,
+          "label": "linearize table-row indices",
+          "detail": "activity [31]",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/batched_embedding_kernel.py#L1847"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 3,
+          "kind": "call",
+          "original_step": 3,
+          "label": "sort indices by embedding row",
+          "detail": "activities [32-43] workspace + four radix passes",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/batched_embedding_kernel.py#L1847"
+          ]
+        },
+        {
+          "a": 3,
+          "b": 2,
+          "kind": "return",
+          "original_step": 4,
+          "label": "build unique-row segments",
+          "detail": "activities [44-53] reduce-by-key + scans",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/batched_embedding_kernel.py#L1847"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 4,
+          "kind": "call",
+          "original_step": 5,
+          "label": "route long and regular segments",
+          "detail": "activities [54-55]",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/batched_embedding_kernel.py#L1847"
+          ]
+        },
+        {
+          "a": 4,
+          "b": 5,
+          "kind": "call",
+          "original_step": 6,
+          "label": "reduce gradients + fused row-wise Adagrad (sample optimizer)",
+          "detail": "activities [56-57] CTA and warp paths",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/batched_embedding_kernel.py#L2587"
+          ]
+        },
+        {
+          "a": 5,
+          "b": 0,
+          "kind": "return",
+          "original_step": 7,
+          "label": "update completes without embedding .grad",
+          "detail": "weights and optimizer state are mutated in the generated kernel",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/batched_embedding_kernel.py#L2624"
+          ]
+        }
+      ],
+      "notes": [
+        "The representative sample uses fused exact row-wise Adagrad. Another configured optimizer selects a different generated update kernel.",
+        "GroupedEmbeddingsLookup and BatchedFusedEmbedding own the forward call chain, but they do not implement Module.backward.",
+        "Activity IDs, sizes, kernel names and optimizer details illustrate one execution configuration; they are not fixed for every run."
+      ],
+      "trace": true,
+      "activations": [
+        [
+          0,
+          1,
+          7,
+          "call"
+        ],
+        [
+          1,
+          1,
+          7,
+          "call"
+        ],
+        [
+          2,
+          2,
+          5,
+          "call"
+        ],
+        [
+          3,
+          3,
+          4,
+          "call"
+        ],
+        [
+          4,
+          5,
+          7,
+          "call"
+        ],
+        [
+          5,
+          6,
+          7,
+          "call"
+        ]
+      ]
+    },
+    {
+      "slug": "12-gradient-boundary",
+      "original": "05_backward_boundary.svg",
+      "origin": "https://jacocheung.github.io/visualization/recsys-examples/embedding_collection_rowwise/backward.html",
+      "title": "Gradient boundary: where backward stops",
+      "subtitle": "No GPU activities: sparse inputs and input distribution are outside the differentiable graph.",
+      "actors": [
+        {
+          "name": "PyTorch autograd engine",
+          "type": "runtime"
+        },
+        {
+          "name": "SplitTableBatchedEmbeddingBagsCodegen",
+          "type": "FBGEMM nn.Module"
+        },
+        {
+          "name": "BatchedFusedEmbedding",
+          "type": "nn.Module"
+        },
+        {
+          "name": "GroupedEmbeddingsLookup",
+          "type": "nn.Module"
+        },
+        {
+          "name": "RwSparseFeaturesDist",
+          "type": "nn.Module"
+        },
+        {
+          "name": "KeyedJaggedTensor",
+          "type": "integer sparse data"
+        }
+      ],
+      "rows": [
+        {
+          "a": 0,
+          "b": 1,
+          "kind": "call",
+          "original_step": 1,
+          "label": "finish TBE autograd node",
+          "detail": "the local shard update is the last differentiable lookup work",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/batched_embedding_kernel.py#L2587"
+          ]
+        },
+        {
+          "a": 1,
+          "b": 2,
+          "kind": "boundary",
+          "original_step": 2,
+          "label": "no Module.backward call",
+          "detail": "BatchedFusedEmbedding is a forward wrapper",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/batched_embedding_kernel.py#L2530"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 3,
+          "kind": "boundary",
+          "original_step": 3,
+          "label": "no Module.backward call",
+          "detail": "GroupedEmbeddingsLookup is a forward wrapper",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding_lookup.py#L408"
+          ]
+        },
+        {
+          "a": 3,
+          "b": 4,
+          "kind": "boundary",
+          "original_step": 4,
+          "label": "no gradient for indices or offsets",
+          "detail": "the lookup receives integer KJT tensors",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/batched_embedding_kernel.py#L1847"
+          ]
+        },
+        {
+          "a": 4,
+          "b": 5,
+          "kind": "boundary",
+          "original_step": 5,
+          "label": "input path is detached",
+          "detail": "ShardedEmbeddingCollection.input_dist uses torch.no_grad",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding.py#L1559"
+          ]
+        }
+      ],
+      "notes": [
+        "Index calculation and KJT input distribution have no matching backward collective or CUDA kernel.",
+        "Fused embedding parameters are exposed without external gradients; a dense optimizer step does not update them.",
+        "Activity IDs, sizes, kernel names and optimizer details illustrate one execution configuration; they are not fixed for every run."
+      ],
+      "trace": true,
+      "activations": [
+        [
+          0,
+          1,
+          1,
+          "call"
+        ],
+        [
+          1,
+          1,
+          1,
+          "call"
+        ]
+      ]
+    },
+    {
+      "slug": "13-context-handoff",
+      "title": "Pipeline rewrite and per-batch handoff",
+      "subtitle": "Only eligible sharded-module calls are rewritten; state stays attached to its batch.",
+      "actors": [
+        {
+          "name": "Pipeline scheduler",
+          "type": "host / runtime"
+        },
+        {
+          "name": "Batch context",
+          "type": "host / runtime"
+        },
+        {
+          "name": "Runtime forward",
+          "type": "host / runtime"
+        },
+        {
+          "name": "Sharded module",
+          "type": "host / runtime"
+        }
+      ],
+      "rows": [
+        {
+          "kind": "call",
+          "a": 0,
+          "b": 3,
+          "label": "Trace eligible inputs; replace forward with a runtime wrapper",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L426-L458",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L500-L556"
+          ]
+        },
+        {
+          "kind": "call",
+          "a": 0,
+          "b": 3,
+          "label": "start_sparse_data_dist(batch): create_context + input_dist",
+          "detail": "Submit split-size AllToAll; compatible metadata requests may be fused by process group.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L276-L287"
+          ]
+        },
+        {
+          "kind": "call",
+          "a": 3,
+          "b": 1,
+          "label": "Store module contexts and split requests",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L279-L287"
+          ]
+        },
+        {
+          "kind": "call",
+          "a": 0,
+          "b": 1,
+          "label": "Fuse compatible split metadata by process group",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L318-L354"
+          ]
+        },
+        {
+          "kind": "host",
+          "a": 0,
+          "b": 1,
+          "label": "wait_sparse_data_dist: first wait -> tensors requests",
+          "detail": "First wait reads received CUDA split sizes on the host, then launches separate lengths and ID AllToAll payloads.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L1146-L1161",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L593-L597",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L812-L826"
+          ],
+          "also_comm": true
+        },
+        {
+          "kind": "note",
+          "label": "The two variants below are alternatives for consuming this state, not consecutive stages."
+        },
+        {
+          "kind": "phase",
+          "label": "Ordinary sparse pipeline"
+        },
+        {
+          "kind": "call",
+          "a": 2,
+          "b": 1,
+          "label": "PipelinedForward pops tensors request + module context",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L106-L123"
+          ]
+        },
+        {
+          "kind": "wait",
+          "a": 2,
+          "b": 2,
+          "label": "Second wait on data_dist stream; train stream joins",
+          "detail": "Consumes payload and reconstructs the KJT; uncached, nonempty CUDA lengths in the fixed-stride path require D2H and current-stream synchronization.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L108-L136"
+          ]
+        },
+        {
+          "kind": "call",
+          "a": 2,
+          "b": 3,
+          "label": "compute_and_output_dist(context, distributed input)",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L136"
+          ]
+        },
+        {
+          "kind": "phase",
+          "label": "Prefetch pipeline"
+        },
+        {
+          "kind": "wait",
+          "a": 0,
+          "b": 1,
+          "label": "_prefetch: second wait -> module.prefetch -> post-prefetch state",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L780-L817"
+          ]
+        },
+        {
+          "kind": "call",
+          "a": 2,
+          "b": 1,
+          "label": "PrefetchPipelinedForward pops ready input + saved context",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L313-L319"
+          ]
+        },
+        {
+          "kind": "dep",
+          "a": 2,
+          "b": 2,
+          "label": "Train stream joins prefetch stream",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L321-L332"
+          ]
+        },
+        {
+          "kind": "call",
+          "a": 2,
+          "b": 3,
+          "label": "compute_and_output_dist(context, distributed input)",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L332"
+          ]
+        }
+      ],
+      "activations": [
+        [
+          0,
+          1,
+          5,
+          "call"
+        ],
+        [
+          0,
+          9,
+          9,
+          "call"
+        ],
+        [
+          1,
+          3,
+          5,
+          "call"
+        ],
+        [
+          1,
+          6,
+          6,
+          "call"
+        ],
+        [
+          1,
+          9,
+          10,
+          "call"
+        ],
+        [
+          2,
+          6,
+          8,
+          "call"
+        ],
+        [
+          2,
+          10,
+          12,
+          "call"
+        ],
+        [
+          3,
+          1,
+          1,
+          "call"
+        ],
+        [
+          3,
+          2,
+          3,
+          "call"
+        ],
+        [
+          3,
+          8,
+          8,
+          "call"
+        ],
+        [
+          3,
+          9,
+          9,
+          "call"
+        ],
+        [
+          3,
+          12,
+          12,
+          "call"
+        ]
+      ],
+      "pending": [],
+      "notes": []
+    },
+    {
+      "slug": "14-sparse-pipeline",
+      "title": "TrainPipelineSparseDist: one steady-state progress()",
+      "subtitle": "Host submission order, not a measured timeline. Batch i is the current training batch.",
+      "actors": [
+        {
+          "name": "Host scheduler",
+          "type": "host / runtime"
+        },
+        {
+          "name": "H2D stream",
+          "type": "stream role"
+        },
+        {
+          "name": "data_dist stream",
+          "type": "stream role"
+        },
+        {
+          "name": "Training stream",
+          "type": "stream role"
+        }
+      ],
+      "rows": [
+        {
+          "kind": "note",
+          "label": "Entry: i has a tensors request; i+1 has been copied. Default enqueue placement is shown."
+        },
+        {
+          "kind": "dep",
+          "a": 0,
+          "b": 3,
+          "label": "zero_grad(i); join prior data_dist work",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L867-L877"
+          ]
+        },
+        {
+          "kind": "dep",
+          "a": 1,
+          "b": 2,
+          "label": "data_dist waits for the copy of i+1",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L1134-L1144"
+          ]
+        },
+        {
+          "kind": "comm",
+          "a": 0,
+          "b": 2,
+          "label": "start_sparse_data_dist(i+1): launch split AllToAll",
+          "detail": "Submit split-size AllToAll; compatible metadata requests may be fused by process group.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L876-L878",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L294"
+          ]
+        },
+        {
+          "kind": "h2d",
+          "a": 0,
+          "b": 1,
+          "label": "enqueue_batch(i+2): nonblocking device copy",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L880-L882",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L1039-L1067"
+          ]
+        },
+        {
+          "kind": "phase",
+          "label": "Forward of batch i"
+        },
+        {
+          "kind": "call",
+          "a": 0,
+          "b": 3,
+          "label": "model(i) reaches PipelinedForward",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L885-L887"
+          ]
+        },
+        {
+          "kind": "wait",
+          "a": 3,
+          "b": 2,
+          "label": "Second wait for i: finish payload / reconstruct KJT",
+          "detail": "Consumes payload and reconstructs the KJT; uncached, nonempty CUDA lengths in the fixed-stride path require D2H and current-stream synchronization.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L106-L120"
+          ]
+        },
+        {
+          "kind": "dep",
+          "a": 2,
+          "b": 3,
+          "label": "Training stream waits for data_dist; record_stream",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L125-L136"
+          ]
+        },
+        {
+          "kind": "comm",
+          "a": 3,
+          "b": 3,
+          "label": "Lookup(i), output AllToAll(i), downstream forward(i)",
+          "detail": "Composite compute stage including an embedding collective; the whole bar is not NCCL execution time.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L136",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L885-L887"
+          ]
+        },
+        {
+          "kind": "phase",
+          "label": "After forward returns to the host"
+        },
+        {
+          "kind": "host",
+          "a": 0,
+          "b": 2,
+          "label": "wait_sparse_data_dist(i+1): host reads splits; launch payload",
+          "detail": "Read receive sizes onto the host (D2H + stream synchronization), allocate buffers, then launch lengths and ID values AllToAll.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L895-L897",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L1151-L1161",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L593-L597",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L812-L826"
+          ],
+          "also_comm": true
+        },
+        {
+          "kind": "comm",
+          "a": 0,
+          "b": 3,
+          "label": "backward(i), reverse embedding AllToAll(i), optimizer(i)",
+          "detail": "Composite compute stage including an embedding collective; the whole bar is not NCCL execution time.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L899-L918"
+          ]
+        },
+        {
+          "kind": "note",
+          "label": "Payload(i+1) can overlap GPU backward(i); no independent cache-prefetch stage."
+        },
+        {
+          "kind": "call",
+          "a": 0,
+          "b": 0,
+          "label": "dequeue i; retain matching batches / contexts for i+1 and i+2",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L913-L914",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L769-L778"
+          ]
+        }
+      ],
+      "activations": [
+        [
+          0,
+          1,
+          11,
+          "call"
+        ],
+        [
+          1,
+          2,
+          2,
+          "dep"
+        ],
+        [
+          1,
+          4,
+          4,
+          "call"
+        ],
+        [
+          2,
+          2,
+          3,
+          "comm"
+        ],
+        [
+          2,
+          6,
+          7,
+          "wait"
+        ],
+        [
+          2,
+          9,
+          9,
+          "wait"
+        ],
+        [
+          3,
+          1,
+          1,
+          "dep"
+        ],
+        [
+          3,
+          5,
+          8,
+          "call"
+        ],
+        [
+          3,
+          10,
+          10,
+          "call"
+        ]
+      ],
+      "pending": [
+        [
+          2,
+          3,
+          9,
+          0,
+          "Splits for i+1"
+        ],
+        [
+          2,
+          9,
+          null,
+          1,
+          "Payload for i+1; consumed in the next progress()"
+        ]
+      ],
+      "notes": []
+    },
+    {
+      "slug": "16-prefetch-pipeline",
+      "title": "PrefetchTrainPipelineSparseDist: one steady-state progress()",
+      "subtitle": "Host submission order, not a measured timeline. Backend cache dependencies still apply.",
+      "actors": [
+        {
+          "name": "Host scheduler",
+          "type": "host / runtime"
+        },
+        {
+          "name": "H2D stream",
+          "type": "stream role"
+        },
+        {
+          "name": "data_dist stream",
+          "type": "stream role"
+        },
+        {
+          "name": "Prefetch stream",
+          "type": "stream role"
+        },
+        {
+          "name": "Training stream",
+          "type": "stream role"
+        }
+      ],
+      "rows": [
+        {
+          "kind": "note",
+          "label": "Entry: i has post-prefetch state; i+1 has an outstanding split request."
+        },
+        {
+          "kind": "dep",
+          "a": 3,
+          "b": 4,
+          "label": "Training stream joins prefetch(i); zero_grad already submitted",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L2167-L2172"
+          ]
+        },
+        {
+          "kind": "h2d",
+          "a": 0,
+          "b": 1,
+          "label": "enqueue_batch(i+2): nonblocking device copy",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L2174-L2175",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L1039-L1067"
+          ]
+        },
+        {
+          "kind": "host",
+          "a": 0,
+          "b": 2,
+          "label": "wait_sparse_data_dist(i+1): host reads splits; launch payload",
+          "detail": "Read receive sizes onto the host (D2H + stream synchronization), allocate buffers, then launch lengths and ID values AllToAll.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L2182-L2183",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L1151-L1161",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L593-L597",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L812-L826"
+          ],
+          "also_comm": true
+        },
+        {
+          "kind": "phase",
+          "label": "Forward of batch i; payload of i+1 can overlap"
+        },
+        {
+          "kind": "call",
+          "a": 0,
+          "b": 4,
+          "label": "PrefetchPipelinedForward consumes ready input / context for i",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L313-L334"
+          ]
+        },
+        {
+          "kind": "comm",
+          "a": 4,
+          "b": 4,
+          "label": "Lookup(i), output AllToAll(i), downstream forward(i)",
+          "detail": "Composite compute stage including an embedding collective; the whole bar is not NCCL execution time.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L2185-L2187",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/runtime_forwards.py#L332"
+          ]
+        },
+        {
+          "kind": "call",
+          "a": 0,
+          "b": 0,
+          "label": "Clear consumed post-prefetch dictionaries for i",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L2189-L2196"
+          ]
+        },
+        {
+          "kind": "phase",
+          "label": "After forward returns; before backward is submitted"
+        },
+        {
+          "kind": "wait",
+          "a": 0,
+          "b": 2,
+          "label": "_prefetch(i+1): second wait / reconstruct KJT on data_dist",
+          "detail": "Consumes payload and reconstructs the KJT; uncached, nonempty CUDA lengths in the fixed-stride path require D2H and current-stream synchronization.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L780-L793"
+          ]
+        },
+        {
+          "kind": "dep",
+          "a": 2,
+          "b": 3,
+          "label": "Prefetch stream waits for data_dist; record_stream",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L795-L807"
+          ]
+        },
+        {
+          "kind": "call",
+          "a": 0,
+          "b": 3,
+          "label": "module.prefetch(i+1); save ready input + context",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/utils.py#L809-L817"
+          ]
+        },
+        {
+          "kind": "comm",
+          "a": 0,
+          "b": 4,
+          "label": "backward(i), reverse embedding AllToAll(i), optimizer(i)",
+          "detail": "Composite compute stage including an embedding collective; the whole bar is not NCCL execution time.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L2204-L2211"
+          ]
+        },
+        {
+          "kind": "note",
+          "label": "Source allows concurrent submission; actual prefetch/backward overlap is backend-dependent."
+        },
+        {
+          "kind": "phase",
+          "label": "Prepare the following iteration"
+        },
+        {
+          "kind": "dep",
+          "a": 1,
+          "b": 2,
+          "label": "data_dist waits for the copy of i+2",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L1134-L1144"
+          ]
+        },
+        {
+          "kind": "comm",
+          "a": 0,
+          "b": 2,
+          "label": "start_sparse_data_dist(i+2): launch split AllToAll",
+          "detail": "Submit split-size AllToAll; compatible metadata requests may be fused by process group.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L2213-L2216"
+          ]
+        },
+        {
+          "kind": "call",
+          "a": 0,
+          "b": 0,
+          "label": "dequeue i; next forward will join prefetch(i+1)",
+          "detail": "",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L2218-L2220",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/train_pipeline/train_pipelines.py#L769-L778"
+          ]
+        }
+      ],
+      "activations": [
+        [
+          0,
+          1,
+          13,
+          "call"
+        ],
+        [
+          1,
+          2,
+          2,
+          "call"
+        ],
+        [
+          1,
+          11,
+          11,
+          "dep"
+        ],
+        [
+          2,
+          3,
+          3,
+          "wait"
+        ],
+        [
+          2,
+          7,
+          7,
+          "wait"
+        ],
+        [
+          2,
+          11,
+          12,
+          "comm"
+        ],
+        [
+          3,
+          1,
+          1,
+          "dep"
+        ],
+        [
+          3,
+          8,
+          9,
+          "call"
+        ],
+        [
+          4,
+          1,
+          1,
+          "dep"
+        ],
+        [
+          4,
+          4,
+          5,
+          "call"
+        ],
+        [
+          4,
+          10,
+          10,
+          "call"
+        ]
+      ],
+      "pending": [
+        [
+          2,
+          3,
+          7,
+          0,
+          "Payload for i+1"
+        ],
+        [
+          2,
+          12,
+          null,
+          0,
+          "Splits for i+2; consumed in the next progress()"
+        ]
+      ],
+      "notes": []
+    }
+  ]
+}
