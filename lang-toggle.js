@@ -89,6 +89,8 @@
     setThemeLabel(theme);
     updatePostMeta();
     renderSeriesNavigation();
+    updateTocLanguage();
+    positionToc();
   }
 
   function createNavigation() {
@@ -145,6 +147,161 @@
       '.layout > aside.toc, body > nav.toc, .layout > nav.toc, body > #toc, .layout > #toc'
     );
     if (toc && toc.parentElement !== main) header.insertAdjacentElement('afterend', toc);
+  }
+
+  let postToc = null;
+  let tocCollapsed = false;
+  const tocSections = [];
+  const tocSectionStorageKey = 'post-toc-sections:' + (meta('slug') || location.pathname);
+  let tocSectionState = {};
+  try { tocCollapsed = localStorage.getItem('post-toc-collapsed') === '1'; } catch (_) {}
+  try {
+    const saved = JSON.parse(localStorage.getItem(tocSectionStorageKey));
+    if (saved && typeof saved === 'object' && !Array.isArray(saved)) tocSectionState = saved;
+  } catch (_) {}
+
+  function isTocSectionCollapsed(section) {
+    return typeof tocSectionState[section.id] === 'boolean'
+      ? tocSectionState[section.id] : tocCollapsed;
+  }
+
+  function visibleTocSections() {
+    return tocSections.filter(section => !section.language || section.language === lang);
+  }
+
+  function saveTocSectionState() {
+    try { localStorage.setItem(tocSectionStorageKey, JSON.stringify(tocSectionState)); } catch (_) {}
+  }
+
+  function updateTocLanguage() {
+    if (!postToc) return;
+    postToc.setAttribute('aria-label', lang === 'en' ? 'Table of contents' : '文章目录');
+    postToc.querySelector('.toc-title').textContent = lang === 'en' ? 'Contents' : '目录';
+    tocSections.forEach(section => {
+      const collapsed = isTocSectionCollapsed(section);
+      section.subsections.hidden = collapsed;
+      section.button.setAttribute('aria-expanded', String(!collapsed));
+      const english = section.language ? section.language === 'en' : lang === 'en';
+      const action = english ? (collapsed ? 'Expand' : 'Collapse') : (collapsed ? '展开' : '折叠');
+      section.button.setAttribute('aria-label', action + (english ? ': ' : '：') + section.link.textContent);
+      section.button.title = section.button.getAttribute('aria-label');
+    });
+    const sections = visibleTocSections();
+    const anyCollapsed = sections.some(isTocSectionCollapsed);
+    const button = postToc.querySelector('.post-toc-toggle');
+    button.hidden = !sections.length;
+    button.textContent = lang === 'en'
+      ? (anyCollapsed ? 'Expand all' : 'Collapse all')
+      : (anyCollapsed ? '全部展开' : '全部折叠');
+    button.setAttribute('aria-expanded', String(!anyCollapsed));
+    if (sections.length) button.setAttribute('aria-controls', sections.map(section => section.subsections.id).join(' '));
+    else button.removeAttribute('aria-controls');
+    updateActiveToc();
+  }
+
+  function positionToc() {
+    if (!postToc) return;
+    const header = Array.from(document.querySelectorAll('main.content .post-header'))
+      .find(element => element.getClientRects().length > 0);
+    if (header) header.insertAdjacentElement('afterend', postToc);
+  }
+
+  function createTableOfContents(main) {
+    const headings = Array.from(main.querySelectorAll('h2, h3')).filter(heading =>
+      !heading.closest('aside.toc, nav.toc, #toc, svg, .diagram-frame, .post-header')
+    );
+    if (!headings.length) return;
+
+    postToc = document.querySelector('aside.toc, nav.toc, #toc');
+    if (!postToc) {
+      postToc = document.createElement('aside');
+      postToc.className = 'toc';
+      main.prepend(postToc);
+    }
+    const existingLabels = new Map(Array.from(postToc.querySelectorAll('a[href^="#"]'))
+      .map(link => [link.getAttribute('href').slice(1), link.textContent.trim()]));
+    const series = postToc.querySelector('.post-series-nav');
+    // Older posts wrap their sidebar in a second, mobile-only disclosure.
+    // The shared control now handles the same outline at every screen size.
+    const wrapper = postToc.closest('details.article-toc');
+    if (wrapper) wrapper.replaceWith(postToc);
+    postToc.classList.add('toc', 'post-toc');
+    postToc.classList.remove('collapsed');
+    postToc.innerHTML = '<div class="post-toc-header"><div class="toc-title"></div>' +
+      '<button class="post-toc-toggle" type="button"></button></div>' +
+      '<div class="post-toc-body" id="post-toc-outline"></div>';
+    if (series) postToc.appendChild(series);
+
+    const lists = new Map();
+    headings.forEach((heading, index) => {
+      if (!heading.id) {
+        let id = `post-section-${index + 1}`;
+        while (document.getElementById(id)) id += '-heading';
+        heading.id = id;
+      }
+      const branch = heading.closest('.lang-zh, .lang-en');
+      const language = branch ? (branch.classList.contains('lang-en') ? 'en' : 'zh') : '';
+      if (!lists.has(language)) {
+        const section = document.createElement('div');
+        if (language) section.className = `lang-${language}`;
+        const list = document.createElement('ul');
+        list.className = 'toc-sections';
+        section.appendChild(list);
+        postToc.querySelector('.post-toc-body').appendChild(section);
+        lists.set(language, { list, chapter: null });
+      }
+      const state = lists.get(language);
+      const item = document.createElement('li');
+      const link = document.createElement('a');
+      link.href = '#' + heading.id;
+      const label = heading.cloneNode(true);
+      label.querySelectorAll('.headerlink').forEach(anchor => anchor.remove());
+      link.textContent = (heading.tagName === 'H2' && existingLabels.get(heading.id)) || label.textContent.trim();
+      if (heading.tagName === 'H2' || !state.chapter) {
+        const row = document.createElement('div');
+        row.className = 'toc-section-heading';
+        row.appendChild(link);
+        item.className = 'toc-section';
+        item.appendChild(row);
+        state.list.appendChild(item);
+        state.chapter = { id: heading.id, language, item, row, link, subsections: null, button: null };
+      } else {
+        const chapter = state.chapter;
+        if (!chapter.subsections) {
+          chapter.subsections = document.createElement('ul');
+          chapter.subsections.className = 'toc-subsections';
+          let id = `post-toc-subsections-${tocSections.length + 1}`;
+          while (document.getElementById(id)) id += '-list';
+          chapter.subsections.id = id;
+          chapter.item.appendChild(chapter.subsections);
+          chapter.button = document.createElement('button');
+          chapter.button.type = 'button';
+          chapter.button.className = 'toc-section-toggle';
+          chapter.button.setAttribute('aria-controls', id);
+          chapter.button.innerHTML = '<svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true" focusable="false"><path d="m3 4.5 3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>';
+          chapter.button.addEventListener('click', () => {
+            tocSectionState[chapter.id] = !isTocSectionCollapsed(chapter);
+            saveTocSectionState();
+            updateTocLanguage();
+          });
+          chapter.row.appendChild(chapter.button);
+          tocSections.push(chapter);
+        }
+        item.appendChild(link);
+        chapter.subsections.appendChild(item);
+      }
+    });
+    postToc.querySelector('.post-toc-toggle').addEventListener('click', () => {
+      // A mixed outline expands on the next click; a fully expanded one collapses.
+      // Keep both language branches in step when applying the global preference.
+      tocCollapsed = !visibleTocSections().some(isTocSectionCollapsed);
+      tocSectionState = {};
+      try { localStorage.setItem('post-toc-collapsed', tocCollapsed ? '1' : '0'); } catch (_) {}
+      saveTocSectionState();
+      updateTocLanguage();
+    });
+    updateTocLanguage();
+    positionToc();
   }
 
   let seriesNavigation = null;
@@ -252,9 +409,12 @@
     const marker = window.scrollY + 120;
     let active = visible[0];
     visible.forEach(entry => {
-      if (entry.heading.offsetTop <= marker) active = entry;
+      if (entry.heading.getBoundingClientRect().top + window.scrollY <= marker) active = entry;
     });
-    tocEntries.forEach(entry => entry.link.classList.toggle('active', entry === active));
+    const subsections = active.link.closest('.toc-subsections');
+    const activeLink = subsections && subsections.hidden
+      ? subsections.parentElement.querySelector('.toc-section-heading > a') : active.link;
+    tocEntries.forEach(entry => entry.link.classList.toggle('active', entry.link === activeLink));
   }
 
   function attachTocTracking() {
@@ -294,6 +454,7 @@
     if (main) {
       const header = createPostHeaders(main);
       moveTocIntoReadingOrder(main, header);
+      createTableOfContents(main);
       addHeadingAnchors(main);
     }
     createSeriesNavigation();

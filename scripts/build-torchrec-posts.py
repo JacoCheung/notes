@@ -51,19 +51,19 @@ SOURCES = {
 FIGS = {'01': ('01-native-forward', 'forward 的模块总览', 'Forward module overview', ['forward', 'input', 'compute']), '02': ('02-input-prepare', '输入重排与可选 unique 的细分调用', 'Input permutation and optional unique', ['prepare', 'input']), '03': ('03-input-distribution', 'Input distribution：H2D、host sync 与三次 AllToAll', 'Input distribution: H2D, host sync, and three AllToAll calls', ['bucket', 'splits', 'tensors', 'host_copy']), '04': ('04-local-lookup', 'Grouped lookup、BatchedFusedEmbedding 与 TBE', 'Grouped lookup, BatchedFusedEmbedding, and TBE', ['lookup', 'tbe', 'tbe_call']), '05': ('05-output-distribution', '输出通信的布局准备、codec 与 AllToAll 发起', 'Output layout preparation, codec, and AllToAll launch', ['output', 'seq']), '06': ('06-output-postprocess', 'Lazy wait、unbucketize 与 reverse_indices 展开', 'Lazy wait, unbucketize, and reverse_indices expansion', ['output', 'jt']), '07': ('07-backward-overview', 'Backward 的完整 autograd 拓扑', 'Complete backward autograd topology', ['jt', 'seq', 'tbe']), '08': ('08-gradient-restore', 'Split、reverse_indices 与 unbucketize 的梯度恢复', 'Gradients through split, reverse_indices, and unbucketize', ['jt', 'output']), '09': ('09-backward-launch', '反向 AllToAll 的 encode、launch 与请求保存', 'Reverse AllToAll encode, launch, and request storage', ['seq']), '10': ('10-backward-finalize', '反向请求的 wait、decode、recat 与梯度缩放', 'Reverse request wait, decode, recat, and gradient scaling', ['seq']), '11': ('11-fused-backward', 'TBE 的本地 backward 与示例中的 fused update', 'Local TBE backward and the sample fused update', ['tbe', 'tbe_call', 'fused']), '12': ('12-gradient-boundary', 'Forward wrapper 与整数输入的梯度边界', 'Gradient boundaries at forward wrappers and integer inputs', ['input', 'tbe', 'fused']), '13': ('13-context-handoff', '两种 pipeline 的 batch context 交接', 'Per-batch state handoff in both pipelines', ['rewrite', 'runtime', 'prefetch_helper', 'preforward']), '14': ('14-sparse-pipeline', '普通 sparse dist pipeline 的稳定态调用序列', 'Steady-state ordinary sparse dist pipeline', ['ordinary', 'runtime', 'wait']), '15': ('15-sparse-pipeline-timeline', '普通 sparse-dist pipeline：三轮交互时间线', 'Ordinary sparse-dist pipeline: interactive three-iteration timeline', ['ordinary', 'wait', 'runtime']), '16': ('16-prefetch-pipeline', '带 prefetch 的 sparse dist pipeline 的稳定态调用序列', 'Steady-state prefetch sparse dist pipeline', ['prefetch', 'prefetch_helper', 'preforward'])}
 
 NATIVE_ZH = r'''
-<h1>TorchRec row-wise sharding：数据流、通信与同步</h1>
+<h1>TorchRec Row-wise Sharding</h1>
 <p class="lead">Row-wise sharding 把 embedding 表按行分到多个 rank。样本要查的行可能在别的 rank 上，因此一次 lookup 需要先把 ID 发给持有对应行的 rank，查表后再把向量传回来。Backward 则把向量梯度送回这些行所在的 rank。本篇沿单个 batch 的 forward 和 backward，说明 ID 路由、本地查表、结果恢复，以及各处 NCCL 通信与同步。</p>
 <div class="note-box"><p>本文分析 TorchRec 提交 <a href="https://github.com/pytorch/torchrec/tree/1d87b8f79b7bb1671cb8be3e646e99e835cce610"><code>1d87b8f79b7bb</code></a> 中的 <code>ShardedEmbeddingCollection</code>，采用多 rank、CUDA/NCCL 和 eager 模式。它返回 unpooled sequence embeddings。基础例子使用固定 batch stride、无权重的 KJT，去重和通信 codec 单独作为可选分支说明。实现机制以这份 TorchRec 源码为依据；Pooled EmbeddingBag 的输出通信走另一条路径。</p></div>
 <p class="reading-note">序列图从上往下阅读。生命线上的 activation bar 表示调用执行或数据访问区间，错开的窄条表示嵌套 self-call；虚线空心条表示尚未消费的异步请求。Stream 泳道中的 bar 对应提交阶段，长度不代表 GPU 耗时。整行色块用 <span class="seq-key seq-h2d">蓝色标 H2D</span>、<span class="seq-key seq-host">红色标 D2H / host sync</span>、<span class="seq-key seq-comm">紫色标 AllToAll</span>，黄色标 request wait，绿色标 GPU stream 依赖。图 3 的 D1 / D2 / D3 对应三处主机读回位置，实际 stall 次数取决于执行路径。点击消息文字或下方的文件行号可打开对应的 TorchRec 源码。图表默认适应宽度，也可放大或单独打开。</p>
 
 <p class="reading-note">图中细分模块调用、异步请求和 backend 计算。消息下方的源码链接定位 TorchRec 调用点；GPU activity 编号、拷贝大小、kernel 名称和 optimizer 配置用于说明具体执行示例，实际运行会随输入、backend 和配置变化。阅读通信与同步时，以函数之间的数据依赖和 wait 位置为准。</p>
-<h2 id="zh-layout">1. 从一张按行切开的表开始</h2>
+<h2 id="zh-layout">1. 行分片与 KJT</h2>
 <p>假设 embedding 表有 8 行，每行 D 个元素，均匀分在两个 rank 上：rank 0 持有全局行 0-3，rank 1 持有全局行 4-7。每个 rank 都有自己的训练样本，但样本中的 ID 可以指向任何一段表。</p>
 <div class="table-scroll"><table><thead><tr><th>请求 rank 0 的一个 feature</th><th>发往 rank 0</th><th>发往 rank 1</th></tr></thead><tbody><tr><td>全局 ID：<code>[6, 2, 6, 1]</code></td><td>本地 ID：<code>[2, 1]</code></td><td>本地 ID：<code>[2, 2]</code>，对应全局行 6</td></tr><tr><td>最终需要的向量</td><td colspan="2"><code>[E6, E2, E6, E1]</code>，保持原始 occurrence 顺序</td></tr></tbody></table></div>
 <p>在这个等长、连续分片的例子中，<code>owner = id // 4</code>，<code>local_id = id % 4</code>。实际分桶还会读取分片的 block sizes 等信息，不能把这个简化公式直接用于所有 sharding plan。TorchRec 用 <code>KeyedJaggedTensor</code>（KJT）携带 feature keys、展平后的 ID values，以及各样本的 lengths / offsets；路由 ID 时必须一起重排这些边界信息。{source:bucket}</p>
 <p>每次 lookup 在 rank 之间传输的是 ID 请求和查到的向量，embedding 表仍由各 rank 持有自己的分片。本地 lookup 处理来自所有请求 rank 的 ID，只访问本 rank 的行，然后把结果发回请求方。{source:rw}</p>
 
-<h2 id="zh-native">2. forward：先分发 ID，再 lookup，最后回传向量</h2>
+<h2 id="zh-native">2. Forward 数据流</h2>
 <p><code>ShardedModule.forward</code> 创建 context 后，依次执行输入分发、本地计算和输出分发。省略类型标注后，调用顺序如下：</p>
 <pre class="code" data-language="python">ctx = module.create_context()
 dist_input = module.input_dist(ctx, features).wait().wait()
@@ -73,56 +73,56 @@ output = module.compute_and_output_dist(ctx, dist_input)
 <p>图 1 按模块阶段概括通信。对于本文固定 stride、无 weights 的 KJT，每个 rank 的一个 row-wise group 在 forward 中发起 <strong>4 次 AllToAll：输入 splits、lengths、ID values 各 1 次，输出 embedding vectors 1 次</strong>。输入阶段先发起 splits，第一次 wait 时再发起 lengths 和 ID values。图中 IN / OUT 色块分别汇总这 3 次和 1 次调用；计数对应使用 NCCL backend 的 PyTorch collective，不是底层 NCCL send/recv 或 GPU kernel 的数量。Backward 的梯度通信另见第 5 节。{source:splits}；{source:tensors}；{source:seq}</p>
 {figure:01}
 
-<h2 id="zh-input">3. Input distribution：输入重排、AllToAll 与同步</h2>
-<h3 id="zh-input-mapping">输入重排与顺序恢复所需的映射</h3>
+<h2 id="zh-input">3. Input Distribution</h2>
+<h3 id="zh-input-mapping">输入重排映射</h3>
 <p><code>ShardedEmbeddingCollection.input_dist</code> 先按 sharding / lookup 需要的顺序重排 feature，再按组拆分。若开启 <code>use_index_dedup</code>，它会调用 <code>jagged_unique_indices</code>，保存原始 features 和 <code>reverse_indices</code>，并把去重后的 KJT 交给分桶逻辑。这是在请求 rank 的输入上做去重，并不是一次跨 rank 的全局去重。{source:input}；{source:prepare}</p>
 <p>Row-wise 分桶把 ID 按目标 rank 分组，生成 owner-local IDs 和新的 lengths，同时保存 <code>unbucketize_permute_tensor</code>。这张映射负责撤销路由导致的重排；可选的 <code>reverse_indices</code> 则负责把 unique 结果展开为原始的每一次出现。两者用途不同，不能互相替代。{source:bucket}</p>
 {figure:02}
 
-<h3 id="zh-input-waits">两阶段 AllToAll 与两次 wait</h3>
+<h3 id="zh-input-waits">两阶段 AllToAll</h3>
 <p>每个 rank 要接收多少 ID，取决于本批次的请求分布。TorchRec 因此先交换 split-size metadata，再按已知尺寸分配接收 buffer 并传输真正的 KJT 数据。</p>
 <ol><li>发起 splits 通信。 <code>SplitsAllToAllAwaitable</code> 发起异步 <code>dist.all_to_all_single</code>，交换各 rank 之间需要发送的数据尺寸。</li><li>第一次 wait。 先消费 splits 的 Work，再把 CUDA 上的尺寸通过 <code>_safe_tolist_2d</code> 转成 Python lists。CPU 必须读到这些数值，才能决定接收尺寸。随后构造 tensors awaitable，并在其构造过程中发起 payload 通信。</li><li>传输 payload。 对于本文的基础 KJT，主要是 lengths 和 ID values 各自的 AllToAll；有 weights 或 variable stride 时，实际 tensor 列表会变化。</li><li>第二次 wait。 消费 payload 的 Work，执行 <code>KJT.dist_init</code>，把接收到的布局 recat 为 lookup 所需的 feature 布局，并整理 KJT metadata。</li></ol>
 <p><code>Awaitable[Awaitable[KJTList]]</code> 对应的正是这两个阶段：外层确定接收尺寸并发起传输，内层把收到的数据整理成可用输入。因此，第一次 wait 返回时，ID payload 仍可能在传输。{source:splits}；{source:tensors}</p>
 {figure:03}
-<h3 id="zh-input-sync">把 Work.wait、metadata 读回和布局变换分开看</h3>
+<h3 id="zh-input-sync">等待与主机同步</h3>
 <p>CPU 等待不只发生在接收 splits 之后。发起通信前，<code>KJT.dist_splits()</code> 就需要主机上的 <code>length_per_key</code>。若这个 metadata 尚未缓存，TorchRec 会对 CUDA lengths 求和，再通过 <code>_safe_tolist</code> 取回 Python list。接收 payload 后，固定 stride 分支的 <code>dist_init()</code> 又会对新 KJT 调用 <code>sync()</code>，整理它的 <code>length_per_key</code> 和 offsets metadata。{source:kjt_splits}；{source:kjt_lengths}；{source:kjt_init}</p>
 <p>图 3 用 D1、D2、D3 分别标出发送尺寸准备、接收尺寸读回和 KJT metadata 重建。非空 CUDA tensor 经过 safe-list 路径时，会先做 D2H，再显式同步当前 stream；已缓存的 metadata 可以直接复用。Splits 的 <code>_wait_impl</code> 也说明了转成主机 list 时的 CPU 等待。{source:host_copy}；{source:splits}</p>
 <p>异步 collective 的 <code>Work.wait()</code> 标出消费通信结果的位置。仅凭这个调用，无法断定 CPU 会等待整张 GPU，也无法推断 NCCL 内部所有 stream 的行为。读图时应把这类通信依赖与必须拿到主机数值的 metadata 同步分开。</p>
 <p>Recat 在本地重排数据，把通信接收时的 rank / feature 布局转成 lookup 所需的布局，这一步不发起跨 rank 通信。完成后，row owner 就有了各请求 rank 发来的 ID，可以开始查表；embedding 向量将在后面的输出分发阶段送回。</p>
 
-<h2 id="zh-lookup">4. 本地 lookup、输出 AllToAll 与顺序恢复</h2>
-<h3 id="zh-lookup-local">Lookup 在 row owner 上执行</h3>
+<h2 id="zh-lookup">4. Lookup 与输出恢复</h2>
+<h3 id="zh-lookup-local">本地 Lookup</h3>
 <p><code>GroupedEmbeddingsLookup</code> 将本地 KJT 按兼容的 embedding 配置拆组，调用对应的 embedding kernel。以 fused backend 为例，<code>BatchedFusedEmbedding</code> 构造的 TBE 使用 <code>PoolingMode.NONE</code>，向 backend 传入 IDs 和 offsets，得到每个 ID 对应的向量。这里没有新增跨 rank collective。图中的 backend 计算与 TorchRec 包装层分开标出，便于区分输入准备和查表；具体 kernel 实现和数量取决于输入与 backend。{source:lookup}；{source:tbe}</p>
 <p>调用 backend 前，TorchRec 还会取得 KJT offsets，并把 values / offsets 转成对应 backend 配置的 index / offset dtype。这些本地准备操作应与真正的查表区分开，不应仅凭它们处在 lookup 调用范围内就算成一次 embedding 访存。{source:tbe_call}</p>
 {figure:04}
-<h3 id="zh-output-a2a">输出通信完成之后，还要恢复语义顺序</h3>
+<h3 id="zh-output-a2a">输出 AllToAll</h3>
 <p><code>SequenceEmbeddingsAllToAll</code> 把向量从 row owners 送回请求 ranks。<code>All2All_Seq_Req.forward</code> 先用 <code>forward_recat</code> 整理发送布局，按需执行通信 codec 的 encode，再发起异步 AllToAll。输出被消费时，<code>All2All_Seq_Req_Wait.forward</code> 消费通信请求并按需 decode。{source:output}；{source:seq}</p>
 {figure:05}
-<h3 id="zh-output-reconstruct">Lazy wait 与两层顺序恢复</h3>
+<h3 id="zh-output-reconstruct">Lazy Wait 与顺序恢复</h3>
 <p>收到向量后，恢复顺序分成两层：先通过 <code>unbucketize_permute_tensor</code> 回到分桶前的输入顺序；如果输入做过去重，再通过 <code>reverse_indices</code> 展开回原始 occurrences。最后按 feature 拆分并附上原始 lengths，构造 <code>Dict[str, JaggedTensor]</code>。默认路径用 <code>index_select</code> 展开，源码也提供可选的 <code>gather</code> 分支；两者承担相同的 occurrence 恢复任务。{source:jt}</p>
 {figure:06}
 <p>例如启用去重后，<code>[2, 6, 2]</code> 可以表示为 unique IDs <code>[2, 6]</code> 和映射 <code>[0, 1, 0]</code>。通信回来的 unique embeddings 是 <code>[E2, E6]</code>，展开后仍然必须得到 <code>[E2, E6, E2]</code>。Unique 的实际排列由算子返回，例子只说明 inverse mapping 的作用。</p>
 
-<h2 id="zh-backward">5. Backward：梯度回到 row owner，再更新本地行</h2>
+<h2 id="zh-backward">5. Backward 与参数更新</h2>
 <p>输出 embedding 的梯度沿 autograd 图回传，依次经过顺序恢复操作、反向 AllToAll 和本地 embedding kernel。图 7 展示整条路径，图 8 至图 12 展开各阶段；图中的 forward wrapper 和实际执行 backward 的 autograd node 分开列出。</p>
 {figure:07}
-<h3 id="zh-backward-reconstruct">先逆转输出的重建过程</h3>
+<h3 id="zh-backward-reconstruct">输出重建的反向传播</h3>
 <p>Backward 从下游对每个输出 embedding 的梯度开始。按 feature 拆开的向量先汇回对应的布局；若 forward 展开过 duplicate occurrences，反向要把这些位置的梯度加回同一个 unique 位置。例如 <code>[2, 6, 2]</code> 的三个 occurrence 梯度 <code>[g0, g1, g2]</code>，给 unique IDs 的梯度就是 <code>[g0 + g2, g1]</code>。接着，unbucketize 对应的张量操作把梯度恢复为输出 AllToAll 接收时的 bucket 布局。这是对 forward 中 tensor 操作的求导，不是依次调用各个 <code>nn.Module.backward()</code>。{source:jt}；{source:output}</p>
 {figure:08}
-<h3 id="zh-backward-a2a">反向通信由两个 autograd.Function 协作完成</h3>
+<h3 id="zh-backward-a2a">反向 AllToAll</h3>
 <p><code>All2All_Seq_Req_Wait.backward</code> 先发起反向 AllToAll，把请求 rank 上的向量梯度送回 row owners；它交换 forward 的 send / receive splits，并按需使用 backward codec。随后，沿 dummy tensor 建立的 autograd 依赖，<code>All2All_Seq_Req.backward</code> 消费这个请求，按需 decode，再用 <code>backward_recat</code> 恢复本地 lookup 的布局。若 <code>GRADIENT_DIVISION</code> 开启，还会除以 process-group size。{source:seq}</p>
 {figure:09}
-<h3 id="zh-backward-wait">由 request-side backward 收尾通信</h3>
+<h3 id="zh-backward-wait">请求端通信等待</h3>
 <p>发起反向通信后，dummy gradient 继续推动 autograd 执行 request-side backward。这个节点先调用 <code>req.wait()</code>，再 decode、执行 backward recat，并按配置缩放梯度，最后把结果交回本地 lookup。</p>
 {figure:10}
-<h3 id="zh-backward-update">本地 embedding 更新与整数输入边界</h3>
+<h3 id="zh-backward-update">本地 Embedding 更新</h3>
 <p>向量梯度回到本地 lookup 后，fused TBE 路径由 backend 在 backward 中完成其配置的 embedding 更新。TorchRec 暴露的 <code>EmbeddingFusedOptimizer.step()</code> 在此实现中设置 backend 的 learning rate，并不是另一次独立的逐行更新。模型其他参数由各自的 optimizer 管理，其他 compute kernel 的更新方式则取决于其实现。{source:tbe}；{source:fused}</p>
 {figure:11}
-<h3 id="zh-backward-boundary">反向传播停在整数输入之前</h3>
+<h3 id="zh-backward-boundary">整数输入边界</h3>
 <p>输入 ID、lengths、offsets 是整数，EC 的输入准备和分发运行在 <code>torch.no_grad()</code> 内。因此，本文这条反向路径不会再把输入阶段的 splits、lengths、IDs AllToAll 各倒放一遍。需要跨 rank 返回的是 embedding 输出的梯度。{source:input}</p>
 {figure:12}
 
-<h2 id="zh-sync">6. 汇总 row-wise sharding 的通信与同步点</h2>
+<h2 id="zh-sync">6. 通信与同步汇总</h2>
 <div class="table-scroll"><table><thead><tr><th>阶段</th><th>跨 rank 传输</th><th>结果在哪消费</th><th>需要区分的同步</th></tr></thead><tbody>
 <tr><td>发送 metadata 准备</td><td>无</td><td><code>dist_splits → length_per_key</code></td><td>未缓存时，CUDA lengths 汇总后读回主机</td></tr>
 <tr><td>Input splits</td><td>Split sizes</td><td>外层 awaitable 的 wait</td><td>CUDA sizes 转 Python lists，存在明确的 CPU 等待</td></tr>
@@ -134,31 +134,31 @@ output = module.compute_and_output_dist(ctx, dist_input)
 <p>对于单个通信组、无额外 KJT 字段的基础路径，AllToAll 调用分别传输输入 splits、lengths、values，输出 embeddings，以及反向 embedding gradients。这个计数描述调用层面的五类通信。多个 sharding group、可选字段和后面的 metadata 融合会改变调用组织方式，NCCL kernel 数量也不能直接由它推出；其他模型参数的通信另计。{source:splits}；{source:tensors}；{source:seq}</p>
 <p>一个 batch 按以下依赖执行：ID 路由完成 → 本地 lookup → embedding 回传与恢复 → 下游计算 → 梯度回传 → 本地更新。输入分发还包含一条 CPU 依赖：主机必须先读到 split-size metadata，才能发起对应 payload。这些先后关系也约束着多个 batch 之间可以重叠的工作。</p>
 
-<h2 id="zh-sources">源码与序列图索引</h2>
+<h2 id="zh-sources">源码与图表索引</h2>
 <p>这 12 张图分别展开 forward 与 backward，各有 6 张。输入分发图标出 H2D、三处 host read 和各次 AllToAll；输出通信与结果重建、反向 launch 与 finalize、本地更新与梯度边界分别列出，方便回查。源码链接对应本文固定的 TorchRec 版本。</p>
 {figure_index}
 <p>阅读源码时，可以从 {source:forward} 的两个 wait 开始，沿 {source:splits}、{source:tensors} 到 {source:seq}，对照通信请求的发起与消费位置。</p>
-<p class="series-next">同系列文章：<a href="torchrec-sparse-dist-pipeline.html">TorchRec sparse dist pipeline：普通调度与 prefetch</a>。</p>
+<p class="series-next">同系列文章：<a href="torchrec-sparse-dist-pipeline.html">TorchRec Sparse Dist Pipeline</a>。</p>
 '''
 
-PIPELINE_ZH = r'''<h1>TorchRec sparse dist pipeline：普通调度与 prefetch</h1>
+PIPELINE_ZH = r'''<h1>TorchRec Sparse Dist Pipeline</h1>
 <p class="lead">输入分发不需要等待前一批的模型输出。TorchRec 利用这个条件，在训练当前 batch 时提前处理后续 batch 的输入。本篇比较普通 TrainPipelineSparseDist 和 PrefetchTrainPipelineSparseDist，沿源码说明两者的 payload 发起时机、第二次 wait、stream 交接，以及 prefetch 所需的缓存约束。</p>
 <div class="note-box"><p>本文分析 TorchRec 提交 <a href="https://github.com/pytorch/torchrec/tree/1d87b8f79b7bb1671cb8be3e646e99e835cce610"><code>1d87b8f79b7bb</code></a> 中的两种 sparse dist pipeline，以多 rank、eager CUDA/NCCL 下的 <code>ShardedEmbeddingCollection</code> 为例。它返回 unpooled sequence embeddings，基础输入是固定 batch stride、无权重的 KJT。实现机制以这份 TorchRec 源码为依据。</p></div>
 <p>Row-wise sharding 把 embedding 表按行分到多个 rank。每个 rank 的样本可能请求其他 rank 持有的行，所以输入分发要把 ID 送到对应的 row owner。<code>KeyedJaggedTensor</code>（KJT）携带 feature keys、ID values 和 lengths / offsets。Row owner 收到输入后查本地表，再通过输出 AllToAll 把向量发回请求方；backward 则沿相反方向回传向量梯度。Pipeline 主要提前调度输入准备和分发，本地 lookup、输出通信和 backward 仍由当前 batch 的模型执行。{source:rw}；{source:input}；{source:seq}</p>
 <p>输入分发分两次等待。第一次消费 split-size metadata，读回接收尺寸并发起 KJT payload 通信；第二次消费 payload，重建本地 lookup 所需的 KJT。第一次返回时，payload 仍可能在传输。Pipeline 可以把这两个阶段安排在不同位置，提前推进后续 batch 的输入准备。各次 AllToAll 的细分调用也可参阅本系列的<a href="torchrec-row-wise-sharding.html#zh-input">row-wise 输入分发</a>。{source:forward}；{source:splits}；{source:tensors}</p>
 <p>这里的 CPU 同步来自 metadata：发送前需要准备各 rank 的 split sizes，第一次 wait 要把接收尺寸从 CUDA 读成 Python lists，第二次 wait 的固定 stride 分支还会整理新 KJT 的 lengths / offsets。非空 CUDA tensor 走 <code>_safe_tolist</code> 路径时，会做 D2H 并同步当前 stream；已经缓存的 metadata 可以跳过重新计算。单独看到 <code>Work.wait()</code>，则不能据此断定 CPU 会等待整张 GPU。{source:kjt_splits}；{source:kjt_init}；{source:host_copy}</p>
 <p class="reading-note">序列图从上往下表示主机提交顺序和逻辑依赖。Activation bar 表示调用或访问区间，错开的窄条表示嵌套 self-call，虚线空心条表示尚未消费的请求；stream 泳道和 bar 长度不代表实测 GPU 耗时。<span class="seq-key seq-h2d">蓝色标 H2D</span>、<span class="seq-key seq-host">红色标 D2H / host sync</span>、<span class="seq-key seq-comm">紫色标 AllToAll</span>，黄色标 request wait，绿色标 stream 依赖。D 编号标出各图中的主机读回位置，实际 stall 次数取决于 metadata 缓存和执行路径。点击消息或文件行号可打开源码，所有图默认适应宽度。</p>
-<h2 id="zh-pipeline">1. Pipeline 从提前执行 input_dist 开始</h2>
+<h2 id="zh-pipeline">1. Pipeline 调度机制</h2>
 <p>训练处理 batch <code>i</code> 时，下一批 <code>i+1</code> 的 ID 已经可以从输入中取出。它的 row-wise 输入分发不依赖当前 batch 的模型输出，所以 TorchRec 可以提前发起这部分工作。当模型执行到下一批的 embedding 调用时，就可以继续处理之前发起的请求。</p>
 <p>TorchRec 通过 tracing / rewrite 找到输入可以提前取出的 sharded module，并改写它的 <code>forward</code>。调度器提前创建 module context、调用 <code>input_dist</code>；模型执行到该模块时，runtime wrapper 从当前 batch 的 context 取回请求和状态，再调用 <code>compute_and_output_dist</code>。本地 lookup、输出 AllToAll 和 backward 仍按原有依赖执行。只有满足改写条件的调用才能采用这种调度。{source:rewrite}；{source:runtime}</p>
-<h3 id="zh-pipeline-distribution">start_sparse_data_dist 与 wait_sparse_data_dist 的分工</h3>
+<h3 id="zh-pipeline-distribution">Input Dist 的启动与等待</h3>
 <ul><li><code>start_sparse_data_dist(batch, ctx)</code>：调用输入分发，并组织可融合的 splits 通信。兼容的 metadata 可按 process group 合并；这不意味着所有 ID payload 合成了一个 collective。</li><li><code>wait_sparse_data_dist(ctx)</code>：消费 fused splits awaitables，把得到的 tensors requests 存入 <code>input_dist_tensors_requests</code>。在这个过程中发起 payload 通信；函数返回时，payload 仍可在进行。</li></ul>
 <p>两种 pipeline 把第二次 wait 放在不同位置。普通版本在 <code>PipelinedForward</code> 中等待并重建输入；prefetch 版本在 <code>prefetch_embeddings</code> 中完成这一步，因为缓存预取需要已经分发好的 ID。{source:wait}；{source:prefetch_helper}</p>
 {figure:13}
-<h3 id="zh-pipeline-streams">Stream 依赖和 tensor 生命周期分别处理</h3>
+<h3 id="zh-pipeline-streams">Stream 依赖与生命周期</h3>
 <p>交接输入和 module context 时，TorchRec 分别处理执行顺序和存储生命周期。<code>wait_stream</code> 让消费者的 GPU 工作等待生产者；<code>record_stream</code> 记录 tensor 在另一个 stream 上的使用，避免 allocator 过早复用它的存储。通信结果是否就绪仍由执行依赖保证，<code>record_stream</code> 不承担等待。{source:stream}；{source:runtime}</p>
 
-<h2 id="zh-sparse">2. 普通 TrainPipelineSparseDist：分发下一批，训练当前批</h2>
+<h2 id="zh-sparse">2. 普通 Sparse Dist Pipeline</h2>
 <p>普通 sparse dist pipeline 分别调度 H2D、input distribution 和训练，最多容纳三个在途 batch。稳定态时，<code>i</code> 做本次 forward / backward，<code>i+1</code> 做输入分发，<code>i+2</code> 从 dataloader 入队并拷到 GPU。以下采用默认配置 <code>enqueue_batch_after_forward=False</code>。{source:ordinary}</p>
 <pre class="code" data-language="python"># 稳定态语义示意；省略边界检查与配置分支。
 zero_grad()
@@ -175,14 +175,14 @@ dequeue_batch(i)</pre>
 <p>下一批 <code>i+1</code> 的 splits 在当前 forward 之前发起；它的 payload 要等当前 forward 返回后、backward 提交前才发起。这样，splits 有机会与当前 forward 重叠，payload 有机会与当前 backward 重叠。设置 <code>enqueue_batch_after_forward=True</code> 会把 H2D 入队移到 forward 之后，仍采用普通 pipeline 的调度。{source:ordinary}</p>
 <p>普通版本没有单独调度 cache prefetch，lookup 内部的缓存管理由 backend 配置决定。实际能重叠多少工作，还取决于 metadata 的 CPU 等待、collective 次序、GPU 资源竞争和 kernel 时长。多个 stream 提供了调度空间，并不保证通信耗时都能被计算覆盖。</p>
 
-<h3 id="zh-multi-iteration">同一个 batch 在三次 progress 中的推进</h3>
+<h3 id="zh-multi-iteration">跨迭代调度</h3>
 <p>沿三次连续的 <code>progress</code> 看，同一个 batch 会依次经过搬运、分发和计算。图 3 默认追踪 <code>N+2</code>：它在 <code>progress(N)</code> 搬到 GPU，在 <code>progress(N+1)</code> 做 input distribution，在 <code>progress(N+2)</code> 被消费并计算。选择阶段或点击操作，可以查看相应依赖和 TorchRec 源码。{source:ordinary}；{source:runtime}</p>
 <p>图 3 的 A1-A4 按一次 progress 内的提交顺序编号：<code>splits(N+1) → output dist(N) → lengths(N+1) → ID values(N+1)</code>。其中既有当前 batch 的工作，也有下一批的工作，编号表示本次 progress 内的提交次序。Backward 仍有 embedding 梯度 AllToAll，只是没有计入这四个 input / forward 标记。图中分别标出 Python forward 返回和 GPU forward 完成，红色区间对应读回 splits 的 host sync。{source:ordinary}；{source:host_copy}；{source:seq}</p>
 {figure:15}
 
-<h2 id="zh-prefetch">3. PrefetchTrainPipelineSparseDist：分发后再提前准备缓存</h2>
+<h2 id="zh-prefetch">3. Prefetch Pipeline</h2>
 <p>Prefetch 版本在 input distribution 之后，单独调度 embedding prefetch。需要缓存的 backend 用分发后的 owner-local IDs 提前准备本地查表所需的缓存；真正的 lookup 仍在当前 batch 的 forward 中执行。<code>ShardedEmbeddingModule.prefetch</code> 把各组输入交给对应 lookup 的 <code>prefetch</code>。{source:prefetch_module}；{source:cache}</p>
-<h3 id="zh-prefetch-waits">提前发起 payload，在 prefetch 中完成第二次 wait</h3>
+<h3 id="zh-prefetch-waits">Payload 与 Prefetch 调度</h3>
 <p>在固定版本里，下一批的 <code>wait_sparse_data_dist(i+1)</code> 被放在当前 forward <strong>之前</strong>，所以下一批的 ID payload 有机会与当前 forward 重叠。当前 forward 返回后，<code>_prefetch(i+1)</code> 才消费 payload、重建 KJT，并发起 prefetch；之后提交当前 batch 的 backward / optimizer，最后再启动 <code>i+2</code> 的 splits。{source:prefetch}</p>
 <pre class="code" data-language="python"># 稳定态语义示意；i+1 的 splits 已在此前启动。
 zero_grad()
@@ -198,12 +198,12 @@ start_sparse_data_dist(i + 2)  # 准备下一次 progress
 dequeue_batch(i)</pre>
 {figure:16}
 <p><code>prefetch_embeddings</code> 在 data_dist stream 中做第二次 <code>request.wait()</code>；prefetch stream 等待该 stream 后，调用模块的 <code>prefetch</code>，并保存 <code>module_input_post_prefetch</code> 与 <code>module_contexts_post_prefetch</code>。下次 forward 的 <code>PrefetchPipelinedForward</code> 直接取这两份状态，让训练 stream 等待 prefetch stream，再执行 <code>compute_and_output_dist</code>，不再在那里消费 input payload request。{source:prefetch_helper}；{source:preforward}</p>
-<h3 id="zh-prefetch-backend">Prefetch 的执行与收益取决于 backend</h3>
+<h3 id="zh-prefetch-backend">Prefetch 后端约束</h3>
 <p><code>GroupedEmbeddingsLookup</code> 只为需要预取的 compute kernel 执行 prefetch，例如 <code>FUSED_UVM_CACHING</code>，其他路径可以直接返回。代码检查的 TBE backend 还要求正确设置 <code>prefetch_pipeline</code>，否则 TorchRec 会记录错误，指出 backward 使用的 cache locations 可能不正确。缓存位置的正确性依赖这些 backend 配置和约束，单独增加 CUDA stream 无法保证。{source:need_prefetch}；{source:cache}</p>
 <p>在 <code>progress()</code> 中，主机先调用 <code>_prefetch(i+1)</code>，再提交 <code>backward(i)</code>。源码没有在这两次调用之间设置统一的 host barrier 来等待下一批 prefetch 完成。两者能否重叠、backend 如何保护 cache locations，要结合 stream 和 cache 约束判断；图中的提交顺序也不能直接换算成 GPU 并行耗时。{source:prefetch}</p>
 <p class="reading-note">图中的 H2D、input distribution、prefetch 和训练泳道按工作角色划分，底层可能还有其他 CUDA/NCCL streams。这个版本另外创建了一个新 Stream 对象，变量名为 <code>_default_stream</code>，并通过 <code>forward_stream</code> 参数传给 prefetch helper。这里的变量名并不表示 CUDA 默认 stream。{source:prefstreams}；{source:prefetch_helper}</p>
 
-<h2 id="zh-compare">4. 两种 pipeline 的差异与首尾阶段</h2>
+<h2 id="zh-compare">4. Pipeline 对比</h2>
 <div class="table-scroll"><table><thead><tr><th>比较点</th><th>TrainPipelineSparseDist</th><th>PrefetchTrainPipelineSparseDist</th></tr></thead><tbody>
 <tr><td><code>i+1</code> 的 splits 启动</td><td>本次 progress 的 forward 前</td><td>前一次 progress 尾部，或首次 fill 时</td></tr>
 <tr><td><code>i+1</code> 的 payload 启动</td><td><code>forward(i)</code> 返回后</td><td><code>forward(i)</code> 之前</td></tr>
@@ -214,7 +214,7 @@ dequeue_batch(i)</pre>
 <tr><td>当前 batch 的实际计算</td><td colspan="2">本地 lookup → 输出 AllToAll → 下游计算 → backward / 反向 AllToAll → optimizer</td></tr>
 </tbody></table></div>
 <p>在本文的源码版本中，prefetch 版本除了多出预取阶段，还改变了 payload 发起时机、第二次 wait 的位置，以及 context 中保存的内容。对照调度时需要一起看这些差异。{source:ordinary}；{source:prefetch}</p>
-<h3 id="zh-pipeline-fill-drain">Fill、steady state 与 drain</h3>
+<h3 id="zh-pipeline-fill-drain">启动、稳态与排空</h3>
 <p>启动时，普通版本先为第一批发起 input distribution，执行第一次 wait，取得 tensors request，再把第二批入队。Prefetch 版本还要完成第一批的第二次 wait 和 prefetch，然后启动第二批的 splits。第一批没有前一批计算可以覆盖这些准备工作，所以启动耗时要单独分析。{source:fill}；{source:prefill}</p>
 <p>进入稳定态后，batch 与 context 始终配对移动。Runtime 消费模块请求时，会从对应字典中 pop；batch 出队时，也要移走匹配的 context。这里假设被改写的 embedding 模块每次 forward 只调用一次，重复消费会报错。队列最多容纳三批，实际在途数量可以更少，显存占用也不能简单按单批大小乘三。{source:fill}；{source:runtime}</p>
 <p>默认 <code>execute_all_batches=True</code> 时，dataloader 耗尽后仍会执行已经入队的批次；没有 <code>i+1</code> 或 <code>i+2</code> 时，相应预备步骤会被跳过。评估模式则不会执行 training 分支中的 backward / optimizer。首尾阶段因此与上面的三批稳定态序列不同。{source:fill}；{source:ordinary}；{source:prefetch}</p>
@@ -223,23 +223,23 @@ dequeue_batch(i)</pre>
 <p>图 1 比较两种 pipeline 的 context 交接；图 2 和图 4 分别展开普通版本与 prefetch 版本的稳定态调用；图 3 沿三次 progress 追踪同一个 batch。三张序列图和交互时间线都按本文源码版本解释调度与依赖。</p>
 {figure_index}
 <p>对照 {source:ordinary} 和 {source:prefetch}，可以看到 payload 的发起位置不同；继续查看 {source:runtime} 和 {source:prefetch_helper}，则能定位第二次 wait 以及 context 的交接。</p>
-<p class="series-next">同系列文章：<a href="torchrec-row-wise-sharding.html">TorchRec row-wise sharding：数据流、通信与同步</a>。</p>
+<p class="series-next">同系列文章：<a href="torchrec-row-wise-sharding.html">TorchRec Row-wise Sharding</a>。</p>
 '''
 
 NATIVE_EN = r'''
-<h1>TorchRec row-wise sharding: data flow, communication, and synchronization</h1>
+<h1>TorchRec row-wise sharding</h1>
 <p class="lead">Row-wise sharding divides an embedding table's rows across ranks. A sample may need rows held on another rank, so lookup sends IDs to the row owners and returns the vectors. Backward sends vector gradients back to those owners. This article follows one batch through forward and backward, covering ID routing, local lookup, output reconstruction, NCCL transfers, and synchronization.</p>
 <div class="note-box"><p>The implementation described here is <code>ShardedEmbeddingCollection</code> at TorchRec commit <a href="https://github.com/pytorch/torchrec/tree/1d87b8f79b7bb1671cb8be3e646e99e835cce610"><code>1d87b8f79b7bb</code></a>, running in eager mode across multiple ranks with CUDA/NCCL. It returns unpooled sequence embeddings. The baseline uses an unweighted KJT with fixed batch stride; deduplication and communication codecs appear as optional branches. All implementation explanations refer to this TorchRec source. Pooled EmbeddingBag output distribution follows a different path.</p></div>
 <p class="reading-note">Read each sequence from top to bottom. Activation bars mark execution or data-access scopes, and offset bars mark nested self-calls. Hollow dashed bars represent unconsumed asynchronous requests. Bars in stream lanes show submission stages; their lengths do not measure GPU time. Full-row bands mark <span class="seq-key seq-h2d">H2D in blue</span>, <span class="seq-key seq-host">D2H / host sync in red</span>, and <span class="seq-key seq-comm">AllToAll in purple</span>. Amber marks request waits, and green marks GPU stream dependencies. D1 / D2 / D3 in Fig. 3 identify three host-read sites; the number of runtime stalls depends on the execution path. Click a message or its file:line label to open the corresponding TorchRec source. Diagrams fit the available width by default and can be enlarged or opened separately.</p>
 
 <p class="reading-note">The diagrams separate module calls, asynchronous requests, and backend computation. Source links below messages locate TorchRec callsites. GPU activity IDs, copy sizes, kernel names, and optimizer settings illustrate specific executions and can vary with inputs, backends, and configuration. Function dependencies and wait locations describe the communication and synchronization mechanism.</p>
-<h2 id="en-layout">1. Start with a table partitioned by rows</h2>
+<h2 id="en-layout">1. Row sharding and KJT</h2>
 <p>Consider an eight-row embedding table with D elements per row. Rank 0 owns global rows 0-3 and rank 1 owns rows 4-7. Each rank receives its own training examples, whose IDs may refer to either shard.</p>
 <div class="table-scroll"><table><thead><tr><th>One feature requested by rank 0</th><th>Send to rank 0</th><th>Send to rank 1</th></tr></thead><tbody><tr><td>Global IDs: <code>[6, 2, 6, 1]</code></td><td>Local IDs: <code>[2, 1]</code></td><td>Local IDs: <code>[2, 2]</code>, both referring to global row 6</td></tr><tr><td>Required output</td><td colspan="2"><code>[E6, E2, E6, E1]</code>, in original occurrence order</td></tr></tbody></table></div>
 <p>For this equally sized, contiguous partition, <code>owner = id // 4</code> and <code>local_id = id % 4</code>. The actual bucketization code takes shard block sizes and other metadata; this simple formula is not universal. TorchRec carries feature keys, flattened ID values, and per-example lengths / offsets in a <code>KeyedJaggedTensor</code> (KJT). Routing values must preserve the corresponding sequence boundaries. {source:bucket}</p>
 <p>Each lookup exchanges ID requests and result vectors while the table remains partitioned across ranks. A local lookup handles requests from all participating ranks, reads only its own table shard, and sends the results back to the requesters. {source:rw}</p>
 
-<h2 id="en-native">2. Forward: distribute IDs, look up rows, return vectors</h2>
+<h2 id="en-native">2. Forward data flow</h2>
 <p><code>ShardedModule.forward</code> creates a context, distributes input, then runs local computation and output distribution. With type annotations omitted, the call order is:</p>
 <pre class="code" data-language="python">ctx = module.create_context()
 dist_input = module.input_dist(ctx, features).wait().wait()
@@ -249,56 +249,56 @@ output = module.compute_and_output_dist(ctx, dist_input)
 <p>Figure 1 summarizes communication by module stage. With the fixed-stride, unweighted KJT used here, each rank issues <strong>4 forward AllToAll calls per row-wise group: one each for input splits, lengths, and ID values, plus one for output embedding vectors</strong>. Splits launch first; the first wait then launches lengths and ID values. The IN / OUT bands summarize these 3 and 1 calls. These are PyTorch collective calls using the NCCL backend; the count does not describe underlying NCCL send/recv operations or GPU kernels. Section 5 covers backward gradient communication separately. {source:splits}; {source:tensors}; {source:seq}</p>
 {figure:01}
 
-<h2 id="en-input">3. Input distribution: reorder inputs, exchange data, synchronize</h2>
-<h3 id="en-input-mapping">Preserve the mappings needed to reconstruct output order</h3>
+<h2 id="en-input">3. Input distribution</h2>
+<h3 id="en-input-mapping">Input permutation maps</h3>
 <p><code>ShardedEmbeddingCollection.input_dist</code> orders features for the sharding and lookup layout, then splits them into groups. With <code>use_index_dedup</code>, it calls <code>jagged_unique_indices</code>, saves the original features and <code>reverse_indices</code>, and sends the deduplicated KJT into bucketization. This deduplicates inputs on the requesting rank; it is not a cross-rank global deduplication operation. {source:input}; {source:prepare}</p>
 <p>Row-wise bucketization groups IDs by destination rank, producing owner-local IDs and new lengths. It also saves <code>unbucketize_permute_tensor</code>, which reverses the routing permutation. The optional <code>reverse_indices</code> mapping expands unique results back to their original occurrences. These mappings solve distinct problems. {source:bucket}</p>
 {figure:02}
 
-<h3 id="en-input-waits">Two AllToAll stages and two waits</h3>
+<h3 id="en-input-waits">Two-stage AllToAll</h3>
 <p>Receive sizes depend on this batch's requests. TorchRec first exchanges split-size metadata, then allocates receive buffers and transfers the KJT payload.</p>
 <ol><li>Launch splits. <code>SplitsAllToAllAwaitable</code> issues asynchronous <code>dist.all_to_all_single</code> for the sizes exchanged between ranks.</li><li>First wait. Consume the splits Work and convert CUDA sizes to Python lists through <code>_safe_tolist_2d</code>. The host needs these values to determine receive sizes. Constructing the tensors awaitable then launches payload communication.</li><li>Transfer payload. The baseline KJT sends lengths and ID values in separate AllToAll calls. Weights or variable stride can change the tensor list.</li><li>Second wait. Consume payload Work handles and run <code>KJT.dist_init</code>, recatting the received data into the lookup layout and preparing KJT metadata.</li></ol>
 <p><code>Awaitable[Awaitable[KJTList]]</code> reflects these two stages. The outer awaitable determines receive sizes and starts the transfer; the inner one turns the received data into usable input. The ID payload may still be in flight when the first wait returns. {source:splits}; {source:tensors}</p>
 {figure:03}
-<h3 id="en-input-sync">Separate Work.wait, host readback, and layout conversion</h3>
+<h3 id="en-input-sync">Waits and host synchronization</h3>
 <p>Host waiting is not limited to receiving splits. Before communication starts, <code>KJT.dist_splits()</code> requires host-side <code>length_per_key</code>. If uncached, TorchRec reduces CUDA lengths and obtains a Python list through <code>_safe_tolist</code>. After receiving payload, the fixed-stride branch of <code>dist_init()</code> calls <code>sync()</code> on the new KJT to prepare its length and offset metadata. {source:kjt_splits}; {source:kjt_lengths}; {source:kjt_init}</p>
 <p>Figure 3 labels send-size preparation, receive-size readback, and KJT metadata reconstruction as D1, D2, and D3. For a nonempty CUDA tensor, the safe-list path performs D2H and explicitly synchronizes the current stream. Cached metadata can be reused. The splits <code>_wait_impl</code> also describes CPU waiting during conversion to a host list. {source:host_copy}; {source:splits}</p>
 <p>An asynchronous collective's <code>Work.wait()</code> marks where TorchRec consumes communication results. The call alone does not establish that the CPU waits for the entire device, or explain all internal NCCL stream behavior. Keep this communication dependency separate from metadata operations that require values on the host.</p>
 <p>Recat transforms the received rank / feature layout into the layout required by the local lookup. It is a local permutation, not another cross-rank transfer. The row owner now has its requests, but has not yet returned embedding vectors.</p>
 
-<h2 id="en-lookup">4. Local lookup, output AllToAll, and order restoration</h2>
-<h3 id="en-lookup-local">The row owner performs the lookup</h3>
+<h2 id="en-lookup">4. Lookup and output reconstruction</h2>
+<h3 id="en-lookup-local">Local lookup</h3>
 <p><code>GroupedEmbeddingsLookup</code> splits the local KJT into compatible embedding groups and calls their embedding kernels. In the fused path, <code>BatchedFusedEmbedding</code> configures TBE with <code>PoolingMode.NONE</code>, passing IDs and offsets to obtain vectors for the distributed ID occurrences. This stage adds no cross-rank collective. The diagram separates backend computation from TorchRec wrappers to distinguish input preparation and table access. Kernel implementations and counts depend on the input and backend. {source:lookup}; {source:tbe}</p>
 <p>Before calling the backend, TorchRec obtains KJT offsets and converts values / offsets to the backend's configured index / offset dtypes. These local preparation operations are distinct from the table lookup, even though they occur within the lookup call's scope. {source:tbe_call}</p>
 {figure:04}
-<h3 id="en-output-a2a">Communication completion still leaves output reconstruction</h3>
+<h3 id="en-output-a2a">Output AllToAll</h3>
 <p><code>SequenceEmbeddingsAllToAll</code> returns vectors from row owners to requesting ranks. <code>All2All_Seq_Req.forward</code> applies <code>forward_recat</code> to prepare the send layout, optionally encodes the payload, and launches asynchronous AllToAll. When the output is consumed, <code>All2All_Seq_Req_Wait.forward</code> consumes the request and optionally decodes the result. {source:output}; {source:seq}</p>
 {figure:05}
-<h3 id="en-output-reconstruct">Lazy wait and the two reconstruction layers</h3>
+<h3 id="en-output-reconstruct">Lazy waits and order restoration</h3>
 <p>Reconstruction has two layers. First, <code>unbucketize_permute_tensor</code> restores the pre-bucketization order. If IDs were deduplicated, <code>reverse_indices</code> expands unique embeddings back to occurrences. The result is split by feature and paired with the original lengths to form <code>Dict[str, JaggedTensor]</code>. The default expansion uses <code>index_select</code>; an optional <code>gather</code> branch serves the same purpose. {source:jt}</p>
 {figure:06}
 <p>For example, <code>[2, 6, 2]</code> can be represented by unique IDs <code>[2, 6]</code> and the inverse map <code>[0, 1, 0]</code>. Returning <code>[E2, E6]</code> must still produce <code>[E2, E6, E2]</code> for the caller. The operator determines the actual unique ordering; the example illustrates the mapping.</p>
 
-<h2 id="en-backward">5. Backward: return gradients to row owners and update local rows</h2>
+<h2 id="en-backward">5. Backward and parameter updates</h2>
 <p>Output embedding gradients flow through the reconstruction operations, reverse AllToAll, and the local embedding kernel. Figure 7 shows the full path; Figures 8 through 12 expand its stages. Forward wrappers and the autograd nodes that execute backward appear as separate actors.</p>
 {figure:07}
-<h3 id="en-backward-reconstruct">Reverse output reconstruction first</h3>
+<h3 id="en-backward-reconstruct">Backward through reconstruction</h3>
 <p>Backward starts from downstream gradients for each output embedding. Gradients from feature splits rejoin the corresponding layout. If forward expanded duplicate occurrences, backward adds their gradients into the same unique position: occurrence gradients <code>[g0, g1, g2]</code> for <code>[2, 6, 2]</code> become <code>[g0 + g2, g1]</code> for the unique IDs. Differentiating unbucketization then restores the bucket layout received by output AllToAll. These are derivatives of tensor operations, not successive calls to wrapper modules' <code>backward()</code> methods. {source:jt}; {source:output}</p>
 {figure:08}
-<h3 id="en-backward-a2a">Two autograd Functions cooperate on reverse communication</h3>
+<h3 id="en-backward-a2a">Backward AllToAll</h3>
 <p><code>All2All_Seq_Req_Wait.backward</code> launches the reverse AllToAll, returning embedding gradients from requesting ranks to row owners. It swaps the forward send / receive splits and optionally applies a backward codec. The dummy-tensor autograd edge then leads to <code>All2All_Seq_Req.backward</code>, which consumes the request, optionally decodes, and applies <code>backward_recat</code> to recover the local lookup layout. When <code>GRADIENT_DIVISION</code> is enabled, it also divides by process-group size. {source:seq}</p>
 {figure:09}
-<h3 id="en-backward-wait">The request-side backward completes communication</h3>
+<h3 id="en-backward-wait">Request-side communication waits</h3>
 <p>After reverse communication launches, the dummy gradient advances autograd to the request-side backward. That node consumes the request, decodes, applies backward recat, optionally scales the gradient, and returns it to the local lookup.</p>
 {figure:10}
-<h3 id="en-backward-update">Local updates and the integer-input boundary</h3>
+<h3 id="en-backward-update">Local embedding updates</h3>
 <p>In the fused TBE path, the backend performs its configured embedding update during backward after receiving the local lookup gradients. TorchRec's <code>EmbeddingFusedOptimizer.step()</code> sets the backend learning rate in this implementation; it is not a second independent row update. Other model parameters still use their configured optimizers, and other compute kernels need not follow this fused behavior. {source:tbe}; {source:fused}</p>
 {figure:11}
-<h3 id="en-backward-boundary">Backward stops at integer inputs</h3>
+<h3 id="en-backward-boundary">Integer-input boundary</h3>
 <p>IDs, lengths, and offsets are integers, and EC prepares and distributes input under <code>torch.no_grad()</code>. Consequently, this backward path does not reverse each input splits, lengths, and ID AllToAll. It sends the differentiable embedding output gradients back to their owners. {source:input}</p>
 {figure:12}
 
-<h2 id="en-sync">6. Communication and synchronization in row-wise sharding</h2>
+<h2 id="en-sync">6. Communication and synchronization</h2>
 <div class="table-scroll"><table><thead><tr><th>Stage</th><th>Cross-rank payload</th><th>Consumption point</th><th>Synchronization distinction</th></tr></thead><tbody>
 <tr><td>Send metadata preparation</td><td>None</td><td><code>dist_splits → length_per_key</code></td><td>Uncached CUDA lengths are reduced and read back to the host</td></tr>
 <tr><td>Input splits</td><td>Split sizes</td><td>Outer awaitable wait</td><td>CUDA sizes become Python lists: explicit host waiting</td></tr>
@@ -310,31 +310,31 @@ output = module.compute_and_output_dist(ctx, dist_input)
 <p>For one communication group with the baseline KJT fields, the inventory is input splits, lengths, and values; output embeddings; and reverse embedding gradients. These five AllToAll calls are not a fixed NCCL kernel count. Additional sharding groups, optional fields, and later metadata fusion change how calls are organized. Communication for other model parameters is outside this inventory. {source:splits}; {source:tensors}; {source:seq}</p>
 <p>A batch follows this dependency chain: route IDs → local lookup → return and reconstruct embeddings → downstream computation → return gradients → local update. Input distribution also has a CPU dependency: the host must read split sizes before launching the corresponding payload. These dependencies also constrain which work can overlap across batches.</p>
 
-<h2 id="en-sources">Source and sequence-diagram index</h2>
+<h2 id="en-sources">Source and diagram index</h2>
 <p>The twelve figures give six views of forward and six of backward. Input distribution labels H2D, three host-read sites, and each AllToAll. Output communication and reconstruction, reverse launch and completion, and local updates and gradient boundaries have separate diagrams for reference. Source links refer to the TorchRec revision used here.</p>
 {figure_index}
 <p>Start with the two waits in {source:forward}, then follow {source:splits}, {source:tensors}, and {source:seq} to locate where communication requests are launched and consumed.</p>
-<p class="series-next">Also in the TorchRec series: <a href="torchrec-sparse-dist-pipeline.html">TorchRec sparse dist pipeline: ordinary scheduling and prefetch</a>.</p>
+<p class="series-next">Also in the TorchRec series: <a href="torchrec-sparse-dist-pipeline.html">TorchRec sparse dist pipeline</a>.</p>
 '''
 
-PIPELINE_EN = r'''<h1>TorchRec sparse dist pipeline: ordinary scheduling and prefetch</h1>
+PIPELINE_EN = r'''<h1>TorchRec sparse dist pipeline</h1>
 <p class="lead">Input distribution does not need the preceding batch's model output. TorchRec uses that independence to prepare later batches while training the current one. This article compares TrainPipelineSparseDist with PrefetchTrainPipelineSparseDist, following their payload launches, second waits, stream handoffs, and backend cache constraints in the source.</p>
 <div class="note-box"><p>This article examines the two sparse distribution pipelines at TorchRec commit <a href="https://github.com/pytorch/torchrec/tree/1d87b8f79b7bb1671cb8be3e646e99e835cce610"><code>1d87b8f79b7bb</code></a>, using multi-rank eager CUDA/NCCL <code>ShardedEmbeddingCollection</code>. It returns unpooled sequence embeddings. The baseline input is an unweighted KJT with fixed batch stride. Implementation explanations refer to this TorchRec source.</p></div>
 <p>Row-wise sharding divides embedding-table rows across ranks. A rank's samples can request rows owned by other ranks, so input distribution routes IDs to their row owners. A <code>KeyedJaggedTensor</code> (KJT) carries feature keys, ID values, and lengths / offsets. Each owner looks up its local rows and returns vectors through output AllToAll; backward sends vector gradients in the reverse direction. Pipeline scheduling advances input preparation and distribution. Local lookup, output communication, and backward still execute as part of the current batch's model work. {source:rw}; {source:input}; {source:seq}</p>
 <p>Input distribution has two waits. The first consumes split-size metadata, reads receive sizes onto the host, and launches the KJT payload. The second consumes that payload and reconstructs the KJT for local lookup. Payload may still be in flight when the first wait returns. A pipeline can schedule these stages separately to prepare later batches ahead of use. For individual AllToAll calls, see <a href="torchrec-row-wise-sharding.html#en-input">row-wise input distribution</a> in this series. {source:forward}; {source:splits}; {source:tensors}</p>
 <p>Host synchronization comes from metadata: split sizes must be prepared before sending, the first wait converts received CUDA sizes to Python lists, and the fixed-stride branch of the second wait prepares the new KJT's length and offset metadata. For nonempty CUDA tensors, <code>_safe_tolist</code> performs D2H and synchronizes the current stream. Cached metadata can avoid recomputation. A <code>Work.wait()</code> call alone does not establish that the CPU waits for the entire device. {source:kjt_splits}; {source:kjt_init}; {source:host_copy}</p>
 <p class="reading-note">Read sequences from top to bottom as host submission order and logical dependencies. Activation bars mark calls or access scopes, offset bars mark nested self-calls, and hollow dashed bars mark unconsumed requests. Stream lanes and bar lengths do not measure GPU time. Bands mark <span class="seq-key seq-h2d">H2D in blue</span>, <span class="seq-key seq-host">D2H / host sync in red</span>, and <span class="seq-key seq-comm">AllToAll in purple</span>; amber marks request waits and green marks stream dependencies. D labels identify host-read sites within each diagram. Runtime stalls depend on cached metadata and the execution path. Messages and file:line labels link to source. All figures fit the available width by default.</p>
-<h2 id="en-pipeline">1. Pipeline scheduling starts by moving input_dist earlier</h2>
+<h2 id="en-pipeline">1. Pipeline scheduling</h2>
 <p>While the model processes batch <code>i</code>, IDs for batch <code>i+1</code> can already be obtained from the next input. Their distribution does not depend on the current batch's model output. TorchRec can advance this preparation so that execution reaches the embedding module with an existing request.</p>
 <p>The scheduler rewrites eligible sharded-module forwards, creates their contexts, and calls <code>input_dist</code> early. When model execution reaches a rewritten module, a runtime wrapper retrieves the request and state for the current batch and continues with <code>compute_and_output_dist</code>. Local lookup, output AllToAll, and backward dependencies remain. Tracing and rewriting determine eligibility; arbitrary sharded calls inside a model do not automatically qualify. {source:rewrite}; {source:runtime}</p>
-<h3 id="en-pipeline-distribution">What start_sparse_data_dist and wait_sparse_data_dist do</h3>
+<h3 id="en-pipeline-distribution">Input distribution launch and wait</h3>
 <ul><li><code>start_sparse_data_dist(batch, ctx)</code> initiates input distribution and organizes compatible splits communication. Metadata can be fused by process group; this does not merge every ID payload into one collective.</li><li><code>wait_sparse_data_dist(ctx)</code> consumes fused splits awaitables and stores tensors requests in <code>input_dist_tensors_requests</code>. It launches payload communication along the way; that payload can still be in flight when the function returns.</li></ul>
 <p>The two pipelines place the second wait in different functions. The ordinary version waits and reconstructs input in <code>PipelinedForward</code>. The prefetch version does so in <code>prefetch_embeddings</code>, because cache prefetch needs IDs that have already been distributed. {source:wait}; {source:prefetch_helper}</p>
 {figure:13}
-<h3 id="en-pipeline-streams">Handle stream ordering and storage lifetime separately</h3>
+<h3 id="en-pipeline-streams">Stream dependencies and lifetimes</h3>
 <p>TorchRec handles execution order and storage lifetime separately when handing off distributed input and module context. <code>wait_stream</code> makes consumer GPU work wait for the producer. <code>record_stream</code> records tensor use on another stream so the allocator does not reuse its storage too early. Execution dependencies determine when communication results are ready; recording the stream does not perform that wait. {source:stream}; {source:runtime}</p>
 
-<h2 id="en-sparse">2. TrainPipelineSparseDist: distribute the next batch, train the current one</h2>
+<h2 id="en-sparse">2. Standard sparse dist pipeline</h2>
 <p>The ordinary pipeline schedules H2D, input distribution, and training, with room for up to three batches in flight. In steady state, <code>i</code> runs forward / backward, <code>i+1</code> advances input distribution, and <code>i+2</code> enters the queue and is copied to the GPU. The sequence uses the default <code>enqueue_batch_after_forward=False</code>. {source:ordinary}</p>
 <pre class="code" data-language="python"># Steady-state pseudocode: boundary checks and configuration branches omitted.
 zero_grad()
@@ -351,14 +351,14 @@ dequeue_batch(i)</pre>
 <p>For <code>i+1</code>, splits launch before the current forward, whereas payload launches after forward returns and before backward is submitted. This creates opportunities for splits to overlap current forward work, and payload to overlap current backward work. Setting <code>enqueue_batch_after_forward=True</code> moves H2D enqueue after forward; it does not add an independent prefetch stage. {source:ordinary}</p>
 <p>The ordinary version has no separately scheduled cache prefetch. The backend configuration controls caching within lookup. Host metadata waits, collective ordering, GPU resource contention, and kernel duration determine how much work can overlap. Multiple streams allow overlap but do not guarantee that computation hides all communication time.</p>
 
-<h3 id="en-multi-iteration">One batch across three progress calls</h3>
+<h3 id="en-multi-iteration">Scheduling across iterations</h3>
 <p>Across three consecutive progress calls, one batch is copied, distributed, then used for computation. Figure 3 follows <code>N+2</code> by default: it is copied during <code>progress(N)</code>, distributed during <code>progress(N+1)</code>, and consumed during <code>progress(N+2)</code>. Select a phase or click an operation to inspect its dependencies and TorchRec source. {source:ordinary}; {source:runtime}</p>
 <p>In Fig. 3, A1-A4 follow submission order within one progress call: <code>splits(N+1) → output dist(N) → lengths(N+1) → ID values(N+1)</code>. The labels cover work from both the current and next batch and follow submission order within this progress call. Backward still includes embedding-gradient AllToAll, which is outside these four input / forward labels. The diagram marks Python forward return separately from GPU forward completion. The red interval marks host synchronization while reading splits. {source:ordinary}; {source:host_copy}; {source:seq}</p>
 {figure:15}
 
-<h2 id="en-prefetch">3. PrefetchTrainPipelineSparseDist: prepare the cache after distribution</h2>
+<h2 id="en-prefetch">3. Prefetch pipeline</h2>
 <p>The prefetch version schedules embedding prefetch after input distribution. Backends that need caching use the distributed owner-local IDs to prepare the cache before lookup. The lookup itself still runs in the current batch's forward. <code>ShardedEmbeddingModule.prefetch</code> passes each group's input to the corresponding lookup's <code>prefetch</code> method. {source:prefetch_module}; {source:cache}</p>
-<h3 id="en-prefetch-waits">Payload launch moves earlier; the second wait moves into prefetch</h3>
+<h3 id="en-prefetch-waits">Payload and prefetch scheduling</h3>
 <p>In the pinned implementation, <code>wait_sparse_data_dist(i+1)</code> runs <strong>before</strong> the current forward, allowing the next ID payload to overlap forward computation. After forward returns, <code>_prefetch(i+1)</code> consumes the payload, reconstructs the KJT, and schedules prefetch. The scheduler then submits current backward / optimizer work and starts splits for <code>i+2</code>. {source:prefetch}</p>
 <pre class="code" data-language="python"># Steady-state pseudocode: splits for i+1 have already been started.
 zero_grad()
@@ -374,12 +374,12 @@ start_sparse_data_dist(i + 2)  # prepare the following progress call
 dequeue_batch(i)</pre>
 {figure:16}
 <p><code>prefetch_embeddings</code> performs the second <code>request.wait()</code> on the data_dist stream. The prefetch stream joins it, calls the module's <code>prefetch</code>, and saves <code>module_input_post_prefetch</code> and <code>module_contexts_post_prefetch</code>. On the next forward, <code>PrefetchPipelinedForward</code> consumes those objects, makes the training stream wait for the prefetch stream, and invokes <code>compute_and_output_dist</code>. It no longer consumes an input payload request there. {source:prefetch_helper}; {source:preforward}</p>
-<h3 id="en-prefetch-backend">Actual cache work depends on the backend</h3>
+<h3 id="en-prefetch-backend">Prefetch backend constraints</h3>
 <p><code>GroupedEmbeddingsLookup</code> enters its prefetch path only for compute kernels requiring it, such as <code>FUSED_UVM_CACHING</code>; otherwise it can return immediately. For the TBE backends checked in the code, <code>prefetch_pipeline</code> must also be configured correctly. TorchRec logs an error otherwise, warning that backward cache locations may be wrong. Adding a CUDA stream alone does not establish the complete cache correctness protocol. {source:need_prefetch}; {source:cache}</p>
 <p>The host calls <code>_prefetch(i+1)</code> before submitting <code>backward(i)</code>. The <code>progress()</code> implementation does not insert a universal host barrier requiring next-batch prefetch to finish before current backward. Actual overlap and protection of cache locations depend on backend stream and cache constraints. These source-level submission sequences are not measured GPU timelines. {source:prefetch}</p>
 <p class="reading-note">The four GPU work lanes represent H2D, input distribution, prefetch, and training roles, not an exhaustive list of CUDA/NCCL streams. This version also creates a new Stream object named <code>_default_stream</code> and passes it as <code>forward_stream</code> to the prefetch helper. Its variable name does not make it CUDA's default stream. {source:prefstreams}; {source:prefetch_helper}</p>
 
-<h2 id="en-compare">4. Compare the pipelines and account for startup and drain</h2>
+<h2 id="en-compare">4. Pipeline comparison</h2>
 <div class="table-scroll"><table><thead><tr><th>Operation</th><th>TrainPipelineSparseDist</th><th>PrefetchTrainPipelineSparseDist</th></tr></thead><tbody>
 <tr><td>Launch splits for <code>i+1</code></td><td>Before forward in this progress call</td><td>At the end of the preceding call, or during initial fill</td></tr>
 <tr><td>Launch payload for <code>i+1</code></td><td>After <code>forward(i)</code> returns</td><td>Before <code>forward(i)</code></td></tr>
@@ -395,16 +395,16 @@ dequeue_batch(i)</pre>
 <p>In steady state, batches and contexts move together. Runtime pops a module's request from the corresponding dictionary when consuming it, and dequeue must remove the matching context. Rewritten embedding modules are assumed to run once per model forward; repeated consumption raises an error. The queue holds up to three batches. Fewer may be in flight, and memory usage cannot be inferred by multiplying the size of one batch by three. {source:fill}; {source:runtime}</p>
 <p>With the default <code>execute_all_batches=True</code>, already queued batches continue after the dataloader is exhausted. Preparation is skipped when <code>i+1</code> or <code>i+2</code> does not exist. Evaluation omits the training branch's backward and optimizer calls. These startup and drain sequences therefore differ from the full three-batch steady-state diagrams. {source:fill}; {source:ordinary}; {source:prefetch}</p>
 
-<h2 id="en-sources">Source and figure index</h2>
+<h2 id="en-sources">Source and diagram index</h2>
 <p>Figure 1 compares context handoff in both pipelines. Figures 2 and 4 show the ordinary and prefetch steady-state call sequences. Figure 3 follows one batch across three progress calls. The sequences and interactive timeline describe scheduling and dependencies in the source revision used here.</p>
 {figure_index}
 <p>Compare {source:ordinary} with {source:prefetch} to locate their payload launches, then inspect {source:runtime} and {source:prefetch_helper} for the second wait and context handoff.</p>
-<p class="series-next">Also in the TorchRec series: <a href="torchrec-row-wise-sharding.html">TorchRec row-wise sharding: data flow, communication, and synchronization</a>.</p>
+<p class="series-next">Also in the TorchRec series: <a href="torchrec-row-wise-sharding.html">TorchRec row-wise sharding</a>.</p>
 '''
-NATIVE_NAV_ZH = [('layout', '1. 行分片与 KJT'), ('native', '2. forward'), ('input', '3. 输入重排、AllToAll 与同步'), ('lookup', '4. Lookup 与输出恢复'), ('backward', '5. Backward 与本地更新'), ('sync', '6. 通信与同步点汇总'), ('sources', '源码与序列图索引')]
-PIPELINE_NAV_ZH = [('pipeline', '1. Pipeline 的共同机制'), ('sparse', '2. 普通 sparse dist pipeline'), ('prefetch', '3. 带 prefetch 的 pipeline'), ('compare', '4. 两种调度与首尾阶段'), ('sources', '源码与序列图索引')]
-NATIVE_NAV_EN = [('layout', '1. Row shards and KJT'), ('native', '2. Forward'), ('input', '3. Input distribution'), ('lookup', '4. Lookup and reconstruction'), ('backward', '5. Backward and local updates'), ('sync', '6. Communication inventory'), ('sources', 'Sources and diagram index')]
-PIPELINE_NAV_EN = [('pipeline', '1. Shared pipeline mechanics'), ('sparse', '2. Ordinary sparse pipeline'), ('prefetch', '3. Prefetch pipeline'), ('compare', '4. Comparison, fill, and drain'), ('sources', 'Sources and diagram index')]
+NATIVE_NAV_ZH = [('layout', '1. 行分片与 KJT'), ('native', '2. Forward 数据流'), ('input', '3. Input Distribution'), ('lookup', '4. Lookup 与输出恢复'), ('backward', '5. Backward 与参数更新'), ('sync', '6. 通信与同步汇总'), ('sources', '源码与图表索引')]
+PIPELINE_NAV_ZH = [('pipeline', '1. Pipeline 调度机制'), ('sparse', '2. 普通 Sparse Dist Pipeline'), ('prefetch', '3. Prefetch Pipeline'), ('compare', '4. Pipeline 对比'), ('sources', '源码与图表索引')]
+NATIVE_NAV_EN = [('layout', '1. Row sharding and KJT'), ('native', '2. Forward data flow'), ('input', '3. Input distribution'), ('lookup', '4. Lookup and output reconstruction'), ('backward', '5. Backward and parameter updates'), ('sync', '6. Communication and synchronization'), ('sources', 'Source and diagram index')]
+PIPELINE_NAV_EN = [('pipeline', '1. Pipeline scheduling'), ('sparse', '2. Standard sparse dist pipeline'), ('prefetch', '3. Prefetch pipeline'), ('compare', '4. Pipeline comparison'), ('sources', 'Source and diagram index')]
 
 def source(key, lang):
     path, lines, zh, en = SOURCES[key]
@@ -477,11 +477,11 @@ HEAD = '''<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__TITLE__</title>
 __POST_META__
-<script src="../lang-toggle.js?v=torchrec-static-series-1" defer></script>
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Geist+Mono:wght@400;500&amp;display=swap">
-<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
 <style>
 html[lang="en"] .lang-zh { display: none !important; }
 html[lang="zh-CN"] .lang-en { display: none !important; }
@@ -516,8 +516,6 @@ main.content h1, main.content h2, main.content h3 { letter-spacing: 0; }
 .seq-comm { color: #6d28d9; background: #f5f3ff; border-color: #c4b5fd; }
 .figure-sources { display: block; margin-top: 5px; color: var(--fg-muted); font-size: 12px; }
 .series-next { margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--border); }
-.post-page aside.toc .toc-subsections { margin: 4px 0 8px 10px; padding-left: 10px; border-left: 1px solid var(--border); columns: 1; }
-.post-page aside.toc .toc-subsections a { white-space: normal; overflow-wrap: anywhere; font-size: 12px; line-height: 1.45; padding: 4px 0; }
 .post-page .post-series-list a, .post-page .post-series-current { white-space: normal; overflow-wrap: anywhere; line-height: 1.55; }
 .figure-index { list-style: none; padding-left: 0; }
 .figure-index li { padding: 6px 0; border-bottom: 1px solid var(--border); }
@@ -549,17 +547,6 @@ window.addEventListener('message', function (event) {
   if (frame && Number.isFinite(height) && height >= 400 && height <= 4000) frame.style.height = Math.ceil(height) + 'px';
 });
 
-// Keep the shared contents rail below the active title on narrow screens.
-function positionArticleToc() {
-  var lang = document.documentElement.lang === 'en' ? 'en' : 'zh';
-  var header = document.querySelector('main .lang-' + lang + ' .post-header');
-  var toc = document.querySelector('aside.toc');
-  if (header && toc) header.insertAdjacentElement('afterend', toc);
-}
-document.addEventListener('DOMContentLoaded', positionArticleToc);
-new MutationObserver(positionArticleToc).observe(document.documentElement, {
-  attributes: true, attributeFilter: ['lang']
-});
 document.querySelectorAll('[data-zoom]').forEach(function (button) {
   button.addEventListener('click', function () {
     var figure = button.closest('.sequence');
@@ -576,7 +563,7 @@ document.querySelectorAll('[data-zoom]').forEach(function (button) {
 </body></html>
 '''
 
-POSTS = [{'slug': 'torchrec-row-wise-sharding', 'title': 'TorchRec row-wise sharding：数据流、通信与同步', 'title_en': 'TorchRec row-wise sharding: data flow, communication, and synchronization', 'tags': 'TorchRec, Row-wise Sharding, Embedding, NCCL', 'reading': '18 分钟', 'reading_en': '15 min', 'summary': '沿单个 batch 的 forward 与 backward，说明 row-wise ID 分发、本地 lookup、输出恢复和梯度回传。12 张序列图标出 H2D、CPU 同步与各次 AllToAll，并链接到固定版本的 TorchRec 源码。', 'summary_en': 'Follow one batch through row-wise forward and backward. Twelve sequence diagrams trace ID distribution, lookup, output reconstruction, and reverse gradients, with H2D, host synchronization, AllToAll, and pinned TorchRec source links.', 'series_order': 1, 'prefix': 'NATIVE', 'keys': ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12']}, {'slug': 'torchrec-sparse-dist-pipeline', 'title': 'TorchRec sparse dist pipeline：普通调度与 prefetch', 'title_en': 'TorchRec sparse dist pipeline: ordinary scheduling and prefetch', 'tags': 'TorchRec, Pipeline, Embedding, Prefetch, NCCL', 'reading': '12 分钟', 'reading_en': '10 min', 'summary': '比较 TrainPipelineSparseDist 与 PrefetchTrainPipelineSparseDist 的 payload 发起时机、两次 wait、context 交接和 stream 依赖。3 张序列图与三轮交互时间线说明稳定态调度、启动和排空。', 'summary_en': 'Compare ordinary and prefetch sparse distribution pipelines: payload launches, the two waits, context handoff, and stream dependencies. Three sequence diagrams and an interactive timeline cover steady state, fill, and drain.', 'series_order': 2, 'prefix': 'PIPELINE', 'keys': ['13', '14', '15', '16']}]
+POSTS = [{'slug': 'torchrec-row-wise-sharding', 'title': 'TorchRec Row-wise Sharding', 'title_en': 'TorchRec row-wise sharding', 'tags': 'TorchRec, Row-wise Sharding, Embedding, NCCL', 'reading': '18 分钟', 'reading_en': '15 min', 'summary': '沿单个 batch 的 forward 与 backward，说明 row-wise ID 分发、本地 lookup、输出恢复和梯度回传。12 张序列图标出 H2D、CPU 同步与各次 AllToAll，并链接到固定版本的 TorchRec 源码。', 'summary_en': 'Follow one batch through row-wise forward and backward. Twelve sequence diagrams trace ID distribution, lookup, output reconstruction, and reverse gradients, with H2D, host synchronization, AllToAll, and pinned TorchRec source links.', 'series_order': 1, 'prefix': 'NATIVE', 'keys': ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12']}, {'slug': 'torchrec-sparse-dist-pipeline', 'title': 'TorchRec Sparse Dist Pipeline', 'title_en': 'TorchRec sparse dist pipeline', 'tags': 'TorchRec, Pipeline, Embedding, Prefetch, NCCL', 'reading': '12 分钟', 'reading_en': '10 min', 'summary': '比较 TrainPipelineSparseDist 与 PrefetchTrainPipelineSparseDist 的 payload 发起时机、两次 wait、context 交接和 stream 依赖。3 张序列图与三轮交互时间线说明稳定态调度、启动和排空。', 'summary_en': 'Compare ordinary and prefetch sparse distribution pipelines: payload launches, the two waits, context handoff, and stream dependencies. Three sequence diagrams and an interactive timeline cover steady state, fill, and drain.', 'series_order': 2, 'prefix': 'PIPELINE', 'keys': ['13', '14', '15', '16']}]
 
 def build_post(post):
     metadata = {key: post[key] for key in ('title', 'title_en', 'slug', 'tags', 'reading', 'reading_en', 'summary', 'summary_en', 'series_order')}
