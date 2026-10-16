@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>FP8 缩放机制与训练 Recipe</title>
-<meta name="post:title"           content="FP8 缩放机制与训练 Recipe">
-<meta name="post:title_en"        content="FP8 Scaling Mechanisms and Training Recipes">
+<title>FP8 缩放与训练 Recipe</title>
+<meta name="post:title"           content="FP8 缩放与训练 Recipe">
+<meta name="post:title_en"        content="FP8 scaling and training recipes">
 <meta name="post:slug"            content="fp8-scaling-recipes">
 <meta name="post:date"            content="2026-07-07">
 <meta name="post:tags"            content="LLM, 训练系统, FP8, 量化">
@@ -21,9 +21,9 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
 <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js" defer></script>
-<script src="../lang-toggle.js" defer></script>
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <style>
   main.content { max-width: 1180px; padding: 56px 32px 96px; }
   @media (max-width: 1180px) { main.content { padding: 48px 22px 84px; } }
@@ -117,17 +117,17 @@
     <div class="toc-title">目录 · TOC</div>
     <div class="lang-zh">
     <ul>
-      <li><a href="#zh-scope">0. 范围</a></li>
+      <li><a href="#zh-scope">0. 适用范围</a></li>
       <li><a href="#zh-format">1. FP8 数值格式</a></li>
-      <li><a href="#zh-scaling">2. scale 的位置</a></li>
-      <li><a href="#zh-map">3. recipe 分类图</a></li>
-      <li><a href="#zh-granularity">4. scale 粒度</a></li>
-      <li><a href="#zh-mxfp8-gemm">5. MXFP8 GEMM 的数学语义</a></li>
-      <li><a href="#zh-update">6. amax 更新方式</a></li>
-      <li><a href="#zh-training">7. 训练系统里的 recipe</a></li>
-      <li><a href="#zh-te-mha">8. TE MHA 的实现例子</a></li>
-      <li><a href="#zh-fake-gemm">9. 用 BF16 GEMM 模拟 MXFP8</a></li>
-      <li><a href="#zh-pytorch">10. PyTorch 视角</a></li>
+      <li><a href="#zh-scaling">2. Scale 语义</a></li>
+      <li><a href="#zh-map">3. Recipe 分类</a></li>
+      <li><a href="#zh-granularity">4. Scale 粒度</a></li>
+      <li><a href="#zh-mxfp8-gemm">5. MXFP8 GEMM 语义</a></li>
+      <li><a href="#zh-update">6. Amax 更新</a></li>
+      <li><a href="#zh-training">7. 训练 Recipe</a></li>
+      <li><a href="#zh-te-mha">8. Transformer Engine MHA</a></li>
+      <li><a href="#zh-fake-gemm">9. BF16 模拟 MXFP8</a></li>
+      <li><a href="#zh-pytorch">10. PyTorch 实现</a></li>
       <li><a href="#zh-refs">参考资料</a></li>
     </ul>
     </div>
@@ -135,15 +135,15 @@
     <ul>
       <li><a href="#en-scope">0. Scope</a></li>
       <li><a href="#en-format">1. FP8 formats</a></li>
-      <li><a href="#en-scaling">2. Where scale lives</a></li>
-      <li><a href="#en-map">3. Recipe map</a></li>
+      <li><a href="#en-scaling">2. Scale semantics</a></li>
+      <li><a href="#en-map">3. Recipe taxonomy</a></li>
       <li><a href="#en-granularity">4. Scale granularity</a></li>
       <li><a href="#en-mxfp8-gemm">5. MXFP8 GEMM semantics</a></li>
-      <li><a href="#en-update">6. Amax update policy</a></li>
-      <li><a href="#en-training">7. Recipes in training systems</a></li>
-      <li><a href="#en-te-mha">8. Transformer Engine MHA example</a></li>
-      <li><a href="#en-fake-gemm">9. Simulating MXFP8 with BF16 GEMM</a></li>
-      <li><a href="#en-pytorch">10. PyTorch view</a></li>
+      <li><a href="#en-update">6. Amax updates</a></li>
+      <li><a href="#en-training">7. Training recipes</a></li>
+      <li><a href="#en-te-mha">8. Transformer Engine MHA</a></li>
+      <li><a href="#en-fake-gemm">9. MXFP8 emulation with BF16</a></li>
+      <li><a href="#en-pytorch">10. PyTorch implementation</a></li>
       <li><a href="#en-refs">References</a></li>
     </ul>
     </div>
@@ -153,11 +153,11 @@
 
 <div class="lang-zh">
 
-<h1>FP8 缩放机制与训练 Recipe</h1>
+<h1>FP8 缩放与训练 Recipe</h1>
 
 <p class="lead">LLM 训练中的线性层和 attention 包含大量 GEMM，FP8 可以降低 operand 的存储与传输成本，并使用相应的 Tensor Core 路径。8 bit 浮点格式的动态范围和有效精度有限，训练系统因而要为量化值配套 scale，并明确 scale 粒度、更新时间、同步范围与算子边界。这组共同决定数值行为和执行成本的约定构成 FP8 training recipe。本文从数值格式与量化公式出发，逐步连接到 MXFP8 GEMM、Transformer Engine attention 和 BF16 fake quantization。</p>
 
-<h2 id="zh-scope">0. 范围</h2>
+<h2 id="zh-scope">0. 适用范围</h2>
 
 <p>本文讨论 LLM 训练中的 FP8 mixed precision，范围包括 Transformer block 内的线性层、MLP 与部分 attention 计算。FP8 在这些计算密集位置充当局部加速类型；optimizer state、master weights、loss、softmax、normalization 与 reduction 通常保留 BF16 或 FP32，以满足各自的动态范围和累加精度要求。</p>
 
@@ -188,7 +188,7 @@
 
 <p>这种分配反映了常见训练张量的取舍：forward 的权重与 activation 往往更受 mantissa 精度影响，梯度则更容易出现较大的动态范围，因此 backward 常使用 exponent 更宽的 E5M2。具体模型仍需通过 amax、saturation 与收敛曲线验证格式选择。</p>
 
-<h2 id="zh-scaling">2. scale 的位置</h2>
+<h2 id="zh-scaling">2. Scale 语义</h2>
 
 <p>外部 scaling 把各个 tensor 的数值分布映射到 FP8 的有限网格。同一个 LLM 中，不同 tensor 的 amax 可能相差数个数量级，例如 0.02 与 2000。独立 scale 既让较大值进入可表示范围，也让常见值使用分辨率更高的码点区域。</p>
 
@@ -233,7 +233,7 @@ x_hat_i = r_i * scale_inv_b(i)</pre>
 
 <p>BF16 依靠更宽的 exponent 覆盖训练中常见的数值范围；FP8 则把这部分适配工作显式交给 scale 与 recipe。</p>
 
-<h2 id="zh-map">3. recipe 分类图</h2>
+<h2 id="zh-map">3. Recipe 分类</h2>
 
 <p>FP8 recipe 由多条相互独立的决策轴组成。下图分别列出 format、scale 粒度、amax 更新、张量覆盖范围与分布式同步；一个实际配置可以同时采用 HYBRID format、delayed scaling、per-tensor FP32 scale 和跨 TP group 的 amax reduction。</p>
 
@@ -241,7 +241,7 @@ x_hat_i = r_i * scale_inv_b(i)</pre>
 
 <div class="lang-en">
 
-<h1>FP8 Scaling Mechanisms and Training Recipes</h1>
+<h1>FP8 scaling and training recipes</h1>
 
 <p class="lead">Linear layers and attention account for a large share of the GEMMs in LLM training. FP8 reduces operand storage and transport costs and enables the corresponding Tensor Core paths, but its limited dynamic range and effective precision require an external scale. The scale granularity, update policy, synchronization domain, and operator boundaries jointly define the numerical behavior and execution cost of an FP8 training recipe. This article begins with formats and quantization equations, then connects them to MXFP8 GEMM, Transformer Engine attention, and BF16 fake quantization.</p>
 
@@ -276,7 +276,7 @@ x_hat_i = r_i * scale_inv_b(i)</pre>
 
 <p>This split reflects a common training tradeoff. Forward weights and activations often benefit from mantissa precision, while gradients are more likely to require additional exponent range. A concrete model still needs validation through amax traces, saturation rates, and convergence behavior.</p>
 
-<h2 id="en-scaling">2. Where scale lives</h2>
+<h2 id="en-scaling">2. Scale semantics</h2>
 
 <p>External scaling maps each tensor distribution onto the finite FP8 grid. Tensor amax values inside one LLM can differ by several orders of magnitude, such as 0.02 and 2000. Independent scales keep large values within range while placing common values in regions with useful resolution.</p>
 
@@ -321,7 +321,7 @@ x_hat_i = r_i * scale_inv_b(i)</pre>
 
 <p>BF16 covers common training ranges through a wider exponent. FP8 delegates that adaptation explicitly to scales and the surrounding recipe.</p>
 
-<h2 id="en-map">3. Recipe map</h2>
+<h2 id="en-map">3. Recipe taxonomy</h2>
 
 <p>An FP8 recipe combines several independent decision axes. The map separates format, scale granularity, amax updates, tensor coverage, and distributed synchronization. One configuration may simultaneously use HYBRID format, delayed scaling, per-tensor FP32 scales, and a cross-TP amax reduction.</p>
 
@@ -344,7 +344,7 @@ x_hat_i = r_i * scale_inv_b(i)</pre>
 
 <div class="lang-zh">
 
-<h2 id="zh-granularity">4. scale 粒度</h2>
+<h2 id="zh-granularity">4. Scale 粒度</h2>
 
 <p>scale 粒度决定一个 scale 覆盖多少元素。粒度越粗,metadata 越少,kernel 越简单,但 outlier 会影响更多元素。粒度越细,数值更稳,但 scale 的存储、加载、同步和 layout 都会变复杂。</p>
 
@@ -371,7 +371,7 @@ Y[m, n] = sum_k X[m, k] * W[k, n]
 X[m, k:k+32]      # 沿 K
 W[k:k+32, n]      # 也沿 K</pre>
 
-<h2 id="zh-mxfp8-gemm">5. MXFP8 GEMM 的数学语义</h2>
+<h2 id="zh-mxfp8-gemm">5. MXFP8 GEMM 语义</h2>
 
 <p>把 GEMM 写成 <code>C[M,N] = A[M,K] @ B[K,N]</code>。MXFP8 block-scaled MMA 接收带有 block scale 的输入 operand：沿 <code>K</code> 的每个 32-value chunk 共享一个 scale，MMA 将解码并缩放后的值累加到 FP32 accumulator。其数学语义可以写成：</p>
 
@@ -412,7 +412,7 @@ C_hat[m, n] = decode_fp8(qC[m, n]) * scale_inv_C[block(m, n)]</pre>
 
 <p>QKV projection 的 output quantizer 沿 packed feature 维量化，也就是 <code>[M, 3*H*D]</code> 的最后一维。attention 的两次 matmul 则要求 Q/K 沿 head dim <code>D</code> 分块，V 沿 sequence 维 <code>Sk</code> 分块。reshape 只能改变 FP8 payload 的逻辑视图，无法重新定义既有 scale 对应的 block membership；因此，projection output 要成为 MXFP8 attention operand，需要在 DPA 边界按新的 reduction 方向重新量化。</p>
 
-<h2 id="zh-update">6. amax 更新方式</h2>
+<h2 id="zh-update">6. Amax 更新</h2>
 
 <p>scale 通常来自 amax,也就是 tensor 的最大绝对值。recipe 需要决定什么时候拿到这个 amax,以及用它怎样更新下一次的 scale。</p>
 
@@ -428,7 +428,7 @@ C_hat[m, n] = decode_fp8(qC[m, n]) * scale_inv_C[block(m, n)]</pre>
 
 <p>DelayedScaling 的状态一般包含 amax history、history 长度、取 history 最大值还是最近值、margin、format、以及分布式 reduce 规则。从实现角度看,它是一套 operator state。每个参与 FP8 的 tensor 都要能找到自己的 scale 和 amax 记录。</p>
 
-<h2 id="zh-training">7. 训练系统里的 recipe</h2>
+<h2 id="zh-training">7. 训练 Recipe</h2>
 
 <p>把前面的轴组合起来,常见 recipe 大致有下面几类。</p>
 
@@ -447,7 +447,7 @@ C_hat[m, n] = decode_fp8(qC[m, n]) * scale_inv_C[block(m, n)]</pre>
 
 <p>分布式训练还要规定 amax 的同步域。TP 或 FSDP group 内的 rank 可以使用局部统计，也可以规约出共享统计；这项选择会影响 checkpoint 一致性、recompute、通信融合和调试。Transformer Engine 的 <code>reduce_amax</code> 等选项用于表达性能、确定性与局部分布适配之间的取舍。</p>
 
-<h2 id="zh-te-mha">8. TE MHA 的实现例子</h2>
+<h2 id="zh-te-mha">8. Transformer Engine MHA</h2>
 
 <p>Transformer Engine 的 MHA 数据流依次经过 QKV projection、dot product attention（DPA）和 output projection。FP8 recipe 可以控制 DPA 内部计算，也可以控制这三个模块之间的 tensor dtype；backend selector 再根据硬件、cuDNN、layout 与 recipe 类型选择可执行路径。TE v2.16 的 MXFP8 attention 把 DPA 视为独立 consumer，在其入口按 attention 的 reduction 方向量化 Q/K/V。</p>
 
@@ -528,7 +528,7 @@ DPA:
 
 <p>selector 还要求 sm100+、满足版本要求的 cuDNN，以及 <code>qkv_format != "thd"</code> 等条件。任一条件失败都会关闭 FusedAttention，并可能使当前组合缺少可用的 FP8 attention backend。</p>
 
-<h2 id="zh-fake-gemm">9. 用 BF16 GEMM 模拟 MXFP8</h2>
+<h2 id="zh-fake-gemm">9. BF16 模拟 MXFP8</h2>
 
 <p>BF16 GEMM 可以承载 MXFP8 的数值 reference：输入先按 MXFP8 block scale 规则量化到 FP8，再反量化回 BF16，最后调用原有 GEMM。该 fake quantization 路径复现量化与反量化误差；Tensor Core 吞吐、寄存器布局和 scale load 开销仍属于真实 MXFP8 kernel 的性能特征。</p>
 
@@ -624,7 +624,7 @@ def mxfp8_gemm_sim(A, B, fp32_accum=False):
 
 <p>这段模拟可以用于两类对照。评估 MXFP8 cast 对既有 BF16 GEMM 的影响时，保留 BF16 GEMM；构造更稳定的数值 reference 时，设置 <code>fp32_accum=True</code> 并让最后的 matmul 使用 FP32 accumulation。</p>
 
-<h2 id="zh-pytorch">10. PyTorch 视角</h2>
+<h2 id="zh-pytorch">10. PyTorch 实现</h2>
 
 <p>PyTorch 的 float8 dtype 是 unscaled 的。<code>torch.float8_e4m3fn</code> 和 <code>torch.float8_e5m2</code> 只描述 raw data 的格式,并不自动携带 scale。scale 需要由上层建模代码、tensor subclass 或专门的 kernel API 管理。PyTorch dev-discuss 里提到的 <code>torch.scaled_mm</code> 就是这种分层设计:matrix 是 FP8,scale 作为单独参数传入。</p>
 
@@ -729,7 +729,7 @@ C_hat[m, n] = decode_fp8(qC[m, n]) * scale_inv_C[block(m, n)]</pre>
 
 <p>The QKV projection output quantizer follows the packed feature dimension, the last dimension of <code>[M, 3*H*D]</code>. Attention's two matmuls require Q/K blocks along head dimension <code>D</code> and V blocks along sequence dimension <code>Sk</code>. Reshaping changes the logical view of the FP8 payload but does not redefine the block membership carried by its scales. An MXFP8 projection output therefore needs re-quantization at the DPA boundary along the new reduction directions.</p>
 
-<h2 id="en-update">6. Amax update policy</h2>
+<h2 id="en-update">6. Amax updates</h2>
 
 <p>The scale usually comes from amax, the maximum absolute value of a tensor. A recipe must decide when that amax is known and how it updates the next scale.</p>
 
@@ -745,7 +745,7 @@ C_hat[m, n] = decode_fp8(qC[m, n]) * scale_inv_C[block(m, n)]</pre>
 
 <p>DelayedScaling state usually contains amax history, history length, max versus most recent selection, margin, format, and distributed reduction rules. Implementation-wise, it is operator state. Every tensor that participates in FP8 needs a way to find its scale and amax record.</p>
 
-<h2 id="en-training">7. Recipes in training systems</h2>
+<h2 id="en-training">7. Training recipes</h2>
 
 <p>Combining the axes above gives a few common recipe families.</p>
 
@@ -764,7 +764,7 @@ C_hat[m, n] = decode_fp8(qC[m, n]) * scale_inv_C[block(m, n)]</pre>
 
 <p>Distributed training also defines the synchronization domain for amax. Ranks in a TP or FSDP group may use local statistics or reduce a shared statistic; that choice affects checkpoint consistency, recompute, communication fusion, and debugging. Transformer Engine options such as <code>reduce_amax</code> express the tradeoff among performance, determinism, and adaptation to local distributions.</p>
 
-<h2 id="en-te-mha">8. Transformer Engine MHA example</h2>
+<h2 id="en-te-mha">8. Transformer Engine MHA</h2>
 
 <p>Transformer Engine MHA passes data through the QKV projection, dot product attention (DPA), and output projection. An FP8 recipe may control computation inside DPA as well as tensor dtypes at the boundaries between these modules. The backend selector then chooses an executable path from the hardware, cuDNN version, layout, and recipe type. In TE v2.16, MXFP8 attention treats DPA as an independent consumer and quantizes Q/K/V at its entrance along attention-specific reduction directions.</p>
 
@@ -845,7 +845,7 @@ DPA:
 
 <p>The selector also requires sm100+, a sufficiently recent cuDNN, and conditions such as <code>qkv_format != "thd"</code>. A failed check disables FusedAttention and may leave the requested combination without a usable FP8 attention backend.</p>
 
-<h2 id="en-fake-gemm">9. Simulating MXFP8 with BF16 GEMM</h2>
+<h2 id="en-fake-gemm">9. MXFP8 emulation with BF16</h2>
 
 <p>A BF16 GEMM can serve as the compute stage of an MXFP8 numerical reference. Inputs are quantized to FP8 with MXFP8 block scales, dequantized back to BF16, and then passed to the existing GEMM. This fake-quantization path reproduces quantization and dequantization error; Tensor Core throughput, register layout, and scale-load overhead remain properties of a real MXFP8 kernel.</p>
 
@@ -941,7 +941,7 @@ def mxfp8_gemm_sim(A, B, fp32_accum=False):
 
 <p>This simulation supports two comparisons. Keep the BF16 GEMM when measuring how MXFP8 casts affect an existing BF16 path. Set <code>fp32_accum=True</code> and accumulate the final matmul in FP32 when building a more stable numerical reference.</p>
 
-<h2 id="en-pytorch">10. PyTorch view</h2>
+<h2 id="en-pytorch">10. PyTorch implementation</h2>
 
 <p>PyTorch float8 dtypes are unscaled. <code>torch.float8_e4m3fn</code> and <code>torch.float8_e5m2</code> describe the raw data format; they do not automatically carry a scale. The modeling layer, a tensor subclass, or a specialized kernel API must manage the scale. The PyTorch dev-discuss post uses <code>torch.scaled_mm</code> as the example: matrices are FP8, scales are separate arguments.</p>
 

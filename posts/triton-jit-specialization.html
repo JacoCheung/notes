@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Triton JIT Specialization 机制：参数特化、编译变体与缓存</title>
-<meta name="post:title"           content="Triton JIT Specialization 机制：参数特化、编译变体与缓存">
-<meta name="post:title_en"        content="Triton JIT Specialization: Arguments, Kernel Variants, and Caching">
+<title>Triton JIT 特化与缓存</title>
+<meta name="post:title"           content="Triton JIT 特化与缓存">
+<meta name="post:title_en"        content="Triton JIT specialization and caching">
 <meta name="post:slug"            content="triton-jit-specialization">
 <meta name="post:date"            content="2026-08-25">
 <meta name="post:tags"            content="Triton, JIT, Specialization, Kernel DSL">
@@ -25,11 +25,11 @@
   };
 </script>
 <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
-<script src="../lang-toggle.js" defer></script>
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
 <style>
   main.content { max-width: 1060px; min-width: 0; padding: 56px 32px 96px; letter-spacing: 0; }
   main.content h1,
@@ -129,29 +129,29 @@
     <div class="toc-title">目录 · TOC</div>
     <div class="lang-zh">
     <ul>
-      <li><a href="#zh-scope">0. Specialization 模型</a></li>
-      <li><a href="#zh-launch">1. Kernel launch 路径</a></li>
-      <li><a href="#zh-descriptor">2. Descriptor 与 specialization key</a></li>
-      <li><a href="#zh-constexpr">3. tl.constexpr</a></li>
-      <li><a href="#zh-runtime">4. 运行时隐式特化</a></li>
-      <li><a href="#zh-cache">5. 两级缓存</a></li>
-      <li><a href="#zh-control">6. 控制变体数量</a></li>
-      <li><a href="#zh-autotune">7. Autotune key 与触发条件</a></li>
-      <li><a href="#zh-inspect">8. 追踪 specialization 与 cache miss</a></li>
+      <li><a href="#zh-scope">0. 特化模型</a></li>
+      <li><a href="#zh-launch">1. Kernel 编译路径</a></li>
+      <li><a href="#zh-descriptor">2. Descriptor 与特化键</a></li>
+      <li><a href="#zh-constexpr">3. tl.constexpr 语义</a></li>
+      <li><a href="#zh-runtime">4. 隐式参数特化</a></li>
+      <li><a href="#zh-cache">5. 缓存层次</a></li>
+      <li><a href="#zh-control">6. 特化数量控制</a></li>
+      <li><a href="#zh-autotune">7. Autotune 触发条件</a></li>
+      <li><a href="#zh-inspect">8. 特化与缓存追踪</a></li>
       <li><a href="#zh-refs">参考资料</a></li>
     </ul>
     </div>
     <div class="lang-en">
     <ul>
       <li><a href="#en-scope">0. Specialization model</a></li>
-      <li><a href="#en-launch">1. Kernel launch path</a></li>
+      <li><a href="#en-launch">1. Kernel compilation path</a></li>
       <li><a href="#en-descriptor">2. Descriptors and specialization keys</a></li>
-      <li><a href="#en-constexpr">3. tl.constexpr</a></li>
-      <li><a href="#en-runtime">4. Implicit specialization</a></li>
-      <li><a href="#en-cache">5. Two cache levels</a></li>
-      <li><a href="#en-control">6. Controlling variants</a></li>
-      <li><a href="#en-autotune">7. Autotune keys and triggers</a></li>
-      <li><a href="#en-inspect">8. Tracing specialization and cache misses</a></li>
+      <li><a href="#en-constexpr">3. tl.constexpr semantics</a></li>
+      <li><a href="#en-runtime">4. Implicit argument specialization</a></li>
+      <li><a href="#en-cache">5. Cache hierarchy</a></li>
+      <li><a href="#en-control">6. Specialization control</a></li>
+      <li><a href="#en-autotune">7. Autotune triggers</a></li>
+      <li><a href="#en-inspect">8. Specialization and cache tracing</a></li>
       <li><a href="#en-refs">References</a></li>
     </ul>
     </div>
@@ -161,11 +161,11 @@
 
 <div class="lang-zh">
 
-<h1>Triton JIT Specialization <span style="white-space: nowrap">机制</span>：参数特化、编译变体与缓存</h1>
+<h1>Triton JIT 特化与缓存</h1>
 
 <p class="lead">一个 Triton kernel 通常要处理多种 shape、dtype、地址对齐和 launch 配置。若每组运行时数值都重新编译，启动成本与缓存体积会迅速增长；若所有调用共用一份 binary，编译器又会失去 tile shape、常量分支和对齐信息。<code>@triton.jit</code> 通过 specialization 在两者之间划分编译等价类：参数类型、编译期常量、对齐属性和编译选项共同构成 key，同一个 key 复用已有 kernel，新的 key 生成新的编译变体。</p>
 
-<h2 id="zh-scope">0. Specialization 模型</h2>
+<h2 id="zh-scope">0. 特化模型</h2>
 
 <p>JIT 是在程序运行期间按需触发编译的执行模型；specialization 是用一组静态属性确定编译变体的划分规则。前者决定编译时机，后者决定哪些调用共享结果。</p>
 
@@ -179,7 +179,7 @@
 
 <p>每个 $K_i$ 都对应一组参数签名、常量、编译属性和 launch options。本文沿 Triton 固定版本 <a href="https://github.com/triton-lang/triton/tree/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7"><code>a2d75c0</code></a> 的 launch 路径展开；整数特化规则具有版本差异，旧版本需要按其对应源码解释。</p>
 
-<h2 id="zh-launch">1. 从 kernel launch 到编译变体</h2>
+<h2 id="zh-launch">1. Kernel 编译路径</h2>
 
 <pre class="code">@triton.jit
 def copy_kernel(
@@ -244,7 +244,7 @@ copy_kernel[(1,)](x, y, 1024, BLOCK=256)</pre>
 
 <p><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L733-L765"><code>JITFunction.run()</code></a> 先调用 binder 生成 specialization，再计算 key 并查询当前 device 的 kernel cache。cache miss 时，signature、constexpr 和属性被打包成 <code>ASTSource</code>，然后进入编译器。</p>
 
-<h2 id="zh-descriptor">2. Descriptor 与 Specialization Key</h2>
+<h2 id="zh-descriptor">2. Descriptor 与特化键</h2>
 
 <p>Specialization descriptor 是运行时参数映射到编译属性后的结构化表示。<a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L397-L427"><code>create_function_from_signature()</code></a> 按参数类别生成 descriptor，再由这些 descriptor 组成 key。固定版本中的规则可以整理为：</p>
 
@@ -273,7 +273,7 @@ copy_kernel[(1,)](x, y, 1024, BLOCK=256)</pre>
   <li>普通整数并非每个数值都生成一个 kernel。当前实现主要按整数宽度和 backend 属性拆分，数值 1 会提升为 constexpr。</li>
 </ul>
 
-<h2 id="zh-constexpr">3. <code>tl.constexpr</code> 的编译期语义</h2>
+<h2 id="zh-constexpr">3. <code>tl.constexpr</code> 语义</h2>
 
 <p><code>tl.constexpr</code> 按精确值进入 key，也会成为 <code>ASTSource.constants</code>。编译器因此可以在 AST 转 TTIR 之前就使用它：</p>
 
@@ -299,7 +299,7 @@ def reduce_kernel(
 
 <p>把任意数据维度都声明成 constexpr 则会迅速放大编译数量。若业务出现 40 种 sequence length，而 kernel 并不需要针对每个长度展开循环，那么 <code>N: tl.constexpr</code> 会产生 40 份近似的 binary。</p>
 
-<h2 id="zh-runtime">4. 普通参数的隐式特化</h2>
+<h2 id="zh-runtime">4. 隐式参数特化</h2>
 
 <p>即使参数没有标成 constexpr，Triton 仍会提取对优化有用的属性。当前通用 backend 用字母 <code>D</code> 表示 <code>tt.divisibility=16</code>：</p>
 
@@ -333,7 +333,7 @@ def reduce_kernel(
   <p>launch grid 通常不是 specialization key 的一部分。若 <code>n</code> 是普通运行时整数，<code>grid=(triton.cdiv(n, BLOCK),)</code> 可以随调用变化而不触发编译。grid 使用的 <code>BLOCK</code> 本身是 constexpr，所以改变 <code>BLOCK</code> 仍会生成新变体。</p>
 </div>
 
-<h2 id="zh-cache">5. 运行时缓存与编译缓存</h2>
+<h2 id="zh-cache">5. 缓存层次</h2>
 
 <p>Descriptor 确定运行时 key 以后，查询依次经过进程内 cache 与 persistent cache。前者复用当前进程已经加载的 kernel 对象，后者复用跨进程保存的编译产物。</p>
 
@@ -402,7 +402,7 @@ def reduce_kernel(
   </svg>
 </div>
 
-<h3>JITFunction 的进程内 per-device cache</h3>
+<h3>进程内设备缓存</h3>
 
 <p>在一个 Python 进程内，每个 <code>JITFunction</code> 按 device 保存 <code>kernel_cache</code>。这一级 cache 的作用域是当前进程与对应的 <code>JITFunction</code>；运行时 key 由 specialization descriptor 和编译 options 组成：</p>
 
@@ -414,7 +414,7 @@ def reduce_kernel(
 
 <p><code>num_warps</code>、<code>num_stages</code>、<code>num_ctas</code> 等属于 options。参数完全相同但 <code>num_warps</code> 不同，仍然是两个 kernel。key 的构造与查询见 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L611-L620"><code>compute_cache_key()</code></a>。</p>
 
-<h3>编译器的 persistent cache</h3>
+<h3>编译持久缓存</h3>
 
 <p>内存 cache miss 后，Triton 构造 <code>ASTSource</code>。它的 hash 包含：</p>
 
@@ -430,7 +430,7 @@ def reduce_kernel(
 
 <p>磁盘 cache miss 有两类来源。Source、signature、constexpr、target、options 或参与 cache invalidation 的环境变量发生变化，会生成新的 persistent key；缓存目录不可访问、产物组不完整或 metadata 校验失败，则会让已有 key 无法恢复有效产物。</p>
 
-<h2 id="zh-control">6. 控制 specialization 数量</h2>
+<h2 id="zh-control">6. 特化数量控制</h2>
 
 <p>普通整数和 pointer 的隐式属性可能带来额外变体。若某个参数的取值很多，而 kernel 不依赖它的整除或对齐信息，可以关闭相应规则：</p>
 
@@ -450,11 +450,11 @@ def dynamic_kernel(x, y, n, BLOCK: tl.constexpr):
   <p>关闭 specialization 不会改变 kernel 的数学语义，但会减少编译器可用的静态信息。变体数量下降以后，某些形状可能失去向量化或无 mask 路径。它是编译时间、代码体积和运行性能之间的取舍。</p>
 </div>
 
-<h2 id="zh-autotune">7. Autotune key 与触发条件</h2>
+<h2 id="zh-autotune">7. Autotune 触发条件</h2>
 
 <p><code>@triton.autotune</code> 是按运行时输入选择 <code>triton.Config</code> 的测量机制。它为一个 tuning key 运行候选配置、记录耗时并保存胜出的 config。Specialization JIT 随后负责为候选配置与参数属性生成可执行 kernel。前者的缓存单位是“输入对应的最佳配置”，后者的缓存单位是“可复用的编译变体”。</p>
 
-<h3>Key 的声明与运行时组成</h3>
+<h3>Autotune Key 组成</h3>
 
 <p><code>key</code> 接收 kernel 形参名列表。官方 matrix multiplication tutorial 以 <code>M</code>、<code>N</code>、<code>K</code> 划分调优输入域；任一维度取值改变，都会得到另一个 tuning key。参数名与示例可在固定版本的 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/tutorials/03-matrix-multiplication.py#L223-L248">matmul autotune decorator</a> 中核对。</p>
 
@@ -490,7 +490,7 @@ def matmul_kernel(
 
 <p>这段构造逻辑位于 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py#L217-L228"><code>Autotuner.run()</code></a>。Tensor 地址和 pointer alignment 不会自动进入 tuning key；它们属于 JIT specialization。实践中通常选择 shape、stride、模式标志或显式 bucket 等能够改变最佳 config 的标量参数，而不把 pointer 参数列入 <code>key</code>。</p>
 
-<h3>新 key 的调优路径</h3>
+<h3>新 Key 调优路径</h3>
 
 <p><code>Autotuner</code> 首先查询进程内的 <code>self.cache</code>。miss 后，候选集先经过 <code>early_config_prune</code> 和 performance model；剩余多个配置时才执行 benchmark。固定版本的 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py#L217-L272">运行路径</a>可以简化为以下伪代码：</p>
 
@@ -529,7 +529,7 @@ launch(process_cache[tuning_key])</pre>
 
 <p>新的 tuning key 在两个条件同时满足时触发 benchmark：disk cache 没有恢复已有结果，并且 prune 后仍有多个候选。若只剩一个 config，运行时直接选中它。<code>cache_results</code> 默认关闭；开启后，磁盘 key 还包含 Triton cache identity、target backend、kernel source hash、cache-invalidating 环境变量和候选配置集合，具体字段见 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py#L175-L215"><code>check_disk_cache()</code></a>。</p>
 
-<h3>Autotune miss 与 JIT miss</h3>
+<h3>Autotune 与 JIT Miss</h3>
 
 <p>一次 autotune miss 会运行候选 config，但每次候选 launch 仍独立查询 JIT cache。新的 tuning key 因而表示“需要重新测量”，不必然表示“所有候选都要重新编译”。JIT miss 也可以出现在 autotune hit 路径上：pointer alignment 改变可能产生新的 specialization，而 shape 与 dtype 对应的 tuning key 仍然命中，此时 Triton 沿用此前选出的 config，只编译缺失的 variant。</p>
 
@@ -552,7 +552,7 @@ launch(process_cache[tuning_key])</pre>
   <p>Autotune 会为同一个 key 多次执行 kernel。Kernel 修改输出、计数器或其他持久状态时，需要使用 <code>reset_to_zero</code>、<code>restore_value</code> 或 hook 在候选之间恢复状态。<a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py#L409-L473"><code>triton.autotune</code> 的固定版本文档</a>同时给出了这些接口；<code>TRITON_PRINT_AUTOTUNING=1</code> 可打印实际发生的调优及胜出配置。</p>
 </div>
 
-<h2 id="zh-inspect">8. 追踪 Specialization 与 Cache Miss</h2>
+<h2 id="zh-inspect">8. 特化与缓存追踪</h2>
 
 <p>出现首次迭代很慢或 cache 目录快速增长时，可以先检查三个位置：</p>
 
@@ -564,7 +564,7 @@ launch(process_cache[tuning_key])</pre>
 
 <p><code>TRITON_CACHE_DIR</code> 可以指定 persistent cache 位置。<code>TRITON_KERNEL_DUMP=1</code> 会把各阶段 IR 写入 <code>TRITON_DUMP_DIR</code>，适合比较两个 specialization 的 TTIR 或 PTX。调试缓存命中时还可以使用 <code>TRITON_ALWAYS_COMPILE=1</code> 强制重编译；这些环境变量的当前定义在 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/knobs.py#L343-L363"><code>knobs.py</code></a> 中。</p>
 
-<h3>两个 Hook 对应两级 Cache</h3>
+<h3>Cache Hooks</h3>
 
 <p><code>knobs.runtime.jit_cache_hook</code> 是进程内 JIT cache miss 的观察点。<code>JITFunction._do_compile()</code> 在构造 <code>ASTSource</code> 之前调用它，并通过 <code>specialization_data</code> 提供 signature、constexpr、argument attributes、options、runtime key 和 target。该事件说明当前进程尚未保存这个 specialization；后续 persistent cache 是否命中，要等编译器完成查询才能确定。hook 的字段和调用位置见固定版本的 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/knobs.py#L442-L490"><code>JITHook</code> protocol</a>、<a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L379-L394"><code>serialize_specialization_data()</code></a> 和 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L640-L686"><code>_call_hook()</code></a>。</p>
 
@@ -574,7 +574,7 @@ launch(process_cache[tuning_key])</pre>
   <p>这两个 hook 是 Triton 固定版本中的进程级 instrumentation knob，并非稳定的公共 API。回调签名和 payload 需要随安装版本核对。<code>jit_cache_hook</code> 应返回 <code>False</code> 或 <code>None</code>；返回 <code>True</code> 会让 <code>_do_compile()</code> 提前返回，正常编译和 kernel launch 都会被跳过。</p>
 </div>
 
-<h3>可复现实验：Pointer 地址对齐产生两个变体</h3>
+<h3>指针对齐特化实验</h3>
 
 <p>Pointer alignment 展示了一个只改变地址、不改变 dtype、shape、<code>BLOCK</code> 或 launch options 的 specialization。固定版本的 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/src/specialize.cc#L330-L396"><code>native_specialize_impl</code></a> 对 Tensor 调用 <code>data_ptr()</code>；当地址满足 16-byte 对齐时，它返回内部 descriptor <code>"D"</code>。随后 <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/backends/compiler.py#L74-L92"><code>BaseBackend.parse_attr()</code></a> 把 <code>"D"</code> 转成 <code>[["tt.divisibility", 16]]</code>。其语义等价于：</p>
 
@@ -791,11 +791,11 @@ TRITON_CACHE_DIR="$CACHE_DIR" python trace_specialization.py \
 
 <div class="lang-en">
 
-<h1>Triton JIT Specialization: Arguments, Kernel Variants, and Caching</h1>
+<h1>Triton JIT specialization and caching</h1>
 
 <p class="lead">A Triton kernel commonly serves many shapes, dtypes, address alignments, and launch configurations. Compiling every runtime value would inflate startup cost and cache size, while forcing every call through one binary would discard static tile shapes, constant branches, and alignment facts. <code>@triton.jit</code> uses specialization to partition calls into compilation-equivalence classes. Argument types, compile-time constants, alignment properties, and compilation options form the key; an existing key reuses its kernel, while a new key produces another compiled variant.</p>
 
-<h2 id="en-scope">0. Specialization Model</h2>
+<h2 id="en-scope">0. Specialization model</h2>
 
 <p>JIT is an execution model that triggers compilation on demand while the program runs. Specialization is the rule that maps a set of static properties to a compiled variant. The first determines when compilation occurs; the second determines which calls share its result.</p>
 
@@ -809,7 +809,7 @@ TRITON_CACHE_DIR="$CACHE_DIR" python trace_specialization.py \
 
 <p>Each $K_i$ corresponds to one argument signature, set of constants, compilation properties, and launch options. This article follows the launch path in pinned Triton revision <a href="https://github.com/triton-lang/triton/tree/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7"><code>a2d75c0</code></a>. Integer-specialization rules vary by release, so older versions should be read against their matching source.</p>
 
-<h2 id="en-launch">1. From Kernel Launch to a Compiled Variant</h2>
+<h2 id="en-launch">1. Kernel compilation path</h2>
 
 <pre class="code">@triton.jit
 def copy_kernel(
@@ -874,7 +874,7 @@ copy_kernel[(1,)](x, y, 1024, BLOCK=256)</pre>
 
 <p><a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L733-L765"><code>JITFunction.run()</code></a> first invokes the binder to produce a specialization, computes the key, and queries the kernel cache for the current device. On a cache miss, Triton packages the signature, constexpr values, and properties into an <code>ASTSource</code> and passes it to the compiler.</p>
 
-<h2 id="en-descriptor">2. Descriptors and Specialization Keys</h2>
+<h2 id="en-descriptor">2. Descriptors and specialization keys</h2>
 
 <p>A specialization descriptor is a structured representation that maps a runtime argument to compilation properties. <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L397-L427"><code>create_function_from_signature()</code></a> builds one descriptor per argument and combines them into the key. The pinned revision follows these rules:</p>
 
@@ -903,7 +903,7 @@ copy_kernel[(1,)](x, y, 1024, BLOCK=256)</pre>
   <li>An ordinary integer does not produce one kernel per numeric value. The current implementation mainly separates integer widths and backend properties; the value 1 is promoted to constexpr.</li>
 </ul>
 
-<h2 id="en-constexpr">3. Compile-Time Semantics of <code>tl.constexpr</code></h2>
+<h2 id="en-constexpr">3. <code>tl.constexpr</code> semantics</h2>
 
 <p>A <code>tl.constexpr</code> argument enters the key by exact value and becomes part of <code>ASTSource.constants</code>. The compiler can use it before lowering the AST to TTIR:</p>
 
@@ -929,7 +929,7 @@ def reduce_kernel(
 
 <p>Declaring every data dimension as constexpr can quickly multiply compilation work. If a workload contains 40 sequence lengths and the kernel does not need to unroll a distinct loop for each one, writing <code>N: tl.constexpr</code> creates 40 similar binaries.</p>
 
-<h2 id="en-runtime">4. Implicit Specialization of Ordinary Arguments</h2>
+<h2 id="en-runtime">4. Implicit argument specialization</h2>
 
 <p>Even when an argument is not constexpr, Triton extracts properties that may help optimization. The current generic backend uses <code>D</code> to denote <code>tt.divisibility=16</code>:</p>
 
@@ -963,7 +963,7 @@ def reduce_kernel(
   <p>The launch grid is normally not part of the specialization key. When <code>n</code> is an ordinary runtime integer, <code>grid=(triton.cdiv(n, BLOCK),)</code> may change between calls without triggering compilation. <code>BLOCK</code>, however, is constexpr, so changing it still creates a new variant.</p>
 </div>
 
-<h2 id="en-cache">5. Runtime Cache and Compilation Cache</h2>
+<h2 id="en-cache">5. Cache hierarchy</h2>
 
 <p>Once the descriptor determines the runtime key, lookup proceeds through an in-process cache and then a persistent cache. The first reuses kernel objects already loaded by the current process; the second reuses compilation artifacts across processes.</p>
 
@@ -1032,7 +1032,7 @@ def reduce_kernel(
   </svg>
 </div>
 
-<h3><code>JITFunction</code> In-Process Per-Device Cache</h3>
+<h3>In-process device cache</h3>
 
 <p>Within one Python process, each <code>JITFunction</code> keeps a <code>kernel_cache</code> indexed by device. The scope of this cache is the current process and that <code>JITFunction</code>. Its runtime key consists of the specialization descriptor and compilation options:</p>
 
@@ -1044,7 +1044,7 @@ def reduce_kernel(
 
 <p><code>num_warps</code>, <code>num_stages</code>, and <code>num_ctas</code> are options. Calls with identical arguments but different <code>num_warps</code> values still use separate kernels. See <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L611-L620"><code>compute_cache_key()</code></a> for key construction and lookup.</p>
 
-<h3>Compiler Persistent Cache</h3>
+<h3>Persistent compiler cache</h3>
 
 <p>After an in-memory cache miss, Triton constructs an <code>ASTSource</code>. Its hash includes:</p>
 
@@ -1060,7 +1060,7 @@ def reduce_kernel(
 
 <p>Disk-cache misses come from two classes of change. Source, signature, constexpr values, target, options, or cache-invalidating environment variables produce a new persistent key. An inaccessible cache directory, incomplete artifact group, or failed metadata validation prevents an existing key from restoring a valid artifact.</p>
 
-<h2 id="en-control">6. Controlling the Number of Specializations</h2>
+<h2 id="en-control">6. Specialization control</h2>
 
 <p>Implicit properties of ordinary integers and pointers may create extra variants. If an argument takes many values and the kernel does not rely on its divisibility or alignment, the corresponding rule can be disabled:</p>
 
@@ -1080,11 +1080,11 @@ def dynamic_kernel(x, y, n, BLOCK: tl.constexpr):
   <p>Disabling specialization does not alter the kernel's mathematical semantics, but it removes static information from the compiler. Fewer variants may cost some shapes their vectorized or mask-free path. The setting trades compilation time and code size against runtime performance.</p>
 </div>
 
-<h2 id="en-autotune">7. Autotune Keys and Trigger Conditions</h2>
+<h2 id="en-autotune">7. Autotune triggers</h2>
 
 <p><code>@triton.autotune</code> is a measurement mechanism that selects a <code>triton.Config</code> for a runtime input. For one tuning key, it runs candidate configurations, records their timings, and caches the winner. Specialization JIT then produces executable kernels for the candidate configurations and argument properties that reach the launch path. The autotune cache stores “the best configuration for an input,” while the JIT cache stores reusable compiled variants.</p>
 
-<h3>Key Declaration and Runtime Composition</h3>
+<h3>Autotune key composition</h3>
 
 <p>The <code>key</code> parameter is a list of names from the kernel signature. Triton's matrix multiplication tutorial partitions the tuning domain by <code>M</code>, <code>N</code>, and <code>K</code>; changing any dimension produces another tuning key. The declaration appears in the pinned <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/tutorials/03-matrix-multiplication.py#L223-L248">matmul autotune decorator</a>.</p>
 
@@ -1120,7 +1120,7 @@ def matmul_kernel(
 
 <p>The construction is implemented in <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py#L217-L228"><code>Autotuner.run()</code></a>. Tensor addresses and pointer-alignment attributes are not added to the tuning key automatically; they belong to JIT specialization. Useful keys are scalar shape, stride, mode, or explicit-bucket arguments that can change the winning configuration, rather than pointer arguments.</p>
 
-<h3>The Path Taken by a New Key</h3>
+<h3>New-key tuning path</h3>
 
 <p><code>Autotuner</code> first queries its in-process <code>self.cache</code>. After a miss, <code>early_config_prune</code> and the performance model reduce the candidate set; benchmarking is required only when multiple candidates remain. The pinned <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py#L217-L272">runtime path</a> can be reduced to the following pseudocode:</p>
 
@@ -1159,7 +1159,7 @@ launch(process_cache[tuning_key])</pre>
 
 <p>A new tuning key triggers benchmarking when two conditions hold: the disk cache does not restore a prior result, and pruning leaves more than one candidate. A single remaining config is selected directly. <code>cache_results</code> is disabled by default. When enabled, the disk key also contains Triton's cache identity, the target backend, kernel source hash, cache-invalidating environment variables, and the candidate-config set; the exact fields are in <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py#L175-L215"><code>check_disk_cache()</code></a>.</p>
 
-<h3>Autotune Misses and JIT Misses</h3>
+<h3>Autotune and JIT misses</h3>
 
 <p>An autotune miss runs candidate configurations, but every candidate launch still queries the JIT cache independently. A new tuning key therefore means “measure again,” not necessarily “compile every candidate again.” A JIT miss can also occur on an autotune-hit path: a pointer-alignment change may create a new specialization while the shape-and-dtype tuning key remains a hit. Triton then keeps the previously selected config and compiles only the missing variant.</p>
 
@@ -1182,7 +1182,7 @@ launch(process_cache[tuning_key])</pre>
   <p>Autotune executes the kernel multiple times for one key. A kernel that modifies outputs, counters, or other persistent state must use <code>reset_to_zero</code>, <code>restore_value</code>, or hooks to restore state between candidates. The pinned <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/autotuner.py#L409-L473"><code>triton.autotune</code> documentation</a> defines these interfaces. <code>TRITON_PRINT_AUTOTUNING=1</code> prints each actual tuning event and its winning config.</p>
 </div>
 
-<h2 id="en-inspect">8. Tracing Specialization and Cache Misses</h2>
+<h2 id="en-inspect">8. Specialization and cache tracing</h2>
 
 <p>When the first iteration is slow or the cache directory grows quickly, inspect three areas:</p>
 
@@ -1194,7 +1194,7 @@ launch(process_cache[tuning_key])</pre>
 
 <p><code>TRITON_CACHE_DIR</code> selects the persistent-cache location. <code>TRITON_KERNEL_DUMP=1</code> writes each IR stage under <code>TRITON_DUMP_DIR</code>, which is useful when comparing the TTIR or PTX of two specializations. <code>TRITON_ALWAYS_COMPILE=1</code> forces recompilation while debugging cache hits. The current definitions of these environment variables are in <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/knobs.py#L343-L363"><code>knobs.py</code></a>.</p>
 
-<h3>Two Hooks Observe Two Cache Levels</h3>
+<h3>Cache hooks</h3>
 
 <p><code>knobs.runtime.jit_cache_hook</code> is an observation point for an in-process JIT cache miss. <code>JITFunction._do_compile()</code> calls it before constructing an <code>ASTSource</code>, and <code>specialization_data</code> carries the signature, constexpr values, argument attributes, options, runtime key, and target. The event establishes that the current process does not hold this specialization; persistent-cache status is known only after the compiler performs its lookup. The fixed-revision definitions are in the <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/knobs.py#L442-L490"><code>JITHook</code> protocol</a>, <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L379-L394"><code>serialize_specialization_data()</code></a>, and <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/runtime/jit.py#L640-L686"><code>_call_hook()</code></a>.</p>
 
@@ -1204,7 +1204,7 @@ launch(process_cache[tuning_key])</pre>
   <p>These hooks are process-wide instrumentation knobs in the pinned Triton revision, not a stable public API. Their callback signatures and payloads must be checked against the installed version. A <code>jit_cache_hook</code> should return <code>False</code> or <code>None</code>; returning <code>True</code> makes <code>_do_compile()</code> return early, skipping normal compilation and the kernel launch.</p>
 </div>
 
-<h3>Reproducible Experiment: Pointer Alignment Creates Two Variants</h3>
+<h3>Pointer-alignment experiment</h3>
 
 <p>Pointer alignment supplies a specialization where the address changes while dtype, shape, <code>BLOCK</code>, and launch options remain fixed. In the pinned <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/src/specialize.cc#L330-L396"><code>native_specialize_impl</code></a>, Triton calls <code>data_ptr()</code> on a tensor and returns the internal descriptor <code>"D"</code> for a 16-byte-aligned address. <a href="https://github.com/triton-lang/triton/blob/a2d75c0e4d7d81f5085053a76d9b971fc6e706e7/python/triton/backends/compiler.py#L74-L92"><code>BaseBackend.parse_attr()</code></a> then converts <code>"D"</code> into <code>[["tt.divisibility", 16]]</code>. The behavior is equivalent to:</p>
 

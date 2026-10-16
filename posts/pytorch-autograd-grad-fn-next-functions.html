@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PyTorch Autograd 反向图模型：grad_fn、next_functions 与 AccumulateGrad</title>
-<meta name="post:title"           content="PyTorch Autograd 反向图模型：grad_fn、next_functions 与 AccumulateGrad">
-<meta name="post:title_en"        content="The PyTorch Autograd Reverse Graph: grad_fn, next_functions, and AccumulateGrad">
+<title>PyTorch Autograd 反向图</title>
+<meta name="post:title"           content="PyTorch Autograd 反向图">
+<meta name="post:title_en"        content="PyTorch Autograd reverse graph">
 <meta name="post:slug"            content="pytorch-autograd-grad-fn-next-functions">
 <meta name="post:date"            content="2026-08-11">
 <meta name="post:tags"            content="PyTorch, Autograd, DDP, Megatron">
@@ -25,11 +25,11 @@
   };
 </script>
 <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
-<script src="../lang-toggle.js" defer></script>
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
 <style>
   main.content { max-width: 1060px; padding: 56px 32px 96px; }
   @media (max-width: 960px) { main.content { padding: 48px 20px 80px; } }
@@ -146,27 +146,27 @@
     <div class="toc-title">目录 · TOC</div>
     <div class="lang-zh">
       <ul>
-        <li><a href="#zh-scope">图模型与版本边界</a></li>
-        <li><a href="#zh-objects">Tensor 与 grad_fn 图</a></li>
-        <li><a href="#zh-forward">forward 建图过程</a></li>
-        <li><a href="#zh-read-next">next_functions 的边与槽位</a></li>
-        <li><a href="#zh-fan-in">多分支梯度的 fan-in 规约</a></li>
-        <li><a href="#zh-backward-order">backward 的依赖顺序</a></li>
-        <li><a href="#zh-accumulate-grad">AccumulateGrad 与 leaf .grad</a></li>
-        <li><a href="#zh-megatron">Megatron-Core DDP 的参数 hook</a></li>
+        <li><a href="#zh-scope">图模型与版本</a></li>
+        <li><a href="#zh-objects">Tensor 与 grad_fn</a></li>
+        <li><a href="#zh-forward">Forward 建图</a></li>
+        <li><a href="#zh-read-next">next_functions 边与槽位</a></li>
+        <li><a href="#zh-fan-in">Fan-in 梯度规约</a></li>
+        <li><a href="#zh-backward-order">Backward 依赖顺序</a></li>
+        <li><a href="#zh-accumulate-grad">AccumulateGrad 与 .grad</a></li>
+        <li><a href="#zh-megatron">Megatron-Core 参数 Hook</a></li>
         <li><a href="#zh-refs">参考资料</a></li>
       </ul>
     </div>
     <div class="lang-en">
       <ul>
-        <li><a href="#en-scope">Graph model and version scope</a></li>
-        <li><a href="#en-objects">Tensors and the grad_fn graph</a></li>
-        <li><a href="#en-forward">Graph construction during forward</a></li>
-        <li><a href="#en-read-next">Edges and slots in next_functions</a></li>
+        <li><a href="#en-scope">Graph model and versions</a></li>
+        <li><a href="#en-objects">Tensors and grad_fn</a></li>
+        <li><a href="#en-forward">Forward graph construction</a></li>
+        <li><a href="#en-read-next">next_functions edges and slots</a></li>
         <li><a href="#en-fan-in">Fan-in gradient reduction</a></li>
-        <li><a href="#en-backward-order">Dependency order during backward</a></li>
-        <li><a href="#en-accumulate-grad">AccumulateGrad and leaf .grad</a></li>
-        <li><a href="#en-megatron">The Megatron-Core DDP parameter hook</a></li>
+        <li><a href="#en-backward-order">Backward dependency order</a></li>
+        <li><a href="#en-accumulate-grad">AccumulateGrad and .grad</a></li>
+        <li><a href="#en-megatron">Megatron-Core parameter hooks</a></li>
         <li><a href="#en-refs">References</a></li>
       </ul>
     </div>
@@ -176,17 +176,17 @@
 
 <div class="lang-zh">
 
-<h1>PyTorch Autograd 反向图模型：grad_fn、next_functions 与 AccumulateGrad</h1>
+<h1>PyTorch Autograd 反向图</h1>
 
 <p class="lead">PyTorch eager 模式在执行 forward 运算的同时，记录 backward 所需的反向关系。模型一旦出现分支、共享 Tensor 或参数 hook，只看 forward Tensor 已经无法解释梯度沿哪条路径回传，以及何时写入 leaf 的 <code>.grad</code>。Python 暴露的 <code>grad_fn</code> 与 <code>next_functions</code> 提供了进入这张反向图的观察入口；沿着这些对象，可以建立 Node、梯度槽位、fan-in 累加和 <code>AccumulateGrad</code> 之间的完整关系。</p>
 
-<h2 id="zh-scope">图模型与版本边界</h2>
+<h2 id="zh-scope">图模型与版本</h2>
 
 <p><a href="https://docs.pytorch.org/docs/2.12/notes/autograd.html#how-autograd-encodes-the-history">PyTorch 2.12 autograd mechanics</a> 将 autograd 描述为一张由 <code>Function</code> 对象组成的反向图。forward 执行实际计算并记录求导历史，backward 再从输出 Tensor 逆向传播到输入 leaves。在 Python 侧，非叶子 Tensor 的 <code>.grad_fn</code> 指向产生它的反向 Node，Node 的 <a href="https://docs.pytorch.org/docs/2.12/generated/torch.autograd.graph.Node.next_functions.html"><code>.next_functions</code></a> 则记录梯度继续传播的目标。</p>
 
 <p>下文讨论 PyTorch 2.12 eager autograd 的常规路径，“图”和“边”均指上述 Python 可观察结构。关于 fan-in 的调度描述来自可复现实验，不扩展为未公开的 engine 实现承诺。Megatron-Core 案例固定在 commit <a href="https://github.com/NVIDIA/Megatron-LM/tree/7ee599a25ca15f042c1087176b73ebddb0566d02"><code>7ee599a</code></a>，后续版本可能采用不同的 hook 接口。</p>
 
-<h2 id="zh-objects">Tensor 与 grad_fn 图</h2>
+<h2 id="zh-objects">Tensor 与 grad_fn</h2>
 
 <p>理解这张反向图需要区分几个 Python 侧对象。</p>
 
@@ -297,7 +297,7 @@ print(y.grad_fn.next_functions)
 
 <p><code>next_functions</code> 是当前反向 Node 的出边表，边的方向与求导传播一致，从 loss 逐步走向 leaves。名称中的 “next” 描述 backward 的下一跳，而不是 forward 的执行顺序。</p>
 
-<h2 id="zh-forward">forward 建图过程</h2>
+<h2 id="zh-forward">Forward 建图</h2>
 
 <p>当一个 operation 的输入需要梯度时，forward 结果会留下以下可观察关系：</p>
 
@@ -315,7 +315,7 @@ print(y.grad_fn.next_functions)
   <p>叶子 Tensor 的 <code>.grad_fn</code> 为 <code>None</code>；它对应的 <code>AccumulateGrad</code> 由消费该 leaf 的下游 Node 通过 <code>next_functions</code> 指向。两者分属 Tensor 属性与反向图 Node 两个层次。</p>
 </div>
 
-<h2 id="zh-read-next">next_functions 的边与槽位</h2>
+<h2 id="zh-read-next">next_functions 边与槽位</h2>
 
 <p>二输出 identity op 可以同时显露 tuple 槽位和 fan-in 行为。下面增加两条消费同一输出的分支，让 fan-in 规约出现在图上。</p>
 
@@ -457,7 +457,7 @@ loss.grad_fn.next_functions[0][0]
 #   (AccumulateGrad(a), 0)
 #   (AccumulateGrad(b), 0)</pre>
 
-<h2 id="zh-fan-in">多分支梯度的 fan-in 规约</h2>
+<h2 id="zh-fan-in">Fan-in 梯度规约</h2>
 
 <p>fan-in 梯度规约是指多个下游分支为同一上游输入产生梯度贡献后，autograd 在调用目标反向 Node 之前，按梯度槽位合并这些贡献。共享 Tensor <code>u</code> 同时进入乘法与正弦分支时，两条反向路径都会向 <code>PairIdentityBackward</code> 的 slot 0 写入梯度。</p>
 
@@ -522,7 +522,7 @@ loss.grad_fn.next_functions[0][0]
 
 <p>这幅图用 slot 表示梯度参数的聚合位置。Python 通过 <code>next_functions</code> 可以遍历相连的 Node 及其 tuple 整数，但不能把 slot 本身作为独立图对象访问。</p>
 
-<h2 id="zh-backward-order">backward 的依赖顺序</h2>
+<h2 id="zh-backward-order">Backward 依赖顺序</h2>
 
 <p>backward 从 <code>loss.grad_fn</code> 接收初始梯度，再沿 <code>next_functions</code> 向 leaves 推进。Node 的可执行条件由依赖决定：当多个下游分支汇入同一个上游 Node 时，engine 先收集这些分支的梯度贡献，再调度该 Node。</p>
 
@@ -581,7 +581,7 @@ loss.grad_fn.next_functions[0][0]
 
 <p>这套顺序包含依赖约束与 ready Node 调度两个层面。依赖约束要求 <code>PairIdentityBackward</code> 等待 <code>MulBackward0</code>、<code>SinBackward0</code> 和 <code>v</code> 分支的贡献；当多个 Node 同时 ready 时，engine 可以选择其中的执行次序。模型逻辑应依赖图中的边和槽位关系，而不依赖同批 ready Node 的具体先后顺序。</p>
 
-<h2 id="zh-accumulate-grad">AccumulateGrad 与 leaf .grad</h2>
+<h2 id="zh-accumulate-grad">AccumulateGrad 与 .grad</h2>
 
 <p><code>AccumulateGrad</code> 是本文版本 eager 图中观察到的 leaf 梯度累加 Node。反向传播到达它时，梯度并入相应 leaf Tensor 的 <code>.grad</code>。根据<a href="https://docs.pytorch.org/docs/2.12/generated/torch.Tensor.is_leaf.html">官方 leaf 文档</a>，用户创建且需要梯度的 leaf 没有生成自身的 operation，所以 <code>p.grad_fn</code> 为 <code>None</code>；消费 <code>p</code> 的下游 Node 则可以通过 <code>next_functions</code> 指向这个累加器。</p>
 
@@ -598,7 +598,7 @@ y.grad_fn.next_functions[0][0]
 
 <p><code>AccumulateGrad</code> 的类名属于实现观察，并未作为普通模型代码的稳定接口单独承诺。这个边界在框架代码利用 Node hook 时尤其重要。</p>
 
-<h2 id="zh-megatron">Megatron-Core DDP 的参数 hook</h2>
+<h2 id="zh-megatron">Megatron-Core 参数 Hook</h2>
 
 <p>Megatron-Core DDP 需要在每个参数的本地梯度累加完成后执行一组动作：把 <code>param.grad</code> 加入 <code>param.main_grad</code>，清空 <code>param.grad</code>，并在启用 overlap 时通知 bucket 该参数已经 ready。<code>AccumulateGrad</code> 正好位于这一就绪时刻，但参数本身是 leaf，<code>param.grad_fn</code> 为 <code>None</code>。固定版本的实现通过临时非叶子 Tensor 暴露通往累加器的反向边。</p>
 
@@ -683,17 +683,17 @@ if param.requires_grad:
 
 <div class="lang-en">
 
-<h1>The PyTorch Autograd Reverse Graph: <code>grad_fn</code>, <code>next_functions</code>, and <code>AccumulateGrad</code></h1>
+<h1>PyTorch Autograd reverse graph</h1>
 
 <p class="lead">PyTorch eager mode records the reverse relationships required by backward while it executes forward operations. Once a model contains branches, shared tensors, or parameter hooks, forward tensors alone no longer explain where gradients travel or when they reach a leaf's <code>.grad</code>. The Python-visible <code>grad_fn</code> and <code>next_functions</code> objects provide an entry point into that reverse graph and connect its nodes, gradient slots, fan-in accumulation, and <code>AccumulateGrad</code> endpoints.</p>
 
-<h2 id="en-scope">Graph model and version scope</h2>
+<h2 id="en-scope">Graph model and versions</h2>
 
 <p>The <a href="https://docs.pytorch.org/docs/2.12/notes/autograd.html#how-autograd-encodes-the-history">PyTorch 2.12 autograd mechanics note</a> describes autograd as a reverse graph of <code>Function</code> objects. Forward execution performs the requested computation and records its differentiation history; backward travels from output tensors toward input leaves. In Python, a non-leaf tensor's <code>.grad_fn</code> points to the reverse node that produced it, and the node's <a href="https://docs.pytorch.org/docs/2.12/generated/torch.autograd.graph.Node.next_functions.html"><code>.next_functions</code></a> records the destinations for further gradient propagation.</p>
 
 <p>The discussion covers the ordinary PyTorch 2.12 eager autograd path, and “graph” and “edge” refer to these Python-visible structures. The fan-in scheduling model is derived from a reproducible experiment rather than presented as an undisclosed engine contract. The Megatron-Core example is pinned to commit <a href="https://github.com/NVIDIA/Megatron-LM/tree/7ee599a25ca15f042c1087176b73ebddb0566d02"><code>7ee599a</code></a>; later releases may use a different hook interface.</p>
 
-<h2 id="en-objects">Tensors and the <code>grad_fn</code> graph</h2>
+<h2 id="en-objects">Tensors and <code>grad_fn</code></h2>
 
 <p>The Python-facing objects are easier to read once their roles are separated.</p>
 
@@ -804,7 +804,7 @@ print(y.grad_fn.next_functions)
 
 <p><code>next_functions</code> is the outgoing edge list of the current reverse node. Following these edges moves from the loss toward the leaves; “next” refers to the next backward destination rather than forward execution order.</p>
 
-<h2 id="en-forward">Graph construction during forward</h2>
+<h2 id="en-forward">Forward graph construction</h2>
 
 <p>When an operation receives an input that requires gradients, its forward result leaves the following observable relationships:</p>
 
@@ -822,7 +822,7 @@ print(y.grad_fn.next_functions)
   <p>A leaf tensor has <code>.grad_fn=None</code>, while the downstream node that consumes it can point to the corresponding <code>AccumulateGrad</code> through <code>next_functions</code>. The tensor attribute and the reverse-graph node belong to separate layers of the model.</p>
 </div>
 
-<h2 id="en-read-next">Edges and slots in <code>next_functions</code></h2>
+<h2 id="en-read-next"><code>next_functions</code> edges and slots</h2>
 
 <p>A two-output identity operation makes the tuple entries visible. Two consumers of the same output also make fan-in reduction appear in the graph.</p>
 
@@ -1029,7 +1029,7 @@ loss.grad_fn.next_functions[0][0]
 
 <p>The diagram uses slots to represent where gradient arguments are aggregated. Python can traverse the connected nodes and tuple integers through <code>next_functions</code>, but the slots are not independently accessible graph objects.</p>
 
-<h2 id="en-backward-order">Dependency order during backward</h2>
+<h2 id="en-backward-order">Backward dependency order</h2>
 
 <p>Backward supplies an initial gradient to <code>loss.grad_fn</code> and then follows <code>next_functions</code> toward the leaves. Dependencies determine when a node becomes executable: when several downstream branches converge on one upstream node, the engine gathers their gradient contributions before scheduling that node.</p>
 
@@ -1088,7 +1088,7 @@ loss.grad_fn.next_functions[0][0]
 
 <p>This order has two layers: dependency constraints and scheduling among ready nodes. The dependency constraint makes <code>PairIdentityBackward</code> wait for <code>MulBackward0</code>, <code>SinBackward0</code>, and the branch through <code>v</code>. Once several nodes are ready together, the engine may choose their relative order. Model logic should depend on graph edges and gradient slots, not on the particular ordering of that ready set.</p>
 
-<h2 id="en-accumulate-grad"><code>AccumulateGrad</code> and leaf <code>.grad</code></h2>
+<h2 id="en-accumulate-grad"><code>AccumulateGrad</code> and <code>.grad</code></h2>
 
 <p><code>AccumulateGrad</code> is the leaf-gradient accumulation node observed in the eager graph used here. When backward reaches it, the arriving gradient is merged into the corresponding leaf tensor's <code>.grad</code>. According to the official <a href="https://docs.pytorch.org/docs/2.12/generated/torch.Tensor.is_leaf.html">leaf tensor documentation</a>, a user-created leaf requiring gradients was not produced by an operation, so <code>p.grad_fn</code> is <code>None</code>. A downstream node that consumes <code>p</code> can still point to its accumulator through <code>next_functions</code>.</p>
 
@@ -1105,7 +1105,7 @@ y.grad_fn.next_functions[0][0]
 
 <p>The <code>AccumulateGrad</code> class name is an implementation observation rather than a separately promised stable API for ordinary model code. That boundary matters when framework code attaches hooks to the node.</p>
 
-<h2 id="en-megatron">The Megatron-Core DDP parameter hook</h2>
+<h2 id="en-megatron">Megatron-Core parameter hooks</h2>
 
 <p>Megatron-Core DDP needs to run several actions after a parameter's local gradient accumulation completes: add <code>param.grad</code> into <code>param.main_grad</code>, clear <code>param.grad</code>, and, when overlap is enabled, notify the bucket that the parameter is ready. <code>AccumulateGrad</code> sits at this readiness point, while the parameter itself is a leaf with <code>param.grad_fn=None</code>. The pinned implementation exposes the reverse edge to the accumulator through a temporary non-leaf tensor.</p>
 

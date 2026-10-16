@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>现代 LLM MoE 架构：路由、分发与融合执行</title>
-<meta name="post:title"           content="现代 LLM MoE 架构：路由、分发与融合执行">
-<meta name="post:title_en"        content="Modern LLM MoE Architectures: Routing, Dispatch, and Fused Execution">
+<title>LLM MoE 架构与执行</title>
+<meta name="post:title"           content="LLM MoE 架构与执行">
+<meta name="post:title_en"        content="LLM MoE architecture and execution">
 <meta name="post:slug"            content="modern-llm-moe-architecture">
 <meta name="post:date"            content="2026-08-07">
 <meta name="post:tags"            content="LLM, MoE, 架构, 系统实现">
@@ -25,11 +25,11 @@
   };
 </script>
 <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
-<script src="../lang-toggle.js" defer></script>
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
 <style>
   main.content { max-width: 1080px; padding: 56px 32px 96px; }
   @media (max-width: 960px) { main.content { padding: 48px 20px 80px; } }
@@ -80,27 +80,27 @@
     <div class="toc-title">目录 · TOC</div>
     <div class="lang-zh">
     <ul>
-      <li><a href="#zh-scope">0. 模型边界</a></li>
-      <li><a href="#zh-block">1. MoE 对 FFN 的替换</a></li>
-      <li><a href="#zh-torch">2. 从路由到执行的数据流</a></li>
+      <li><a href="#zh-scope">0. 模型范围</a></li>
+      <li><a href="#zh-block">1. MoE 与 FFN</a></li>
+      <li><a href="#zh-torch">2. 路由与分发</a></li>
       <li><a href="#zh-terms">3. 运行时术语</a></li>
       <li><a href="#zh-arch">4. 架构与执行类型</a></li>
-      <li><a href="#zh-history">5. 演进历史</a></li>
-      <li><a href="#zh-megamoe">6. MegaMoE 执行 contract</a></li>
-      <li><a href="#zh-problems">7. 执行瓶颈与约束</a></li>
+      <li><a href="#zh-history">5. 架构演进</a></li>
+      <li><a href="#zh-megamoe">6. MegaMoE 执行约束</a></li>
+      <li><a href="#zh-problems">7. 性能瓶颈</a></li>
       <li><a href="#zh-refs">参考资料</a></li>
     </ul>
     </div>
     <div class="lang-en">
     <ul>
-      <li><a href="#en-scope">0. Model boundary</a></li>
-      <li><a href="#en-block">1. Replacing the FFN</a></li>
-      <li><a href="#en-torch">2. Routing-to-execution dataflow</a></li>
+      <li><a href="#en-scope">0. Model scope</a></li>
+      <li><a href="#en-block">1. MoE and FFN</a></li>
+      <li><a href="#en-torch">2. Routing and dispatch</a></li>
       <li><a href="#en-terms">3. Runtime terminology</a></li>
-      <li><a href="#en-arch">4. Architecture and execution patterns</a></li>
-      <li><a href="#en-history">5. History</a></li>
-      <li><a href="#en-megamoe">6. The MegaMoE execution contract</a></li>
-      <li><a href="#en-problems">7. Execution bottlenecks</a></li>
+      <li><a href="#en-arch">4. Architecture and execution types</a></li>
+      <li><a href="#en-history">5. Architectural evolution</a></li>
+      <li><a href="#en-megamoe">6. MegaMoE execution contract</a></li>
+      <li><a href="#en-problems">7. Performance bottlenecks</a></li>
       <li><a href="#en-refs">References</a></li>
     </ul>
     </div>
@@ -110,7 +110,7 @@
 
 <div class="lang-zh">
 
-<h1>现代 LLM MoE 架构：路由、分发与融合执行</h1>
+<h1>LLM MoE 架构与执行</h1>
 
 <p class="lead">Transformer 的 FFN 保存了模型中很大一部分参数，dense 执行会让每个 token 经过同一组权重，扩展模型容量也会直接增加单 token 计算量。Sparse MoE 把 FFN 权重改为条件选择，使模型容量与每次前向实际激活的计算量可以分别扩展。</p>
 
@@ -118,13 +118,13 @@
 
 <p class="small">版本范围：下文按 2026-08-07 可见的公开论文、文档和开源实现整理。讨论对象是 Transformer block 中替换 FFN/MLP 的 sparse MoE；attention 仍负责 token 之间的信息混合。</p>
 
-<h2 id="zh-scope">0. 模型边界</h2>
+<h2 id="zh-scope">0. 模型范围</h2>
 
 <p>Sparse MLP-MoE 是一类条件执行的 FFN：模型包含 \(E\) 个 expert，每个 token 根据 router 分数激活其中 \(K\) 个，并将这些 expert 的输出加权合并。在 \(K \ll E\) 时，模型可以增加总参数量，而每个 token 只支付被选 expert 的计算成本。</p>
 
 <p>这一定义把讨论限定在 Transformer block 内的 MLP-MoE。Embedding MoE、attention MoE、RL policy MoE 与传统 ensemble 具有不同的选择对象和执行路径，不纳入下文。后续章节沿着 router、indexer、dispatcher、expert parallel 与 MegaMoE 的顺序追踪一次完整执行。</p>
 
-<h2 id="zh-block">1. MoE 对 FFN 的替换</h2>
+<h2 id="zh-block">1. MoE 与 FFN</h2>
 
 <p>在 dense Transformer block 中，FFN 对所有 token 使用同一组 MLP 权重。MoE block 保留 attention、residual 与 normalization 的位置，只把 FFN 替换为 router、expert 集合和 weighted combine。由此，attention 继续混合 token 信息，MoE 负责在参数空间中选择计算路径。</p>
 
@@ -166,7 +166,7 @@ y_t = \sum_{j \in \mathrm{TopK}(r(x_t))} p_{t,j} E_j(x_t)
 
 <p>其中 \(x_t\) 是 hidden state，\(r(x_t)\) 产生 \(E\) 个 expert 的 routing score，\(\mathrm{TopK}(r(x_t))\) 给出被激活的 expert 集合。\(E_j\) 表示第 \(j\) 个 expert MLP，\(p_{t,j}\) 是合并该 expert 输出时使用的权重。</p>
 
-<h2 id="zh-torch">2. 从路由到执行的数据流</h2>
+<h2 id="zh-torch">2. 路由与分发</h2>
 
 <p>公式只描述每个 token 的结果，kernel 还需要知道哪些 token 属于同一个 expert。下面的 torch-like 代码把这一步展开：router 先产生 top-k expert id 与权重，indexer 再按 expert 重排 token，GroupedGEMM 执行各个 expert，最后按原 token 顺序加权回填。</p>
 
@@ -297,7 +297,7 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
   </svg>
 </div>
 
-<h2 id="zh-history">5. 演进历史</h2>
+<h2 id="zh-history">5. 架构演进</h2>
 
 <div class="table-scroll">
 <table class="wide-table">
@@ -323,7 +323,7 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
 
 <p>这段演进把研究重心从稀疏激活本身推向了可扩展执行。早期工作建立条件计算与负载均衡方法；随着 expert 数量、设备规模和低精度格式增加，token 分布、all-to-all、动态 shape 与融合 kernel 逐渐成为同一设计的一部分。</p>
 
-<h2 id="zh-megamoe">6. MegaMoE 执行 contract</h2>
+<h2 id="zh-megamoe">6. MegaMoE 执行约束</h2>
 
 <p>在 DeepGEMM 与 vLLM 的公开代码语境中，MegaMoE 是面向 MoE expert 层的融合执行路径。它把 prepare/indexing、量化、dispatch、expert GEMM、activation 与 combine 中的若干阶段压缩到更少的 kernel 和中间内存访问中。模型的 routed-expert 语义保持不变，变化发生在后端执行 contract。</p>
 
@@ -359,7 +359,7 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
 
 <p>同一个 routed-expert 模型可以映射到常规 GroupedGEMM，也可以映射到 MegaMoE 类 fused kernel。两条路径共享路由数学定义，却采用不同的量化格式、布局 metadata 和阶段划分；评估实现时应分别检查模型语义与 backend contract。</p>
 
-<h2 id="zh-problems">7. 执行瓶颈与约束</h2>
+<h2 id="zh-problems">7. 性能瓶颈</h2>
 
 <p>MoE 的动态路由会同时改变 GEMM 形状、通信量和中间布局，这些开销彼此耦合：expert histogram 决定 bucket 大小，bucket 大小影响 GroupedGEMM 利用率，expert placement 又把同一分布转换成 all-to-all 流量。</p>
 
@@ -408,7 +408,7 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
 
 <div class="lang-en">
 
-<h1>Modern LLM MoE Architectures: Routing, Dispatch, and Fused Execution</h1>
+<h1>LLM MoE architecture and execution</h1>
 
 <p class="lead">The FFN stores a large share of a Transformer's parameters. Dense execution sends every token through the same weights, so increasing model capacity also raises per-token compute. Sparse MoE makes the FFN weights conditional, allowing model capacity and the computation activated by each forward pass to scale separately.</p>
 
@@ -416,13 +416,13 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
 
 <p class="small">Version scope: the discussion follows public papers, documentation, and open-source implementations visible on 2026-08-07. It covers sparse MoE layers that replace the FFN/MLP in a Transformer block; attention continues to mix information across tokens.</p>
 
-<h2 id="en-scope">0. Model boundary</h2>
+<h2 id="en-scope">0. Model scope</h2>
 
 <p>A sparse MLP-MoE is a conditionally executed FFN with \(E\) experts. Router scores select \(K\) experts for each token, and their outputs are combined with routing weights. When \(K \ll E\), total parameters can grow while each token pays for only the selected experts.</p>
 
 <p>This definition limits the discussion to MLP-MoE inside Transformer blocks. Embedding MoE, attention MoE, RL policy MoE, and conventional ensembles select different objects and follow different execution paths. The sections below trace one MLP-MoE execution through the router, indexer, dispatcher, expert-parallel runtime, and MegaMoE backend.</p>
 
-<h2 id="en-block">1. Replacing the FFN</h2>
+<h2 id="en-block">1. MoE and FFN</h2>
 
 <p>In a dense Transformer block, every token uses the same FFN weights. A MoE block leaves attention, residual connections, and normalization in place, replacing only the FFN with a router, an expert pool, and a weighted combine. Attention continues to mix information among tokens; MoE chooses a parameter-space compute path for each token.</p>
 
@@ -462,7 +462,7 @@ y_t = \sum_{j \in \mathrm{TopK}(r(x_t))} p_{t,j} E_j(x_t)
   </svg>
 </div>
 
-<h2 id="en-torch">2. Routing-to-execution dataflow</h2>
+<h2 id="en-torch">2. Routing and dispatch</h2>
 
 <p>The equation specifies a token's output, but a kernel also needs to know which tokens belong to each expert. The torch-like code below makes that transformation explicit. The router emits top-k expert ids and weights, the indexer groups tokens by expert, GroupedGEMM executes the expert MLPs, and the final accumulation restores token order.</p>
 
@@ -537,7 +537,7 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
 
 <p>In this article, <code>indexer</code> names the layout-building stage that turns router top-k output into token permutations, expert offsets, bucket sizes, and combine metadata. MoE papers do not prescribe a common indexer API, so names such as FP4 Indexer in DeepGEMM or lightning indexer elsewhere refer to implementation-specific kernel primitives and data contracts.</p>
 
-<h2 id="en-arch">4. Architecture and execution patterns</h2>
+<h2 id="en-arch">4. Architecture and execution types</h2>
 
 <p>An MoE design chooses routing cardinality, expert granularity, shared paths, capacity policy, and parallel placement. These dimensions are independent, so one model may occupy several rows. DeepSeek-V3, for example, combines fine-grained experts, a shared expert path, and expert-parallel execution.</p>
 
@@ -583,7 +583,7 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
   </svg>
 </div>
 
-<h2 id="en-history">5. History</h2>
+<h2 id="en-history">5. Architectural evolution</h2>
 
 <div class="table-scroll">
 <table class="wide-table">
@@ -605,7 +605,7 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
 
 <p>This progression moved the research focus from sparse activation itself toward scalable execution. Early work established conditional computation and load-balancing methods. As expert counts, device scale, and low-precision formats grew, token distributions, all-to-all traffic, dynamic shapes, and fused kernels became parts of the same design problem.</p>
 
-<h2 id="en-megamoe">6. The MegaMoE execution contract</h2>
+<h2 id="en-megamoe">6. MegaMoE execution contract</h2>
 
 <p>In the public DeepGEMM and vLLM code, MegaMoE is a fused execution path for an MoE expert layer. It collapses selected parts of prepare/indexing, quantization, dispatch, expert GEMM, activation, and combination into fewer kernels and intermediate memory passes. The routed-expert model semantics stay fixed; the backend execution contract changes.</p>
 
@@ -640,7 +640,7 @@ y.index_add_(0, token_id[order], y_perm * gate_perm[:, None])</pre>
 
 <p>The same routed-expert model can map to a conventional GroupedGEMM path or a MegaMoE-style fused kernel. Both implement the same routing equation, but they use different quantization formats, metadata layouts, and stage boundaries. Implementation analysis must therefore keep model semantics separate from the backend contract.</p>
 
-<h2 id="en-problems">7. Execution bottlenecks and constraints</h2>
+<h2 id="en-problems">7. Performance bottlenecks</h2>
 
 <p>Dynamic routing changes GEMM shapes, communication volume, and intermediate layouts together. The following costs interact: the expert histogram sets bucket sizes, bucket sizes determine GroupedGEMM utilization, and expert placement converts that same distribution into all-to-all traffic.</p>
 

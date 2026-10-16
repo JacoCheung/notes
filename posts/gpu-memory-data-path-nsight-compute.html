@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NVIDIA GPU 访存层级与 Nsight Compute 数据通路模型</title>
-<meta name="post:title"           content="NVIDIA GPU 访存层级与 Nsight Compute 数据通路模型">
-<meta name="post:title_en"        content="NVIDIA GPU Memory Hierarchy and the Nsight Compute Data-Path Model">
+<title>GPU 访存路径与 Nsight Compute</title>
+<meta name="post:title"           content="GPU 访存路径与 Nsight Compute">
+<meta name="post:title_en"        content="GPU memory paths in Nsight Compute">
 <meta name="post:slug"            content="gpu-memory-data-path-nsight-compute">
 <meta name="post:date"            content="2026-08-28">
 <meta name="post:tags"            content="GPU, CUDA, Nsight Compute, Memory Hierarchy, L1TEX, L2 Cache">
@@ -25,11 +25,11 @@
   };
 </script>
 <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
-<script src="../lang-toggle.js" defer></script>
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
 <style>
   .lead {
     margin: -6px 0 30px;
@@ -159,39 +159,39 @@
 <summary><span class="lang-zh">目录与系列</span><span class="lang-en">Contents and series</span></summary>
 <aside class="toc"><div class="toc-title">目录 · TOC</div>
 <div class="lang-zh"><ul>
-<li><a href="#zh-scope">1. 从一个 warp 的读取开始</a></li>
-<li><a href="#zh-granularity">2. 一条指令为什么会请求 4 个或 32 个 sector</a></li>
-<li><a href="#zh-global-path">3. 从 L1TEX 向下追踪一次读取</a></li>
-<li><a href="#zh-diagnosis">4. 把布局改动变成可验证的实验</a></li>
-<li><a href="#zh-other-paths">5. 其他访存操作需要换哪些判断</a></li>
-<li><a href="#zh-conclusion">6. 从 sector 算例回到 kernel</a></li>
-<li><a href="#zh-units">附录 A：Memory Chart 周边的单元缩写</a></li>
-<li><a href="#zh-metrics">附录 B：采集入口与计数单位</a></li>
+<li><a href="#zh-scope">1. Warp 访存模型</a></li>
+<li><a href="#zh-granularity">2. 访存合并与 Sector</a></li>
+<li><a href="#zh-global-path">3. L1TEX、L2 与显存</a></li>
+<li><a href="#zh-diagnosis">4. 访存布局对照实验</a></li>
+<li><a href="#zh-other-paths">5. 其他访存路径</a></li>
+<li><a href="#zh-conclusion">6. Kernel 访存分析</a></li>
+<li><a href="#zh-units">附录 A：Memory Chart 单元</a></li>
+<li><a href="#zh-metrics">附录 B：指标采集与计数单位</a></li>
 <li><a href="#zh-refs">参考资料</a></li>
 </ul></div>
 <div class="lang-en"><ul>
-<li><a href="#en-scope">1. Start with one warp's load</a></li>
-<li><a href="#en-granularity">2. How one instruction requests 4 or 32 sectors</a></li>
-<li><a href="#en-global-path">3. Follow the read beyond L1TEX</a></li>
-<li><a href="#en-diagnosis">4. Turn the layout change into a testable experiment</a></li>
-<li><a href="#en-other-paths">5. What changes for other memory operations</a></li>
-<li><a href="#en-conclusion">6. Bring the sector calculation back to the kernel</a></li>
-<li><a href="#en-units">Appendix A: Units around the Memory Chart</a></li>
-<li><a href="#en-metrics">Appendix B: Collection entry points and units</a></li>
+<li><a href="#en-scope">1. Warp memory accesses</a></li>
+<li><a href="#en-granularity">2. Coalescing and sectors</a></li>
+<li><a href="#en-global-path">3. L1TEX, L2, and device memory</a></li>
+<li><a href="#en-diagnosis">4. Memory-layout experiment</a></li>
+<li><a href="#en-other-paths">5. Other memory paths</a></li>
+<li><a href="#en-conclusion">6. Kernel memory analysis</a></li>
+<li><a href="#en-units">Appendix A: Memory Chart units</a></li>
+<li><a href="#en-metrics">Appendix B: Collection and counter units</a></li>
 <li><a href="#en-refs">References</a></li>
 </ul></div>
 </aside>
 </details>
 <div class="lang-zh">
 
-<h1>NVIDIA GPU 访存层级与 Nsight Compute 数据通路模型</h1>
+<h1>GPU 访存路径与 Nsight Compute</h1>
 <p class="lead">处理矩阵的一列和一行，可能执行同样数量的 load，运行时间却差很多。区别往往从 warp 内的地址分布开始：线程各要一个 float，硬件实际搬运的数据按 sector 组织；这些请求随后还要经过缓存。有的流量止于 L1，有的穿过 L2 才到显存。要解释一段 kernel 的访存成本，需要把这几步连起来看。</p>
 <div class="reading-guide">
 <p><strong>快速索引</strong> · <a href="#zh-granularity">4 个与 32 个 sector 的算例</a> · <a href="#zh-global-path">请求经过哪些层级</a> · <a href="#zh-diagnosis">在 NCU 中验证改动</a> · <a href="#zh-units">硬件缩写速查</a></p>
 <p>阅读前只需了解 thread、warp 和 global/shared memory。正文围绕一次 global load 展开；shared、atomic 和远端内存的差异放在后半篇。</p>
 </div>
 
-<h2 id="zh-scope">1. 从一个 warp 的读取开始</h2>
+<h2 id="zh-scope">1. Warp 访存模型</h2>
 <p>假设一个 warp 的 32 个 lane 都参与执行，每个 lane 读取一个 32-bit float，数据来自 GPU 本地显存中的数组。我们比较同一组逻辑值的两种存放方式：连续布局把相邻值放在相邻地址；跨步布局把相邻值隔开 8 个 float。这样的差别常见于矩阵的行、列访问，也可能来自一个较大结构体中同一字段的读取。[<a href="#zh-ref-cuda">5</a>]</p>
 <p>下面的代码只表达地址关系，是教学伪代码。<code>lane</code> 在 0 到 31 之间，<code>s</code> 是以 float 为单位的间隔。两种布局事先装入相同的逻辑数据；直接改真实程序里的 <code>s</code> 会改变读取内容，还需要相应的数据布局转换。</p>
 <pre><code class="language-cpp">// One warp; all 32 lanes are active.
@@ -200,7 +200,7 @@ float value = x_s[s * lane];   // s = 1 or s = 8
 consume(value);               // Keep the loaded value live.</code></pre>
 <p>先固定一个便于计算的执行条件：编译结果是一条每线程读取 4 byte 的 warp 级 global-load 指令，基址按 128 byte 对齐，采用允许查询 L1 的普通缓存策略。后文使用 Nsight Compute 2026.2 对 Volta 及更新 GPU 的简化 L1TEX 模型：这类 LSU 指令向 L1TEX 发出一个 request，request 中包含参与线程的地址。特殊指令、缓存策略与架构差异需要另行核对。[<a href="#zh-ref-ncu">1</a>]</p>
 
-<h2 id="zh-granularity">2. 一条指令为什么会请求 4 个或 32 个 sector</h2>
+<h2 id="zh-granularity">2. 访存合并与 Sector</h2>
 <p><strong>Sector 是对齐的 32-byte 数据区域。</strong> L1TEX 依据线程地址，把落在同一 sector 的读取合并处理。因此，线程要的有效数据量相同，涉及的 sector 数仍可能相差很大。</p>
 <p>设数组基址为 \(B\)，lane 编号为 \(\ell\)，取值 0 到 31，间隔为 \(s\)。该 lane 的字节地址和相对 sector 编号为：</p>
 \[
@@ -221,12 +221,12 @@ consume(value);               // Keep the loaded value live.</code></pre>
 </tbody></table></div>
 <p>这给出了一个具体的优化方向：如果相邻 lane 能改读相邻元素，这条指令覆盖的 sector 数可以从 32 降到 4。这里的 8 倍是<strong>地址分布造成的请求覆盖量之比</strong>。表中还没有缓存命中、其他 warp 对同一数据的复用，也没有 DRAM 事务或耗时测量。</p>
 
-<h3 id="zh-wavefront">Request、sector 与 wavefront 各自在数什么</h3>
+<h3 id="zh-wavefront">Request、Sector 与 Wavefront</h3>
 <p>Request 是送入一个硬件单元的一项请求；sector 描述它涉及的数据区域；<strong>wavefront 是该单元一次能并行处理的工作包</strong>。如果一个 request 的工作装不进一个包，就要拆成多个依次处理的 wavefront。三个量回答的是请求数量、数据覆盖范围和内部服务工作量。[<a href="#zh-ref-ncu">1</a>]</p>
 <p>Wavefront 的划分还受 cache line、memory space 等处理限制影响。NCU 文档明确给出：一个涉及 4 个 sector 的 request，可能用一个 wavefront，也可能用两个或更多。因此，上面的地址计算能确定 sector 数，不能据此填出 wavefront 数；后者要查目标 GPU 上的实际值与理想值。</p>
 <p>同样，4 sectors/request 只适用于本例的全 warp、连续、不同地址且对齐的 32-bit 访问。NCU 表中同类 64-bit 和 128-bit 访问的理想值分别是 8 和 16；只有部分 lane 活跃、多个 lane 读取相同地址时，数值还会更小。判定访问效率时，要把访问宽度与活跃线程一起带入。</p>
 
-<h2 id="zh-global-path">3. 从 L1TEX 向下追踪一次读取</h2>
+<h2 id="zh-global-path">3. L1TEX、L2 与显存</h2>
 <p>两种布局在进入 L1TEX 时已经形成不同的 sector 需求，但显存未必承担全部流量。允许使用 L1 的普通 global load 会先查询 L1TEX；未命中的部分向 L2 请求，L2 仍未命中的部分才需要访问对应的后备内存。本例的后备内存是本地 device memory。[<a href="#zh-ref-chart">2</a>]</p>
 <figure class="diagram-frame">
 <figcaption class="diagram-title">图 1 · 普通本地 global load 的逻辑请求与返回</figcaption>
@@ -245,18 +245,18 @@ consume(value);               // Keep the loaded value live.</code></pre>
 <p>例如，跨步版本请求 32 个 L1 sector，其中已有 28 个在 L1，向下查询的只剩未命中的 4 个 sector。这个假设说明了为什么“L1 请求多”不一定对应“DRAM 字节多”，它不是一份实测结果。反过来，若工作集很大、复用很少，跨步访问产生的额外 sector 更可能传递到后端，此时还要检查 L2 命中和实际显存流量。</p>
 <p>NCU Memory Chart 把这些逻辑层级和流量放在一张图里。它适合回答流量在哪里产生、被缓存吸收或继续向下传播。GNIC、LRC 等更细的接口名称见<a href="#zh-units">附录 A</a>；它们的物理连接随实现而变，不影响先按缓存层级分析这个案例。</p>
 
-<h2 id="zh-diagnosis">4. 把布局改动变成可验证的实验</h2>
+<h2 id="zh-diagnosis">4. 访存布局对照实验</h2>
 <p>现在把真实 kernel 的两个版本记为 A（跨步）与 B（连续）。实验首先保证它们产生相同结果、处理相同数量的逻辑元素，随后检查“sector 变少”这一预测是否发生，再追踪它是否带来时间收益。这样即使 B 没有变快，也能知道是哪一步没有兑现。</p>
 
-<h3 id="zh-profile">4.1 先确认指令与 L1 请求</h3>
+<h3 id="zh-profile">4.1 指令与 L1 请求</h3>
 <p>在 Source/SASS 视图中找到目标 load，确认访问宽度、谓词和参与线程，与算例假设一致。编译器可能把源代码合并为向量访问，也可能消去未使用的 load；两种情况都会改变计数基准。接着在 Memory Workload Analysis 的 L1/TEX 表中查看 global-load 对应的 Instructions、Requests、Sectors/Req 和 Bytes。[<a href="#zh-ref-tables">3</a>]</p>
 <p>如果目标访问混在许多别的 load 中，整张表的平均 Sectors/Req 不会精确等于 32 或 4。此时用源码定位、指令级指标或保持其他访问不变的对照，确认这部分访问的变化。L1 表的 Bytes 是 sector 数乘以 32，统计的是此处请求的数据覆盖量。</p>
 
-<h3 id="zh-downstream">4.2 检查流量是否继续传到 L2 和显存</h3>
+<h3 id="zh-downstream">4.2 L2 与显存流量</h3>
 <p>沿 global-load 的来源，查看 L1 miss 之后的 L2 sector、L2 hit/miss，以及 device-memory read bytes。先核对所选表格行和 aperture，避免把 writeback、atomic、系统内存或另一条访问路径混进来。显存吞吐量需要同时看 bytes 与执行时间：少量数据也可能在很短的时间内跑到高带宽。</p>
 <p>两个版本必须使用相同的 profiling 设置。NCU 为收集指标可能重放 kernel，默认会在 kernel replay 的各 pass 前清理 GPU cache。若你关注重复执行后的热缓存表现，须选择并记录相应的 cache-control 设置，且给两个版本相同的预热条件。小 kernel 还容易受到其他 GPU 工作对 L2、DRAM 计数的影响。[<a href="#zh-ref-replay">4</a>]</p>
 
-<h3 id="zh-results">4.3 用结果决定下一步</h3>
+<h3 id="zh-results">4.3 结果分析</h3>
 <div class="table-scroll"><table class="note-table">
 <thead><tr><th>A → B 后观察到的结果</th><th>目前能成立的判断</th><th>后续动作</th></tr></thead>
 <tbody>
@@ -268,22 +268,22 @@ consume(value);               // Keep the loaded value live.</code></pre>
 <p>在 NCU 之外独立重复测量运行时间，例如充分预热后用 CUDA events 包住目标工作区间。这样得到的是正常执行的耗时，避免混入 profiling 与 replay 的影响。布局转换若属于产品流程，就应纳入端到端计时。</p>
 <p>当时间没有改善时，Memory Chart 仍能帮助缩小范围。若某单元吞吐接近上限，再结合上游 backpressure 和 scheduler 发射情况判断它是否限制 kernel；若计算端在等待返回值，则到<a href="gpu-warp-stall-nsight-compute.html#zh-causal-chain">Warp Stall 的依赖定位案例</a>继续追踪对应 load。图中的单条链路也可能与其他链路共享端口，单条百分比偏低并不自动表示共享端口空闲。</p>
 
-<h2 id="zh-other-paths">5. 其他访存操作需要换哪些判断</h2>
-<h3 id="zh-shared">5.1 Shared memory：看 bank 与服务工作量</h3>
+<h2 id="zh-other-paths">5. 其他访存路径</h2>
+<h3 id="zh-shared">5.1 Shared Memory 与 Bank</h3>
 <p>普通 CTA 内的 shared-memory 访问由 SM 侧资源服务，不经过本例的 L2、显存读取路径。此时地址分布关注的是 bank：同一请求对同一个 bank 中不同位置的访问可能需要拆开服务。宽 shared 指令本来就可能需要多个 wavefront，应比较实际 wavefront 与该指令的理想值，再判断 bank conflict 带来的额外工作。[<a href="#zh-ref-tables">3</a>]</p>
 <p>如果报告同时出现 MIO Throttle，还要区分输入侧队列拥塞与消费者等待返回值。减少 shared 指令数量、处理 bank conflict 和改善依赖距离分别改变不同环节，具体代码对照见<a href="gpu-mio-throttle-nsight-compute.html">MIO Throttle 篇</a>。Cluster 的 distributed shared memory 和异步搬运有额外路径与同步规则，不能套用普通 CTA shared load 的全部假设。</p>
-<h3 id="zh-store-atomic">5.2 Store 与 atomic：方向和语义也会改变</h3>
+<h3 id="zh-store-atomic">5.2 Store 与 Atomic</h3>
 <p>Global store 的有效写入字节同样可能分布到多个 sector，但写策略、合并、写回以及完成确认改变了后续流量。分析时切换到 store 对应的表格行，不能把上面的 load 命中与返回模型直接反向使用。</p>
 <p>Atomic 还要完成对目标位置的原子更新。同一地址上的大量竞争会造成串行化，即使 DRAM 带宽不高也可能很慢；带返回值的指令还会给消费者建立依赖。修改 atomic 前须先保留所需的 scope 和 memory order，详见<a href="gpu-atomic-memory-ordering.html">GPU Atomic 与内存顺序</a>。</p>
-<h3 id="zh-remote">5.3 Global 地址可以指向系统或 peer 内存</h3>
+<h3 id="zh-remote">5.3 系统与 Peer 内存</h3>
 <p>Global memory 是地址空间概念。一个 global 地址可以映射到本地 device memory，也可以映射到系统内存或另一块 GPU 的可访问内存。NCU 中的 <code>aperture_device</code>、<code>aperture_sysmem</code>、<code>aperture_peer</code> 区分这些目的地。[<a href="#zh-ref-ncu">1</a>]</p>
 <p>如果目标属于后两者，应跟踪对应 aperture 和互连流量。本地 DRAM bytes 偏低只描述本地显存这一路，无法代表整个访存过程的成本。</p>
 
-<h2 id="zh-conclusion">6. 从 sector 算例回到 kernel</h2>
+<h2 id="zh-conclusion">6. Kernel 访存分析</h2>
 <p>在这个 32-lane 算例中，问题起于数据布局：跨步访问让同样的 128 B 有效数据覆盖 32 个 sector，连续布局只覆盖 4 个。L1TEX 之后的缓存命中与请求处理决定了多少额外流量继续向后传，scheduler 和其他工作则共同决定运行时间。</p>
 <p>这也是布局优化值得采用的验证顺序：先把地址到 sector 的预测算清楚，再确认编译结果和各层计数，最后测实际耗时。若转换布局本身的成本已经超过节省的时间，可以考虑调整 tile、复用现有布局，或把转换合并进已有的数据处理步骤。下一次遇到低效访存时，起点是线程在读哪些地址，以及这些地址让硬件多处理了什么。</p>
 
-<h2 id="zh-units">附录 A：Memory Chart 周边的单元缩写</h2>
+<h2 id="zh-units">附录 A：Memory Chart 单元</h2>
 <p>NCU 的 metric 名称比主图更细。以下定义来自 2026.2 Metrics Guide；GNIC 一项另外引用 NVIDIA 的公开专利实施例。它们适合解释指标所属位置，具体 GPU 是否暴露某项计数仍需用本机 NCU 查询。</p>
 <div class="table-scroll"><table class="note-table">
 <thead><tr><th>名称</th><th>公开资料中的职责</th><th>阅读时的用途</th></tr></thead><tbody>
@@ -298,7 +298,7 @@ consume(value);               // Keep the loaded value live.</code></pre>
 </tbody></table></div>
 <p>接口修饰符采用 <code>sender2receiver</code> 形式，指明发送端与接收端。例如，在目标上存在的 <code>gnic2l1tex</code> 指标描述朝向 L1TEX 的接口方向。方向只限定该接口的流向，完整语义还要读对应 metric 的说明。[<a href="#zh-ref-ncu">1</a>][<a href="#zh-ref-patent">6</a>]</p>
 
-<h2 id="zh-metrics">附录 B：采集入口与计数单位</h2>
+<h2 id="zh-metrics">附录 B：指标采集与计数单位</h2>
 <pre><code class="language-bash"># Inspect metrics and sections available on the profiling machine.
 ncu --query-metrics
 ncu --list-sections
@@ -335,14 +335,14 @@ ncu --section MemoryWorkloadAnalysis_Chart ./app</code></pre>
 </div>
 <div class="lang-en">
 
-<h1>NVIDIA GPU Memory Hierarchy and the Nsight Compute Data-Path Model</h1>
+<h1>GPU memory paths in Nsight Compute</h1>
 <p class="lead">Reading a matrix column and reading a row can execute the same number of loads yet take very different amounts of time. The difference often starts with the addresses inside each warp: every thread wants one float, but hardware handles the data in sectors. Those requests then pass through caches. Some traffic stops at L1; some reaches device memory after missing in L2. Explaining a kernel's memory cost means connecting those steps.</p>
 <div class="reading-guide">
 <p><strong>Quick links</strong> · <a href="#en-granularity">The 4-sector versus 32-sector example</a> · <a href="#en-global-path">Following a request</a> · <a href="#en-diagnosis">Testing a change in NCU</a> · <a href="#en-units">Hardware abbreviations</a></p>
 <p>This article assumes familiarity with threads, warps, and global/shared memory. The main example follows one global load; shared memory, atomics, and remote memory are covered afterward.</p>
 </div>
 
-<h2 id="en-scope">1. Start with one warp's load</h2>
+<h2 id="en-scope">1. Warp memory accesses</h2>
 <p>Suppose all 32 lanes of a warp participate, each loading one 32-bit float from an array in local GPU device memory. Compare two layouts of the same logical values: a contiguous layout places neighboring values at neighboring addresses; a strided layout separates them by 8 floats. Matrix row and column accesses can produce this difference, as can reading one field from an array of larger structures.[<a href="#en-ref-cuda">5</a>]</p>
 <p>The following teaching pseudocode expresses only the address relationship. <code>lane</code> ranges from 0 to 31, and <code>s</code> is the spacing in floats. Both layouts have been populated with the same logical data. Changing <code>s</code> in a real program also changes the values read unless the data layout is changed accordingly.</p>
 <pre><code class="language-cpp">// One warp; all 32 lanes are active.
@@ -351,7 +351,7 @@ float value = x_s[s * lane];   // s = 1 or s = 8
 consume(value);               // Keep the loaded value live.</code></pre>
 <p>Use a specific execution model for the calculation: the compiler emits one warp-level global-load instruction that reads 4 bytes per thread, the base address is 128-byte aligned, and ordinary caching permits an L1 lookup. Nsight Compute 2026.2 describes a simplified L1TEX model for Volta and newer GPUs in which this LSU instruction sends one request containing the participating threads' addresses to L1TEX. Specialized instructions, cache policies, and architecture differences require their own checks.[<a href="#en-ref-ncu">1</a>]</p>
 
-<h2 id="en-granularity">2. How one instruction requests 4 or 32 sectors</h2>
+<h2 id="en-granularity">2. Coalescing and sectors</h2>
 <p><strong>A sector is an aligned 32-byte data region.</strong> L1TEX combines accesses to the same sector using the threads' addresses. The same number of useful bytes can therefore cover very different numbers of sectors.</p>
 <p>Let \(B\) be the array's base address, \(\ell\) the lane index from 0 to 31, and \(s\) the spacing. The byte address and relative sector index for that lane are:</p>
 \[
@@ -371,12 +371,12 @@ consume(value);               // Keep the loaded value live.</code></pre>
 </tbody></table></div>
 <p>This suggests a specific optimization: arranging for adjacent lanes to read adjacent elements can reduce this instruction's sector footprint from 32 to 4. The factor of 8 is a <strong>ratio of requested coverage caused by the address layout</strong>. The table does not yet include cache hits, reuse by other warps, DRAM transactions, or timing measurements.</p>
 
-<h3 id="en-wavefront">What requests, sectors, and wavefronts count</h3>
+<h3 id="en-wavefront">Requests, sectors, and wavefronts</h3>
 <p>A request is a command sent into a hardware unit. Sectors describe the data regions it touches. A <strong>wavefront is a work package that the unit can process in parallel</strong>. If a request's work does not fit in one package, it is split into multiple wavefronts processed serially. These quantities describe the number of requests, the data footprint, and the internal service work.[<a href="#en-ref-ncu">1</a>]</p>
 <p>Wavefront formation also depends on processing limits involving cache lines, memory spaces, and other constraints. The NCU guide explicitly allows a request for 4 sectors to require one wavefront, two, or more. The address calculation above determines sectors; the target GPU's actual and ideal wavefront counts must be checked separately.</p>
 <p>Likewise, 4 sectors per request applies to this example's full-warp, contiguous, distinct-address, aligned 32-bit access. The corresponding ideal values in NCU's table are 8 for 64-bit accesses and 16 for 128-bit accesses. Partial participation or overlapping addresses can produce smaller values. Access width and active lanes belong in any assessment of access efficiency.</p>
 
-<h2 id="en-global-path">3. Follow the read beyond L1TEX</h2>
+<h2 id="en-global-path">3. L1TEX, L2, and device memory</h2>
 <p>The two layouts already create different sector demands on entry to L1TEX, but device memory may not service all of that traffic. An ordinary global load permitted to use L1 first queries L1TEX. Missing data is requested from L2; data that also misses there must be fetched from the relevant backing memory. In this example, that backing memory is local device memory.[<a href="#en-ref-chart">2</a>]</p>
 <figure class="diagram-frame">
 <figcaption class="diagram-title">Figure 1 · Logical requests and returns for a local global load</figcaption>
@@ -395,18 +395,18 @@ consume(value);               // Keep the loaded value live.</code></pre>
 <p>For example, if 28 of the strided version's 32 requested sectors are already present in L1, only the 4 missing sectors need a downstream lookup. This hypothetical state explains how a large L1 demand can coexist with modest DRAM traffic; it is not a measurement. Conversely, with a large working set and little reuse, extra sectors from strided access are more likely to reach the backend. L2 hits and measured device-memory traffic establish how far they actually travel.</p>
 <p>The NCU Memory Chart places these logical levels and their traffic in one view. It helps locate where demand originates, where caches absorb it, and where it continues downstream. More detailed interface names such as GNIC and LRC are covered in <a href="#en-units">Appendix A</a>. Their physical connections vary by implementation; the cache-level analysis of this example does not depend on a specific internal network.</p>
 
-<h2 id="en-diagnosis">4. Turn the layout change into a testable experiment</h2>
+<h2 id="en-diagnosis">4. Memory-layout experiment</h2>
 <p>Call the real kernel's strided version A and its contiguous version B. First ensure that both produce the same results and process the same number of logical elements. Then test the predicted sector reduction and follow its effect on execution time. If B does not become faster, this sequence identifies where the expected benefit stopped.</p>
 
-<h3 id="en-profile">4.1 Confirm the instruction and L1 requests</h3>
+<h3 id="en-profile">4.1 Instructions and L1 requests</h3>
 <p>Locate the target load in the Source/SASS view and check its access width, predicate, and participating threads against the example's assumptions. The compiler may combine source operations into a vector load or eliminate an unused load; either changes the counting baseline. Next, inspect the global-load Instructions, Requests, Sectors/Req, and Bytes in the L1/TEX table of Memory Workload Analysis.[<a href="#en-ref-tables">3</a>]</p>
 <p>If many other loads contribute to the table, its average Sectors/Req will not be exactly 32 or 4. Source attribution, instruction-level metrics, or a comparison that keeps other accesses unchanged can help isolate the change. Bytes in the L1 table is sectors multiplied by 32: the data coverage requested at that level.</p>
 
-<h3 id="en-downstream">4.2 Check whether the traffic reaches L2 and device memory</h3>
+<h3 id="en-downstream">4.2 L2 and device-memory traffic</h3>
 <p>Follow the global-load source through L2 sectors after L1 misses, L2 hits and misses, and device-memory read bytes. Check the selected table row and aperture before combining counters, so that writebacks, atomics, system memory, or another path do not enter the comparison. Evaluate device-memory bytes together with execution time: a small transfer can still reach high bandwidth over a short interval.</p>
 <p>Both versions need the same profiling settings. NCU may replay a kernel to collect metrics and, by default, flushes GPU caches before each kernel-replay pass. If the question concerns warm-cache behavior after repeated execution, select and record suitable cache-control settings and apply the same warm-up conditions to both versions. Other GPU activity can also affect L2 and DRAM counters, particularly for small kernels.[<a href="#en-ref-replay">4</a>]</p>
 
-<h3 id="en-results">4.3 Let the result determine the next step</h3>
+<h3 id="en-results">4.3 Result analysis</h3>
 <div class="table-scroll"><table class="note-table">
 <thead><tr><th>Observed after changing A to B</th><th>Supported interpretation</th><th>Next step</th></tr></thead><tbody>
 <tr><td>Target-load sectors, DRAM bytes, and time all decrease</td><td>The layout reduces backend traffic and improves this workload</td><td>Test the real input distribution and include layout-conversion cost</td></tr>
@@ -417,22 +417,22 @@ consume(value);               // Keep the loaded value live.</code></pre>
 <p>Measure execution time independently outside NCU, repeating a stable measurement such as CUDA events around the intended work after sufficient warm-up. This measures normal execution without profiling and replay effects. Include layout conversion in end-to-end timing when it is part of the production path.</p>
 <p>Even when time does not improve, the Memory Chart can narrow the search. If a unit approaches its throughput limit, combine that observation with upstream backpressure and scheduler issue behavior to assess whether it limits the kernel. If computation is waiting for a returned value, continue at the <a href="gpu-warp-stall-nsight-compute.html#en-causal-chain">Warp Stall dependency example</a> to identify the load. Individual chart links may also share a port: low utilization on one link does not establish that the shared port is idle.</p>
 
-<h2 id="en-other-paths">5. What changes for other memory operations</h2>
-<h3 id="en-shared">5.1 Shared memory: banks and service work</h3>
+<h2 id="en-other-paths">5. Other memory paths</h2>
+<h3 id="en-shared">5.1 Shared memory and banks</h3>
 <p>Ordinary shared-memory accesses within a CTA are served by SM-side resources, without following this example's L2 and device-memory read path. The relevant address mapping is to banks: accesses within one request to different locations in the same bank may require separate service. A wide shared instruction can inherently need multiple wavefronts. Compare actual wavefronts with the instruction's ideal count to identify extra work from bank conflicts.[<a href="#en-ref-tables">3</a>]</p>
 <p>If the report also shows MIO Throttle, distinguish congestion at the input queue from a consumer waiting for a result. Reducing shared instructions, addressing bank conflicts, and increasing dependency distance affect different stages; the <a href="gpu-mio-throttle-nsight-compute.html">MIO Throttle article</a> develops the code comparison. Cluster distributed shared memory and asynchronous transfers add paths and synchronization rules beyond ordinary CTA shared loads.</p>
-<h3 id="en-store-atomic">5.2 Stores and atomics: direction and semantics</h3>
+<h3 id="en-store-atomic">5.2 Stores and atomics</h3>
 <p>A global store's useful bytes can also span multiple sectors, but write policies, combining, writeback, and completion acknowledgments affect the subsequent traffic. Select the store rows when analyzing these operations; the load hit-and-return model cannot simply be run backward.</p>
 <p>An atomic must also perform an indivisible update at its target. Heavy contention on one address can serialize work and make a kernel slow without saturating DRAM bandwidth. A returning instruction can additionally establish a dependency for its consumer. Preserve the required scope and memory order when changing atomics; see <a href="gpu-atomic-memory-ordering.html">GPU Atomics and Memory Ordering</a>.</p>
-<h3 id="en-remote">5.3 Global addresses can target system or peer memory</h3>
+<h3 id="en-remote">5.3 System and peer memory</h3>
 <p>Global memory names an address space. A global address can map to local device memory, system memory, or accessible memory on another GPU. NCU distinguishes those destinations with <code>aperture_device</code>, <code>aperture_sysmem</code>, and <code>aperture_peer</code>.[<a href="#en-ref-ncu">1</a>]</p>
 <p>For the latter two, follow the relevant aperture and interconnect traffic. Low local DRAM bytes describe only the local device-memory path, not the cost of the entire access.</p>
 
-<h2 id="en-conclusion">6. Bring the sector calculation back to the kernel</h2>
+<h2 id="en-conclusion">6. Kernel memory analysis</h2>
 <p>The problem in this 32-lane example begins with layout: strided access spreads the same 128 useful bytes across 32 sectors, while the contiguous layout covers 4. Cache hits and request handling beyond L1TEX determine how much extra traffic propagates downstream. Scheduling and the kernel's other work then contribute to the execution time.</p>
 <p>This gives a useful order for validating a layout optimization: calculate the predicted sector footprint, confirm the generated instructions and counters at each level, then measure time. If converting the layout costs more than it saves, consider changing the tile, reusing the existing layout, or folding conversion into another data-processing step. The starting point for the next inefficient access is the addresses the threads read and the extra work those addresses impose on hardware.</p>
 
-<h2 id="en-units">Appendix A: Units around the Memory Chart</h2>
+<h2 id="en-units">Appendix A: Memory Chart units</h2>
 <p>NCU metric names expose finer detail than the main diagram. The definitions below come from the 2026.2 Metrics Guide, with GNIC additionally grounded in a public NVIDIA patent embodiment. They help identify where a metric belongs; query the local NCU installation to see which counters the target GPU exposes.</p>
 <div class="table-scroll"><table class="note-table">
 <thead><tr><th>Name</th><th>Role in public documentation</th><th>Use when reading metrics</th></tr></thead><tbody>
@@ -447,7 +447,7 @@ consume(value);               // Keep the loaded value live.</code></pre>
 </tbody></table></div>
 <p>Interface qualifiers use <code>sender2receiver</code> to identify the source and destination. For example, a <code>gnic2l1tex</code> metric, where exposed, names a direction toward L1TEX. Direction identifies the interface flow; the metric's description supplies its full meaning.[<a href="#en-ref-ncu">1</a>][<a href="#en-ref-patent">6</a>]</p>
 
-<h2 id="en-metrics">Appendix B: Collection entry points and units</h2>
+<h2 id="en-metrics">Appendix B: Collection and counter units</h2>
 <pre><code class="language-bash"># Inspect metrics and sections available on the profiling machine.
 ncu --query-metrics
 ncu --list-sections

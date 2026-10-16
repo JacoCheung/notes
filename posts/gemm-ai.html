@@ -3,10 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GEMM Arithmetic Intensity 的分块模型与适用边界</title>
+<title>GEMM 计算强度与分块</title>
 <!-- Post metadata (consumed by scripts/build-index.py) -->
-<meta name="post:title"      content="GEMM Arithmetic Intensity 的分块模型与适用边界">
-<meta name="post:title_en"   content="GEMM Arithmetic Intensity: Blocking Models and Their Limits">
+<meta name="post:title"      content="GEMM 计算强度与分块">
+<meta name="post:title_en"   content="GEMM arithmetic intensity and tiling">
 <meta name="post:slug"       content="gemm-ai">
 <meta name="post:date"       content="2026-04-24">
 <meta name="post:tags"       content="GPU, GEMM, 性能分析, CUDA">
@@ -29,7 +29,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
 <style>
   /* gemm-ai-specific override: a wider article column for math and tables. */
   main.content { max-width: 880px; padding: 64px 32px 96px; }
@@ -71,7 +71,7 @@
 
 <div class="lang-zh">
 
-  <h1>GEMM Arithmetic Intensity 的分块模型与适用边界</h1>
+  <h1>GEMM 计算强度与分块</h1>
   <p class="lead">GEMM 在固定矩阵形状下执行确定数量的 FLOP，但 kernel 为这些计算搬运多少数据，取决于 tile 如何组织复用以及数据跨越哪一级存储边界。Arithmetic intensity 是某段计算量与指定边界流量的比值：HBM、L2 和 shared memory 各自对应不同的分母。单层 blocking 公式可以刻画 tile 内复用；进入多级 cache、CTA 调度和 kernel 融合后，则需要为每个边界单独建立流量模型。</p>
   <p class="meta">除非另有说明，本文分析 $C=AB$（等价于 GEMM 中 $\beta=0$）且输入、输出元素均占 $b$ 字节；FMA 按 2 FLOPs 计。若需要读取原始 $C$，分母还要增加一次 $MN b$。</p>
 
@@ -109,17 +109,17 @@
 
   <hr>
 
-  <h2 id="zh-square">一、方阵基线（$N \times N$）</h2>
+  <h2 id="zh-square">一、方阵基线</h2>
   <p>$C = A \cdot B$，三者都是 $N \times N$。总 FLOPs $= 2N^3$（每个 $C$ 元素 $N$ 次乘加）。</p>
 
-  <h3>1. 理论下界（完美复用）</h3>
+  <h3 id="sec-1">1. 理想复用下界</h3>
   <p>每个输入 / 输出元素只从主存进出一次，总访存 $3N^2$ 元素：</p>
   <div class="eq">
     $$\text{AI}_{\text{ideal}} \;=\; \frac{2N^3}{3N^2 \cdot b} \;=\; \frac{2N}{3b}\ \text{FLOP/byte}$$
   </div>
   <p>该下界随 $N$ 线性增长。它只说明在完美复用假设下，大矩阵具有较高的计算/访存比；是否越过目标 GPU 的 Roofline balance point，还需要使用同一 dtype 的峰值算力、对应存储层带宽和实测流量。</p>
 
-  <h3>2. 完全无复用（naive 三重循环）</h3>
+  <h3 id="sec-2">2. 无复用模型</h3>
   <p>$C$ 在寄存器 <code>acc</code> 里累加，K 走完后一次写回。整个 GEMM：</p>
   <ul>
     <li>FLOPs：$2 N^3$</li>
@@ -142,7 +142,7 @@
         C[i, j] = acc                       <span class="cm"># C 全程留在寄存器</span></pre>
   <p>内层每次 FMA 都从 DRAM 拉 <code>A[i,k]</code> 和 <code>B[k,j]</code>，没有任何跨迭代复用，故 $\text{AI} = 1/b$。</p>
 
-  <h3>3. 分块（块大小 $T \times T$，cache 零延迟）</h3>
+  <h3 id="sec-3">3. 方形 Tile 分块</h3>
   <p>一个 $T \times T$ 的 $C$ 块沿 $k$ 方向扫过 $N/T$ 次：</p>
   <ul>
     <li>FLOPs: $(N/T) \cdot 2T^3 = 2NT^2$</li>
@@ -170,7 +170,7 @@
         C[i0:i0+T, j0:j0+T] = C_tile     <span class="cm"># 一次写回</span></pre>
   <p>每对 <code>A_tile</code>、<code>B_tile</code> 从 DRAM 加载一次后，会在 tile 内复用 $T$ 次，因此 AI 从 $1/b$ 增长到 $T/b$。</p>
 
-  <h3>4. cache 容量约束</h3>
+  <h3 id="sec-4">4. Cache 容量约束</h3>
   <p>三个 tile 同时在 cache：$3T^2 b \le M$，故</p>
   <div class="eq">
     $$T_{\max} \;=\; \sqrt{\frac{M}{3b}}, \qquad \text{AI}_{\max} \;=\; \sqrt{\frac{M}{3b^{3}}}$$
@@ -179,11 +179,11 @@
 
   <hr>
 
-  <h2 id="zh-rectangular">二、任意形状 tile <span class="tag">generalized</span></h2>
+  <h2 id="zh-rectangular">二、矩形 Tile</h2>
 
   <p>一般 GEMM：$C\,(M{\times}N)= A\,(M{\times}K)\cdot B\,(K{\times}N)$，tile 尺寸 $M_t \times N_t$（$C$ 块）、$M_t \times K_t$（$A$ 块）、$K_t \times N_t$（$B$ 块）。</p>
 
-  <h3>1. 单个输出 tile 的流量公式</h3>
+  <h3 id="sec-6">1. Tile 流量公式</h3>
   <p>算一个 $M_t \times N_t$ 的 $C$ tile：</p>
   <table>
     <thead><tr><th>项</th><th>量（元素）</th></tr></thead>
@@ -203,7 +203,7 @@
   </div>
   <p>其中 $H(M_t, N_t) \;=\; \dfrac{2 M_t N_t}{M_t + N_t}$ 是调和平均。后续关于 tile 形状的比较使用这个渐近形式；Split-K 会把一个 C tile 的 reduction 分给多个 CTA，并引入 partial sum 的写入与规约，因此第五节分析工作分解时仍需回到完整流量。</p>
 
-  <h3>2. 较短的 tile 边限制复用</h3>
+  <h3 id="sec-7">2. 短边与复用率</h3>
   <p>调和平均更接近较小的输入。这里的直观解释是：$A$ 的每个元素在 tile 内最多复用 $N_t$ 次，$B$ 的每个元素最多复用 $M_t$ 次。</p>
   <table>
     <thead><tr><th>$M_t \times N_t$</th><th>$H(M_t, N_t)$</th><th>解释</th></tr></thead>
@@ -220,7 +220,7 @@
     在这个单层模型中，GEMV、skinny GEMM 与 LLM decode 中一侧较短的 $Q\cdot K^\top$ 都受到短边复用上限约束，因此 arithmetic intensity 较低。
   </div>
 
-  <h3>3. $K_t$ 在单层渐近式中消去</h3>
+  <h3 id="sec-8">3. \(K_t\) 渐近消项</h3>
   <ul>
     <li>$K_t$ 只是 $K$ 循环的切片，不改变 $A$、$B$ 的复用倍数（仍是 $N_t$、$M_t$）。</li>
     <li>$K_t$ 仍会改变 A/B stage 的容量、循环次数、同步频率和编译器生成的指令序列。</li>
@@ -228,14 +228,14 @@
     <li>放开“tile 间无复用”假设后，应从观测到的各层流量重新计算 AI，而不是把 $K_t$ 直接代入一个通用 cache 公式。</li>
   </ul>
 
-  <h3>4. cache 预算下的最优形状</h3>
+  <h3 id="sec-9">4. Cache 预算与最优形状</h3>
   <p>固定 $K_t$，约束 $M_t N_t + K_t (M_t + N_t) \le M/b$，最大化 $H(M_t, N_t)$：</p>
   <div class="eq">
     $$\arg\max_{M_t,\,N_t} H(M_t, N_t)\ \Longrightarrow\ M_t=N_t=T,\quad T\le -K_t+\sqrt{K_t^2+M/b}$$
   </div>
   <p>在这一容量约束下，$M_t$ 与 $N_t$ 越接近，调和平均越大。方形 tile 因而给出单层流量模型中的上界基线。</p>
 
-  <h3>5. 两种退化极端：行条 / 列条 tile</h3>
+  <h3 id="sec-10">5. 行条与列条 Tile</h3>
   <p>当 $M_t$ 或 $N_t$ 退化到 1 时，$H(1, N) \to 2$、$H(M, 1) \to 2$，AI 都趋近 $2/b$。Berkeley slide 中 naive 情形的 $q \approx 2$ 可以用这种行条或列条 tile 解释：实现保留一维复用，另一输入则随输出位置反复加载。</p>
 
   <p class="caption">$M_t = 1,\ N_t = N$（行条）：A 的第 $i$ 行加载一次、被 $N$ 次复用：</p>
@@ -270,7 +270,7 @@
 
   <hr>
 
-  <h2 id="zh-hierarchical">三、分层 Roofline 与跨 tile 复用</h2>
+  <h2 id="zh-hierarchical">三、分层 Roofline</h2>
 
   <p>单层公式描述的是一个理想化的 tile 流量。真实 GPU 还会受到 L2 命中、CTA 执行顺序、并发 kernel 和 cache 替换策略影响。相邻输出 tile 具有复用 A 或 B panel 的机会，但 CUDA 不保证这些 tile 以能够命中 L2 的顺序执行，也不保证某个 panel 在下一次访问前仍驻留。</p>
 
@@ -304,7 +304,7 @@
 
   <hr>
 
-  <h2 id="zh-scheduling">五、Arithmetic Intensity 与 GEMM 工作分解</h2>
+  <h2 id="zh-scheduling">五、计算强度与任务分解</h2>
   <p>Arithmetic intensity 描述每字节对应多少计算，不描述工作如何分配给 CTA。当输出 tile 数不足、尾部不均衡或单个 tile 的 $K$ 很长时，库可以在几种分解之间选择：</p>
   <table>
     <thead><tr><th>分解</th><th>工作分配</th><th>额外成本</th></tr></thead>
@@ -322,7 +322,7 @@
 
   <hr>
 
-  <h2 id="zh-b2b">六、串联 GEMM 的中间结果流量</h2>
+  <h2 id="zh-b2b">六、串联 GEMM 流量</h2>
   <p>前面的模型只处理一个 GEMM。对串联计算
     \(P=AB\)、\(D=PC\)，新的问题是中间矩阵 \(P\) 是否需要写回 HBM。设
     \(A\in\mathbb{R}^{M\times K}\)、\(B\in\mathbb{R}^{K\times N}\)、
@@ -351,7 +351,7 @@
   </div>
   <p>它不是 kernel speedup。融合还会改变寄存器和 shared memory 占用、occupancy、同步、epilogue 以及可选 scheduler；只要其中一项成为瓶颈，运行时间就不会按 AI 比值缩短。</p>
 
-  <h3>中间维决定保存策略</h3>
+  <h3 id="sec-15">中间结果存储</h3>
   <p>GEMM1 的输出列维 \(N\) 同时是 GEMM2 的 reduction 维。实现通常在以下策略之间取舍：</p>
   <table>
     <thead><tr><th>策略</th><th>中间结果</th><th>主要约束</th></tr></thead>
@@ -367,7 +367,7 @@
   </div>
   <p>这还没有计入 A、B、C 的 stage buffer 和运行时保留的寄存器，因此不能从架构的整块 register-file 或 shared-memory 容量直接推出一个通用的 \(N\) 上限。</p>
 
-  <h3>Attention 只能借用流量模型</h3>
+  <h3 id="sec-16">Attention 流量模型</h3>
   <p>Attention 包含 softmax，不能代数化为 \((QK^\top)V\)。不过，上述模型仍能隔离“score 或 probability 矩阵是否物化”这一项。令序列长度为 \(S\)、head dimension 为 \(d\)，把
     \(M=N=S\)、\(K=L=d\) 代入，并暂取 \(b_p=b\)，得到：</p>
   <div class="eq">
@@ -379,7 +379,7 @@
 
   <hr>
 
-  <h2 id="zh-training">七、Linear 训练中的三个 GEMM 形状</h2>
+  <h2 id="zh-training">七、Linear 训练 GEMM</h2>
   <p>Linear 层能说明为什么“FLOPs 相同”并不等于“kernel 性能相同”。令
     \(R=B\cdot S\) 为展平后的 token 数，\(I=d_{in}\)，\(O=d_{out}\)，前向为
     \(Y=XW^\top\)。忽略 bias 后，前向和两项反向分别是：</p>
@@ -396,7 +396,7 @@
 
   <hr>
 
-  <h2 id="zh-limits">八、模型的使用条件</h2>
+  <h2 id="zh-limits">八、模型适用范围</h2>
   <ul>
     <li>单层 blocking 中，方形 tile 的渐近 AI 为 \(T/b\)；任意形状由 \(H(M_t,N_t)/b\) 给出，较短边限制复用。</li>
     <li>\(K_t\) 在单层渐近式中消去，但仍影响 stage 容量、指令合法性、同步频率、寄存器占用与 occupancy。</li>
@@ -422,7 +422,7 @@
   <hr>
 
   <section id="comments" style="margin-top: 40px;">
-    <h2 style="border: none; font-size: 1.2rem; color: var(--muted); font-weight: 600;">💬 评论</h2>
+    <h2 style="border: none; font-size: 1.2rem; color: var(--muted); font-weight: 600;" id="sec-20">评论</h2>
     <script src="https://giscus.app/client.js"
       data-repo="JacoCheung/notes"
       data-repo-id="R_kgDOSLhzsA"
@@ -445,7 +445,7 @@
 
 <div class="lang-en">
 
-  <h1>GEMM Arithmetic Intensity: Blocking Models and Their Limits</h1>
+  <h1>GEMM arithmetic intensity and tiling</h1>
   <p class="lead">A fixed GEMM shape performs a fixed number of FLOPs, while its data traffic depends on tile reuse and on the memory boundary being measured. Arithmetic intensity is the ratio of that work to traffic across a specified boundary, so HBM, L2, and shared memory each produce a different denominator. A single-level blocking model captures reuse within a tile; multi-level caches, CTA scheduling, and kernel fusion require separate traffic models for their respective boundaries.</p>
   <p class="meta">Unless stated otherwise, the model is \(C=AB\), equivalent to \(\beta=0\) in GEMM. Inputs and outputs occupy \(b\) bytes per element, and one FMA counts as 2 FLOPs. A nonzero \(\beta\) adds an \(MN b\) read of the original \(C\).</p>
 
@@ -486,14 +486,14 @@
   <h2 id="en-square">1. Square-matrix baseline</h2>
   <p>For \(N\times N\) matrices, \(C=AB\) performs \(2N^3\) FLOPs because each output element requires \(N\) multiply-adds.</p>
 
-  <h3>1. Ideal lower bound with perfect reuse</h3>
+  <h3 id="sec-22">1. Ideal-reuse lower bound</h3>
   <p>If every input and output element crosses HBM exactly once, the ideal lower-bound traffic is \(3N^2b\):</p>
   <div class="eq">
     \[\mathrm{AI}_{\mathrm{ideal}}=\frac{2N^3}{3N^2b}=\frac{2N}{3b}.\]
   </div>
   <p>This value grows linearly with \(N\). Determining whether it lies above a particular GPU's Roofline balance point still requires peak compute and bandwidth for the same dtype and memory boundary.</p>
 
-  <h3>2. No reuse in the naive triple loop</h3>
+  <h3 id="sec-23">2. No-reuse model</h3>
   <p>At the opposite extreme, every inner-loop iteration reloads one A and one B element while the C accumulator stays in a register until completion. Across the full GEMM, this gives:</p>
   <ul>
     <li>FLOPs: \(2N^3\)</li>
@@ -518,7 +518,7 @@
         C[i, j] = acc                     <span class="cm"># C stays in a register</span></pre>
   <p>Under the stated model, the inner FMA obtains both operands from HBM on every iteration, which produces the \(1/b\) asymptote.</p>
 
-  <h3>3. Blocking with a \(T\times T\) output tile</h3>
+  <h3 id="sec-24">3. Square tiling</h3>
   <p>A \(T\times T\) output tile advances through \(N/T\) blocks along K. It performs \((N/T)2T^3=2NT^2\) FLOPs, reads \(NT\) elements from each input, and writes \(T^2\) output elements once:</p>
   <div class="eq">
     \[\mathrm{AI}_{\mathrm{blocked}}
@@ -541,7 +541,7 @@
         C[i0:i0+T, j0:j0+T] = C_tile</pre>
   <p>Each loaded A or B element participates in \(T\) output updates inside the tile. This local reuse raises the asymptotic intensity from \(1/b\) to \(T/b\).</p>
 
-  <h3>4. Cache-capacity bound</h3>
+  <h3 id="sec-25">4. Cache-capacity bound</h3>
   <p>If three same-precision tiles must fit in a fast store of capacity \(M\) bytes, \(3T^2b\le M\), giving:</p>
   <div class="eq">
     \[T_{\max}=\sqrt{\frac{M}{3b}},\qquad
@@ -551,10 +551,10 @@
 
   <hr>
 
-  <h2 id="en-rectangular">2. Rectangular output tiles</h2>
+  <h2 id="en-rectangular">2. Rectangular tiles</h2>
   <p>For \(C[M,N]=A[M,K]B[K,N]\), let the output tile be \(M_t\times N_t\), with A and B stages of \(M_t\times K_t\) and \(K_t\times N_t\).</p>
 
-  <h3>1. Traffic for one output tile</h3>
+  <h3 id="sec-27">1. Tile traffic model</h3>
   <p>Computing one output tile across the full reduction dimension gives:</p>
   <table>
     <thead><tr><th>Term</th><th>Elements</th></tr></thead>
@@ -578,7 +578,7 @@
   </div>
   <p>The tile-shape comparisons below use this asymptotic form. Split-K changes the model because multiple CTAs write and reduce partial results for one output tile, so its traffic must be evaluated with the complete expression.</p>
 
-  <h3>2. The shorter tile edge limits reuse</h3>
+  <h3 id="sec-28">2. Short edges and reuse</h3>
   <p>The harmonic mean lies closer to its smaller input. In the tile, each A element can be reused across at most \(N_t\) output columns, while each B element can be reused across at most \(M_t\) output rows.</p>
   <table>
     <thead><tr><th>\(M_t\times N_t\)</th><th>\(H(M_t,N_t)\)</th><th>Interpretation</th></tr></thead>
@@ -595,7 +595,7 @@
     In this single-level model, GEMV, skinny GEMM, and a decode-time \(QK^\top\) product with one short dimension all have limited operand reuse and correspondingly low arithmetic intensity.
   </div>
 
-  <h3>3. Cancellation of \(K_t\) in the single-level asymptote</h3>
+  <h3 id="sec-29">3. Asymptotic \(K_t\) cancellation</h3>
   <ul>
     <li>\(K_t\) partitions the full K loop without changing the reuse count: A elements are still reused \(N_t\) times and B elements \(M_t\) times.</li>
     <li>It still changes A/B stage capacity, loop count, synchronization frequency, and the generated instruction sequence.</li>
@@ -603,7 +603,7 @@
     <li>Once cross-tile cache reuse is admitted, intensity must be recomputed from traffic at each memory boundary rather than by inserting \(K_t\) into a universal cache formula.</li>
   </ul>
 
-  <h3>4. Shape optimum under a cache budget</h3>
+  <h3 id="sec-30">4. Cache budget and optimal shape</h3>
   <p>For a fixed \(K_t\) and a byte budget \(M\), maximizing \(H(M_t,N_t)\) under
     \(M_tN_t+K_t(M_t+N_t)\le M/b\) favors a square tile:</p>
   <div class="eq">
@@ -613,7 +613,7 @@
   </div>
   <p>Within this capacity constraint, bringing \(M_t\) and \(N_t\) closer together raises their harmonic mean. The square tile therefore supplies the upper-bound baseline for the single-level traffic model.</p>
 
-  <h3>5. Degenerate row-strip and column-strip tiles</h3>
+  <h3 id="sec-31">5. Row-strip and column-strip tiles</h3>
   <p>When either \(M_t\) or \(N_t\) becomes 1, \(H(1,N)\to2\) and \(H(M,1)\to2\). Each strip retains reuse for one operand while repeatedly loading the other.</p>
 
   <p class="caption">For \(M_t=1\) and \(N_t=N\), a row strip loads row \(i\) of A once and reuses it across N output columns:</p>
@@ -649,7 +649,7 @@
 
   <hr>
 
-  <h2 id="en-hierarchical">3. Hierarchical Roofline and cross-tile reuse</h2>
+  <h2 id="en-hierarchical">3. Hierarchical Roofline</h2>
   <p>The single-level expression describes idealized traffic for one tile. Actual L2 reuse also depends on CTA execution order, concurrent kernels, cache indexing, and replacement. CUDA does not guarantee that adjacent output tiles run in an order that preserves a particular A or B panel in L2.</p>
   <p>A hierarchical analysis therefore defines traffic separately at each boundary:</p>
   <div class="eq">
@@ -668,7 +668,7 @@
 
   <hr>
 
-  <h2 id="en-nonsquare">4. Traffic Optima and Implementation Constraints</h2>
+  <h2 id="en-nonsquare">4. Traffic optima and constraints</h2>
   <p>The harmonic mean supplies a traffic optimum for a fixed element budget, while a kernel must also satisfy MMA instruction shapes, register allocation, shared-memory layouts, boundary dimensions, and concurrency targets. Holding \(M_tN_t\) constant illustrates the traffic effect of elongating a tile. For FP16 inputs under the large-K single-level model:</p>
   <table>
     <thead><tr><th>Tile</th><th>\(H(M_t,N_t)\)</th><th>FP16 asymptotic AI</th><th>Interpretation</th></tr></thead>
@@ -683,7 +683,7 @@
 
   <hr>
 
-  <h2 id="en-scheduling">5. Arithmetic Intensity and GEMM Work Decomposition</h2>
+  <h2 id="en-scheduling">5. Intensity and work decomposition</h2>
   <p>Arithmetic intensity describes work per byte; it does not say how CTAs should divide that work. Libraries may choose among several decompositions when there are too few output tiles, an imbalanced tail, or a long reduction:</p>
   <table>
     <thead><tr><th>Decomposition</th><th>Work assignment</th><th>Additional cost</th></tr></thead>
@@ -699,7 +699,7 @@
 
   <hr>
 
-  <h2 id="en-b2b">6. Intermediate traffic in back-to-back GEMMs</h2>
+  <h2 id="en-b2b">6. Back-to-back GEMM traffic</h2>
   <p>For \(P=AB\) followed by \(D=PC\), the intermediate matrix introduces a new traffic decision. Let
     \(A\in\mathbb{R}^{M\times K}\), \(B\in\mathbb{R}^{K\times N}\), and
     \(C\in\mathbb{R}^{N\times L}\). The two multiplications execute:</p>
@@ -724,7 +724,7 @@
   </div>
   <p>The ratio is an ideal traffic-model result, not a speedup. Fusion also changes register and shared-memory use, occupancy, synchronization, epilogues, and scheduler choices.</p>
 
-  <h3>The shared dimension determines how the intermediate is held</h3>
+  <h3 id="sec-36">Intermediate storage</h3>
   <p>GEMM1's N dimension is GEMM2's reduction dimension. Implementations usually choose among three storage strategies:</p>
   <table>
     <thead><tr><th>Strategy</th><th>Data movement</th><th>Primary constraint</th></tr></thead>
@@ -740,7 +740,7 @@
   </div>
   <p>A universal N limit cannot be inferred from the architecture's total register-file or shared-memory capacity because input stages, compiler allocation, occupancy targets, and per-block limits also consume those resources.</p>
 
-  <h3>Attention uses the same traffic question, not the same algebra</h3>
+  <h3 id="sec-37">Attention traffic model</h3>
   <p>Softmax prevents attention from being reduced algebraically to \((QK^\top)V\). The B2B model can still isolate the cost of materializing the score or probability matrix. Setting sequence length to \(S\), head dimension to \(d\), \(M=N=S\), \(K=L=d\), and temporarily \(b_p=b\) gives:</p>
   <div class="eq">
     \[\frac{\mathrm{AI}_{\mathrm{fused}}}
@@ -751,7 +751,7 @@
 
   <hr>
 
-  <h2 id="en-training">7. The three GEMM shapes in Linear training</h2>
+  <h2 id="en-training">7. Linear training GEMMs</h2>
   <p>Let \(R=B\cdot S\) be the flattened token count, \(I=d_{in}\), and \(O=d_{out}\). With \(Y=XW^\top\) and bias omitted, forward and the two backward products are:</p>
   <table>
     <thead><tr><th>Phase</th><th>Matrix product</th><th>GEMM \((M,N,K)\)</th><th>Reduction</th></tr></thead>
@@ -766,7 +766,7 @@
 
   <hr>
 
-  <h2 id="en-limits">8. Conditions for Applying the Model</h2>
+  <h2 id="en-limits">8. Model scope</h2>
   <ul>
     <li>Under single-level blocking, a square tile approaches \(T/b\); a rectangular tile approaches \(H(M_t,N_t)/b\), with the shorter edge limiting reuse.</li>
     <li>\(K_t\) cancels from the single-level asymptote but still affects stage capacity, legal instructions, synchronization, register use, and occupancy.</li>
@@ -792,7 +792,7 @@
   <hr>
 
   <section id="en-comments-en" style="margin-top: 40px;">
-    <h2 style="border: none; font-size: 1.2rem; color: var(--muted); font-weight: 600;">Comments</h2>
+    <h2 style="border: none; font-size: 1.2rem; color: var(--muted); font-weight: 600;" id="sec-41">Comments</h2>
     <script src="https://giscus.app/client.js"
       data-repo="JacoCheung/notes"
       data-repo-id="R_kgDOSLhzsA"
@@ -846,85 +846,9 @@ function cycleTheme() {
 }
 document.addEventListener('DOMContentLoaded', updateThemeBtn);
 
-// --- 目录导航生成 ---
-(function buildTOC() {
-  const wrap = document.querySelector('main.content');
-  if (!wrap) return;
-  const headings = wrap.querySelectorAll('.lang-zh h2, .lang-zh h3, .lang-en h2, .lang-en h3');
-  if (headings.length === 0) return;
-
-  const toc = document.createElement('nav');
-  toc.id = 'toc';
-
-  const btn = document.createElement('button');
-  btn.id = 'toc-toggle';
-  btn.title = '折叠 / 展开目录 / Collapse or expand contents';
-  btn.textContent = '⤢';
-  btn.addEventListener('click', () => {
-    const collapsed = toc.classList.toggle('collapsed');
-    btn.textContent = collapsed ? '☰' : '⤢';
-    try { localStorage.setItem('toc-collapsed', collapsed ? '1' : '0'); } catch (_) {}
-  });
-  toc.appendChild(btn);
-
-  const title = document.createElement('h4');
-  title.innerHTML = '<span class="lang-zh">目录</span><span class="lang-en">Contents</span>';
-  toc.appendChild(title);
-
-  const list = document.createElement('ul');
-  toc.appendChild(list);
-
-  headings.forEach((h, i) => {
-    if (!h.id) h.id = 'sec-' + i;
-    const li = document.createElement('li');
-    const headingLang = h.closest('.lang-en') ? 'en' : 'zh';
-    li.className = 'lvl-' + h.tagName.substring(1) + ' lang-' + headingLang;
-    const a = document.createElement('a');
-    a.href = '#' + h.id;
-    a.textContent = h.textContent.trim();
-    a.dataset.target = h.id;
-    a.addEventListener('click', (e) => {
-      e.preventDefault();
-      h.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      history.replaceState(null, '', '#' + h.id);
-    });
-    li.appendChild(a);
-    list.appendChild(li);
-  });
-
-  document.body.appendChild(toc);
-
-  try {
-    if (localStorage.getItem('toc-collapsed') === '1') {
-      toc.classList.add('collapsed');
-      btn.textContent = '☰';
-    }
-  } catch (_) {}
-
-  const observer = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (!entry.isIntersecting) return;
-      const id = entry.target.id;
-      toc.querySelectorAll('a.active').forEach(a => a.classList.remove('active'));
-      const link = toc.querySelector('a[data-target="' + id + '"]');
-      if (link) {
-        link.classList.add('active');
-        const r = link.getBoundingClientRect();
-        const tr = toc.getBoundingClientRect();
-        if (r.top < tr.top || r.bottom > tr.bottom) {
-          link.scrollIntoView({ block: 'nearest' });
-        }
-      }
-    });
-  }, {
-    rootMargin: '-15% 0px -70% 0px',
-    threshold: 0,
-  });
-  headings.forEach(h => observer.observe(h));
-})();
 </script>
 
-<script src="../lang-toggle.js"></script>
+<script src="../lang-toggle.js?v=post-toc-3"></script>
 
 </body>
 </html>

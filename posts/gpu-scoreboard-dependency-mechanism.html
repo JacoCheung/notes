@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GPU Scoreboard 机制：Warp 依赖跟踪、SASS 控制与 Long/Short Stall</title>
-<meta name="post:title"           content="GPU Scoreboard 机制：Warp 依赖跟踪、SASS 控制与 Long/Short Stall">
-<meta name="post:title_en"        content="GPU Scoreboard Mechanism: Warp Dependency Tracking, SASS Control, and Long/Short Stalls">
+<title>GPU Scoreboard 与依赖跟踪</title>
+<meta name="post:title"           content="GPU Scoreboard 与依赖跟踪">
+<meta name="post:title_en"        content="GPU Scoreboard and dependency tracking">
 <meta name="post:slug"            content="gpu-scoreboard-dependency-mechanism">
 <meta name="post:date"            content="2026-08-28">
 <meta name="post:tags"            content="GPU, CUDA, Nsight Compute, Scoreboard, SASS">
@@ -25,11 +25,11 @@
   };
 </script>
 <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
-<script src="../lang-toggle.js" defer></script>
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Geist+Mono:wght@400;500&amp;display=swap">
-<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
 <style>
   .lead {
     margin: -6px 0 30px;
@@ -139,53 +139,53 @@
 <summary><span class="lang-zh">目录与系列</span><span class="lang-en">Contents and series</span></summary>
 <aside class="toc"><div class="toc-title">目录 · TOC</div>
 <div class="lang-zh"><ul>
-<li><a href="#zh-definition">1. 一次读取与随后消费结果的指令</a>
+<li><a href="#zh-definition">1. Producer/Consumer 依赖</a>
 </li>
-<li><a href="#zh-scheduler">2. Warp 在哪里停下，又如何继续</a>
+<li><a href="#zh-scheduler">2. Warp 等待与恢复</a>
 <ul>
-<li><a href="#zh-distance">编译器能改变 consumer 到达的时刻</a></li>
+<li><a href="#zh-distance">编译器调度</a></li>
 </ul></li>
-<li><a href="#zh-sass">3. 编译结果如何表达这条等待</a>
+<li><a href="#zh-sass">3. SASS 依赖控制</a>
 <ul>
-<li><a href="#zh-classification">Read dependency 保护尚未读完的源寄存器</a></li>
-<li><a href="#zh-depbar">显式 DEPBAR 与工具中的依赖标识</a></li>
+<li><a href="#zh-classification">Read Dependency</a></li>
+<li><a href="#zh-depbar">DEPBAR 与依赖标识</a></li>
 </ul></li>
-<li><a href="#zh-long-short">4. Long 与 Short 指向哪一种 producer</a>
+<li><a href="#zh-long-short">4. Long 与 Short Scoreboard</a>
 </li>
-<li><a href="#zh-observation">5. 在 NCU 中区分等待位置与归因位置</a>
+<li><a href="#zh-observation">5. NCU 采样与归因</a>
 <ul>
-<li><a href="#zh-trace">从 FFMA 样本回到 LDG</a></li>
-<li><a href="#zh-evidence">让 producer 的类型决定下一份证据</a></li>
+<li><a href="#zh-trace">FFMA 与 LDG 依赖</a></li>
+<li><a href="#zh-evidence">Producer 类型与诊断</a></li>
 </ul></li>
-<li><a href="#zh-result">6. 从依赖链决定改动位置</a>
+<li><a href="#zh-result">6. 依赖链优化</a>
 </li>
-<li><a href="#zh-reference-table">附录：邻近机制与控制信息速查</a>
+<li><a href="#zh-reference-table">附录：控制信息速查</a>
 </li>
 <li><a href="#zh-refs">参考资料</a>
 </li>
 </ul></div>
 <div class="lang-en"><ul>
-<li><a href="#en-definition">1. A load and the instruction that consumes its result</a>
+<li><a href="#en-definition">1. Producer/consumer dependencies</a>
 </li>
-<li><a href="#en-scheduler">2. Where the warp stops and how it resumes</a>
+<li><a href="#en-scheduler">2. Warp suspension and resumption</a>
 <ul>
-<li><a href="#en-distance">The compiler can change when the consumer arrives</a></li>
+<li><a href="#en-distance">Compiler scheduling</a></li>
 </ul></li>
-<li><a href="#en-sass">3. How compiled code expresses the wait</a>
+<li><a href="#en-sass">3. SASS dependency control</a>
 <ul>
-<li><a href="#en-classification">Read dependencies protect source registers still in use</a></li>
-<li><a href="#en-depbar">Explicit DEPBAR and identifiers in the tool</a></li>
+<li><a href="#en-classification">Read dependencies</a></li>
+<li><a href="#en-depbar">DEPBAR and dependency identifiers</a></li>
 </ul></li>
-<li><a href="#en-long-short">4. Which producer Long and Short identify</a>
+<li><a href="#en-long-short">4. Long and Short Scoreboard</a>
 </li>
-<li><a href="#en-observation">5. Separate the waiting location from the attributed location</a>
+<li><a href="#en-observation">5. NCU sampling and attribution</a>
 <ul>
-<li><a href="#en-trace">Follow FFMA samples back to LDG</a></li>
-<li><a href="#en-evidence">Use the producer type to choose supporting evidence</a></li>
+<li><a href="#en-trace">FFMA and LDG dependencies</a></li>
+<li><a href="#en-evidence">Producer types and diagnosis</a></li>
 </ul></li>
-<li><a href="#en-result">6. Choose the change from the dependency chain</a>
+<li><a href="#en-result">6. Dependency-chain optimization</a>
 </li>
-<li><a href="#en-reference-table">Appendix: Nearby mechanisms and control information</a>
+<li><a href="#en-reference-table">Appendix: Control-information reference</a>
 </li>
 <li><a href="#en-refs">References</a>
 </li>
@@ -193,17 +193,17 @@
 </aside>
 </details>
 <div class="lang-zh">
-<h1>GPU Scoreboard 机制：Warp 依赖跟踪、SASS 控制与 Long/Short Stall</h1>
+<h1>GPU Scoreboard 与依赖跟踪</h1>
 <p class="lead">CUDA kernel 读入数据后，通常还要用这些值做乘加、计算地址或判断分支。Load 已经发射，结果却未必已经回到寄存器；同一个 warp 在这段时间里还可能有别的指令可做。硬件需要分清哪些工作能够继续，哪些工作必须等结果。Scoreboard 就出现在这条 load 到后续指令的依赖关系上。</p>
 <p>分析报告时，这段等待可能落在一条 <code>FFMA</code> 上。它所在的行有很多 Long Scoreboard 样本，值得检查的 producer 却是前面那条 <code>LDG</code>。要从报告找对改动位置，需要同时理解指令的先后关系、编译器留下的依赖控制，以及 profiler 如何记录和归因等待。</p>
 <nav class="reading-guide" aria-label="文章快速索引"><p>快速索引</p><ul>
-<li><a href="#zh-definition">沿一条 load 追踪到 consumer</a></li>
-<li><a href="#zh-sass">读 SASS 的依赖控制信息</a></li>
-<li><a href="#zh-long-short">区分 Long 与 Short 的来源</a></li>
-<li><a href="#zh-observation">把等待样本归回 producer</a></li>
+<li><a href="#zh-definition">1. Producer/Consumer 依赖</a></li>
+<li><a href="#zh-sass">3. SASS 依赖控制</a></li>
+<li><a href="#zh-long-short">4. Long 与 Short Scoreboard</a></li>
+<li><a href="#zh-observation">5. NCU 采样与归因</a></li>
 </ul></nav>
 
-<h2 id="zh-definition">1. 一次读取与随后消费结果的指令</h2>
+<h2 id="zh-definition">1. Producer/Consumer 依赖</h2>
 <p>考虑一个执行乘加的 warp：先从 global memory 读出一个输入，中间做一次独立的整数加法，再把读出的值乘入累加器。下面是为了说明依赖而写的 SASS 示意，省略地址计算和目标相关修饰；它不是某次编译输出或测量记录。</p>
 <pre class="code"><code>I0: LDG.E R8, [R2]
 I1: IADD3 R10, R11, R12, RZ
@@ -213,7 +213,7 @@ I3: IADD3 R21, R22, R23, RZ</code></pre>
 <p><strong>Scoreboard 是与尚未完成的操作关联的动态依赖状态；scheduler 用它判断 warp 当前指令要求的完成条件是否已经满足。</strong> 对这个例子，只需把 load 对应的状态记成 pending 或已满足。寄存器保存数值，scoreboard 保存判断能否继续所需的控制状态。<a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/NsightCompute/index.html#instructions-dependencies-table">NCU 的依赖视图</a>据此连接等待中的指令和它的前驱操作。</p>
 <p>这个区别在 cache 命中时仍然存在。命中可能缩短 load 的完成时间，consumer 仍然需要等待结果就绪。它等待多久，要看 producer 的完成时刻和 consumer 抵达这条依赖的时刻，而不能从 <code>FFMA</code> 的算术延迟直接得出。</p>
 
-<h2 id="zh-scheduler">2. Warp 在哪里停下，又如何继续</h2>
+<h2 id="zh-scheduler">2. Warp 等待与恢复</h2>
 <p><code>I0</code> 发射后，load 在执行路径中前进，对应依赖进入 pending。随后 <code>I1</code> 可以发射。若 warp 到达 <code>I2</code> 时 load 还没有完成，<code>I2</code> 的输入条件不满足，这个 warp 暂时不能提供这条指令的发射机会。</p>
 <p><code>I3</code> 虽然也不读取 <code>R8</code>，但在给定的 SASS 序列中排在 <code>I2</code> 后面。这里采用同一条 warp 指令路径按既定顺序发射的模型；等待期间，scheduler 可以从自己管理的其他 eligible warp 中选择指令。CUDA 的<a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-c-programming-guide/index.html#hardware-multithreading">Hardware Multithreading</a>描述了这种选择 warp 下一条就绪指令的发射方式。</p>
 <figure class="diagram-frame">
@@ -233,11 +233,11 @@ I3: IADD3 R21, R22, R23, RZ</code></pre>
 </svg>
 <figcaption>图 1：完成事件使依赖得到满足。满足这一条依赖后，warp 仍须通过其他发射条件并被 scheduler 选中。</figcaption>
 </figure>
-<h3 id="zh-distance">编译器能改变 consumer 到达的时刻</h3>
+<h3 id="zh-distance">编译器调度</h3>
 <p>如果程序语义允许，编译器可以把 <code>I3</code> 放到 <code>I2</code> 前面。这给 load 多留出一段独立工作，consumer 可能在结果已经就绪时才到达。这里利用的是同一 warp 内的指令级并行（ILP）；其他 warp 提供的工作则覆盖跨 warp 的等待。两者都能减少空闲发射机会，却有不同的资源代价。</p>
 <p>例如展开循环，把下一轮 load 提前，常会同时保留更多输入和中间结果，增加寄存器的存活区间。需要检查编译后的顺序、registers/thread 和是否出现 spill，再判断更大的 load-use 距离是否划算。Occupancy 对这种资源变化的解释见<a href="gpu-occupancy-resource-limits.html#zh-performance">驻留与性能判断</a>。</p>
 
-<h2 id="zh-sass">3. 编译结果如何表达这条等待</h2>
+<h2 id="zh-sass">3. SASS 依赖控制</h2>
 <p>程序在 CUDA C++ 和 PTX 层表达数据依赖，目标代码还需要安排等待。对可静态调度的固定延迟指令，编译器能够安排发射间隔；对于需要动态跟踪的操作，SASS 控制信息把 producer 的完成事件与 consumer 的等待关联起来。</p>
 <p>Jia 等人的<a href="https://arxiv.org/pdf/1804.06826v1#page=14">Volta 微基准研究，第 2.1 节</a>分析了 Maxwell、Pascal 和 Volta 的 read/write barrier index、wait mask 与 stall 字段。以下沿用这些字段的阅读语义，并用 <code>SB0</code> 表示示例中的依赖标识。它们属于目标相关的机器码控制信息；PTX 程序的可移植契约不包含这些位的位置。</p>
 <pre class="code"><code>// Control annotations, not literal disassembler syntax
@@ -245,17 +245,17 @@ I0: LDG.E R8, [R2]             // write dependency = SB0
 I1: IADD3 R10, R11, R12, RZ    // no wait on SB0
 I2: FFMA R16, R8, R20, R16     // wait mask includes SB0</code></pre>
 <p>Write dependency 将 <code>I0</code> 的结果就绪事件关联到 <code>SB0</code>，wait mask 则要求 <code>I2</code> 在该条件满足后才能发射。一条指令可能需要等多个标识。若用集合 $P$ 表示尚未满足的依赖、$W$ 表示当前指令要求全部满足的依赖，那么 $W\cap P\ne\varnothing$ 就足以阻止它因这些依赖而就绪。这个集合模型用于解释等待条件，不规定硬件用位、计数器还是其他结构保存状态。</p>
-<h3 id="zh-classification">Read dependency 保护尚未读完的源寄存器</h3>
+<h3 id="zh-classification">Read Dependency</h3>
 <p>前面的 RAW 等待保护 producer 的目的寄存器。另一个方向是 write-after-read（WAR）：某条异步或解耦操作还没有读完源寄存器，后续指令准备覆盖它。上述微基准研究将这类约束解释为 read dependency。一个 store 的教学示意是：</p>
 <pre class="code"><code>// A read-dependency example, not a compiled trace
 STG.E [R2], R8       // protect consumption of source R8 with SB1
 MOV R8, RZ          // wait on SB1 before overwriting R8</code></pre>
 <p>这里等待的是旧 <code>R8</code> 被该操作消费，而不是等某条 load 产生新 <code>R8</code>。因此，仅沿着“谁写了当前输入寄存器”追踪，可能漏掉另一类 scoreboard 依赖。NCU 的官方依赖表同时涵盖 RAW、WAR，以及部分状态更新和内存顺序相关条件。</p>
-<h3 id="zh-depbar">显式 DEPBAR 与工具中的依赖标识</h3>
+<h3 id="zh-depbar">DEPBAR 与依赖标识</h3>
 <p><a href="https://docs.nvidia.com/cuda/archive/13.0.3/cuda-binary-utilities/index.html#instruction-set-reference">CUDA Binary Utilities 13.0.3</a>将 <code>DEPBAR</code> 列为 Dependency Barrier。NVIDIA <a href="https://patents.google.com/patent/US9612836B2/en">专利 US9612836B2</a>描述过按标识和阈值等待 outstanding-operation counter 的一种实现。它说明显式等待可以针对一组操作的进度；专利中的计数器宽度和电路组织不能直接移作所有 GPU 的规格。</p>
 <p>NCU 2026.2 的 Instructions &amp; Dependencies 文档用六个 scoreboard 标识显示依赖边。阅读时可以沿同一标识找到 producer 和 consumer，但不应据此计算某个 SM 最多有多少笔访存在途。标识的复用、同一标识关联的操作以及目标指令的完成规则，超出了“六列”本身能回答的范围。</p>
 
-<h2 id="zh-long-short">4. Long 与 Short 指向哪一种 producer</h2>
+<h2 id="zh-long-short">4. Long 与 Short Scoreboard</h2>
 <p>回到最初的 <code>LDG → FFMA</code>。如果 consumer 因这次 global load 尚未完成而等待，NCU 把相应样本归入 Long Scoreboard。将 producer 换成产生同一输入的 shared-memory <code>LDS</code>，相应等待通常归入 Short Scoreboard。分类跟随被等待的操作，样本所在的 <code>FFMA</code> 仍然可以是同一种指令。</p>
 <div class="table-scroll"><table class="note-table"><thead><tr><th>NCU 分类</th><th>官方定义对应的操作</th><th>沿 producer 继续检查</th></tr></thead><tbody>
 <tr><td>Long Scoreboard</td><td>L1TEX 的 local、global、surface、texture 操作</td><td>访问合并、cache 命中、请求数量、local spill、依赖式地址计算</td></tr>
@@ -264,20 +264,20 @@ MOV R8, RZ          // wait on SB1 before overwriting R8</code></pre>
 <p>这些是 <a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#warp-stall-reasons">NCU 2026.2 Warp Stall Reasons</a>的分类。Long/Short 没有以某个周期阈值划界：shared load 也可能让 consumer 等很久，global load 也可能很快完成。诊断时仍要回到具体 opcode 和访问行为。</p>
 <p>Shared-memory bank conflict 会增加一次访问需要处理的工作，因而可能推迟结果可用的时刻。但 Short Scoreboard 本身不能证明存在 bank conflict，紧密的 load-use 依赖也会产生等待。若 producer 还没发射，正在等 MIO queue 接收，则对应的是<a href="gpu-mio-throttle-nsight-compute.html#zh-position">MIO Throttle 的发射前反压</a>，还没有进入这里讨论的结果等待阶段。</p>
 
-<h2 id="zh-observation">5. 在 NCU 中区分等待位置与归因位置</h2>
+<h2 id="zh-observation">5. NCU 采样与归因</h2>
 <p>最初的例子给报告留下两个值得查看的地址：<code>I2</code> 是停下来的 consumer，<code>I0</code> 是产生这条依赖的 load。NCU 的普通 Warp Stall Sampling 列按采样到的程序位置显示等待；Source 页的 <strong>Attributed Stalls</strong> 则把 Long/Short Scoreboard 的 Not-issued 样本归到对应 producer。两列的热点可以位于不同的行。</p>
-<h3 id="zh-trace">从 FFMA 样本回到 LDG</h3>
+<h3 id="zh-trace">FFMA 与 LDG 依赖</h3>
 <p>若报告在 <code>I2</code> 的 PC 上显示 Long Scoreboard，先在 SASS 视图选择它，再查看 <em>Input Scoreboard Dependencies</em>。这个视图列出它需要等待的前驱操作；沿依赖链接到 <code>I0</code> 后，<em>Output Scoreboard Dependencies</em>可反查哪些 consumer 在等这条 load。一个 consumer 可能同时等待多个 producer，不能把整行的所有等待都交给找到的第一条边。</p>
 <p>在这组关系中，<code>I2</code> 的 Not-issued 样本和 <code>I0</code> 的 Attributed Stalls 回答不同问题：前者给出 scheduler 没有发射指令时所采到的等待位置，后者帮助查找造成这类等待的 producer。官方<a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/NsightCompute/index.html#source-page">Source Page</a>还说明，All 与 Not-issued 样本可能来自不同 profiling pass，数值不必严格逐项对应。这些采样读数也不是某一次 load 的精确延迟。</p>
-<h3 id="zh-evidence">让 producer 的类型决定下一份证据</h3>
+<h3 id="zh-evidence">Producer 类型与诊断</h3>
 <p>找到 <code>I0</code> 后，如果它是一条 global load，就结合该位置的访问模式、sector 数与 cache 行为判断等待来源；若它来自 local-memory spill，还要回看寄存器压力。若 producer 是 <code>LDS</code>，则查看实际与理想 shared wavefront 以及 bank-conflict 指标。没有冲突时，继续检查 consumer 是否过早抵达，而不是继续尝试消除并不存在的冲突。</p>
 <p>最后回到 Scheduler Statistics：等待出现时，其他 warp 能否持续提供 eligible 指令，issue slots 是否有明显空闲？如果发射已经被其他工作覆盖，减少某一行的等待样本未必能缩短 kernel。若依赖链限制了前进，则在相同输入和工作量下比较一个单项改动，并记录 SASS 顺序、资源占用和独立计时结果。</p>
 
-<h2 id="zh-result">6. 从依赖链决定改动位置</h2>
+<h2 id="zh-result">6. 依赖链优化</h2>
 <p>对于 <code>LDG → FFMA</code> 这条链，改善 load 的访问行为是在改变 producer；提前 load 或在 consumer 前安排独立工作，可以扩大 producer 发射到 consumer 使用之间的间隔；增加可用 warp 则是在增加等待期间的其他工作。沿同一条链区分这些作用，才容易解释改动后的报告。比如 consumer 的样本减少，同时寄存器增加并引入 spill，就需要把新增的 local-memory producer 也放进分析。</p>
 <p>本文的示例建立了依赖关系，没有给出哪一种方案必然更快的测量结论。实际优化的结束条件是正确性保持、目标工作量的运行时间稳定改善，并且报告能解释收益或新增成本。进一步的发射条件见<a href="gpu-instruction-issue-latency-hiding.html">指令发射与延迟隐藏</a>，整体读报告的方法见<a href="gpu-warp-stall-nsight-compute.html">Warp Stall 分析</a>。</p>
 
-<h2 id="zh-reference-table">附录：邻近机制与控制信息速查</h2>
+<h2 id="zh-reference-table">附录：控制信息速查</h2>
 <div class="table-scroll"><table class="note-table"><thead><tr><th>名称</th><th>等待或控制的对象</th></tr></thead><tbody>
 <tr><td>Write dependency / wait mask</td><td>前驱结果就绪与后续读取该结果的条件</td></tr><tr><td>Read dependency</td><td>旧源操作数被消费后，寄存器才可以覆盖</td></tr>
 <tr><td>Static stall count / NCU <code>wait</code></td><td>静态安排的发射间隔 / 固定延迟执行依赖</td></tr><tr><td><code>lg_throttle</code> / <code>mio_throttle</code></td><td>新指令发射前，相关 instruction queue 能够接收</td></tr>
@@ -299,17 +299,17 @@ MOV R8, RZ          // wait on SB1 before overwriting R8</code></pre>
 
 </div>
 <div class="lang-en">
-<h1>GPU Scoreboard Mechanism: Warp Dependency Tracking, SASS Control, and Long/Short Stalls</h1>
+<h1>GPU Scoreboard and dependency tracking</h1>
 <p class="lead">After a CUDA kernel loads data, it usually uses those values in arithmetic, address calculations, or a branch decision. A load can have issued while its result is still unavailable in a register. The same warp may have other instructions it can execute during that interval. Hardware must distinguish work that can proceed from work that needs the result. Scoreboarding manages the dependency between that load and the instructions that follow it.</p>
 <p>In a profiling report, this wait may appear on an <code>FFMA</code>. The line has many Long Scoreboard samples, but the producer worth investigating is an earlier <code>LDG</code>. Finding the right place to change requires the instruction order, the dependency controls left by the compiler, and the profiler's distinction between sampling and attribution.</p>
 <nav class="reading-guide" aria-label="Article quick links"><p>Quick links</p><ul>
-<li><a href="#en-definition">Follow a load to its consumer</a></li>
-<li><a href="#en-sass">Read dependency controls in SASS</a></li>
-<li><a href="#en-long-short">Identify Long and Short producers</a></li>
-<li><a href="#en-observation">Attribute a wait to its producer</a></li>
+<li><a href="#en-definition">1. Producer/consumer dependencies</a></li>
+<li><a href="#en-sass">3. SASS dependency control</a></li>
+<li><a href="#en-long-short">4. Long and Short Scoreboard</a></li>
+<li><a href="#en-observation">5. NCU sampling and attribution</a></li>
 </ul></nav>
 
-<h2 id="en-definition">1. A load and the instruction that consumes its result</h2>
+<h2 id="en-definition">1. Producer/consumer dependencies</h2>
 <p>Consider a warp doing a multiply-add: it loads an input from global memory, performs an independent integer addition, and then uses the input in an accumulator update. This SASS illustration omits address calculations and target-specific modifiers. It is a dependency example, not recorded compiler output or a measurement.</p>
 <pre class="code"><code>I0: LDG.E R8, [R2]
 I1: IADD3 R10, R11, R12, RZ
@@ -319,7 +319,7 @@ I3: IADD3 R21, R22, R23, RZ</code></pre>
 <p><strong>A scoreboard is dynamic dependency state associated with outstanding operations. The scheduler uses it to determine whether the completion conditions required by a warp's current instruction have been met.</strong> For this example, the load's condition can be represented as pending or satisfied. The register holds the value; the scoreboard holds control state needed to decide whether execution can proceed. <a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/NsightCompute/index.html#instructions-dependencies-table">NCU's dependency view</a> connects a waiting instruction to its predecessor operations.</p>
 <p>A cache hit still leaves this dependency to resolve. The hit may shorten load completion, but the consumer needs the result to be ready. Its wait depends on when the producer completes and when the consumer reaches the dependency. The arithmetic latency of <code>FFMA</code> alone does not give that interval.</p>
 
-<h2 id="en-scheduler">2. Where the warp stops and how it resumes</h2>
+<h2 id="en-scheduler">2. Warp suspension and resumption</h2>
 <p>After <code>I0</code> issues, the load progresses along its execution path and the associated dependency is pending. <code>I1</code> can then issue. If the load is incomplete when the warp reaches <code>I2</code>, that instruction's input condition is unsatisfied and the warp cannot currently offer it for issue.</p>
 <p><code>I3</code> also does not read <code>R8</code>, but it follows <code>I2</code> in the given SASS sequence. This example models one warp instruction path issuing in its established order. During the wait, the scheduler can select an instruction from another eligible warp that it manages. CUDA's <a href="https://docs.nvidia.com/cuda/archive/13.2.0/cuda-c-programming-guide/index.html#hardware-multithreading">Hardware Multithreading</a> describes issue as selecting a warp ready to execute its next instruction.</p>
 <figure class="diagram-frame">
@@ -339,11 +339,11 @@ I3: IADD3 R21, R22, R23, RZ</code></pre>
 </svg>
 <figcaption>Figure 1. A completion event satisfies the dependency. The warp must still meet its other issue conditions and be selected by the scheduler.</figcaption>
 </figure>
-<h3 id="en-distance">The compiler can change when the consumer arrives</h3>
+<h3 id="en-distance">Compiler scheduling</h3>
 <p>When program semantics permit, the compiler can place <code>I3</code> before <code>I2</code>. This adds independent work while the load is outstanding, so the consumer may arrive after the result is already ready. It uses instruction-level parallelism (ILP) within one warp. Work from other warps covers waits across warps. Both can reduce idle issue opportunities, but their resource costs differ.</p>
 <p>For example, unrolling a loop and advancing the next iteration's load often keeps more inputs and intermediates live. Inspect the compiled order, registers per thread, and any spills before judging the larger load-use distance. The <a href="gpu-occupancy-resource-limits.html#en-performance">occupancy performance discussion</a> explains how those resource changes affect residency.</p>
 
-<h2 id="en-sass">3. How compiled code expresses the wait</h2>
+<h2 id="en-sass">3. SASS dependency control</h2>
 <p>CUDA C++ and PTX express program dependencies; target code also needs a way to schedule waiting. For fixed-latency instructions that can be scheduled statically, the compiler can arrange issue distance. For operations requiring dynamic tracking, SASS control information links a producer's completion event to its consumers' waits.</p>
 <p><a href="https://arxiv.org/pdf/1804.06826v1#page=14">Section 2.1 of Jia et al.'s Volta microbenchmark study</a> analyzes read/write barrier indices, wait masks, and stall fields on Maxwell, Pascal, and Volta. The annotations below use that reading model, with <code>SB0</code> as the example dependency identifier. These are target-specific machine-code controls. Their bit positions are not part of PTX's portable program contract.</p>
 <pre class="code"><code>// Control annotations, not literal disassembler syntax
@@ -351,17 +351,17 @@ I0: LDG.E R8, [R2]             // write dependency = SB0
 I1: IADD3 R10, R11, R12, RZ    // no wait on SB0
 I2: FFMA R16, R8, R20, R16     // wait mask includes SB0</code></pre>
 <p>The write dependency associates <code>I0</code>'s result-ready event with <code>SB0</code>. The wait mask requires <code>I2</code> to await that condition before issue. One instruction can wait on several identifiers. If $P$ is the set of unsatisfied dependencies and $W$ is the set the current instruction requires to be fully satisfied, then $W\cap P\ne\varnothing$ is enough to block readiness on those dependencies. This set model explains the wait condition without prescribing bits, counters, or another physical representation.</p>
-<h3 id="en-classification">Read dependencies protect source registers still in use</h3>
+<h3 id="en-classification">Read dependencies</h3>
 <p>The RAW dependency protects a producer's destination. The opposite direction is write-after-read (WAR): an asynchronous or decoupled operation has not finished consuming a source register when a later instruction wants to overwrite it. The microbenchmark study describes read dependencies for this constraint. A store provides a useful illustration:</p>
 <pre class="code"><code>// A read-dependency example, not a compiled trace
 STG.E [R2], R8       // protect consumption of source R8 with SB1
 MOV R8, RZ          // wait on SB1 before overwriting R8</code></pre>
 <p>This wait protects consumption of the old <code>R8</code>, rather than a load producing a new value in it. Tracing only the writer of each current input register can therefore miss another kind of scoreboard dependency. NCU's official dependency table includes RAW, WAR, and conditions involving state updates or memory ordering.</p>
-<h3 id="en-depbar">Explicit DEPBAR and identifiers in the tool</h3>
+<h3 id="en-depbar">DEPBAR and dependency identifiers</h3>
 <p><a href="https://docs.nvidia.com/cuda/archive/13.0.3/cuda-binary-utilities/index.html#instruction-set-reference">CUDA Binary Utilities 13.0.3</a> lists <code>DEPBAR</code> as a Dependency Barrier. NVIDIA's <a href="https://patents.google.com/patent/US9612836B2/en">patent US9612836B2</a> describes an implementation that waits on an outstanding-operation counter selected by identifier and compared against a threshold. This illustrates how an explicit wait can track progress across a group of operations. The patent's counter width and circuitry are not specifications for every GPU.</p>
 <p>NCU 2026.2's Instructions &amp; Dependencies documentation displays dependency edges using six scoreboard identifiers. Following an identifier can connect producers and consumers; counting the columns does not establish an SM's maximum number of outstanding memory operations. Identifier reuse, associated operations, and target-instruction completion rules require additional information.</p>
 
-<h2 id="en-long-short">4. Which producer Long and Short identify</h2>
+<h2 id="en-long-short">4. Long and Short Scoreboard</h2>
 <p>Return to <code>LDG → FFMA</code>. If the consumer waits because this global load is incomplete, NCU classifies the sample as Long Scoreboard. Replacing the producer with a shared-memory <code>LDS</code> producing the same input normally makes the corresponding wait Short Scoreboard. The class follows the operation being awaited; the sampled <code>FFMA</code> can remain the same instruction type.</p>
 <div class="table-scroll"><table class="note-table"><thead><tr><th>NCU class</th><th>Operations in the documented definition</th><th>Evidence to inspect at the producer</th></tr></thead><tbody>
 <tr><td>Long Scoreboard</td><td>L1TEX local, global, surface, or texture operations</td><td>Coalescing, cache hits, request counts, local spills, and dependent address calculations</td></tr>
@@ -370,20 +370,20 @@ MOV R8, RZ          // wait on SB1 before overwriting R8</code></pre>
 <p>These classes follow <a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/ProfilingGuide/index.html#warp-stall-reasons">NCU 2026.2 Warp Stall Reasons</a>. They do not use a cycle-count threshold: a shared load can keep a consumer waiting, while a global load may complete quickly. The opcode and access behavior still determine the next diagnostic step.</p>
 <p>A shared-memory bank conflict increases the work needed to process an access and can delay its result. Short Scoreboard alone does not establish a bank conflict; a tight load-use dependency also produces waiting. If the producer has yet to issue because it is waiting for room in the MIO queue, the condition is <a href="gpu-mio-throttle-nsight-compute.html#en-position">MIO Throttle's pre-issue backpressure</a>. The result wait discussed here has not started.</p>
 
-<h2 id="en-observation">5. Separate the waiting location from the attributed location</h2>
+<h2 id="en-observation">5. NCU sampling and attribution</h2>
 <p>The initial example gives the report two relevant addresses: <code>I2</code> is the waiting consumer, and <code>I0</code> is the load that produces the dependency. Ordinary Warp Stall Sampling columns show waits at the sampled program location. The Source page's <strong>Attributed Stalls</strong> instead attributes Long/Short Scoreboard Not-issued samples to the corresponding producer. The two columns can highlight different lines.</p>
-<h3 id="en-trace">Follow FFMA samples back to LDG</h3>
+<h3 id="en-trace">FFMA and LDG dependencies</h3>
 <p>If the report shows Long Scoreboard at <code>I2</code>'s PC, select it in the SASS view and inspect <em>Input Scoreboard Dependencies</em>. This view lists the predecessor operations it needs to await. Follow the dependency link to <code>I0</code>, then use <em>Output Scoreboard Dependencies</em> to find the consumers waiting on that load. A consumer may await several producers; finding the first edge is not enough to assign every wait on its line to that producer.</p>
 <p>In this relationship, <code>I2</code>'s Not-issued samples and <code>I0</code>'s Attributed Stalls answer different questions. The former shows a sampled waiting location on cycles when the scheduler issued no instruction. The latter helps identify the producer responsible for such waits. The official <a href="https://archive.docs.nvidia.com/nsight-compute/2026.2/NsightCompute/index.html#source-page">Source Page documentation</a> also notes that All and Not-issued samples can come from different profiling passes and need not correspond exactly. These samples do not measure the precise latency of an individual load.</p>
-<h3 id="en-evidence">Use the producer type to choose supporting evidence</h3>
+<h3 id="en-evidence">Producer types and diagnosis</h3>
 <p>Once <code>I0</code> is identified as a global load, inspect its access pattern, sectors, and cache behavior. If it is a local-memory spill instead, revisit register pressure. For an <code>LDS</code> producer, compare actual and ideal shared wavefronts together with bank-conflict metrics. If no conflict appears, examine whether the consumer reaches the dependency too soon instead of trying to remove a nonexistent conflict.</p>
 <p>Then return to Scheduler Statistics. Can other warps keep providing eligible instructions during the wait, or are issue slots substantially idle? A wait already covered by other work may be reduced without shortening the kernel. If the dependency chain limits progress, compare one change at a time on the same input and amount of work, recording SASS order, resource use, and independent timing.</p>
 
-<h2 id="en-result">6. Choose the change from the dependency chain</h2>
+<h2 id="en-result">6. Dependency-chain optimization</h2>
 <p>On the <code>LDG → FFMA</code> chain, improving access behavior changes the producer. Advancing the load or placing independent work before the consumer can increase the interval between producer issue and consumer use. Adding available warps provides more work during the wait. Separating these effects makes the revised report easier to interpret. If consumer samples fall while register use rises and spills appear, the new local-memory producers also belong in the analysis.</p>
 <p>The example establishes the dependency relationship, without a measured claim that one approach must be faster. A successful optimization preserves correctness, produces a repeatable timing improvement for the target workload, and has profiler evidence that explains the benefit or added cost. <a href="gpu-instruction-issue-latency-hiding.html">Instruction issue and latency hiding</a> covers the remaining issue conditions; <a href="gpu-warp-stall-nsight-compute.html">Warp Stall analysis</a> develops the broader report-reading process.</p>
 
-<h2 id="en-reference-table">Appendix: Nearby mechanisms and control information</h2>
+<h2 id="en-reference-table">Appendix: Control-information reference</h2>
 <div class="table-scroll"><table class="note-table"><thead><tr><th>Name</th><th>Object of the wait or control</th></tr></thead><tbody>
 <tr><td>Write dependency / wait mask</td><td>Readiness of a predecessor result and the later instruction that reads it</td></tr><tr><td>Read dependency</td><td>Consumption of an old source operand before its register is overwritten</td></tr>
 <tr><td>Static stall count / NCU <code>wait</code></td><td>A scheduled issue distance / a fixed-latency execution dependency</td></tr><tr><td><code>lg_throttle</code> / <code>mio_throttle</code></td><td>Acceptance by an instruction queue before a new instruction issues</td></tr>

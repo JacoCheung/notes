@@ -3,9 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PyTorch TorchDispatchMode 的双向调度机制</title>
-<meta name="post:title"        content="PyTorch TorchDispatchMode 的双向调度机制">
-<meta name="post:title_en"     content="Bidirectional Dispatch with PyTorch TorchDispatchMode">
+<title>PyTorch TorchDispatchMode</title>
+<meta name="post:title"        content="PyTorch TorchDispatchMode">
+<meta name="post:title_en"     content="PyTorch TorchDispatchMode">
 <meta name="post:slug"         content="pytorch-torch-dispatch-mode">
 <meta name="post:date"         content="2026-05-20">
 <meta name="post:tags"         content="PyTorch, 系统设计, C++, Python">
@@ -21,7 +21,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
 </head>
 <body>
 <div class="layout">
@@ -30,98 +30,98 @@
 <div class="lang-zh">
 <strong>目录</strong>
 <ul>
-  <li><a href="#zh-sec1">1. Python 介入 dispatcher 的位置</a>
+  <li><a href="#zh-sec1">1. Python 算子拦截</a>
     <ul>
       <li><a href="#zh-sec1-1">1.1 Dispatcher 调用链</a></li>
       <li><a href="#zh-sec1-2">1.2 算子级拦截</a></li>
-      <li><a href="#zh-sec1-3">1.3 代表性使用场景</a></li>
-      <li><a href="#zh-sec1-4">1.4 Python API 钩子的边界</a></li>
+      <li><a href="#zh-sec1-3">1.3 使用场景</a></li>
+      <li><a href="#zh-sec1-4">1.4 Python API Hook 边界</a></li>
     </ul>
   </li>
-  <li><a href="#zh-sec2">2. C++ → Python 的实现路径</a>
+  <li><a href="#zh-sec2">2. C++ 到 Python 调度</a>
     <ul>
-      <li><a href="#zh-sec2-1">2.1 c10 与 CPython 的依赖边界</a></li>
-      <li><a href="#zh-sec2-2">2.2 PyInterpreterVTable:抽象接口</a></li>
-      <li><a href="#zh-sec2-3">2.3 TensorImpl::pyobj_slot:解释器与包装对象</a></li>
-      <li><a href="#zh-sec2-4">2.4 PythonFallbackKernel:路径选择</a></li>
-      <li><a href="#zh-sec2-5">2.5 Mode 暂存与 key 屏蔽</a></li>
-      <li><a href="#zh-sec2-6">2.6 ConcretePyInterpreterVTable::dispatch</a></li>
+      <li><a href="#zh-sec2-1">2.1 c10 与 CPython 依赖</a></li>
+      <li><a href="#zh-sec2-2">2.2 PyInterpreterVTable</a></li>
+      <li><a href="#zh-sec2-3">2.3 PyObjectSlot</a></li>
+      <li><a href="#zh-sec2-4">2.4 PythonFallbackKernel</a></li>
+      <li><a href="#zh-sec2-5">2.5 Mode 暂存与 Key 屏蔽</a></li>
+      <li><a href="#zh-sec2-6">2.6 解释器分派</a></li>
     </ul>
   </li>
-  <li><a href="#zh-sec3">3. TorchDispatchMode 的 Python 协议</a>
+  <li><a href="#zh-sec3">3. TorchDispatchMode 协议</a>
     <ul>
-      <li><a href="#zh-sec3-1">3.1 类与 with 块</a></li>
-      <li><a href="#zh-sec3-2">3.2 <code>__torch_dispatch__</code> 签名</a></li>
-      <li><a href="#zh-sec3-3">3.3 Mode 与 subclass 的调度次序</a></li>
-      <li><a href="#zh-sec3-4">3.4 <code>func(*args)</code> 的嵌套调度</a></li>
-      <li><a href="#zh-sec3-5">3.5 与 <code>__torch_function__</code> 的边界</a></li>
+      <li><a href="#zh-sec3-1">3.1 Mode 类与上下文</a></li>
+      <li><a href="#zh-sec3-2">3.2 __torch_dispatch__ 签名</a></li>
+      <li><a href="#zh-sec3-3">3.3 Mode 与 Subclass 顺序</a></li>
+      <li><a href="#zh-sec3-4">3.4 嵌套调度</a></li>
+      <li><a href="#zh-sec3-5">3.5 __torch_function__ 边界</a></li>
     </ul>
   </li>
-  <li><a href="#zh-sec4">4. 四个 Python 相关 DispatchKey 的分工</a>
+  <li><a href="#zh-sec4">4. Python DispatchKey</a>
     <ul>
-      <li><a href="#zh-sec4-1">4.1 阶梯重看</a></li>
-      <li><a href="#zh-sec4-2">4.2 PythonDispatcher / PreDispatch / Python / Snapshot</a></li>
+      <li><a href="#zh-sec4-1">4.1 Key 优先级</a></li>
+      <li><a href="#zh-sec4-2">4.2 Key 职责</a></li>
     </ul>
   </li>
-  <li><a href="#zh-sec5">5. 三类协议使用者</a>
+  <li><a href="#zh-sec5">5. 协议应用</a>
     <ul>
-      <li><a href="#zh-sec5-1">5.1 FakeTensorMode:无数据执行</a></li>
-      <li><a href="#zh-sec5-2">5.2 ProxyTorchDispatchMode + make_fx</a></li>
-      <li><a href="#zh-sec5-3">5.3 DTensor:分布式分片</a></li>
-      <li><a href="#zh-sec5-4">5.4 DTensor 的 C++ 快路径</a></li>
+      <li><a href="#zh-sec5-1">5.1 FakeTensorMode</a></li>
+      <li><a href="#zh-sec5-2">5.2 Proxy Mode 与图捕获</a></li>
+      <li><a href="#zh-sec5-3">5.3 DTensor</a></li>
+      <li><a href="#zh-sec5-4">5.4 DTensor C++ 快路径</a></li>
     </ul>
   </li>
-  <li><a href="#zh-sec6">6. 在 torch.compile 中的位置</a></li>
-  <li><a href="#zh-sec7">7. 成本模型与实现边界</a></li>
+  <li><a href="#zh-sec6">6. torch.compile 集成</a></li>
+  <li><a href="#zh-sec7">7. 成本与实现约束</a></li>
   <li><a href="#zh-sec8">参考资料</a></li>
 </ul>
 </div>
 <div class="lang-en">
 <strong>Contents</strong>
 <ul>
-  <li><a href="#en-sec1">1. Where Python enters the dispatcher</a>
+  <li><a href="#en-sec1">1. Python operator interception</a>
     <ul>
-      <li><a href="#en-sec1-1">1.1 The dispatcher call chain</a></li>
+      <li><a href="#en-sec1-1">1.1 Dispatcher call chain</a></li>
       <li><a href="#en-sec1-2">1.2 Operator-level interception</a></li>
-      <li><a href="#en-sec1-3">1.3 Representative use cases</a></li>
-      <li><a href="#en-sec1-4">1.4 The boundary of Python API hooks</a></li>
+      <li><a href="#en-sec1-3">1.3 Use cases</a></li>
+      <li><a href="#en-sec1-4">1.4 Python API hook boundary</a></li>
     </ul>
   </li>
-  <li><a href="#en-sec2">2. The C++ → Python implementation path</a>
+  <li><a href="#en-sec2">2. C++ to Python dispatch</a>
     <ul>
-      <li><a href="#en-sec2-1">2.1 The dependency boundary between c10 and CPython</a></li>
-      <li><a href="#en-sec2-2">2.2 PyInterpreterVTable: the abstract interface</a></li>
-      <li><a href="#en-sec2-3">2.3 TensorImpl::pyobj_slot: interpreter and wrapper</a></li>
-      <li><a href="#en-sec2-4">2.4 PythonFallbackKernel: path selection</a></li>
+      <li><a href="#en-sec2-1">2.1 c10 and CPython dependencies</a></li>
+      <li><a href="#en-sec2-2">2.2 PyInterpreterVTable</a></li>
+      <li><a href="#en-sec2-3">2.3 PyObjectSlot</a></li>
+      <li><a href="#en-sec2-4">2.4 PythonFallbackKernel</a></li>
       <li><a href="#en-sec2-5">2.5 Mode stashing and key masking</a></li>
-      <li><a href="#en-sec2-6">2.6 ConcretePyInterpreterVTable::dispatch</a></li>
+      <li><a href="#en-sec2-6">2.6 Interpreter dispatch</a></li>
     </ul>
   </li>
-  <li><a href="#en-sec3">3. The TorchDispatchMode Python protocol</a>
+  <li><a href="#en-sec3">3. TorchDispatchMode protocol</a>
     <ul>
-      <li><a href="#en-sec3-1">3.1 The class and the with block</a></li>
-      <li><a href="#en-sec3-2">3.2 <code>__torch_dispatch__</code> signature</a></li>
-      <li><a href="#en-sec3-3">3.3 Dispatch order for modes and subclasses</a></li>
-      <li><a href="#en-sec3-4">3.4 Nested dispatch through <code>func(*args)</code></a></li>
-      <li><a href="#en-sec3-5">3.5 Boundary with <code>__torch_function__</code></a></li>
+      <li><a href="#en-sec3-1">3.1 Mode class and context</a></li>
+      <li><a href="#en-sec3-2">3.2 __torch_dispatch__ signature</a></li>
+      <li><a href="#en-sec3-3">3.3 Mode and subclass order</a></li>
+      <li><a href="#en-sec3-4">3.4 Nested dispatch</a></li>
+      <li><a href="#en-sec3-5">3.5 __torch_function__ boundary</a></li>
     </ul>
   </li>
-  <li><a href="#en-sec4">4. Roles of the four Python-related DispatchKeys</a>
+  <li><a href="#en-sec4">4. Python dispatch keys</a>
     <ul>
-      <li><a href="#en-sec4-1">4.1 The priority ladder revisited</a></li>
-      <li><a href="#en-sec4-2">4.2 PythonDispatcher / PreDispatch / Python / Snapshot</a></li>
+      <li><a href="#en-sec4-1">4.1 Key priority</a></li>
+      <li><a href="#en-sec4-2">4.2 Key roles</a></li>
     </ul>
   </li>
-  <li><a href="#en-sec5">5. Three protocol users</a>
+  <li><a href="#en-sec5">5. Protocol applications</a>
     <ul>
-      <li><a href="#en-sec5-1">5.1 FakeTensorMode: shape inference without computation</a></li>
-      <li><a href="#en-sec5-2">5.2 ProxyTorchDispatchMode + make_fx</a></li>
-      <li><a href="#en-sec5-3">5.3 DTensor: distributed sharding</a></li>
-      <li><a href="#en-sec5-4">5.4 The DTensor C++ fast path</a></li>
+      <li><a href="#en-sec5-1">5.1 FakeTensorMode</a></li>
+      <li><a href="#en-sec5-2">5.2 Proxy mode and graph capture</a></li>
+      <li><a href="#en-sec5-3">5.3 DTensor</a></li>
+      <li><a href="#en-sec5-4">5.4 DTensor C++ fast path</a></li>
     </ul>
   </li>
-  <li><a href="#en-sec6">6. Position in torch.compile</a></li>
-  <li><a href="#en-sec7">7. Cost model and implementation boundaries</a></li>
+  <li><a href="#en-sec6">6. torch.compile integration</a></li>
+  <li><a href="#en-sec7">7. Costs and implementation constraints</a></li>
   <li><a href="#en-sec8">References</a></li>
 </ul>
 </div>
@@ -131,11 +131,11 @@
 
 <div class="lang-zh">
 
-<h1>PyTorch TorchDispatchMode 的双向调度机制</h1>
+<h1>PyTorch TorchDispatchMode</h1>
 
-<p class="small">PyTorch 的 dispatcher 既要把 ATen 算子送到 CPU、CUDA 和 autograd 实现，也要允许 FakeTensor、代理追踪与分布式张量在 Python 中改写算子语义。<code>TorchDispatchMode</code> 提供了这条跨语言路径：C++ dispatcher 把调用交给 Python handler，handler 可以返回结果，也可以重新进入 dispatcher 继续分派。本文按公开的 <a href="https://github.com/pytorch/pytorch/tree/v2.12.0">PyTorch <code>v2.12.0</code> 源码</a>追踪这条回路；常规 key 选择与 redispatch 的背景见 <a href="pytorch-dispatcher.html">《PyTorch Dispatcher 的多维分派与算子执行路径》</a>。</p>
+<p class="small">PyTorch 的 dispatcher 既要把 ATen 算子送到 CPU、CUDA 和 autograd 实现，也要允许 FakeTensor、代理追踪与分布式张量在 Python 中改写算子语义。<code>TorchDispatchMode</code> 提供了这条跨语言路径：C++ dispatcher 把调用交给 Python handler，handler 可以返回结果，也可以重新进入 dispatcher 继续分派。本文按公开的 <a href="https://github.com/pytorch/pytorch/tree/v2.12.0">PyTorch <code>v2.12.0</code> 源码</a>追踪这条回路；常规 key 选择与 redispatch 的背景见 <a href="pytorch-dispatcher.html">《PyTorch Dispatcher 机制》</a>。</p>
 
-<h2 id="zh-sec1">1. Python 介入 dispatcher 的位置</h2>
+<h2 id="zh-sec1">1. Python 算子拦截</h2>
 
 <p>常规算子调用由 dispatcher 选择最高优先级的 <code>DispatchKey</code>，各层处理本层语义后再向下 redispatch。<code>TorchDispatchMode</code> 与 tensor subclass 在其中加入一个受控的 C++/Python 回路：<code>Python</code> key 触发 boxed fallback，fallback 经 <code>PyInterpreterVTable</code> 调用 Python handler；当 handler 调用 <code>func(*args, **kwargs)</code> 时，算子重新进入 dispatcher。mode 暂存与 key 屏蔽分别控制重入和优先级，使多个 Python 覆盖层能够按既定顺序组合。</p>
 
@@ -176,7 +176,7 @@ Dispatcher 以 redispatch 连接多个行为层。每层处理本层语义、调
 
 <p>这些功能共享同一项工程需求：C++ dispatcher 必须在算子级别调用 Python 扩展逻辑，同时保持 libtorch 的纯 C++ 使用方式。PyTorch 没有把 Python 函数直接塞进每个算子的 dispatch 表，而是在 <code>Python</code> key 上注册统一 fallback，再由 fallback 找到当前 mode 或 tensor subclass。</p>
 
-<h3 id="zh-sec1-3">1.3 代表性使用场景</h3>
+<h3 id="zh-sec1-3">1.3 使用场景</h3>
 
 <p>三个短例分别展示 mode、代理追踪和 tensor subclass 的外部行为。第 5 章再说明它们在 <code>v2.12.0</code> 中采用的具体路径。</p>
 
@@ -194,7 +194,7 @@ with FakeTensorMode():
 
 <p>这段代码不为 <code>x</code>、<code>y</code> 或 <code>z</code> 分配 CUDA storage，也不启动 CUDA matmul kernel。<code>FakeTensorMode</code> 拦截相关 factory 与矩阵运算调用，通过 meta kernel、专用 fake 实现或 decomposition 推导输出 metadata。并非每个 ATen 算子都有独立的 meta kernel，缺少 fake 支持的算子仍可能报错。</p>
 
-<h4>(b) make_fx / ProxyTorchDispatchMode</h4>
+<h4>(b) make_fx 与 Proxy Mode</h4>
 
 <pre class="code">import torch
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -230,7 +230,7 @@ y = x @ w                                                            <span class
 FakeTensor 与 Proxy tracing 使用 infra mode，DTensor 则以 tensor subclass 参与调度。它们共享 C++ 到 Python 的协议入口，但 handler 顺序、后续执行和 fallback 条件并不相同。
 </div>
 
-<h3 id="zh-sec1-4">1.4 Python API 钩子的边界</h3>
+<h3 id="zh-sec1-4">1.4 Python API Hook 边界</h3>
 
 <p><code>__torch_function__</code> 在可覆盖的 Python API 层分派，适合重定义 <code>torch.*</code> 函数和 Tensor method 的外部语义。它不会自动观察绕过该 Python API 层、直接进入 dispatcher 的 C++ 调用。</p>
 
@@ -257,11 +257,11 @@ FakeTensor 与 Proxy tracing 使用 infra mode，DTensor 则以 tensor subclass 
 
 <p>第 2 章沿固定版本源码展开这五项职责。</p>
 
-<h2 id="zh-sec2">2. C++ → Python 的实现路径</h2>
+<h2 id="zh-sec2">2. C++ 到 Python 调度</h2>
 
 <p><code>Python</code> key 把算子从 dispatcher 的 C++ 表项送入 Python runtime。下面沿 PyTorch <code>v2.12.0</code> 源码追踪这条路径中的依赖隔离、对象映射、GIL 获取、参数转换、handler 调用、结果回传与重入控制；其它版本应以对应 tag 或 commit 为准。</p>
 
-<h3 id="zh-sec2-1">2.1 c10 与 CPython 的依赖边界</h3>
+<h3 id="zh-sec2-1">2.1 c10 与 CPython 依赖</h3>
 
 <p><code>libc10.so</code> 是可由纯 C++ 程序使用的核心库，因此跨语言调用首先受到一条依赖约束：</p>
 
@@ -291,7 +291,7 @@ FakeTensor 与 Proxy tracing 使用 infra mode，DTensor 则以 tensor subclass 
 
 <p>因此，dispatcher 通过 vtable 发起跨语言调用，CPython 相关实现留在 <code>libtorch_python.so</code>。这个接口就是下一节的 <code>PyInterpreterVTable</code>。</p>
 
-<h3 id="zh-sec2-2">2.2 PyInterpreterVTable:抽象接口</h3>
+<h3 id="zh-sec2-2">2.2 PyInterpreterVTable</h3>
 
 <p>vtable 定义在 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/c10/core/impl/PyInterpreter.h"><code>c10/core/impl/PyInterpreter.h</code></a> 第 75-175 行附近。完整结构(裁剪):</p>
 
@@ -354,7 +354,7 @@ struct C10_API PyInterpreter {
 <code>PyInterpreterHolder</code> 的静态生命周期可能晚于 CPython 中对象的可用期。其析构函数调用 <code>PyInterpreter::disarm()</code>,把解释器切换到 c10 的无操作 vtable,从而避免后续 C++ 析构路径再进入已经不可用的 CPython。具体的引用计数操作由 vtable 实现和包装对象的所有权代码负责,不是 <code>PyObjectSlot</code> 的成员方法。
 </div>
 
-<h3 id="zh-sec2-3">2.3 PyObjectSlot:解释器关联与包装指针</h3>
+<h3 id="zh-sec2-3">2.3 PyObjectSlot</h3>
 
 <p>Vtable 规定跨语言调用接口，<code>PyObjectSlot</code> 则把 C++ tensor 表示映射回所属 Python 对象。tensor subclass 依赖这项映射：dispatcher 持有 <code>TensorImpl*</code>，而待执行的 <code>__torch_dispatch__</code> 定义在对应的 Python 类上。</p>
 
@@ -403,7 +403,7 @@ struct C10_API PyObjectSlot {
 <strong>两个条件</strong>:tensor subclass 路径既依赖 <code>TensorImpl</code> 的 <code>Python</code> key,也依赖 <code>PyObjectSlot</code> 中匹配的解释器标记与 Python 包装。前者触发 fallback,后者把 C++ tensor 映射回正确的 Python 对象。
 </div>
 
-<h3 id="zh-sec2-4">2.4 PythonFallbackKernel:路径选择</h3>
+<h3 id="zh-sec2-4">2.4 PythonFallbackKernel</h3>
 
 <p>vtable 和 pyobj_slot 提供了所需的基础设施,实际跳转由一个 <strong>boxed kernel</strong> 完成。它以 <code>m.fallback</code> 形式注册到 <code>Python</code> key 上(另有几个相关 key),实现位于 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/core/PythonFallbackKernel.cpp"><code>aten/src/ATen/core/PythonFallbackKernel.cpp</code></a>。</p>
 
@@ -509,7 +509,7 @@ void pythonFallback(const c10::OperatorHandle&amp; op,
 <code>pythonFallback</code> 先检查 mode stack,因此最外层 C++ 入口先由栈顶 mode 的解释器接管。不过完整的 Python 多重分派顺序还由 <code>dispatch_on_mode</code> 与 <code>dispatch_on_subclass</code> 决定。在 <code>v2.12.0</code> 中,用户 mode 和用户 subclass 优先于基础设施 mode;基础设施 mode 可以返回 <code>NotImplemented</code>,再交给 subclass 或下一 mode。仅凭 fallback 中两个分支的排列,不能推出所有 mode 都无条件压过所有 subclass。
 </div>
 
-<h3 id="zh-sec2-5">2.5 Mode 暂存与 key 屏蔽</h3>
+<h3 id="zh-sec2-5">2.5 Mode 暂存与 Key 屏蔽</h3>
 
 <p>2.4 节的 guard:</p>
 
@@ -532,7 +532,7 @@ void pythonFallback(const c10::OperatorHandle&amp; op,
 Tensor subclass 不依赖这项 mode 栈暂存。Subclass 若直接用原 subclass 参数再次调用 <code>func</code>,仍可能重入自身;常见实现会先 unwrap 参数,或使用相应的 dispatch-disable guard。
 </div>
 
-<h3 id="zh-sec2-6">2.6 ConcretePyInterpreterVTable::dispatch</h3>
+<h3 id="zh-sec2-6">2.6 解释器分派</h3>
 
 <p><code>pythonFallback</code> 在 mode 路径调用 <code>cur_mode-&gt;pyinterpreter()-&gt;dispatch(op, stack)</code>。这个虚函数在固定版本的 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/PyInterpreter.cpp#L290-L344"><code>torch/csrc/PyInterpreter.cpp</code></a> 第 290 至 344 行实现:</p>
 
@@ -600,11 +600,11 @@ void ConcretePyInterpreterVTable::dispatch(
 跨语言路径由三项状态协同完成：vtable 隔离 <code>libc10</code> 与 CPython 依赖，<code>PyObjectSlot</code> 关联解释器和 Python wrapper，mode 暂存与 key mask 分别控制重入和优先级。Tensor subclass 还需要在自己的表示转换中处理自身重入。
 </div>
 
-<h2 id="zh-sec3">3. TorchDispatchMode 的 Python 协议</h2>
+<h2 id="zh-sec3">3. TorchDispatchMode 协议</h2>
 
 <p>C++ fallback 把 boxed 算子交给 Python 后，<code>TorchDispatchMode</code> 协议规定 handler 如何接收调用、返回结果以及发起嵌套调度。动态作用域由 <code>with</code> 管理，<code>__torch_dispatch__</code> 接收规范化的 operator 与参数，而 <code>func(*args, **kwargs)</code> 用于继续执行剩余调度层。</p>
 
-<h3 id="zh-sec3-1">3.1 类与 with 块</h3>
+<h3 id="zh-sec3-1">3.1 Mode 类与上下文</h3>
 
 <p><code>TorchDispatchMode</code> 基类定义在 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/utils/_python_dispatch.py"><code>torch/utils/_python_dispatch.py</code></a> 第 72 行附近。简化:</p>
 
@@ -734,11 +734,11 @@ with LoggingMode():
 这个 mode 记录到达其 dispatch 位置的 ATen 调用。示例中的 factory op 也能被 mode 捕获,因为 mode 由 TLS 激活,不要求输入中已有 subclass tensor。
 </div>
 
-<h3 id="zh-sec3-3">3.3 mode 与 subclass 的处理顺序</h3>
+<h3 id="zh-sec3-3">3.3 Mode 与 Subclass 顺序</h3>
 
 <p><code>pythonFallback</code> 为 mode stack 与 tensor subclass 提供两条入口。前者由动态作用域激活，后者由参与运算的 tensor 类型激活；两种入口对应不同的状态归属和重入规则。</p>
 
-<h4>(A) Mode 路径:全局拦截</h4>
+<h4>(A) Mode 全局拦截</h4>
 
 <p>Mode 路径继承 <code>TorchDispatchMode</code>,并由 <code>with</code> 块激活。它具有以下运行特征:</p>
 
@@ -748,7 +748,7 @@ with LoggingMode():
   <li>同时多个 mode 时构成<strong>LIFO 栈</strong>,栈顶优先。</li>
 </ul>
 
-<h4>(B) Subclass 路径:只在某些张量参与时拦截</h4>
+<h4>(B) Subclass 张量拦截</h4>
 
 <p>Subclass 路径在 <code>torch.Tensor</code> 子类的 <code>__torch_dispatch__</code> classmethod 中定义算子语义:</p>
 
@@ -777,7 +777,7 @@ with LoggingMode():
 Mode 把语义附着在一段动态执行作用域上,因此能够覆盖 factory op；subclass 把语义附着在 tensor 类型及其实例上,因此只在相关对象参与调用时激活。两种入口可以配合使用：<code>FakeTensorMode</code> 创建的张量本身也是 <code>FakeTensor</code> subclass。离开 <code>with</code> 块后,后续 operator 仍可通过 tensor 类型识别这些对象。mode 负责创建动态环境,subclass 保存数据语义。
 </div>
 
-<h4>(C) 同时存在时的处理顺序</h4>
+<h4>(C) 处理优先级</h4>
 
 <p><code>pythonFallback</code> 首先检查 mode stack,随后处理 tensor subclass 路径:</p>
 
@@ -792,7 +792,7 @@ if interpreter &amp;&amp; tensors_with_python_key_present {
 
 <p>这段代码只选择进入哪个 <code>PyInterpreter</code>,并不独自决定全部 Python handler 的先后。<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/utils/python_arg_parser.cpp"><code>python_arg_parser.cpp</code></a> 的多重分派按用户 mode、用户 subclass、基础设施 mode 或 subclass 的分组处理候选项。基础设施 mode 常用 <code>NotImplemented</code> 把不属于自己的组合交给下一候选项。</p>
 
-<h3 id="zh-sec3-4">3.4 嵌套调度如何继续</h3>
+<h3 id="zh-sec3-4">3.4 嵌套调度</h3>
 
 <p><code>func</code> 是 <code>OpOverload</code>;调用它会再次进入 dispatcher。对 mode 而言,Python 参数分派层已经用 <code>StashTorchDispatchModeGuard</code> 暂存当前 mode:</p>
 
@@ -809,7 +809,7 @@ if interpreter &amp;&amp; tensors_with_python_key_present {
 <strong>边界</strong>:对 mode,调用 <code>func</code> 可以继续到下一 mode、tensor subclass、autograd 或 backend。对 subclass,若参数仍包含原 subclass,同样的调用可能重入自身。该行为依赖内部 guard 与参数分派实现,调试其它版本时应核对对应源码。
 </div>
 
-<h3 id="zh-sec3-5">3.5 与 <code>__torch_function__</code> 的边界</h3>
+<h3 id="zh-sec3-5">3.5 <code>__torch_function__</code> 边界</h3>
 
 <p>PyTorch 还有一个更早的协议叫 <code>__torch_function__</code>。两者名字相似容易混,但<strong>拦截位置完全不同</strong>:</p>
 
@@ -827,11 +827,11 @@ if interpreter &amp;&amp; tensors_with_python_key_present {
 
 <p><code>__torch_function__</code> 适合表达 public API override;<code>__torch_dispatch__</code> 适合表达 ATen operator 语义。后者覆盖范围更低,但观察到的具体算子集合仍由 decomposition 表、dispatch key 位置和内部实现共同决定,不能从某个示例输出推广成固定调用次数。</p>
 
-<h2 id="zh-sec4">4. 四个 Python 相关 DispatchKey 的职责</h2>
+<h2 id="zh-sec4">4. Python DispatchKey</h2>
 
 <p>PyTorch v2.12.0 为 Python 相关控制路径分配了 <code>PythonDispatcher</code>、<code>PreDispatch</code>、<code>PythonTLSSnapshot</code> 和 <code>Python</code> 四个 key。它们位于不同优先级并执行不同 fallback，各自负责拦截、TLS 保存或 Python dispatcher 接入。</p>
 
-<h3 id="zh-sec4-1">4.1 DispatchKey 优先级位置</h3>
+<h3 id="zh-sec4-1">4.1 Key 优先级</h3>
 
 <p>把 dispatcher 优先级阶梯顶部局部放大:</p>
 
@@ -880,7 +880,7 @@ if interpreter &amp;&amp; tensors_with_python_key_present {
 
 <p>前三个 key 位于 autograd 相关 key 之上,<code>Python</code> 位于其下。这个位置影响 mode 看到的 operator 形态,但图中相对位置不能替代具体 decomposition 与注册表分析。</p>
 
-<h3 id="zh-sec4-2">4.2 四个 key 的实现职责</h3>
+<h3 id="zh-sec4-2">4.2 Key 职责</h3>
 
 <table>
 <thead><tr><th>Key</th><th>位置</th><th>语义</th><th>使用者</th></tr></thead>
@@ -907,11 +907,11 @@ TORCH_LIBRARY_IMPL(_, Python,              m) { m.fallback(... pythonFallback ..
 这些 fallback 不共享同一控制流。<code>Python</code> 和 <code>PythonDispatcher</code> 分别调用 vtable 的 <code>dispatch</code> 与 <code>python_dispatcher</code>;<code>PythonTLSSnapshot</code> 设置 guard 后 redispatch;<code>PreDispatch</code> 本身只做 redispatch。
 </div>
 
-<h2 id="zh-sec5">5. 三类协议使用者</h2>
+<h2 id="zh-sec5">5. 协议应用</h2>
 
 <p>同一套跨语言协议可以承载不同的 operator 语义。FakeTensorMode 传播元数据，ProxyTorchDispatchMode 记录 ATen graph，DTensor 则根据 placement 规划局部计算与通信。三者共享 dispatcher 入口，却使用不同的 handler 状态和返回值约束。</p>
 
-<h3 id="zh-sec5-1">5.1 FakeTensorMode:无数据执行</h3>
+<h3 id="zh-sec5-1">5.1 FakeTensorMode</h3>
 
 <p><code>FakeTensorMode</code> 是一种元数据执行环境：它用 shape、dtype、stride 和模拟 device 表示 tensor，并在不访问数值 storage 的条件下传播算子输出信息。</p>
 
@@ -964,7 +964,7 @@ def dispatch(self, func, types, args=(), kwargs=None):
 
 <p>一次 fake matmul 会把 fake 输入映射到 meta 执行所需的表示,运行 <code>aten::matmul</code> 的元数据路径,再把输出包装成带模拟 CUDA device 的 <code>FakeTensor</code>。这一过程传播 shape、dtype、stride 与 device 信息,不启动 CUDA 数值 kernel。</p>
 
-<h4>Factory op 的特殊处理</h4>
+<h4>Factory Op 处理</h4>
 
 <p>调用 <code>torch.randn(1024, 1024, device="cuda")</code> 时,<code>aten::randn</code> 的输入中没有 tensor,因而不会从 tensor subclass 引入 Python key。Mode 路径由线程局部状态提供拦截能力；<code>FakeTensorMode.__torch_dispatch__</code> 将调用转发到 meta 设备的 <code>randn</code>，生成形状描述后再包装成 <code>FakeTensor</code>。</p>
 
@@ -972,7 +972,7 @@ def dispatch(self, func, types, args=(), kwargs=None):
 <strong>FakeTensorMode 使用单个基础设施槽位。</strong><code>TorchDispatchModeTLS</code> 的 <code>infra_modes_</code> 为它保留固定位置,第二次 push 为 no-op。<code>ProxyTorchDispatchMode</code> 使用可嵌套的 mode stack,两者的组合规则不同。
 </div>
 
-<h3 id="zh-sec5-2">5.2 ProxyTorchDispatchMode + make_fx:图捕获</h3>
+<h3 id="zh-sec5-2">5.2 Proxy Mode 与图捕获</h3>
 
 <p><code>make_fx</code> 执行 Python 函数并生成 <code>fx.Graph</code>。图中的 ATen 节点可供后续分析、变换和编译使用，<code>ProxyTorchDispatchMode</code> 在每次 operator 调用时建立对应代理节点。</p>
 
@@ -1061,7 +1061,7 @@ output         output  output              ((relu,),)      {}
 在这个示例边界中,<code>pre_dispatch=True</code> 将 <code>relu</code> 保留为单个 operator。普通 <code>Python</code>-key 捕获可能根据当前 decomposition 路径观察到 <code>clamp_min</code> 等更低层形式。
 </div>
 
-<h3 id="zh-sec5-3">5.3 DTensor:分布式张量</h3>
+<h3 id="zh-sec5-3">5.3 DTensor</h3>
 
 <p><code>DTensor</code> 为 tensor 数据附加分布式 placement。当 <code>x @ w</code> 这样的表达式进入 handler 时，框架推导：</p>
 <ol>
@@ -1087,7 +1087,7 @@ output         output  output              ((relu,),)      {}
 DTensor 以 tensor subclass 保存 placement，所有使用该 tensor 的 operator 都会继承分布式语义。FakeTensorMode 则以动态作用域控制元数据执行。前者把语义附着在数据上，后者把语义附着在一段执行上下文上。
 </div>
 
-<h3 id="zh-sec5-4">5.4 DTensor 的 C++ 快路径</h3>
+<h3 id="zh-sec5-4">5.4 DTensor C++ 快路径</h3>
 
 <p>2025 年下半年的 PR <a href="https://github.com/pytorch/pytorch/pull/167051">#167051</a> 将常见 DTensor operator 的 sharding 决策移入 C++ 路径。基础 DTensor 因而可以先尝试 C++ fast path，再由常规 Python multiple dispatch 覆盖未命中的对象与行为。</p>
 
@@ -1119,11 +1119,11 @@ DTensor 以 tensor subclass 保存 placement，所有使用该 tensor 的 operat
 
 <p class="callout">这里优化的是基础 DTensor 的常见 Python multiple-dispatch 路径，不是把所有 <code>__torch_dispatch__</code> handler 一般化为 C++ 实现。复杂行为、subclass 参与方式与 fast-path 覆盖范围都应以对应版本源码为准。</p>
 
-<h2 id="zh-sec6">6. 与 torch.compile 的连接</h2>
+<h2 id="zh-sec6">6. torch.compile 集成</h2>
 
 <p><code>torch.compile</code> 由多层捕获与变换机制组成。Dynamo 主要使用 frame evaluation 与字节码分析；AOTAutograd、FakeTensor 和若干 proxy/functionalization 路径会使用 dispatcher 与 <code>__torch_dispatch__</code>。因此后者是编译栈的重要组成部分，但不是整个图捕获机制的唯一入口。</p>
 
-<h3>6.1 Dynamo 和 AOTAutograd:两个阶段</h3>
+<h3>6.1 Dynamo 与 AOTAutograd</h3>
 
 <p>其中两个主要阶段具有不同的捕获边界:</p>
 
@@ -1137,7 +1137,7 @@ DTensor 以 tensor subclass 保存 placement，所有使用该 tensor 的 operat
 
 <p>Dynamo 从 Python frame 开始捕获,AOTAutograd 则把捕获后的程序转换为 ATen 级 forward 与 backward graph。<code>__torch_dispatch__</code> 通过 FakeTensor 和 proxy mode 参与后一个阶段,并与 functionalization、autograd tracing 等机制协作。</p>
 
-<h3>6.2 AOTAutograd 的 joint tracing 与前后向分图</h3>
+<h3>6.2 Joint Tracing 与分图</h3>
 
 <p>AOTAutograd 先在抽象输入上建立包含前向与梯度语义的 joint graph,再由 partition 阶段拆成 forward graph 与 backward graph。下面的伪代码只表示阶段关系:</p>
 
@@ -1159,7 +1159,7 @@ fw_graph, bw_graph = partition_fn(joint_graph)</pre>
 
 <p>实际实现由 AOTAutograd 的 tracing、functionalization、autograd 与 partition helpers 协同完成,并不会按上面的函数名逐行调用。伪代码的用途是区分三个阶段:FakeTensor 提供抽象值,proxy/autograd tracing 建立 joint graph,partition 再生成独立的前向与反向图。相关入口见 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/_functorch/aot_autograd.py"><code>torch/_functorch/aot_autograd.py</code></a>。</p>
 
-<h3>6.3 PreDispatch 在 PT2 编译流程中的角色</h3>
+<h3>6.3 PreDispatch</h3>
 
 <p><code>PreDispatch</code> 位于 Autograd 之上。编译与导出路径在请求 <code>pre_dispatch=True</code> 时,可以在后续 autograd wrapper 或 decomposition 之前捕获较高层的 ATen operator,例如保留 <code>relu</code> 而非立即观察其底层组成。这个选择影响后续阶段所看到的图:</p>
 
@@ -1173,11 +1173,11 @@ fw_graph, bw_graph = partition_fn(joint_graph)</pre>
 <code>PreDispatch</code> 为编译流程提供位于 autograd 之前的捕获位置，使代理模式能够保留更高层的 ATen operator 形态。普通 <code>Python</code> key 上的捕获则适合观察经过既有分解与包装层之后的 operator 序列。
 </div>
 
-<h2 id="zh-sec7">7. 成本模型与实现边界</h2>
+<h2 id="zh-sec7">7. 成本与实现约束</h2>
 
 <p>跨语言调度的适用性取决于两个方面:单次调用需要完成多少 Python 边界工作,以及这些成本能否由后续执行摊销。下面先拆解成本来源,再说明协议适合承载的任务与实现约束。</p>
 
-<h3>7.1 跨语言调度的成本来源</h3>
+<h3>7.1 跨语言调度开销</h3>
 
 <p><code>ConcretePyInterpreterVTable::dispatch</code> 的成本来自跨语言路径本身：线程获取 GIL，dispatcher 查找 Python operator，扫描候选 mode 与 subclass，在 IValue 和 Python 对象之间转换参数，执行 handler，再按 schema 转回结果。这些工作随参数数量、对象复用情况、handler 内容和 GIL 竞争而变化。</p>
 
@@ -1193,7 +1193,7 @@ fw_graph, bw_graph = partition_fn(joint_graph)</pre>
 
 <p>本文没有提供固定的纳秒或微秒估计，因为公开源码只能确定控制流，无法给出跨硬件、Python 构建和 workload 稳定成立的常数。性能敏感路径应在目标环境中按 operator 粒度测量；DTensor 的 C++ fast path 则说明，减少常见算子的 Python multiple-dispatch 次数可以成为明确的优化方向。</p>
 
-<h3>7.2 协议适用范围</h3>
+<h3>7.2 适用范围</h3>
 
 <table>
 <thead><tr><th>适合由协议承载</th><th>通常需要专用实现</th></tr></thead>
@@ -1207,15 +1207,15 @@ fw_graph, bw_graph = partition_fn(joint_graph)</pre>
 
 <h3>7.3 实现约束</h3>
 
-<h4>约束 1:引用关系 <code>TensorImpl ↔ PyObject ↔ Mode</code></h4>
+<h4>约束 1:对象引用关系</h4>
 
 <p><code>pyobj_slot_</code> 关联 <code>PyObject*</code>,Python wrapper 则持有 <code>intrusive_ptr&lt;TensorImpl&gt;</code>。Mode 若把 tensor 保存在自身字段中,还会延长这条引用链的生命周期。长期存活的 mode 应使用 <code>weakref</code> 保存非拥有引用,或在 <code>__exit__</code> 中显式清理缓存。</p>
 
-<h4>约束 2:嵌套 mode 的 LIFO 次序</h4>
+<h4>约束 2:Mode LIFO 顺序</h4>
 
 <p>调用 mode handler 时，当前 mode 会被临时移出栈。handler 内执行 <code>func(*args, **kwargs)</code> 会重新进入调度，因此下一层 mode 或 tensor subclass 仍有机会处理该算子。若 handler 直接返回自行构造的结果，才会终止这次链式处理。<code>super().__torch_dispatch__</code> 属于 Python 继承语义，不能替代 mode stack 的调度。</p>
 
-<h4>约束 3:<code>_DISPATCH_HANDLE_DIRECTLY</code> 的覆盖范围</h4>
+<h4>约束 3:直接处理范围</h4>
 
 <p>FakeTensor 的部分查询 op,包括 <code>size</code>、<code>stride</code>、<code>device</code> 和 <code>dim</code>,可通过 <code>_DISPATCH_HANDLE_DIRECTLY</code> 与 <code>in_kernel_invocation_manager</code> 在通用 handler 路径之外处理。依赖完整 op 日志的 mode 需要先核对 <code>fake_tensor.py</code> 中的直接处理集合；若目标是用户级 API 调用,也可在边界清楚的场景组合 <code>__torch_function__</code>。</p>
 
@@ -1231,18 +1231,18 @@ thread_local std::optional&lt;c10::impl::LocalDispatchKeySet&gt; tls_on_entry;</
 
 <p>Mode handler 通过 <code>func(*args, **kwargs)</code> 发起下一次 dispatch,由框架维护该 TLS 不变量。绕过此入口手动调用 <code>op.redispatchBoxed(...)</code> 可能触发 "Accessing torch dispatch state outside of __torch_dispatch__ is not allowed" 错误。</p>
 
-<h4>约束 5:Python 退出时的 disarm</h4>
+<h4>约束 5:Python 退出清理</h4>
 
 <p>Python teardown 会 disarm vtable。C++ 侧若在 static 容器中缓存带 <code>pyobj_slot</code> 的 <code>TensorImpl</code>,其析构顺序必须早于解释器失效,否则可能触发 "<em>attempted to call dispatch on a Tensor with nontrivial PyObject after corresponding interpreter died</em>" 断言。相应缓存可在 atexit 前清空,或由拥有者在析构时调用 <code>pyobj_slot.clear()</code>。</p>
 
-<h4>约束 6:FakeTensorMode 的基础设施槽位</h4>
+<h4>约束 6:FakeTensorMode 槽位</h4>
 
 <p><code>infra_modes_</code> 为 FakeTensorMode 保留固定槽位,第二次 push 为 no-op。因此嵌套的内层 FakeTensorMode 不会替换外层实例。需要在 fake 环境中执行局部真实操作时,应使用 <code>FakeTensorMode.disable()</code> 临时关闭该 mode。</p>
 
 <h2 id="zh-sec8">参考资料</h2>
 
 <ul>
-  <li>相关章节：<a href="pytorch-dispatcher.html">PyTorch Dispatcher 的多维分派与算子执行路径</a></li>
+  <li>相关章节：<a href="pytorch-dispatcher.html">PyTorch Dispatcher 机制</a></li>
   <li><a href="https://dev-discuss.pytorch.org/t/what-and-why-of-torch-dispatch/557">"What and Why of <code>__torch_dispatch__</code>": Chillee et al., PyTorch dev-discuss 2022</a></li>
   <li><a href="https://github.com/albanD/subclass_zoo">albanD/subclass_zoo</a>: 一组小型 <code>__torch_dispatch__</code> 示例(LoggingTensor、NegativeTensor 等)</li>
   <li><a href="https://github.com/pytorch/pytorch/pull/167051">PyTorch PR #167051: DTensor C++ fast path</a></li>
@@ -1269,11 +1269,11 @@ thread_local std::optional&lt;c10::impl::LocalDispatchKeySet&gt; tls_on_entry;</
 
 <div class="lang-en">
 
-<h1>Bidirectional Dispatch with PyTorch TorchDispatchMode</h1>
+<h1>PyTorch TorchDispatchMode</h1>
 
-<p class="small">The PyTorch dispatcher routes ATen operators to CPU, CUDA, and autograd implementations, while FakeTensor, proxy tracing, and distributed tensors need to redefine operator semantics in Python. <code>TorchDispatchMode</code> supplies that cross-language path: the C++ dispatcher transfers a call to a Python handler, which may return a result or re-enter the dispatcher. This article traces the loop in the public <a href="https://github.com/pytorch/pytorch/tree/v2.12.0">PyTorch <code>v2.12.0</code> source</a>; the related <a href="pytorch-dispatcher.html"><i>PyTorch Dispatcher: Multidimensional Dispatch and Operator Execution</i></a> article covers ordinary key selection and redispatch.</p>
+<p class="small">The PyTorch dispatcher routes ATen operators to CPU, CUDA, and autograd implementations, while FakeTensor, proxy tracing, and distributed tensors need to redefine operator semantics in Python. <code>TorchDispatchMode</code> supplies that cross-language path: the C++ dispatcher transfers a call to a Python handler, which may return a result or re-enter the dispatcher. This article traces the loop in the public <a href="https://github.com/pytorch/pytorch/tree/v2.12.0">PyTorch <code>v2.12.0</code> source</a>; the related <a href="pytorch-dispatcher.html"><i>PyTorch Dispatcher</i></a> article covers ordinary key selection and redispatch.</p>
 
-<h2 id="en-sec1">1. Where Python enters the dispatcher</h2>
+<h2 id="en-sec1">1. Python operator interception</h2>
 
 <p>Ordinary dispatch selects the highest-priority <code>DispatchKey</code>, lets that layer process its semantics, and then redispatches toward the backend. <code>TorchDispatchMode</code> and tensor subclasses add a controlled C++/Python loop to that chain. The <code>Python</code> key invokes a boxed fallback, the fallback reaches a Python handler through <code>PyInterpreterVTable</code>, and a handler call to <code>func(*args, **kwargs)</code> enters the dispatcher again. Mode stashing controls re-entry while key masking preserves dispatch priority, allowing several Python override layers to compose.</p>
 
@@ -1314,7 +1314,7 @@ Python interception is a continuation of dispatcher execution. The C++ fallback 
 
 <p>These features share a protocol, not one implementation. Modes and subclasses expose Python handlers, while selected paths such as base DTensor may use a C++ implementation with equivalent dispatch semantics.</p>
 
-<h3 id="en-sec1-3">1.3 Representative use cases</h3>
+<h3 id="en-sec1-3">1.3 Use cases</h3>
 
 <p>The following examples establish the three distinct uses of the protocol that are revisited in section 5.</p>
 
@@ -1332,7 +1332,7 @@ with FakeTensorMode():
 
 <p>This code allocates neither CUDA storage for <code>x</code>, <code>y</code>, and <code>z</code> nor a CUDA matmul kernel launch. <code>FakeTensorMode</code> handles the relevant factory and matrix operations through meta kernels, dedicated fake implementations, or decompositions. Fake support is not equivalent to every ATen operator having an independent meta kernel, and unsupported operators can still fail.</p>
 
-<h4>(b) make_fx / ProxyTorchDispatchMode</h4>
+<h4>(b) make_fx and proxy mode</h4>
 
 <pre class="code">import torch
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -1395,11 +1395,11 @@ y = x @ w                                                            <span class
 
 <p>Section 2 follows these responsibilities through the fixed-version source.</p>
 
-<h2 id="en-sec2">2. The C++ → Python implementation path</h2>
+<h2 id="en-sec2">2. C++ to Python dispatch</h2>
 
 <p>The <code>Python</code> key moves an operator from a C++ dispatcher entry into the Python runtime. The PyTorch <code>v2.12.0</code> source path below covers dependency isolation, object mapping, GIL acquisition, argument conversion, handler invocation, result conversion, and re-entry control. Use the matching tag or commit when debugging another release.</p>
 
-<h3 id="en-sec2-1">2.1 The dependency boundary between c10 and CPython</h3>
+<h3 id="en-sec2-1">2.1 c10 and CPython dependencies</h3>
 
 <p><code>libc10.so</code> is a core library that pure C++ programs can use, which imposes a dependency constraint on cross-language dispatch:</p>
 
@@ -1429,7 +1429,7 @@ y = x @ w                                                            <span class
 
 <p>The dispatcher therefore initiates cross-language calls through the vtable, leaving CPython-specific implementation in <code>libtorch_python.so</code>. The interface itself is <code>PyInterpreterVTable</code>.</p>
 
-<h3 id="en-sec2-2">2.2 PyInterpreterVTable: the abstract interface</h3>
+<h3 id="en-sec2-2">2.2 PyInterpreterVTable</h3>
 
 <p>The vtable is defined in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/c10/core/impl/PyInterpreter.h"><code>c10/core/impl/PyInterpreter.h</code></a> around lines 75-175. The full structure (abbreviated):</p>
 
@@ -1492,7 +1492,7 @@ struct C10_API PyInterpreter {
 The static lifetime of <code>PyInterpreterHolder</code> can outlast the period in which CPython objects are usable. Its destructor calls <code>PyInterpreter::disarm()</code>, which switches the interpreter to c10's no-op vtable and prevents later C++ destruction paths from entering unavailable CPython state. Reference-count operations are owned by the vtable implementation and wrapper-lifetime code, not by methods on <code>PyObjectSlot</code>.
 </div>
 
-<h3 id="en-sec2-3">2.3 PyObjectSlot: interpreter association and wrapper pointer</h3>
+<h3 id="en-sec2-3">2.3 PyObjectSlot</h3>
 
 <p>The vtable defines the cross-language call interface. <code>PyObjectSlot</code> maps a C++ tensor representation back to its Python object. Tensor subclasses rely on this mapping because the dispatcher holds a <code>TensorImpl*</code>, while the relevant <code>__torch_dispatch__</code> method belongs to the associated Python class.</p>
 
@@ -1541,7 +1541,7 @@ struct C10_API PyObjectSlot {
 <strong>Two conditions</strong>: the tensor-subclass path needs the <code>Python</code> key on <code>TensorImpl</code> and a matching interpreter plus wrapper association in <code>PyObjectSlot</code>. The key selects the fallback; the association maps the C++ tensor back to the correct Python object.
 </div>
 
-<h3 id="en-sec2-4">2.4 PythonFallbackKernel: path selection</h3>
+<h3 id="en-sec2-4">2.4 PythonFallbackKernel</h3>
 
 <p>The vtable and pyobj_slot establish the cross-language interface and object association. <code>PythonFallbackKernel.cpp</code> supplies the dispatcher entry: a <strong>boxed kernel</strong> registered through <code>m.fallback</code> for the <code>Python</code> key and several related keys. Source: <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/core/PythonFallbackKernel.cpp"><code>aten/src/ATen/core/PythonFallbackKernel.cpp</code></a>.</p>
 
@@ -1671,7 +1671,7 @@ For <code>with OuterMode(): z = x + y</code>, the top-level call first reaches <
 Tensor subclasses do not use this mode-stack stash. Calling <code>func</code> again with the same subclass arguments can re-enter the subclass, so implementations commonly unwrap arguments or use an appropriate dispatch-disable guard.
 </div>
 
-<h3 id="en-sec2-6">2.6 ConcretePyInterpreterVTable::dispatch</h3>
+<h3 id="en-sec2-6">2.6 Interpreter dispatch</h3>
 
 <p>In the mode path, <code>pythonFallback</code> calls <code>cur_mode-&gt;pyinterpreter()-&gt;dispatch(op, stack)</code>. The fixed-version implementation is in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/PyInterpreter.cpp#L290-L344"><code>torch/csrc/PyInterpreter.cpp</code></a> at lines 290 through 344:</p>
 
@@ -1739,11 +1739,11 @@ void ConcretePyInterpreterVTable::dispatch(
 Three pieces of state complete the cross-language path: the vtable isolates <code>libc10</code> from CPython, <code>PyObjectSlot</code> associates an interpreter with a Python wrapper, and mode stashing plus key masking control re-entry and priority. Tensor subclasses also handle self-reentry in their representation conversion.
 </div>
 
-<h2 id="en-sec3">3. The TorchDispatchMode Python protocol</h2>
+<h2 id="en-sec3">3. TorchDispatchMode protocol</h2>
 
 <p>After the C++ fallback transfers a boxed operator to Python, the <code>TorchDispatchMode</code> protocol defines how a handler receives the call, returns a result, or starts nested dispatch. A <code>with</code> block owns the dynamic scope, <code>__torch_dispatch__</code> receives the normalized operator and arguments, and <code>func(*args, **kwargs)</code> continues through the remaining dispatch layers.</p>
 
-<h3 id="en-sec3-1">3.1 The class and the with block</h3>
+<h3 id="en-sec3-1">3.1 Mode class and context</h3>
 
 <p>The <code>TorchDispatchMode</code> base class is defined in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/utils/_python_dispatch.py"><code>torch/utils/_python_dispatch.py</code></a> around line 72. Simplified:</p>
 
@@ -1833,7 +1833,7 @@ C++:     TorchDispatchModeTLS::pop()         <span class="cm"># Python bit leave
 </tbody>
 </table>
 
-<h4>Continuation calls and return values</h4>
+<h4>Continuation and return values</h4>
 
 <p><code>func(*args, **kwargs)</code> is a nested operator call initiated by the handler, not a special return value interpreted by the dispatcher. Only <code>NotImplemented</code> has a special multiple-dispatch meaning:</p>
 
@@ -1873,11 +1873,11 @@ with LoggingMode():
 This mode records ATen calls that reach its dispatch position. It can also observe the factory operations in the example because TLS activates a mode without requiring an existing subclass tensor in the inputs.
 </div>
 
-<h3 id="en-sec3-3">3.3 Mode and subclass handler order</h3>
+<h3 id="en-sec3-3">3.3 Mode and subclass order</h3>
 
 <p><code>pythonFallback</code> exposes separate entries for the mode stack and tensor subclasses. A mode is activated by dynamic scope, whereas a subclass is activated by participating tensor objects; the two paths therefore differ in state ownership and re-entry behavior.</p>
 
-<h4>(A) Mode path: global interception</h4>
+<h4>(A) Global mode interception</h4>
 
 <p>The mode path subclasses <code>TorchDispatchMode</code> and is activated by a <code>with</code> block. It has the following runtime properties:</p>
 
@@ -1887,7 +1887,7 @@ This mode records ATen calls that reach its dispatch position. It can also obser
   <li>When multiple modes are present they form a <strong>LIFO stack</strong>, top of stack first.</li>
 </ul>
 
-<h4>(B) Subclass path: intercept only when certain tensors participate</h4>
+<h4>(B) Subclass tensor interception</h4>
 
 <p>Define a subclass of <code>torch.Tensor</code> and put the interception logic into its <code>__torch_dispatch__</code> classmethod:</p>
 
@@ -1916,7 +1916,7 @@ This mode records ATen calls that reach its dispatch position. It can also obser
 A mode attaches semantics to a dynamic execution scope and can therefore cover factory ops. A subclass attaches semantics to a tensor type and its instances, so it activates only when those objects participate in a call. The two entries can cooperate: tensors created under <code>FakeTensorMode</code> are also <code>FakeTensor</code> subclasses. After the <code>with</code> block exits, later operators can still identify those objects from their tensor type. The mode creates the dynamic environment, while the subclass preserves the data semantics.
 </div>
 
-<h4>(C) Handler order when both are present</h4>
+<h4>(C) Handler priority</h4>
 
 <p><code>pythonFallback</code> checks the mode stack first and then considers the tensor-subclass path:</p>
 
@@ -1931,7 +1931,7 @@ if interpreter &amp;&amp; tensors_with_python_key_present {
 
 <p>This branch chooses which <code>PyInterpreter</code> receives the initial C++ entry; it does not determine the complete ordering of Python handlers. Multiple dispatch in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/utils/python_arg_parser.cpp"><code>python_arg_parser.cpp</code></a> groups candidates as user modes, user subclasses, and infrastructure modes or subclasses. Infrastructure modes commonly return <code>NotImplemented</code> so that a subclass or another mode can handle combinations outside their scope.</p>
 
-<h3 id="en-sec3-4">3.4 Nested dispatch continuation</h3>
+<h3 id="en-sec3-4">3.4 Nested dispatch</h3>
 
 <p><code>func</code> is an <code>OpOverload</code>, so calling it enters the dispatcher again. For a mode, the Python argument-dispatch layer has already stashed the current mode with <code>StashTorchDispatchModeGuard</code>:</p>
 
@@ -1948,7 +1948,7 @@ if interpreter &amp;&amp; tensors_with_python_key_present {
 <strong>Boundary</strong>: for a mode, calling <code>func</code> can continue to another mode, a tensor subclass, autograd, or a backend. For a subclass, calling it with the original subclass arguments can re-enter that same subclass. The behavior depends on internal guards and argument dispatch, so another release should be checked against its matching source.
 </div>
 
-<h3 id="en-sec3-5">3.5 Boundary with <code>__torch_function__</code></h3>
+<h3 id="en-sec3-5">3.5 <code>__torch_function__</code> boundary</h3>
 
 <p>PyTorch has an older protocol called <code>__torch_function__</code>. The names sound similar and are easy to confuse, but <strong>the interception location is completely different</strong>:</p>
 
@@ -1966,11 +1966,11 @@ if interpreter &amp;&amp; tensors_with_python_key_present {
 
 <p><code>__torch_function__</code> expresses public API overrides; <code>__torch_dispatch__</code> expresses ATen operator semantics. The latter has a lower interception point, but the exact set of observed operators still depends on decomposition tables, dispatch-key position, and implementation details. A single trace cannot establish a fixed call count for other versions or workloads.</p>
 
-<h2 id="en-sec4">4. The four Python-family DispatchKeys</h2>
+<h2 id="en-sec4">4. Python dispatch keys</h2>
 
 <p>PyTorch v2.12.0 assigns four dispatch keys to Python-related control paths: <code>PythonDispatcher</code>, <code>PreDispatch</code>, <code>PythonTLSSnapshot</code>, and <code>Python</code>. Their priority positions and fallbacks differ, so each key owns a distinct interception or state-management role.</p>
 
-<h3 id="en-sec4-1">4.1 The priority ladder revisited</h3>
+<h3 id="en-sec4-1">4.1 Key priority</h3>
 
 <p>Zooming in on the top of the dispatcher priority ladder:</p>
 
@@ -2019,7 +2019,7 @@ if interpreter &amp;&amp; tensors_with_python_key_present {
 
 <p>The first three keys sit above the autograd-related keys, while <code>Python</code> sits below them. Those positions affect the operator form observed by a mode, although relative priority alone does not determine decomposition or registration behavior.</p>
 
-<h3 id="en-sec4-2">4.2 Roles of PythonDispatcher, PreDispatch, Python, and Snapshot</h3>
+<h3 id="en-sec4-2">4.2 Key roles</h3>
 
 <table>
 <thead><tr><th>Key</th><th>Position</th><th>Semantics</th><th>Representative use</th></tr></thead>
@@ -2046,11 +2046,11 @@ TORCH_LIBRARY_IMPL(_, Python,              m) { m.fallback(... pythonFallback ..
 The fallbacks do not share one control flow. <code>Python</code> and <code>PythonDispatcher</code> call the vtable methods <code>dispatch</code> and <code>python_dispatcher</code>, respectively. <code>PythonTLSSnapshot</code> installs a guard and redispatches, while <code>PreDispatch</code> itself performs redispatch.
 </div>
 
-<h2 id="en-sec5">5. Three protocol users</h2>
+<h2 id="en-sec5">5. Protocol applications</h2>
 
 <p>The same cross-language protocol carries different operator semantics. FakeTensorMode propagates metadata, ProxyTorchDispatchMode records an ATen graph, and DTensor plans local computation and communication from placements. They share the dispatcher entry while imposing different handler state and result constraints.</p>
 
-<h3 id="en-sec5-1">5.1 FakeTensorMode: shape inference without computation</h3>
+<h3 id="en-sec5-1">5.1 FakeTensorMode</h3>
 
 <p><code>FakeTensorMode</code> is a metadata execution environment. It represents tensors through shape, dtype, stride, and simulated device, then propagates operator outputs without reading numerical storage.</p>
 
@@ -2103,7 +2103,7 @@ def dispatch(self, func, types, args=(), kwargs=None):
 
 <p>A fake matrix multiplication maps its inputs into the representation required by the metadata path, evaluates the abstract behavior of <code>aten::matmul</code>, and wraps the output with a simulated CUDA device. The process propagates shape, dtype, stride, and device information without launching the CUDA numerical kernel.</p>
 
-<h4>Special handling for factory ops</h4>
+<h4>Factory-op handling</h4>
 
 <p>A call to <code>torch.randn(1024, 1024, device="cuda")</code> has no tensor input from which a subclass could contribute the <code>Python</code> key. TLS still activates the mode path, allowing <code>FakeTensorMode.__torch_dispatch__</code> to run the metadata implementation and wrap the result as a <code>FakeTensor</code> with a simulated CUDA device.</p>
 
@@ -2111,7 +2111,7 @@ def dispatch(self, func, types, args=(), kwargs=None):
 <strong>FakeTensorMode uses one infrastructure slot.</strong> <code>TorchDispatchModeTLS</code> reserves a fixed position in <code>infra_modes_</code> for it, and a second push is a no-op. <code>ProxyTorchDispatchMode</code> uses the nestable mode stack, so the two modes follow different composition rules.
 </div>
 
-<h3 id="en-sec5-2">5.2 ProxyTorchDispatchMode + make_fx: graph capture</h3>
+<h3 id="en-sec5-2">5.2 Proxy mode and graph capture</h3>
 
 <p><code>make_fx</code> executes a Python function and produces an <code>fx.Graph</code>. Its ATen nodes can be analyzed, transformed, and compiled later, while <code>ProxyTorchDispatchMode</code> creates the corresponding proxy node for each operator call.</p>
 
@@ -2200,7 +2200,7 @@ output         output  output              ((relu,),)      {}
 With <code>pre_dispatch=True</code>, this capture preserves <code>relu</code> as a single operator at the illustrated boundary. A regular <code>Python</code>-key capture can instead observe a lower-level decomposed form such as <code>clamp_min</code>, depending on the active decomposition path.
 </div>
 
-<h3 id="en-sec5-3">5.3 DTensor: distributed tensors</h3>
+<h3 id="en-sec5-3">5.3 DTensor</h3>
 
 <p><code>DTensor</code> attaches a distributed placement to tensor data. When an expression such as <code>x @ w</code> reaches its handler, the framework derives:</p>
 <ol>
@@ -2226,7 +2226,7 @@ With <code>pre_dispatch=True</code>, this capture preserves <code>relu</code> as
 DTensor stores placement in a tensor subclass, so every operator using that tensor inherits its distributed semantics. FakeTensorMode uses a dynamic scope to control metadata execution instead. The former attaches semantics to data; the latter attaches semantics to an execution context.
 </div>
 
-<h3 id="en-sec5-4">5.4 The DTensor C++ fast path</h3>
+<h3 id="en-sec5-4">5.4 DTensor C++ fast path</h3>
 
 <p>In the second half of 2025, PR <a href="https://github.com/pytorch/pytorch/pull/167051">#167051</a> moved sharding decisions for common DTensor operators into a C++ path. Base DTensor can therefore try the C++ fast path first, while ordinary Python multiple dispatch covers objects and behavior that do not match it.</p>
 
@@ -2258,11 +2258,11 @@ DTensor stores placement in a tensor subclass, so every operator using that tens
 
 <p class="callout">This optimization targets the common Python multiple-dispatch path for base DTensor. It does not generalize every <code>__torch_dispatch__</code> handler into a C++ implementation. Fast-path coverage, subclass participation, and complex behavior remain version-specific.</p>
 
-<h2 id="en-sec6">6. Connection to torch.compile</h2>
+<h2 id="en-sec6">6. torch.compile integration</h2>
 
 <p><code>torch.compile</code> combines several capture and transformation mechanisms. Dynamo primarily uses frame evaluation and bytecode analysis; AOTAutograd, FakeTensor, and several proxy or functionalization paths use the dispatcher and <code>__torch_dispatch__</code>. The protocol is important to the compiler stack, but it is not the sole entry point for graph capture.</p>
 
-<h3>6.1 Dynamo and AOTAutograd: two stages</h3>
+<h3>6.1 Dynamo and AOTAutograd</h3>
 
 <p>Two major stages expose different capture boundaries:</p>
 
@@ -2276,7 +2276,7 @@ DTensor stores placement in a tensor subclass, so every operator using that tens
 
 <p>Dynamo starts from the Python frame, whereas AOTAutograd transforms the captured program through ATen-level forward and backward graphs. <code>__torch_dispatch__</code> participates in the latter through FakeTensor and proxy modes, alongside functionalization and autograd tracing.</p>
 
-<h3>6.2 AOTAutograd joint tracing and forward/backward partitioning</h3>
+<h3>6.2 Joint tracing and partitioning</h3>
 
 <p>AOTAutograd first builds a joint graph that represents forward and gradient semantics over abstract inputs, then partitions it into separate forward and backward graphs. The following pseudocode shows only those stage boundaries:</p>
 
@@ -2298,7 +2298,7 @@ fw_graph, bw_graph = partition_fn(joint_graph)</pre>
 
 <p>The implementation coordinates AOTAutograd tracing, functionalization, autograd, and partition helpers; it does not invoke the illustrative function names above line by line. The sketch separates three roles: FakeTensor supplies abstract values, proxy and autograd tracing build the joint graph, and partitioning produces the forward and backward graphs. The relevant entry points are in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/_functorch/aot_autograd.py"><code>torch/_functorch/aot_autograd.py</code></a>.</p>
 
-<h3>6.3 The role of PreDispatch in the PT2 pipeline</h3>
+<h3>6.3 PreDispatch</h3>
 
 <p><code>PreDispatch</code> sits above autograd. Compiler and export paths that request <code>pre_dispatch=True</code> can capture higher-level ATen operators before later autograd wrappers or decompositions, retaining an operator such as <code>relu</code> instead of immediately observing its lower-level composition. This choice shapes the graph presented to later stages:</p>
 
@@ -2312,11 +2312,11 @@ fw_graph, bw_graph = partition_fn(joint_graph)</pre>
 <code>PreDispatch</code> gives the compiler stack an interception point above autograd, allowing proxy modes to retain higher-level ATen operator forms. Capture at the regular <code>Python</code> key instead observes the operator sequence after the existing wrapper and decomposition layers.
 </div>
 
-<h2 id="en-sec7">7. Cost model and implementation boundaries</h2>
+<h2 id="en-sec7">7. Costs and implementation constraints</h2>
 
 <p>The suitability of cross-language dispatch depends on the amount of Python-boundary work per call and whether later execution can amortize that work. This section first separates the cost sources, then defines the tasks and implementation constraints for which the protocol is appropriate.</p>
 
-<h3>7.1 Sources of cross-language dispatch cost</h3>
+<h3>7.1 Cross-language dispatch overhead</h3>
 
 <p><code>ConcretePyInterpreterVTable::dispatch</code> pays for the cross-language path itself: the thread acquires the GIL, the dispatcher resolves the Python operator, scans mode and subclass candidates, converts arguments between IValue and Python objects, executes the handler, and converts the result back according to the schema. The cost varies with argument count, wrapper reuse, handler behavior, and GIL contention.</p>
 
@@ -2332,7 +2332,7 @@ fw_graph, bw_graph = partition_fn(joint_graph)</pre>
 
 <p>This article gives no fixed nanosecond or microsecond estimate because public source establishes the control flow, not a constant that remains valid across hardware, Python builds, and workloads. Performance-sensitive paths should be measured per operator in the target environment. The DTensor C++ fast path demonstrates one concrete optimization direction: reduce repeated Python multiple dispatch for common operators.</p>
 
-<h3>7.2 Protocol scope</h3>
+<h3>7.2 Scope</h3>
 
 <table>
 <thead><tr><th>Fits the protocol</th><th>Usually needs a dedicated implementation</th></tr></thead>
@@ -2346,19 +2346,19 @@ fw_graph, bw_graph = partition_fn(joint_graph)</pre>
 
 <h3>7.3 Implementation constraints</h3>
 
-<h4>Constraint 1: references among <code>TensorImpl</code>, <code>PyObject</code>, and mode state</h4>
+<h4>Constraint 1: Object references</h4>
 
 <p><code>pyobj_slot_</code> associates a <code>PyObject*</code> with <code>TensorImpl</code>, while the Python wrapper holds an <code>intrusive_ptr&lt;TensorImpl&gt;</code>. Storing a tensor on the mode itself can extend this reference chain for the lifetime of the mode. Long-lived modes should keep non-owning references through <code>weakref</code> or clear their caches explicitly in <code>__exit__</code>.</p>
 
-<h4>Constraint 2: LIFO order for nested modes</h4>
+<h4>Constraint 2: Mode LIFO order</h4>
 
 <p>The current mode is temporarily removed while its handler runs. Calling <code>func(*args, **kwargs)</code> re-enters dispatch, so the next mode or a tensor subclass can still process the operator. Returning a result constructed by the handler ends that chain. <code>super().__torch_dispatch__</code> follows Python inheritance and is not a substitute for mode-stack dispatch.</p>
 
-<h4>Constraint 3: coverage of <code>_DISPATCH_HANDLE_DIRECTLY</code></h4>
+<h4>Constraint 3: Direct-handling scope</h4>
 
 <p>Some FakeTensor queries, including <code>size</code>, <code>stride</code>, <code>device</code>, and <code>dim</code>, can be handled through <code>_DISPATCH_HANDLE_DIRECTLY</code> and <code>in_kernel_invocation_manager</code> outside the general handler path. Modes that require a complete operator log must account for the direct-handling set in <code>fake_tensor.py</code>. When the intended boundary is the user-facing API, <code>__torch_function__</code> can be composed with the mode explicitly.</p>
 
-<h4>Constraint 4: the <code>tls_on_entry</code> invariant</h4>
+<h4>Constraint 4: <code>tls_on_entry</code> invariant</h4>
 
 <p>The comment around lines 17-23 of <code>PythonFallbackKernel.cpp</code>:</p>
 
@@ -2370,18 +2370,18 @@ thread_local std::optional&lt;c10::impl::LocalDispatchKeySet&gt; tls_on_entry;</
 
 <p>A mode handler continues dispatch through <code>func(*args, **kwargs)</code>, allowing the framework to maintain this TLS invariant. Calling <code>op.redispatchBoxed(...)</code> directly can instead trigger the "Accessing torch dispatch state outside of __torch_dispatch__ is not allowed" error.</p>
 
-<h4>Constraint 5: vtable disarm during Python teardown</h4>
+<h4>Constraint 5: Python teardown</h4>
 
 <p>Python teardown disarms the vtable. A C++ cache that keeps a <code>TensorImpl</code> with a <code>pyobj_slot</code> in a static container must be released before the interpreter becomes unavailable; otherwise the "<em>attempted to call dispatch on a Tensor with nontrivial PyObject after corresponding interpreter died</em>" assertion can fire. Such caches can be cleared before atexit or by their owners through <code>pyobj_slot.clear()</code> during destruction.</p>
 
-<h4>Constraint 6: the FakeTensorMode infrastructure slot</h4>
+<h4>Constraint 6: FakeTensorMode slot</h4>
 
 <p><code>infra_modes_</code> reserves a fixed slot for FakeTensorMode, and a second push is a no-op. A nested inner FakeTensorMode therefore does not replace the outer instance. Local real execution inside a fake environment uses <code>FakeTensorMode.disable()</code> to suspend the mode temporarily.</p>
 
 <h2 id="en-sec8">References</h2>
 
 <ul>
-  <li>Related chapter: <a href="pytorch-dispatcher.html">PyTorch Dispatcher: Multidimensional Dispatch and Operator Execution</a></li>
+  <li>Related chapter: <a href="pytorch-dispatcher.html">PyTorch Dispatcher</a></li>
   <li><a href="https://dev-discuss.pytorch.org/t/what-and-why-of-torch-dispatch/557">"What and Why of <code>__torch_dispatch__</code>", Chillee et al., PyTorch dev-discuss 2022</a></li>
   <li><a href="https://github.com/albanD/subclass_zoo">albanD/subclass_zoo</a>: a collection of small <code>__torch_dispatch__</code> examples (LoggingTensor, NegativeTensor, etc.)</li>
   <li><a href="https://github.com/pytorch/pytorch/pull/167051">PyTorch PR #167051: DTensor C++ fast path</a></li>
@@ -2408,6 +2408,6 @@ thread_local std::optional&lt;c10::impl::LocalDispatchKeySet&gt; tls_on_entry;</
 
 </main>
 </div>
-<script src="../lang-toggle.js"></script>
+<script src="../lang-toggle.js?v=post-toc-3"></script>
 </body>
 </html>

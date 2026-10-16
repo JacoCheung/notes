@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CUDA Graph 与 autocast：backward 应在 context 之外执行</title>
-<meta name="post:title" content="CUDA Graph 与 autocast：backward 应在 context 之外执行">
-<meta name="post:title_en" content="CUDA Graphs and Autocast: Backward Should Run Outside the Context">
+<title>CUDA Graph 的 autocast 边界</title>
+<meta name="post:title" content="CUDA Graph 的 autocast 边界">
+<meta name="post:title_en" content="Autocast boundaries in CUDA Graphs">
 <meta name="post:slug" content="cuda-graph-autocast-backward">
 <meta name="post:date" content="2026-10-10">
 <meta name="post:tags" content="PyTorch, CUDA Graph, AMP, Autocast, Autograd">
@@ -18,11 +18,11 @@
 <meta name="post:series_title" content="PyTorch 内部机制">
 <meta name="post:series_title_en" content="PyTorch Internals">
 <meta name="post:series_order" content="9">
-<script src="../lang-toggle.js" defer></script>
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Geist+Mono:wght@400;500&amp;display=swap">
-<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
 <style>
   main.content { max-width: 1060px; min-width: 0; padding: 56px 32px 96px; letter-spacing: 0; }
   main.content h1, main.content h2, main.content h3 { letter-spacing: 0; }
@@ -47,31 +47,31 @@
 <aside class="toc">
   <div class="toc-title">目录 · TOC</div>
   <div class="lang-zh"><ul>
-    <li><a href="#zh-rule">规则：forward 决定精度路径</a></li>
-    <li><a href="#zh-hidden">隐藏在 capture API 里的 backward</a></li>
-    <li><a href="#zh-dtype">副作用一：额外 cast 与梯度错误</a></li>
-    <li><a href="#zh-cache">副作用二：cache 生命周期与 IMA</a></li>
-    <li><a href="#zh-fix">正确的 autocast 边界</a></li>
-    <li><a href="#zh-verify">如何验证这两条路径</a></li>
+    <li><a href="#zh-rule">Forward 与 Backward 精度</a></li>
+    <li><a href="#zh-hidden">Backward 捕获路径</a></li>
+    <li><a href="#zh-dtype">额外 Cast 与精度偏差</a></li>
+    <li><a href="#zh-cache">Cache 生命周期与悬空引用</a></li>
+    <li><a href="#zh-fix">autocast 作用域</a></li>
+    <li><a href="#zh-verify">验证方法</a></li>
     <li><a href="#zh-refs">参考资料</a></li>
   </ul></div>
   <div class="lang-en"><ul>
-    <li><a href="#en-rule">Forward establishes precision</a></li>
-    <li><a href="#en-hidden">Backward inside the capture API</a></li>
-    <li><a href="#en-dtype">Effect 1: casts and wrong gradients</a></li>
-    <li><a href="#en-cache">Effect 2: cache lifetime and IMA</a></li>
-    <li><a href="#en-fix">The correct autocast boundary</a></li>
-    <li><a href="#en-verify">Verifying both paths</a></li>
+    <li><a href="#en-rule">Forward and backward precision</a></li>
+    <li><a href="#en-hidden">Backward capture path</a></li>
+    <li><a href="#en-dtype">Extra casts and precision changes</a></li>
+    <li><a href="#en-cache">Cache lifetime and dangling references</a></li>
+    <li><a href="#en-fix">Autocast scope</a></li>
+    <li><a href="#en-verify">Verification</a></li>
     <li><a href="#en-refs">References</a></li>
   </ul></div>
 </aside>
 <main class="content">
 <div class="lang-zh">
 
-<h1>CUDA Graph 与 autocast：backward 应在 context 之外执行</h1>
+<h1>CUDA Graph 的 autocast 边界</h1>
 <p class="lead">Autocast 应只包住 forward 和 loss 计算，backward 应在启用的 autocast context 之外执行。这条规则也适用于 CUDA Graph capture。<code>make_graphed_callables()</code> 内部也会执行 backward。若调用这个 API 时 autocast 开着，backward 就可能在错误的精度环境下被捕获；之后即使在 autocast 外调用 <code>loss.backward()</code>，仍会重放这张已经捕获的图。在 autocast 下执行 backward 会带来两个不同层面的副作用：一是重新 cast backward 的操作数，改变梯度计算的精度；二是在 autograd worker 上意外启用 cast cache，使 graph 依赖一个可能在 replay 前失效的张量地址。</p>
 
-<h2 id="zh-rule">规则：forward 决定精度路径，backward 沿图执行</h2>
+<h2 id="zh-rule">Forward 与 Backward 精度</h2>
 <p>PyTorch 的 <a href="https://docs.pytorch.org/docs/2.12/amp.html#torch.autocast">AMP 文档</a>建议只对 forward 和 loss 开启 autocast。常规写法的边界非常明确：</p>
 <pre class="code" data-language="python">with torch.autocast("cuda", dtype=torch.bfloat16):
     output = model(x)
@@ -82,7 +82,7 @@ loss.backward()</pre>
 <p>“Backward 的 dtype 由 forward 决定”在这里指<strong>沿 forward 建立的计算图和各 backward 算子的规则执行</strong>。它不表示所有反向中间值或累加器必须是同一种 dtype，也不表示关闭 autocast 后整个 backward 就会变成 FP32。Forward 中刻意保留的 FP32 子区域，其反向计算同样不应被外层 autocast 再次降精度。</p>
 <div class="note-box"><p><strong>本文范围：</strong>标准 eager autograd 与 <code>torch.cuda.make_graphed_callables</code>，源码固定为 <a href="https://github.com/pytorch/pytorch/tree/v2.12.0">PyTorch v2.12.0</a>。下文的 worker 状态传播缺口属于该版本实现，不应直接推广到所有版本；<code>torch.compile</code> 与自定义 <code>autograd.Function</code> 的 AMP 协议需要单独分析。</p></div>
 
-<h2 id="zh-hidden">隐藏在 <code>make_graphed_callables</code> 里的 backward</h2>
+<h2 id="zh-hidden">Backward 捕获路径</h2>
 <p>下面的代码看上去只是在用 AMP 捕获模型，但它把内部 backward 一起放进了 autocast：</p>
 <pre class="code" data-language="python">with torch.autocast(
     "cuda",
@@ -102,7 +102,7 @@ loss.backward()</pre>
 </div>
 <p>因此，在训练循环中把 <code>loss.backward()</code> 放到 autocast 外，只能保证那次调用的环境正确。<strong>如果 backward graph 在 capture 时已经录错，replay 时关闭 autocast 不会重写图中的 cast、GEMM 或地址参数。</strong>PyTorch issue <a href="https://github.com/pytorch/pytorch/issues/120930">#120930</a>也报告了这类 eager 与 graphed backward 不一致的问题。</p>
 
-<h2 id="zh-dtype">副作用一：backward 额外 cast，破坏 FP32 计算语义</h2>
+<h2 id="zh-dtype">额外 Cast 与精度偏差</h2>
 <p>用一个明确要求 FP32 的线性层来隔离问题。参数是 FP32，输入也提供 FP32；forward 内部显式关闭 autocast：</p>
 <pre class="code" data-language="python">import torch
 
@@ -133,7 +133,7 @@ class FP32Linear(torch.nn.Module):
 </table></div>
 <p>最后一行很容易误导排查：autograd 在校验返回梯度时，可以按目标 metadata 把梯度转回 FP32，见 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/autograd/engine.cpp#L946-L962"><code>validate_outputs()</code></a>。因此，检查 <code>weight.grad.dtype == torch.float32</code> 不足以证明 backward 的数值路径正确。这种错误可能静默发生，同时多出 FP32 → BF16、BF16 → FP32 的转换。</p>
 
-<h3>把梯度差异与 cache 问题分开观察</h3>
+<h3>精度对照实验</h3>
 <p>下面的代码接在 <code>FP32Linear</code> 定义后运行。这里刻意让 <code>x.requires_grad=False</code>，只求权重梯度；其 backward 的矩阵乘法操作数不满足后文的 leaf cache 条件，从而集中观察第一个副作用。该设置仅用于这个最小例子。</p>
 <pre class="code" data-language="python"># Requires a CUDA device with BF16 support.
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -181,10 +181,10 @@ torch.testing.assert_close(
 )</pre>
 <p class="caption">在上述受影响路径下，预期 reference/good 的权重梯度约为 1.001，bad 约为 1.0，三者的 forward 输出一致。这里给出的是由固定版本源码与 BF16 舍入推导的预期，未作为 GPU 实测输出；实际运行时应记录 PyTorch 版本与 GPU 型号。</p>
 
-<h2 id="zh-cache">副作用二：worker 意外启用 cache，replay 引用失效地址</h2>
+<h2 id="zh-cache">Cache 生命周期与悬空引用</h2>
 <p>第二个副作用还需要额外条件：backward 中出现可缓存的 cast，并且捕获的 graph 依赖了不能跨 replay 保持有效的缓存存储。它解释了为什么外层已经写了 <code>cache_enabled=False</code>，仍可能发生 illegal memory access（IMA）。</p>
 
-<h3>Thread-local 不等于所有状态都会一起传播</h3>
+<h3>线程状态传播</h3>
 <p>在这里讨论的 CUDA autograd 路径中，backward node 由 autograd 的设备 worker thread 执行。调用线程创建 <code>GraphTask</code> 时保存 <code>ThreadLocalState</code>；worker 在执行 node 前用 <code>ThreadLocalStateGuard</code> 恢复其中的状态。源码入口分别是 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/autograd/graph_task.h#L123-L126"><code>GraphTask::thread_locals_</code></a> 与 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/autograd/engine.cpp#L550-L559">worker 的 TLS guard</a>。</p>
 <p>关键在于，这份快照只保存了<strong>指定字段</strong>。v2.12.0 的 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/ThreadLocalState.cpp"><code>ThreadLocalState.cpp</code></a> 保存、恢复 dispatch key set 和各设备的 autocast dtype，却没有保存、恢复 <code>cache_enabled</code>。</p>
 <div class="table-scroll"><table class="note-table">
@@ -198,13 +198,13 @@ torch.testing.assert_close(
 </table></div>
 <p>这里的“继承”是 Engine 在任务执行前显式恢复状态，不是操作系统自动复制所有 thread-local 变量。<code>make_graphed_callables()</code> 的入口检查也只读取<strong>调用线程</strong>的 cache 开关，因此无法排除 worker 上重新启用缓存的路径。</p>
 
-<h3>Cache 开关是 thread-local，cache 容器是进程内共享的</h3>
+<h3>Cache 开关与共享容器</h3>
 <p>还必须区分开关和数据容器。固定版本的 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/autocast_mode.cpp#L22-L107"><code>autocast_mode.cpp</code></a> 中，<code>cache_enabled</code>、dtype 和 nesting 是 thread-local；<code>get_cached_casts()</code> 返回的 cast map 则是由 mutex 保护的共享容器。它以源 tensor 的 <code>TensorImpl*</code> 为 key，并持有低精度 cast tensor。</p>
 <p>因此，worker 可以往共享 map 插入缓存，而调用线程退出最外层 autocast context 时，又可以通过 <code>clear_autocast_cache()</code> 清空这个 map。调用线程设置的 <code>cache_enabled=False</code> 既不能阻止另一线程插入，也不会跳过 context 退出时的清理。</p>
 <p><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/autocast_mode.cpp#L112-L145"><code>cached_cast()</code></a> 也并非缓存所有转换。主要条件包括：源是 FP32、<code>requires_grad=True</code>、leaf、非 view，目标是当前设备的低精度 dtype，且当前线程允许 cache；实现还排除了 inference mode 和已被特殊缓存管理的 tensor。普通中间 activation 或转置 view 不一定满足这些条件，所以这条路径取决于模型及 backward 实际传给算子的 tensor。</p>
 <p>这也能接回同一个 <code>FP32Linear</code>：若把输入改成 <code>requires_grad=True</code>，这个实数 1×1 例子的权重梯度会走 <code>mm_mat2_backward</code> 的布局分支，将保存的输入 <code>x</code> 作为 <code>mm</code> 操作数。此时 <code>x</code> 是 FP32、需要梯度的非 view 叶子，符合缓存条件。于是同一个例子可以从“仅发生额外舍入”进入“backward 还可能建立 cache”的路径；是否最终报 IMA 仍取决于后续存储生命周期。</p>
 
-<h3>从 warmup cache 到 replay 的悬空依赖</h3>
+<h3>Cache 释放与 Replay</h3>
 <p>最清晰的失效路径是<strong>在 warmup 中创建 cache，在 capture 中命中它</strong>。不能简单把所有情况都概括为“capture 内创建临时 tensor，退出 context 就一定 IMA”：PyTorch 的 graph-private pool 会保护 capture 期间分配的存储，而 warmup 创建的外部缓存并不自动获得同样的保护。</p>
 <div class="table-scroll"><table class="note-table">
   <thead><tr><th>阶段</th><th>CPU / autocast 行为</th><th>GPU graph 的依赖</th></tr></thead>
@@ -218,7 +218,7 @@ torch.testing.assert_close(
 <p>退出 context 的清理见 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/amp/autocast_mode.py#L355-L364"><code>autocast.__exit__()</code></a>。CUDA Graph 保存的是 CUDA 工作及地址参数，持有 <code>CUDAGraph</code> 不等于持有每个外部输入 tensor；<a href="https://docs.pytorch.org/docs/2.12/notes/cuda.html#graph-memory-management">PyTorch graph memory management</a> 明确要求 replay 使用的地址保持有效。</p>
 <p><strong>IMA 是这种生命周期错误的一种结果，不是必然立即出现的症状。</strong>Allocator 可能暂时保留那块显存，也可能把它复用给另一个 tensor；于是错误可能表现为旧值、被覆盖的数据、其他 tensor 被破坏，或后续 CUDA 同步点才报告 IMA。即使人为延长 <code>C</code> 的生命周期，若 graph 没有捕获刷新副本的 cast，输入或参数更新后仍可能使用旧的低精度数据。</p>
 
-<h2 id="zh-fix">正确用法：把 autocast 限定在 forward 内</h2>
+<h2 id="zh-fix">autocast 作用域</h2>
 <p>对上面的纯 FP32 模型，直接在 autocast 关闭时调用 <code>make_graphed_callables()</code> 即可。对确实需要混合精度的模型，更通用的办法是让被捕获模块的 <code>forward()</code> 自己管理 autocast，API 的外层保持关闭。这样，每次 forward 返回后，内部 warmup/backward capture 都回到 autocast 关闭的环境。</p>
 <pre class="code" data-language="python"># Uses FP32Linear from above; it can also wrap a mixed-precision model.
 class ForwardAutocast(torch.nn.Module):
@@ -253,7 +253,7 @@ torch.testing.assert_close(
 <p><code>FP32Linear</code> 内层的 <code>enabled=False</code> 仍然生效，因此这个例子的 forward/backward 都保持应有的 FP32 路径。换成普通混合精度模型时，其 forward 仍可按 AMP 规则选择精度，backward 则沿它生成的图执行。保留 <code>cache_enabled=False</code> 是为了满足 graph capture 的缓存约束；关闭 backward 的 autocast 则同时阻止重新选择精度和本文所述的额外缓存路径。</p>
 <p>若维护的是自定义 <code>make_graphed_callables</code> 实现，应在 <strong>warmup 与 capture 两处</strong> <code>torch.autograd.grad()</code> 周围关闭 autocast，且让 forward 的 AMP 策略与真实训练一致。只改 replay 时的 context，或只修 capture 而留下 warmup，不足以完整纠正这条执行路径。</p>
 
-<h2 id="zh-verify">如何验证这两条路径</h2>
+<h2 id="zh-verify">验证方法</h2>
 <p>首先用前面的数值例子比较 forward 输出和参数梯度。Forward 一致、最终 <code>.grad</code> 也是 FP32，但梯度已经被 BF16 舍入，是第一个问题的直接信号。Profiler 中额外的 cast 可以提供旁证，数值对照才是正确性判断的依据。</p>
 <p>然后用一个不做 cacheable 矩阵乘法的探针，单独检查 worker 的 TLS。下面故意在 autocast 内调用 backward，仅用于诊断；在 <strong>eager、capture 之外</strong>执行它：</p>
 <pre class="code" data-language="python">import threading
@@ -301,10 +301,10 @@ with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
 </div>
 
 <div class="lang-en">
-<h1>CUDA Graphs and Autocast: Backward Should Run Outside the Context</h1>
+<h1>Autocast boundaries in CUDA Graphs</h1>
 <p class="lead">Autocast should cover forward and loss computation; backward should run outside an enabled autocast context. The same boundary matters during CUDA Graph capture. <code>make_graphed_callables()</code> also executes backward internally. If autocast is enabled when this API is called, backward may be captured under the wrong precision settings. A later <code>loss.backward()</code> outside autocast still replays that captured graph. Running backward under autocast can have two effects: backward operands are cast again, changing gradient precision; and an autograd worker can unexpectedly enable the cast cache, leaving the graph dependent on storage that may expire before replay.</p>
 
-<h2 id="en-rule">Forward establishes the precision path</h2>
+<h2 id="en-rule">Forward and backward precision</h2>
 <p>The <a href="https://docs.pytorch.org/docs/2.12/amp.html#torch.autocast">PyTorch AMP documentation</a> recommends limiting autocast to forward and loss computation:</p>
 <pre class="code" data-language="python">with torch.autocast("cuda", dtype=torch.bfloat16):
     output = model(x)
@@ -315,7 +315,7 @@ loss.backward()</pre>
 <p>“Forward determines backward precision” means following the graph established by forward and the rules of its backward operators. It does not require every intermediate or accumulator to have one dtype, and disabling autocast does not turn all backward computation into FP32. A forward region deliberately kept in FP32 should also retain its intended backward precision.</p>
 <div class="note-box"><p><strong>Scope:</strong> standard eager autograd and <code>torch.cuda.make_graphed_callables</code>, with source pinned to <a href="https://github.com/pytorch/pytorch/tree/v2.12.0">PyTorch v2.12.0</a>. The worker-state propagation gap below describes this implementation, not every release. <code>torch.compile</code> and custom <code>autograd.Function</code> AMP protocols require separate treatment.</p></div>
 
-<h2 id="en-hidden">The backward hidden inside the capture API</h2>
+<h2 id="en-hidden">Backward capture path</h2>
 <p>This apparently forward-oriented capture also places the API's internal backward under autocast:</p>
 <pre class="code" data-language="python">with torch.autocast(
     "cuda",
@@ -333,7 +333,7 @@ loss.backward()</pre>
 </ol></div>
 <p>Moving the later <code>loss.backward()</code> outside autocast fixes the environment of that invocation. <strong>It cannot rewrite casts, GEMMs, or address arguments already recorded in the backward graph.</strong> PyTorch issue <a href="https://github.com/pytorch/pytorch/issues/120930">#120930</a> reports the corresponding discrepancy between eager and graphed backward.</p>
 
-<h2 id="en-dtype">Effect 1: additional casts change FP32 gradient semantics</h2>
+<h2 id="en-dtype">Extra casts and precision changes</h2>
 <p>Consider a linear layer that explicitly requests FP32. Both its parameter and the supplied input are FP32:</p>
 <pre class="code" data-language="python">import torch
 
@@ -364,7 +364,7 @@ class FP32Linear(torch.nn.Module):
 </table></div>
 <p>Autograd can convert a returned gradient to the target metadata dtype during <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/autograd/engine.cpp#L946-L962"><code>validate_outputs()</code></a>. Checking that <code>weight.grad.dtype</code> is FP32 therefore does not establish numerical correctness. The path may include extra FP32 → BF16 and BF16 → FP32 conversions while silently losing precision.</p>
 
-<h3>Isolate the numerical effect from caching</h3>
+<h3>Precision comparison</h3>
 <p>Run this after the class definition. Here <code>x.requires_grad=False</code> deliberately requests only the weight gradient. The operands of its backward matrix multiplication do not satisfy the leaf-cache conditions discussed below, isolating the first effect for this particular model.</p>
 <pre class="code" data-language="python"># Requires a CUDA device with BF16 support.
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -412,10 +412,10 @@ torch.testing.assert_close(
 )</pre>
 <p class="caption">For the affected path, the expected reference/good gradients are approximately 1.001 and the bad gradient approximately 1.0, with matching forward outputs. These are predictions from the pinned implementation and BF16 rounding, not reported GPU measurements. Record the actual PyTorch version and GPU when running the example.</p>
 
-<h2 id="en-cache">Effect 2: an unexpected worker cache outlives its safe boundary</h2>
+<h2 id="en-cache">Cache lifetime and dangling references</h2>
 <p>The memory-lifetime failure needs additional conditions: a cacheable cast during backward, and a graph dependency on cached storage that does not remain valid across replay. This explains how illegal memory access (IMA) can occur despite <code>cache_enabled=False</code> in the outer context.</p>
 
-<h3>Thread-local state is propagated selectively</h3>
+<h3>Thread-state propagation</h3>
 <p>In this CUDA autograd path, device worker threads execute backward nodes. A <code>GraphTask</code> stores the caller's <code>ThreadLocalState</code>, and the worker restores its fields with <code>ThreadLocalStateGuard</code> before running a node. See <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/autograd/graph_task.h#L123-L126"><code>GraphTask::thread_locals_</code></a> and the <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/autograd/engine.cpp#L550-L559">worker TLS guard</a>.</p>
 <p>The snapshot includes only specified fields. In v2.12.0, <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/ThreadLocalState.cpp"><code>ThreadLocalState.cpp</code></a> saves and restores the dispatch key set and per-device autocast dtypes, but not <code>cache_enabled</code>.</p>
 <div class="table-scroll"><table class="note-table">
@@ -429,13 +429,13 @@ torch.testing.assert_close(
 </table></div>
 <p>This is explicit Engine state restoration, not automatic operating-system inheritance of every thread-local variable. The API's entry check also reads the caller's cache flag only; passing that check does not establish the worker's cache state.</p>
 
-<h3>A thread-local flag controls a shared cache</h3>
+<h3>Cache flags and shared storage</h3>
 <p>The flag and the container have different scopes. In the pinned <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/autocast_mode.cpp#L22-L107"><code>autocast_mode.cpp</code></a>, cache enablement, dtype, and nesting are thread-local. The cast map returned by <code>get_cached_casts()</code> is shared within the process and protected by a mutex. Its key identifies the source <code>TensorImpl</code>; its value holds the lower-precision tensor.</p>
 <p>A worker can therefore insert an entry, and the caller can clear that same entry when its outermost autocast context exits. Setting the caller's <code>cache_enabled=False</code> neither prevents another thread from inserting nor skips the exit-time cache clear.</p>
 <p>Not every cast is cached. <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/autocast_mode.cpp#L112-L145"><code>cached_cast()</code></a> requires an eligible FP32 source with <code>requires_grad=True</code>, leaf status, no view, the configured lower-precision destination, and an enabled cache on the executing thread. It also excludes inference mode and tensors handled by a special caching mechanism. Intermediate activations and transpose views may not qualify; the actual backward operands matter.</p>
 <p>The same <code>FP32Linear</code> connects these conditions: setting its input to <code>requires_grad=True</code> makes the saved real-valued 1×1 input <code>x</code> a cache-eligible operand in the layout-specific <code>mm_mat2_backward</code> branch for the weight gradient. It is an FP32 leaf requiring gradients and is not a view. The example can therefore progress from extra rounding to a backward cache entry; an eventual IMA still depends on the subsequent storage lifetime.</p>
 
-<h3>From a warmup cache entry to a dangling replay dependency</h3>
+<h3>Cache release and replay</h3>
 <p>The clearest failure path creates the cached tensor during warmup and reuses it during capture. A temporary created inside capture is not automatically an IMA: the graph-private pool protects capture-time allocations. An external cache allocation from warmup does not automatically receive that protection.</p>
 <div class="table-scroll"><table class="note-table">
   <thead><tr><th>Phase</th><th>CPU / autocast behavior</th><th>GPU graph dependency</th></tr></thead>
@@ -449,7 +449,7 @@ torch.testing.assert_close(
 <p>Exit-time cleanup is in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/amp/autocast_mode.py#L355-L364"><code>autocast.__exit__()</code></a>. Keeping a <code>CUDAGraph</code> object does not keep every external tensor alive. The <a href="https://docs.pytorch.org/docs/2.12/notes/cuda.html#graph-memory-management">graph memory-management contract</a> requires replay addresses to remain valid.</p>
 <p><strong>IMA is one possible outcome, not an inevitable immediate symptom.</strong> The allocator may retain or reuse the storage. Replay can read stale or overwritten data, corrupt another tensor, or report IMA at a later synchronization point. Even retaining <code>C</code> would not solve stale contents after an input or parameter update if no refreshing cast was captured.</p>
 
-<h2 id="en-fix">Put the autocast boundary inside forward</h2>
+<h2 id="en-fix">Autocast scope</h2>
 <p>The FP32-only model needs no enabled autocast during capture. For a mixed-precision model, let its forward manage autocast locally and keep the capture API's surrounding context disabled. Each forward then returns to an environment where the internal warmup and capture backward run with autocast off.</p>
 <pre class="code" data-language="python"># Uses FP32Linear from above; it can also wrap a mixed-precision model.
 class ForwardAutocast(torch.nn.Module):
@@ -484,7 +484,7 @@ torch.testing.assert_close(
 <p>The inner FP32 region remains effective. A mixed-precision replacement can choose forward dtypes through AMP while backward follows the resulting graph. Disabling the forward cache respects capture's cache constraint; disabling backward autocast prevents both the unintended precision selection and the additional cache path described here.</p>
 <p>If maintaining a custom capture helper, disable autocast around <code>torch.autograd.grad()</code> in <strong>both warmup and capture</strong>, while preserving the intended forward AMP policy. Changing replay alone cannot repair the captured graph; changing capture alone still leaves warmup running backward under the wrong context.</p>
 
-<h2 id="en-verify">Verify numerical behavior and worker state separately</h2>
+<h2 id="en-verify">Verification</h2>
 <p>First compare forward outputs and parameter gradients using the numerical example. Matching forward results and FP32 <code>.grad</code> storage can coexist with BF16-rounded gradients. Additional profiler casts support the diagnosis; the numerical comparison establishes the correctness difference.</p>
 <p>Next, inspect worker TLS independently with a probe that performs no cacheable matrix multiplication. This intentionally runs backward under autocast for diagnosis. Run it eagerly, <strong>outside capture</strong>:</p>
 <pre class="code" data-language="python">import threading

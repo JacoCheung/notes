@@ -3,9 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PyTorch Dispatcher 的多维分派与算子执行路径</title>
-<meta name="post:title"        content="PyTorch Dispatcher 的多维分派与算子执行路径">
-<meta name="post:title_en"     content="PyTorch Dispatcher: Multidimensional Dispatch and Operator Execution">
+<title>PyTorch Dispatcher 机制</title>
+<meta name="post:title"        content="PyTorch Dispatcher 机制">
+<meta name="post:title_en"     content="PyTorch Dispatcher">
 <meta name="post:slug"         content="pytorch-dispatcher">
 <meta name="post:date"         content="2026-05-20">
 <meta name="post:tags"         content="PyTorch, 系统设计, C++, CUDA">
@@ -21,7 +21,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
 </head>
 <body>
 <div class="layout">
@@ -30,152 +30,152 @@
 <div class="lang-zh">
 <strong>目录</strong>
 <ul>
-  <li><a href="#zh-sec1">1. 调度键:运行时多维分派的基础</a>
+  <li><a href="#zh-sec1">1. DispatchKey</a>
     <ul>
-      <li><a href="#zh-sec1-1">1.1 多维分派的工程约束</a></li>
-      <li><a href="#zh-sec1-2">1.2 按调度键索引的函数表</a></li>
-      <li><a href="#zh-sec1-3">1.3 DispatchKey 的枚举定义</a></li>
-      <li><a href="#zh-sec1-4">1.4 二维拆分:functionality × backend</a></li>
-      <li><a href="#zh-sec1-5">1.5 DispatchKeySet:64 位位图</a></li>
-      <li><a href="#zh-sec1-6">1.6 优先级阶梯</a></li>
-      <li><a href="#zh-sec1-7">1.7 redispatch 的层间控制转移</a></li>
+      <li><a href="#zh-sec1-1">1.1 多维分派约束</a></li>
+      <li><a href="#zh-sec1-2">1.2 函数分派表</a></li>
+      <li><a href="#zh-sec1-3">1.3 DispatchKey 枚举</a></li>
+      <li><a href="#zh-sec1-4">1.4 Functionality 与 Backend</a></li>
+      <li><a href="#zh-sec1-5">1.5 DispatchKeySet 位图</a></li>
+      <li><a href="#zh-sec1-6">1.6 Key 优先级</a></li>
+      <li><a href="#zh-sec1-7">1.7 Redispatch</a></li>
     </ul>
   </li>
-  <li><a href="#zh-sec2">2. Schema:算子的类型签名</a>
+  <li><a href="#zh-sec2">2. 算子 Schema</a>
     <ul>
-      <li><a href="#zh-sec2-1">2.1 Schema 字段语义</a></li>
-      <li><a href="#zh-sec2-2">2.2 三种变体:functional / in-place / out</a></li>
-      <li><a href="#zh-sec2-3">2.3 native_functions.yaml:批量声明</a></li>
-      <li><a href="#zh-sec2-4">2.4 derivatives.yaml:反向公式</a></li>
+      <li><a href="#zh-sec2-1">2.1 Schema 字段</a></li>
+      <li><a href="#zh-sec2-2">2.2 Functional、In-place 与 Out</a></li>
+      <li><a href="#zh-sec2-3">2.3 native_functions.yaml</a></li>
+      <li><a href="#zh-sec2-4">2.4 derivatives.yaml</a></li>
     </ul>
   </li>
-  <li><a href="#zh-sec3">3. C++ 注册接口:TORCH_LIBRARY 家族</a>
+  <li><a href="#zh-sec3">3. C++ 注册接口</a>
     <ul>
-      <li><a href="#zh-sec3-1">3.1 Library 的三种身份</a></li>
-      <li><a href="#zh-sec3-2">3.2 TORCH_LIBRARY:开新命名空间</a></li>
-      <li><a href="#zh-sec3-3">3.3 TORCH_LIBRARY_FRAGMENT:同空间拼接</a></li>
-      <li><a href="#zh-sec3-4">3.4 TORCH_LIBRARY_IMPL:挂载 kernel</a></li>
+      <li><a href="#zh-sec3-1">3.1 Library 注册类型</a></li>
+      <li><a href="#zh-sec3-2">3.2 TORCH_LIBRARY</a></li>
+      <li><a href="#zh-sec3-3">3.3 TORCH_LIBRARY_FRAGMENT</a></li>
+      <li><a href="#zh-sec3-4">3.4 TORCH_LIBRARY_IMPL</a></li>
       <li><a href="#zh-sec3-5">3.5 m.def 与 m.impl</a></li>
-      <li><a href="#zh-sec3-6">3.6 Boxed 与 unboxed</a></li>
-      <li><a href="#zh-sec3-7">3.7 Fallback 与 fallthrough</a></li>
-      <li><a href="#zh-sec3-8">3.8 自定义 op 的完整注册路径</a></li>
+      <li><a href="#zh-sec3-6">3.6 Boxed 与 Unboxed 调用</a></li>
+      <li><a href="#zh-sec3-7">3.7 Fallback 与 Fallthrough</a></li>
+      <li><a href="#zh-sec3-8">3.8 自定义算子注册</a></li>
     </ul>
   </li>
-  <li><a href="#zh-sec4">4. Python 注册接口:torch.library 与 register_fake</a>
+  <li><a href="#zh-sec4">4. Python 注册接口</a>
     <ul>
-      <li><a href="#zh-sec4-1">4.1 Library 与 custom_op 两套 API</a></li>
-      <li><a href="#zh-sec4-2">4.2 Python 与 C++ 共用 schema 语法</a></li>
-      <li><a href="#zh-sec4-3">4.3 register_kernel / register_fake / register_autograd</a></li>
-      <li><a href="#zh-sec4-4">4.4 Meta 与 FakeTensor 的抽象执行路径</a></li>
-      <li><a href="#zh-sec4-5">4.5 Python → Dispatcher 注册路径</a></li>
-      <li><a href="#zh-sec4-6">4.6 Python 自定义 op 的完整注册</a></li>
-      <li><a href="#zh-sec4-7">4.7 opcheck 验证一致性</a></li>
+      <li><a href="#zh-sec4-1">4.1 Library 与 custom_op</a></li>
+      <li><a href="#zh-sec4-2">4.2 Schema 语法</a></li>
+      <li><a href="#zh-sec4-3">4.3 Kernel、Fake 与 Autograd 注册</a></li>
+      <li><a href="#zh-sec4-4">4.4 Meta 与 FakeTensor</a></li>
+      <li><a href="#zh-sec4-5">4.5 Python 与 C++ 注册表</a></li>
+      <li><a href="#zh-sec4-6">4.6 Python 自定义算子</a></li>
+      <li><a href="#zh-sec4-7">4.7 opcheck 验证</a></li>
     </ul>
   </li>
-  <li><a href="#zh-sec5">5. 构建期自动化:torchgen</a>
+  <li><a href="#zh-sec5">5. Torchgen 代码生成</a>
     <ul>
-      <li><a href="#zh-sec5-1">5.1 两套生成入口</a></li>
-      <li><a href="#zh-sec5-2">5.2 产物清单与对应宏</a></li>
+      <li><a href="#zh-sec5-1">5.1 生成入口</a></li>
+      <li><a href="#zh-sec5-2">5.2 生成产物</a></li>
     </ul>
   </li>
-  <li><a href="#zh-sec6">6. 端到端追踪:<code>aten::add</code> on CUDA</a>
+  <li><a href="#zh-sec6">6. aten::add 执行路径</a>
     <ul>
-      <li><a href="#zh-sec6-1">6.1 起点:YAML 声明与微分公式</a></li>
-      <li><a href="#zh-sec6-2">6.2 Python → C 绑定层</a></li>
+      <li><a href="#zh-sec6-1">6.1 YAML 与微分公式</a></li>
+      <li><a href="#zh-sec6-2">6.2 Python/C 绑定</a></li>
       <li><a href="#zh-sec6-3">6.3 C++ API 与 Dispatcher::call</a></li>
-      <li><a href="#zh-sec6-4">6.4 DispatchKeySet 现场计算</a></li>
-      <li><a href="#zh-sec6-5">6.5 AutogradCUDA wrapper:建图与 redispatch</a></li>
-      <li><a href="#zh-sec6-6">6.6 CUDA 后端 wrapper</a></li>
-      <li><a href="#zh-sec6-7">6.7 Structured kernel 与 ufunc</a></li>
-      <li><a href="#zh-sec6-8">6.8 反向:<code>AddBackward0::apply</code></a></li>
+      <li><a href="#zh-sec6-4">6.4 DispatchKeySet 计算</a></li>
+      <li><a href="#zh-sec6-5">6.5 AutogradCUDA Wrapper</a></li>
+      <li><a href="#zh-sec6-6">6.6 CUDA 后端 Wrapper</a></li>
+      <li><a href="#zh-sec6-7">6.7 Structured Kernel 与 Ufunc</a></li>
+      <li><a href="#zh-sec6-8">6.8 AddBackward0::apply</a></li>
       <li><a href="#zh-sec6-9">6.9 完整调用栈</a></li>
     </ul>
   </li>
   <li><a href="#zh-sec7">7. 调试与验证</a>
     <ul>
-      <li><a href="#zh-sec7-1">7.1 观察调用与 redispatch</a></li>
-      <li><a href="#zh-sec7-2">7.2 检查注册表</a></li>
-      <li><a href="#zh-sec7-3">7.3 教学用 computed table</a></li>
-      <li><a href="#zh-sec7-4">7.4 C++ 断点的边界</a></li>
+      <li><a href="#zh-sec7-1">7.1 Dispatch Trace</a></li>
+      <li><a href="#zh-sec7-2">7.2 注册表检查</a></li>
+      <li><a href="#zh-sec7-3">7.3 PythonDispatcher</a></li>
+      <li><a href="#zh-sec7-4">7.4 C++ 断点</a></li>
     </ul>
   </li>
-  <li><a href="#zh-sec8">8. 历史资料的版本边界</a></li>
+  <li><a href="#zh-sec8">8. 版本差异</a></li>
   <li><a href="#zh-sec9">参考资料</a></li>
 </ul>
 </div>
 <div class="lang-en">
 <strong>Contents</strong>
 <ul>
-  <li><a href="#en-sec1">1. Dispatch keys and runtime multidimensional dispatch</a>
+  <li><a href="#en-sec1">1. Dispatch keys</a>
     <ul>
-      <li><a href="#en-sec1-1">1.1 Engineering constraints of multidimensional dispatch</a></li>
-      <li><a href="#en-sec1-2">1.2 A function table indexed by dispatch key</a></li>
-      <li><a href="#en-sec1-3">1.3 The structure of the DispatchKey enum</a></li>
-      <li><a href="#en-sec1-4">1.4 Two-dimensional split: functionality × backend</a></li>
-      <li><a href="#en-sec1-5">1.5 DispatchKeySet: a 64-bit bitmap</a></li>
-      <li><a href="#en-sec1-6">1.6 The priority ladder</a></li>
-      <li><a href="#en-sec1-7">1.7 Inter-layer control transfer through redispatch</a></li>
+      <li><a href="#en-sec1-1">1.1 Multidimensional dispatch constraints</a></li>
+      <li><a href="#en-sec1-2">1.2 Dispatch table</a></li>
+      <li><a href="#en-sec1-3">1.3 DispatchKey enumeration</a></li>
+      <li><a href="#en-sec1-4">1.4 Functionality and backend</a></li>
+      <li><a href="#en-sec1-5">1.5 DispatchKeySet bitmap</a></li>
+      <li><a href="#en-sec1-6">1.6 Key priority</a></li>
+      <li><a href="#en-sec1-7">1.7 Redispatch</a></li>
     </ul>
   </li>
-  <li><a href="#en-sec2">2. Schema: The Operator Type Signature</a>
+  <li><a href="#en-sec2">2. Operator schemas</a>
     <ul>
-      <li><a href="#en-sec2-1">2.1 Schema field semantics</a></li>
-      <li><a href="#en-sec2-2">2.2 Three variants: functional / in-place / out</a></li>
-      <li><a href="#en-sec2-3">2.3 native_functions.yaml: bulk declaration</a></li>
-      <li><a href="#en-sec2-4">2.4 derivatives.yaml: backward formulas</a></li>
+      <li><a href="#en-sec2-1">2.1 Schema fields</a></li>
+      <li><a href="#en-sec2-2">2.2 Functional, in-place, and out</a></li>
+      <li><a href="#en-sec2-3">2.3 native_functions.yaml</a></li>
+      <li><a href="#en-sec2-4">2.4 derivatives.yaml</a></li>
     </ul>
   </li>
-  <li><a href="#en-sec3">3. The C++ Registration Interface: TORCH_LIBRARY Family</a>
+  <li><a href="#en-sec3">3. C++ registration</a>
     <ul>
-      <li><a href="#en-sec3-1">3.1 The three identities of Library</a></li>
-      <li><a href="#en-sec3-2">3.2 TORCH_LIBRARY: opening a new namespace</a></li>
-      <li><a href="#en-sec3-3">3.3 TORCH_LIBRARY_FRAGMENT: extending the same namespace</a></li>
-      <li><a href="#en-sec3-4">3.4 TORCH_LIBRARY_IMPL: attaching a kernel</a></li>
+      <li><a href="#en-sec3-1">3.1 Library registration types</a></li>
+      <li><a href="#en-sec3-2">3.2 TORCH_LIBRARY</a></li>
+      <li><a href="#en-sec3-3">3.3 TORCH_LIBRARY_FRAGMENT</a></li>
+      <li><a href="#en-sec3-4">3.4 TORCH_LIBRARY_IMPL</a></li>
       <li><a href="#en-sec3-5">3.5 m.def and m.impl</a></li>
-      <li><a href="#en-sec3-6">3.6 Boxed and unboxed</a></li>
+      <li><a href="#en-sec3-6">3.6 Boxed and unboxed calls</a></li>
       <li><a href="#en-sec3-7">3.7 Fallback and fallthrough</a></li>
-      <li><a href="#en-sec3-8">3.8 Complete registration path for a custom op</a></li>
+      <li><a href="#en-sec3-8">3.8 Custom-operator registration</a></li>
     </ul>
   </li>
-  <li><a href="#en-sec4">4. Python registration: torch.library and register_fake</a>
+  <li><a href="#en-sec4">4. Python registration</a>
     <ul>
-      <li><a href="#en-sec4-1">4.1 Library vs custom_op</a></li>
-      <li><a href="#en-sec4-2">4.2 Schema syntax shared with C++</a></li>
-      <li><a href="#en-sec4-3">4.3 register_kernel / register_fake / register_autograd</a></li>
-      <li><a href="#en-sec4-4">4.4 Abstract execution with Meta and FakeTensor</a></li>
-      <li><a href="#en-sec4-5">4.5 Python registration and the shared C++ dispatcher</a></li>
-      <li><a href="#en-sec4-6">4.6 Complete Python registration of a custom op</a></li>
-      <li><a href="#en-sec4-7">4.7 opcheck invariant verification</a></li>
+      <li><a href="#en-sec4-1">4.1 Library and custom_op</a></li>
+      <li><a href="#en-sec4-2">4.2 Schema syntax</a></li>
+      <li><a href="#en-sec4-3">4.3 Kernel, fake, and autograd registration</a></li>
+      <li><a href="#en-sec4-4">4.4 Meta and FakeTensor</a></li>
+      <li><a href="#en-sec4-5">4.5 Python and C++ registry</a></li>
+      <li><a href="#en-sec4-6">4.6 Python custom operators</a></li>
+      <li><a href="#en-sec4-7">4.7 opcheck validation</a></li>
     </ul>
   </li>
-  <li><a href="#en-sec5">5. Build-Time Automation: torchgen</a>
+  <li><a href="#en-sec5">5. Torchgen code generation</a>
     <ul>
-      <li><a href="#en-sec5-1">5.1 Two generation entry points</a></li>
-      <li><a href="#en-sec5-2">5.2 Output inventory and corresponding macros</a></li>
+      <li><a href="#en-sec5-1">5.1 Generation entry points</a></li>
+      <li><a href="#en-sec5-2">5.2 Generated artifacts</a></li>
     </ul>
   </li>
-  <li><a href="#en-sec6">6. End-to-End Trace: <code>aten::add</code> on CUDA</a>
+  <li><a href="#en-sec6">6. aten::add execution path</a>
     <ul>
-      <li><a href="#en-sec6-1">6.1 Starting point: YAML declarations and derivative formulas</a></li>
-      <li><a href="#en-sec6-2">6.2 Python → C binding layer</a></li>
+      <li><a href="#en-sec6-1">6.1 YAML and derivative formulas</a></li>
+      <li><a href="#en-sec6-2">6.2 Python/C bindings</a></li>
       <li><a href="#en-sec6-3">6.3 C++ API and Dispatcher::call</a></li>
-      <li><a href="#en-sec6-4">6.4 On-the-fly DispatchKeySet computation</a></li>
-      <li><a href="#en-sec6-5">6.5 AutogradCUDA wrapper: graph construction and redispatch</a></li>
-      <li><a href="#en-sec6-6">6.6 The CUDA backend wrapper</a></li>
-      <li><a href="#en-sec6-7">6.7 Structured kernel and ufunc</a></li>
-      <li><a href="#en-sec6-8">6.8 Backward: <code>AddBackward0::apply</code></a></li>
-      <li><a href="#en-sec6-9">6.9 The complete call stack</a></li>
+      <li><a href="#en-sec6-4">6.4 DispatchKeySet computation</a></li>
+      <li><a href="#en-sec6-5">6.5 AutogradCUDA wrapper</a></li>
+      <li><a href="#en-sec6-6">6.6 CUDA backend wrapper</a></li>
+      <li><a href="#en-sec6-7">6.7 Structured kernels and ufuncs</a></li>
+      <li><a href="#en-sec6-8">6.8 AddBackward0::apply</a></li>
+      <li><a href="#en-sec6-9">6.9 Complete call stack</a></li>
     </ul>
   </li>
-  <li><a href="#en-sec7">7. Debugging and Verification</a>
+  <li><a href="#en-sec7">7. Debugging and validation</a>
     <ul>
-      <li><a href="#en-sec7-1">7.1 Observe calls and redispatch</a></li>
-      <li><a href="#en-sec7-2">7.2 Inspect registrations</a></li>
-      <li><a href="#en-sec7-3">7.3 Teaching helper for computed tables</a></li>
-      <li><a href="#en-sec7-4">7.4 Boundaries of C++ breakpoints</a></li>
+      <li><a href="#en-sec7-1">7.1 Dispatch trace</a></li>
+      <li><a href="#en-sec7-2">7.2 Registry inspection</a></li>
+      <li><a href="#en-sec7-3">7.3 PythonDispatcher</a></li>
+      <li><a href="#en-sec7-4">7.4 C++ breakpoints</a></li>
     </ul>
   </li>
-  <li><a href="#en-sec8">8. Version boundaries of older references</a></li>
+  <li><a href="#en-sec8">8. Version differences</a></li>
   <li><a href="#en-sec9">References</a></li>
 </ul>
 </div>
@@ -185,7 +185,7 @@
 
 <div class="lang-zh">
 
-<h1>PyTorch Dispatcher 的多维分派与算子执行路径</h1>
+<h1>PyTorch Dispatcher 机制</h1>
 
 <p>Python 只暴露一个 <code>torch.add</code>，一次实际调用却可能同时受设备、layout、autograd、张量子类和线程局部 mode 影响。Dispatcher 位于 Python/C++ API 与具体 kernel 之间，负责把同一个 operator schema 映射到这些可组合的行为层。</p>
 
@@ -193,11 +193,11 @@
 
 <p class="small">实现说明按公开的 <a href="https://github.com/pytorch/pytorch/tree/v2.12.0">PyTorch <code>v2.12.0</code> 源码</a>核对。源码文件名、生成符号和内部 API 会随版本变化；第 6 章的调用链是针对文中输入条件、根据源码与 codegen 模板整理的阅读模型，不是跨版本稳定 API，也不覆盖所有 tensor layout、mode 或编译配置。</p>
 
-<h2 id="zh-sec1">1. 调度键:运行时多维分派的基础</h2>
+<h2 id="zh-sec1">1. DispatchKey</h2>
 
 <p>Dispatcher 的运行时模型可以归纳为三步:从张量参数和 TLS 状态构造 key set,选择优先级最高的运行时 key,再调用该算子在这个 key 下的 kernel。如果当前 kernel 是包装层,它会缩小 key set 并 redispatch,直到抵达实现数值计算的 backend kernel。</p>
 
-<h3 id="zh-sec1-1">1.1 多维分派的工程约束</h3>
+<h3 id="zh-sec1-1">1.1 多维分派约束</h3>
 
 <p>一行普通的 <code>y = x + 1</code> 已经包含运行时设备选择。对于不记录梯度的 Dense CPU float32 tensor，数值计算可以简化为 <code>y[i] = x[i] + 1</code>；若系统只支持 CPU 和 CUDA，玩具实现只需要一个设备分支：</p>
 
@@ -245,7 +245,7 @@ Tensor run_op(const Tensor&amp; x, const Tensor&amp; y) {
 新后端 <code>Foo</code> 不需要把 <code>is_foo()</code> 条件插进每个调用点。它为支持的算子注册 <code>Foo</code> kernel,未覆盖的算子则按明确的 fallback 或报错行为处理。扩展范围因此由注册项表达,而不是由分散的分支表达。
 </div>
 
-<h3 id="zh-sec1-2">1.2 按 key 索引的函数表</h3>
+<h3 id="zh-sec1-2">1.2 函数分派表</h3>
 
 <p>PyTorch 把"该走哪条路"的决策从算子实现中抽出来,放进按 dispatch key 索引的查找表。</p>
 
@@ -344,7 +344,7 @@ AutocastCUDA         →  fallthrough</pre>
 虚函数表根据单个接收者的动态类型选择方法,而 dispatcher 的候选 key 来自所有张量参数与 TLS 状态的并集。<code>std::function</code> 可以存放类型擦除后的 callable,却不负责 schema 注册、key 优先级、fallback 或 redispatch。这里需要的是算子级注册表与可组合的运行时选择规则,不是某一种 C++ callable 容器。本文不对单次 dispatch 延迟给出固定数字,因为它取决于构建配置、调用路径和测量方法。
 </div>
 
-<h3 id="zh-sec1-3">1.3 DispatchKey 的枚举定义</h3>
+<h3 id="zh-sec1-3">1.3 DispatchKey 枚举</h3>
 
 <p><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/c10/core/DispatchKey.h"><code>c10/core/DispatchKey.h</code></a> 定义所有 dispatch key。以下简化枚举表达功能层次；实际定义采用 functionality 与 backend 的二维拆分，详见 1.4 节。</p>
 
@@ -395,7 +395,7 @@ enum class DispatchKey : uint16_t {
 普通 CPU tensor 在 <code>requires_grad=False</code> 时仍带有 AutogradCPU。<code>x + 1</code> 先进入 Autograd wrapper,wrapper 发现无需记录梯度后直接 redispatch 到 CPU；把 <code>requires_grad</code> 改为 true 不改变这一层的存在,只改变 wrapper 是否创建 <code>AddBackward0</code>。这一点可由 v2.12.0 的 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/core/VariableFallbackKernel.cpp#L5-L16"><code>VariableFallbackKernel.cpp</code></a> 注释直接确认。
 </div>
 
-<h3 id="zh-sec1-4">1.4 二维拆分:functionality × backend</h3>
+<h3 id="zh-sec1-4">1.4 Functionality 与 Backend</h3>
 
 <p>若把每种行为与每个 backend 直接展开成笛卡儿积，枚举规模会随两个维度相乘。以新增 Habana（HPU）为例，直接展开需要加入下列条目：</p>
 
@@ -437,7 +437,7 @@ Habana（HPU）后端的 sparse 实现使用 <code>(Sparse, HPU)</code> 组合 k
 ezyang 2019 年的 <a href="https://blog.ezyang.com/2019/05/pytorch-internals/">PyTorch internals</a> 没有 BackendComponent 这一层,2020 年的 dispatcher 文章也没有。本节描述的二维拆分来自 2022 年后的实现；早期资料把 <code>SparseCUDA</code> 视为单独枚举值，而 v2.12.0 将其表示为 <code>(Sparse, CUDABit)</code> 的组合。
 </div>
 
-<h3 id="zh-sec1-5">1.5 DispatchKeySet:64 位位图</h3>
+<h3 id="zh-sec1-5">1.5 DispatchKeySet 位图</h3>
 
 <p><code>DispatchKeySet</code> 是把 functionality 与最多 16 个 <code>BackendComponent</code> 编码进 <code>uint64_t</code> 的运行时集合。每次 operator 调用都以这个 64 位值表示当前候选 key，随后由 lookup 选择最高优先级表项。</p>
 
@@ -521,7 +521,7 @@ inline DispatchKeySet computeDispatchKeySet(
 这组运行时 key 构成 1.2 节受控例子的初始 key set。Policy 列表见 v2.12.0 的 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/autocast_mode.h#L819-L852"><code>autocast_mode.h</code></a>；<code>add</code> 不在这份 lower-precision 列表中。
 </div>
 
-<h3 id="zh-sec1-6">1.6 优先级阶梯</h3>
+<h3 id="zh-sec1-6">1.6 Key 优先级</h3>
 
 <p>给定一个 64 位位图,dispatcher 用 <code>highestPriorityTypeId()</code> 取"最高位 1 对应的 functionality"。"最高"指的是位图里最高编号的 set bit: <strong>功能位是按优先级排好的,bit 编号 = 优先级</strong>。</p>
 
@@ -589,7 +589,7 @@ inline DispatchKeySet computeDispatchKeySet(
 
 <p>这些 alias 提供跨 key 的覆盖语义。它们会参与 computed dispatch table 的填充与 precedence 计算,而一次实际 lookup 仍以 <code>AutogradCUDA</code>、<code>CUDA</code> 等 runtime key 定位条目。具体规则见 v2.12.0 的 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/core/dispatch/OperatorEntry.cpp#L348-L435"><code>OperatorEntry.cpp</code></a>。</p>
 
-<h3 id="zh-sec1-7">1.7 redispatch 的层间控制转移</h3>
+<h3 id="zh-sec1-7">1.7 Redispatch</h3>
 
 <p>包装层完成本层工作后，需要把控制权交给下一优先级 key，同时避免再次命中自身。Redispatch 通过调用方提供的 key set 实现这项层间转移。</p>
 
@@ -661,7 +661,7 @@ Tensor VariableType::add_Tensor(
 Dispatcher 的一次 operator 调用可以包含多次表项选择。functionality 的 bit 顺序决定层次，包装层通过 RAII guard 与显式 mask 移除自身，再由 redispatch 选择下一最高优先级 key。
 </div>
 
-<h2 id="zh-sec2">2. Schema:算子的类型签名</h2>
+<h2 id="zh-sec2">2. 算子 Schema</h2>
 
 <p>运行时 key 选择需要一个稳定的 operator 身份与参数契约。Schema 记录 <code>aten::add.Tensor</code> 的参数、返回值、overload、alias 与 mutation 语义，使 dispatcher 及其上层工具能够解释同一个调用。</p>
 
@@ -669,7 +669,7 @@ Dispatcher 的一次 operator 调用可以包含多次表项选择。functionali
 
 <p>下面依次说明 schema 的字符串语法、变体命名规则以及它在 YAML 中的声明形式。</p>
 
-<h3 id="zh-sec2-1">2.1 Schema 字段语义</h3>
+<h3 id="zh-sec2-1">2.1 Schema 字段</h3>
 
 <p>以 <code>aten::add.Tensor</code> 的 schema 为例：</p>
 
@@ -735,7 +735,7 @@ Alias 注解（<code>(a)</code> 和 <code>(a!)</code>）把 storage 共享与 mu
 
 <p>注册时,这个字符串会被 <code>torch::jit::parseSchema</code> 解析进一个 <code>c10::FunctionSchema</code> 结构体,记录每个参数的名字、类型、alias 信息、默认值;然后才登记到 dispatcher 的内部 op 表里。所以"schema 字符串"是源头,<code>FunctionSchema</code> 是它的 in-memory 表示。</p>
 
-<h3 id="zh-sec2-2">2.2 三种变体:functional / in-place / out</h3>
+<h3 id="zh-sec2-2">2.2 Functional、In-place 与 Out</h3>
 
 <p>很多算子具有副作用能力(in-place 改写、写入预分配的 out 张量)。PyTorch 给这类算子同时提供三种 schema 变体，功能等价但接口不同。<code>add</code> 的三个变体如下：</p>
 
@@ -783,7 +783,7 @@ add.out      :  out wrapper 绑定用户提供的 out,调用共享 meta() / impl
 codegen 看到 <code>autogen:</code> 后会按允许的规则补出相应 schema 与 adapter。生成方向取决于源变体和 operator metadata,不能概括成固定的"out 包装 functional"。实现仍须满足生成变体的 aliasing、resize 与 dtype 契约。
 </div>
 
-<h3 id="zh-sec2-3">2.3 native_functions.yaml:批量声明</h3>
+<h3 id="zh-sec2-3">2.3 native_functions.yaml</h3>
 
 <p>PyTorch 内置算子的 schema 主要声明在 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/native/native_functions.yaml"><code>aten/src/ATen/native/native_functions.yaml</code></a>。每个 YAML 条目除了 schema，还包含供构建期 codegen 使用的元数据：</p>
 
@@ -854,7 +854,7 @@ codegen 看到 <code>autogen:</code> 后会按允许的规则补出相应 schema
 没有 structured codegen 时,functional / inplace / out 变体要分别处理输出创建、resize、设备检查和 implementation 调用,这些胶水很容易漂移。<strong>Structured kernel</strong> 把共同工作分成 <code>meta()</code> 与 <code>impl()</code>,再由 codegen 为各个变体生成 wrapper。共享的是实现逻辑与约束,不是一次从 functional schema 到 out schema 的二次 dispatcher 调用。
 </div>
 
-<h3 id="zh-sec2-4">2.4 derivatives.yaml:反向公式</h3>
+<h3 id="zh-sec2-4">2.4 derivatives.yaml</h3>
 
 <p>到目前为止 schema 只描述了"前向行为"。<strong>反向(autograd)信息在另一个文件里</strong>:<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/tools/autograd/derivatives.yaml"><code>tools/autograd/derivatives.yaml</code></a>。每个 differentiable op 在这里给一段反向公式:</p>
 
@@ -903,7 +903,7 @@ codegen 看到 <code>autogen:</code> 后会按允许的规则补出相应 schema
 Schema 为 dispatcher、autograd、JIT、functionalization 和 Python binding 提供共同契约，其中 alias 注解决定 storage 共享与 mutation 语义。<code>native_functions.yaml</code> 保存 operator 声明，<code>derivatives.yaml</code> 保存微分公式；两者分别进入 ATen 与 autograd codegen，并在生成的注册表和 wrapper 中汇合。
 </div>
 
-<h2 id="zh-sec3">3. C++ 注册接口:TORCH_LIBRARY 家族</h2>
+<h2 id="zh-sec3">3. C++ 注册接口</h2>
 
 <p>Schema 确立 operator 契约后，注册接口把契约与实现写入 dispatcher。<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/library.h"><code>torch/library.h</code></a> 中的 <code>TORCH_LIBRARY</code> 家族分别负责声明 schema、扩展 namespace 和为既有 operator 挂接 kernel。</p>
 
@@ -915,7 +915,7 @@ Schema 为 dispatcher、autograd、JIT、functionalization 和 Python binding �
 
 <p>差异在于注册 schema、追加 namespace 片段,还是为既有 operator 挂接 kernel。理解这层约束后,boxed/unboxed、fallback/fallthrough 和 def/impl 的关系才不会混在一起。</p>
 
-<h3 id="zh-sec3-1">3.1 Library 的三种身份:DEF / FRAGMENT / IMPL</h3>
+<h3 id="zh-sec3-1">3.1 Library 注册类型</h3>
 
 <p>注册入口的核心对象是 <code>torch::Library</code>。每个 <code>TORCH_LIBRARY*</code> 宏都会构造一个 <code>Library</code> 实例，其 <code>Kind</code> 分为三类（<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/library.h"><code>torch/library.h:551-553</code></a>）：</p>
 
@@ -953,7 +953,7 @@ Schema 与 kernel 可以写在同一个 DEF 块。<code>m.impl</code> 既有继�
 <code>TORCH_LIBRARY</code> 创建 DEF,不携带 block-level dispatch key；<code>TORCH_LIBRARY_IMPL</code> 创建 IMPL 并携带 key；FRAGMENT 允许多个注册块追加 schema。<code>C10_UID</code> 用于避免 FRAGMENT 与 IMPL initializer 在同一翻译单元中的名字冲突。"一个 namespace 只能有一个 DEF"由 <code>Dispatcher::registerLibrary</code> 在运行时注册阶段检查,不是依赖链接期重复符号完成。
 </div>
 
-<h3 id="zh-sec3-2">3.2 TORCH_LIBRARY:开新命名空间</h3>
+<h3 id="zh-sec3-2">3.2 TORCH_LIBRARY</h3>
 
 <p><code>TORCH_LIBRARY</code> 的宏定义位于 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/library.h"><code>torch/library.h:982-991</code></a>:</p>
 
@@ -1016,7 +1016,7 @@ TORCH_LIBRARY(myops, m) {
 <strong>关键限制:</strong>同一个 namespace 在整个进程里只能有一个 <code>TORCH_LIBRARY(ns, ...)</code>。第二个 DEF 会在 <code>Dispatcher::registerLibrary</code> 阶段触发注册错误；若要把 schema 分散到多个 .cpp 文件,应使用 <code>TORCH_LIBRARY_FRAGMENT</code>。
 </div>
 
-<h3 id="zh-sec3-3">3.3 TORCH_LIBRARY_FRAGMENT:同命名空间拼接</h3>
+<h3 id="zh-sec3-3">3.3 TORCH_LIBRARY_FRAGMENT</h3>
 
 <p>FRAGMENT 解决"同 namespace 跨文件"的需求。看宏(<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/library.h"><code>torch/library.h:1001-1023</code></a>,简化):</p>
 
@@ -1071,7 +1071,7 @@ TORCH_LIBRARY_FRAGMENT(myops, m) {
 整个进程仍然至多有一个 <code>TORCH_LIBRARY(myops, ...)</code>(DEF),但 <strong>FRAGMENT 不要求先存在 DEF</strong>。在 v2.12.0 中,只有 DEF 调用 <code>registerLibrary</code> 做 namespace 唯一性检查；FRAGMENT 只要求 namespace 不是通配符 <code>_</code>,随后可以直接定义 operator。对应分支见 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/core/library.cpp#L82-L114"><code>library.cpp</code></a>。
 </div>
 
-<h3 id="zh-sec3-4">3.4 TORCH_LIBRARY_IMPL:挂载 kernel</h3>
+<h3 id="zh-sec3-4">3.4 TORCH_LIBRARY_IMPL</h3>
 
 <p>schema 是"声明",kernel 才是"实现"。<code>TORCH_LIBRARY_IMPL</code> 是<strong>给已存在的 op 挂某个 DispatchKey 上的 kernel</strong> 的宏(<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/library.h"><code>torch/library.h:1064-1084</code></a>,简化):</p>
 
@@ -1126,7 +1126,7 @@ TORCH_LIBRARY_IMPL(_, AutogradCUDA, m) {
 含义:任何 namespace 下的算子如果没有更具体的 AutogradCUDA 条目,都会进入这个 backend fallback。<strong>它不会自动推导正确梯度。</strong>v2.12.0 的源码注释明确说明该 fallback 只检查 autograd 条件后下传,不是正确 autograd implementation；自定义算子需要注册 autograd formula,或者由可微的 dispatched operators 构成 CompositeImplicitAutograd 实现。证据边界见 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/core/VariableFallbackKernel.cpp#L5-L16"><code>VariableFallbackKernel.cpp</code></a>。
 </div>
 
-<h3 id="zh-sec3-5">3.5 m.def 与 m.impl 的语义差异</h3>
+<h3 id="zh-sec3-5">3.5 m.def 与 m.impl</h3>
 
 <p><code>m.def</code> 和 <code>m.impl</code> 是 <code>Library</code> 对象上最常用的两个方法。它们职责完全不同:</p>
 
@@ -1167,7 +1167,7 @@ Tensor(const Tensor&amp;, int): but the schema declares type Tensor(Tensor, Tens
 Schema 是注册契约的单一可信源,每个 kernel 的签名都必须与它兼容。
 </div>
 
-<h3 id="zh-sec3-6">3.6 Boxed 与 unboxed 调用路径</h3>
+<h3 id="zh-sec3-6">3.6 Boxed 与 Unboxed 调用</h3>
 
 <p>Dispatcher 查表得到 <code>KernelFunction</code> 后,<code>KernelFunction</code> 根据调用点是否具有静态类型签名选择 unboxed 或 boxed 路径。前者使用 typed C++ 参数,后者使用统一的 IValue stack ABI。</p>
 
@@ -1190,7 +1190,7 @@ Schema 是注册契约的单一可信源,每个 kernel 的签名都必须与它�
 旧版 <code>m.impl_UNBOXED("name", &amp;fn)</code> 明确注册的是 <strong>unboxed</strong> C++ kernel,不是 boxed-only kernel。v2.12.0 保留了一个只会触发 <code>static_assert</code> 的兼容入口,错误信息要求直接改用 <code>.impl(...)</code>。<code>makeFromBoxedFunction</code> 用于本来就符合 boxed ABI 的函数,不是 <code>impl_UNBOXED</code> 的等价迁移。源码见 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/library.h#L772-L781"><code>torch/library.h</code></a>。
 </div>
 
-<h3 id="zh-sec3-7">3.7 Fallback 与 fallthrough</h3>
+<h3 id="zh-sec3-7">3.7 Fallback 与 Fallthrough</h3>
 
 <p>除了 <code>m.def</code> 和 <code>m.impl</code>,<code>Library</code> 还有一个 <code>m.fallback</code>。它的语义是:<strong>给整个 DispatchKey 注册一个 op-agnostic 的 kernel</strong>,在该 key 下"没有单独 impl 的 op"都走它。</p>
 
@@ -1220,7 +1220,7 @@ m.fallback(torch::CppFunction::makeFromBoxedFunction&lt;&amp;my_boxed_fallback&g
 <strong>设计边界:</strong>扩展层可以用 TLS 或 tensor key 激活,并用 fallthrough registration 表示某些 operator 无需处理该层。这样 mode 的语义集中在注册规则中,调用点不需要复制条件树。
 </div>
 
-<h3 id="zh-sec3-8">3.8 自定义 op 的完整注册路径</h3>
+<h3 id="zh-sec3-8">3.8 自定义算子注册</h3>
 
 <p>前述注册规则可以组合成一条完整路径。下面的自定义 <code>relu</code> 同时提供 CPU、CUDA 与 autograd 实现,代码分布在四个 .cpp 文件中:</p>
 
@@ -1339,11 +1339,11 @@ TORCH_LIBRARY_IMPL(myops, CompositeImplicitAutograd, m) {
 只需一个 .cpp 文件,前面三个 IMPL 块都不需要,因为其中的 <code>at::clamp_min</code> 会再次经过 dispatcher,同时获得 backend 路由和 autograd 支持。<strong>对于由现有 op 组合而成的算子,这是首选写法。</strong>只有直接实现 CUDA kernel、而非组合 <code>at::*</code> 算子时,才需要 3.8 节所示的四文件结构。
 </div>
 
-<h2 id="zh-sec4">4. Python 注册接口:<code>torch.library</code> 与 <code>register_fake</code></h2>
+<h2 id="zh-sec4">4. Python 注册接口</h2>
 
 <p>Python 端的 <code>torch.library</code> 与 C++ <code>TORCH_LIBRARY</code> 家族写入同一个 <code>c10::Dispatcher</code> 注册表,但两端 API 与生命周期管理并非逐项等同。下面对照它们的注册入口,并说明 <code>register_fake</code> 为 meta 推断、Dynamo、export、Inductor 与 AOTI 提供的抽象语义。</p>
 
-<h3 id="zh-sec4-1">4.1 两套 Python API:<code>Library</code> 与 <code>custom_op</code></h3>
+<h3 id="zh-sec4-1">4.1 <code>Library</code> 与 <code>custom_op</code></h3>
 
 <p>PyTorch 提供底层 <code>Library</code> API 和较高层的 <code>custom_op</code> API。后者会协调多项 registration,但不能简单视为逐行宏展开:</p>
 
@@ -1367,7 +1367,7 @@ TORCH_LIBRARY_IMPL(myops, CompositeImplicitAutograd, m) {
 
 <p>两套 API 最终写入同一个 dispatcher。<code>custom_op</code> 适合以 Python callable 为边界的自定义算子；需要精确指定 library kind、dispatch key 或 registration lifetime 时,<code>Library</code> 暴露更多控制。v2.12.0 的初始化流程见 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/_library/custom_ops.py#L635-L669"><code>custom_ops.py</code></a>。</p>
 
-<h3 id="zh-sec4-2">4.2 Python 与 C++ 共用 schema 语法</h3>
+<h3 id="zh-sec4-2">4.2 Schema 语法</h3>
 
 <p>Python schema 字符串与 C++ <code>m.def("...")</code> 都由 <code>aten/src/ATen/core/function_schema_parser.cpp</code> 中的 <code>torch::jit::parseSchema(str)</code> 解析。二者都会生成 <code>c10::FunctionSchema</code> 并注册到 dispatcher。</p>
 
@@ -1398,7 +1398,7 @@ lib.define(<span class="cm">"scale_add(Tensor x, float scale, Tensor bias) -&gt;
   </tbody>
 </table>
 
-<h3 id="zh-sec4-3">4.3 三类核心注册:<code>register_kernel</code> / <code>register_fake</code> / <code>register_autograd</code></h3>
+<h3 id="zh-sec4-3">4.3 Kernel、Fake 与 Autograd 注册</h3>
 
 <p>每一类对应 dispatcher 上一个特定的 DispatchKey 入口,跟 §1.3 / §3.4 那张 key 表对得起来:</p>
 
@@ -1438,11 +1438,11 @@ lib.define(<span class="cm">"scale_add(Tensor x, float scale, Tensor bias) -&gt;
   </tbody>
 </table>
 
-<h3 id="zh-sec4-4">4.4 Meta 与 FakeTensor 的抽象执行路径</h3>
+<h3 id="zh-sec4-4">4.4 Meta 与 FakeTensor</h3>
 
 <p>Meta 是与 CPU、CUDA 同属 Dense backend family 的 runtime key。Meta tensor 保存 shape、stride 和 dtype 等元数据,但没有可读取的数值 storage。FakeTensorMode 在 Python 层拦截 operator,再使用 Meta kernel、decomposition 或少量专用 fake logic 完成抽象执行。下面只讨论 v2.12.0 中这条常见路径,不把它视为所有 compiler pass 的唯一实现。</p>
 
-<h4>4.4.1 Meta key 在 dispatcher 表里的位置</h4>
+<h4>4.4.1 Meta Key</h4>
 
 <p>一个 operator 同时有 CPU、CUDA 与 Meta entries 很常见。裸 meta tensor 的 key set 包含 Meta backend component,lookup 因而可以选择该 operator 的 Meta entry。</p>
 
@@ -1457,7 +1457,7 @@ lib.define(<span class="cm">"scale_add(Tensor x, float scale, Tensor bias) -&gt;
 
 <p>许多原生 structured operators 的 Meta wrapper 由 torchgen 生成,其 <code>meta()</code> 逻辑负责输出 metadata。另一些 operator 依靠手写 Meta kernel 或 decomposition。Python custom operator 通常需要用户提供 fake implementation；少数 schema 可以生成 trivial fake behavior。</p>
 
-<h4>4.4.2 FakeTensor:Meta key 之上的薄层</h4>
+<h4>4.4.2 FakeTensor 封装</h4>
 
 <p>编译与导出流程常使用 <strong><code>FakeTensor</code></strong>(<code>torch._subclasses.fake_tensor.FakeTensor</code>),一个由 <code>FakeTensorMode</code> 管理的 <code>__torch_dispatch__</code> tensor subclass。二者的关系如下:</p>
 
@@ -1474,7 +1474,7 @@ lib.define(<span class="cm">"scale_add(Tensor x, float scale, Tensor bias) -&gt;
 
 <p>在常见路径上,FakeTensorMode 以无真实数据的 tensor 执行 operator,由 Meta kernel 或 decomposition 计算输出 metadata,并保留模拟的原始 device。具备 Meta kernel 往往是 FakeTensor compatibility 的重要条件,但 data-dependent shape、aliasing 和专用 fake handlers 仍可能需要额外逻辑。</p>
 
-<h4>4.4.3 <code>register_fake</code> 注册 Meta wrapper</h4>
+<h4>4.4.3 <code>register_fake</code> 目标</h4>
 
 <p><code>register_fake(fn)</code> 把 Python function 保存在 fake implementation holder 中,再构造一个 wrapper 注册到 <strong>Meta</strong> key:</p>
 
@@ -1488,7 +1488,7 @@ lib.impl(<span class="cm">"myops::scale_add"</span>, constructed_meta_wrapper, <
 
 <p>因此 API 名称与最终 dispatcher slot 描述的是同一机制的两面:用户编写 FakeTensor behavior,实现层把 wrapper 挂到 Meta。v2.12.0 的 registration 与冲突检查见 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/_library/fake_impl.py#L35-L85"><code>fake_impl.py</code></a>。</p>
 
-<h4>4.4.4 <code>torch.export</code> 使用 FakeTensor 传播元数据</h4>
+<h4>4.4.4 元数据传播</h4>
 
 <p>下面给出 <code>torch.export.export(model, example_inputs)</code> 的简化数据流,只标出与本文相关的 FakeTensor 部分:</p>
 
@@ -1525,7 +1525,7 @@ torch.export.save(exported_program, <span class="cm">"model.pt2"</span>)</pre>
 
 <p><code>torch.export.export</code> 与 <code>torch.export.save</code> 是分开的 API；后者才创建 <code>.pt2</code> archive。对应入口见 v2.12.0 的 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/export/__init__.py#L211-L272"><code>torch/export/__init__.py</code></a>。</p>
 
-<h4>4.4.5 <code>register_fake</code> 的实现约束</h4>
+<h4>4.4.5 <code>register_fake</code> 约束</h4>
 
 <ul>
   <li><strong>可以组合 PyTorch operators,但不能读取 storage 或数据。</strong><code>x.mul(2)</code>、<code>torch.add(x, y)</code> 与 <code>x * 2</code> 都会继续在 FakeTensorMode 中抽象执行。<code>data_ptr()</code>、<code>.item()</code> 或依赖 tensor 值的 Python 分支则越过了 fake implementation 的证据边界。官方 docstring 明确要求 implementation 只由 PyTorch operations 构成且不直接访问输入或中间 tensor 的 storage/data。</li>
@@ -1545,7 +1545,7 @@ torch.export.save(exported_program, <span class="cm">"model.pt2"</span>)</pre>
   <li><strong>dtype 必须符合真实 type-promotion 规则。</strong>可使用 <code>torch.promote_types</code> 或等价的 PyTorch operation 推导；无条件沿用 <code>x.dtype</code> 可能使抽象输出与实际 kernel 不一致。</li>
 </ul>
 
-<h4>4.4.6 几个常见错误案例</h4>
+<h4>4.4.6 常见错误</h4>
 
 <pre class="code"><span class="cm"># 错误案例 1:读取 tensor 数据来决定输出 shape</span>
 @my_op.register_fake
@@ -1588,7 +1588,7 @@ torch.export.save(exported_program, <span class="cm">"model.pt2"</span>)</pre>
     <span class="kw">return</span> [torch.empty((chunk,) + x.shape[1:], dtype=x.dtype, device=x.device)
             <span class="kw">for</span> _ <span class="kw">in</span> <span class="kw">range</span>(n)]</pre>
 
-<h4>4.4.7 export 链路上 Meta 之外的入口</h4>
+<h4>4.4.7 Export 扩展入口</h4>
 
 <p>除了 <code>register_fake</code>,跟 Meta 推断相关的还有几个 hook 点,容易混:</p>
 
@@ -1620,7 +1620,7 @@ torch.export.save(exported_program, <span class="cm">"model.pt2"</span>)</pre>
 
 <p>普通 custom op 若要参与 FakeTensor-based tracing,通常只需提供 <code>register_fake</code>,无需直接修改 FakeTensor 内部表。训练还需要独立的 autograd registration,编译执行也可能需要 decomposition 或 backend lowering；fake implementation 只负责抽象语义。</p>
 
-<h3 id="zh-sec4-5">4.5 Python registration 共享 C++ dispatcher</h3>
+<h3 id="zh-sec4-5">4.5 Python 与 C++ 注册表</h3>
 
 <p>Python API 管理 registration handle 与 Python callable,底层仍调用 C++ <code>torch::Library</code> 和 <code>c10::Dispatcher</code>。下图只保留稳定的边界,不把内部 binding 名称当成公开 API:</p>
 
@@ -1652,7 +1652,7 @@ c10::Dispatcher::singleton().registerImpl(
   <li>调用 Python kernel 需要进入 Python runtime,通常比纯 C++ kernel 有额外开销；是否值得迁移到 C++ 应以目标 workload 的 profile 为依据。v2.12.0 的 Python <code>Library.impl</code> 到 C++ binding 的边界见 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/library.py#L283-L366"><code>torch/library.py</code></a>。</li>
 </ul>
 
-<h3 id="zh-sec4-6">4.6 Python 自定义 op 的完整注册</h3>
+<h3 id="zh-sec4-6">4.6 Python 自定义算子</h3>
 
 <p>§3.8 的 <code>myops::custom_relu</code> 用 C++ 分开注册 schema、backend 与 autograd。Python 端可以在一份文件中表达同样的 operator contract:</p>
 
@@ -1704,7 +1704,7 @@ y.sum().backward()</pre>
   <li>不能脱离 Python runtime；AOTI 部署时还需要 C++ shim，见 <a href="aoti-cuda-deployment.html">PyTorch AOTI 的 CUDA C++ 部署链路</a> §9.4。</li>
 </ul>
 
-<h3 id="zh-sec4-7">4.7 <code>torch.library.opcheck</code>:自动验证一致性</h3>
+<h3 id="zh-sec4-7">4.7 opcheck 验证</h3>
 
 <p>完成 custom op 注册后，应执行 <code>opcheck</code> 验证注册契约：</p>
 
@@ -1726,13 +1726,13 @@ y.sum().backward()</pre>
 
 <hr>
 
-<h2 id="zh-sec5">5. 构建期自动化:torchgen</h2>
+<h2 id="zh-sec5">5. Torchgen 代码生成</h2>
 
 <p>ATen 算子的 schema、后端注册、C++ API 与 autograd wrapper 如果全部手写，会产生大量重复代码。PyTorch 因此把算子声明和微分公式放进 YAML，再在构建期生成注册与调用所需的 C++ 文件。</p>
 
 <p>这里有两套相互衔接但并不相同的生成入口。<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torchgen/gen.py"><code>torchgen/gen.py</code></a> 处理 ATen schema、tags 与 backend codegen；<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/tools/autograd/gen_autograd.py"><code>tools/autograd/gen_autograd.py</code></a> 读取微分公式并生成 autograd 相关代码。构建脚本负责依次调用它们，而不是由一个程序同时 join 三份 YAML。</p>
 
-<h3 id="zh-sec5-1">5.1 两套生成入口</h3>
+<h3 id="zh-sec5-1">5.1 生成入口</h3>
 
 <p>两条路径使用的输入和职责如下。入口关系可在 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/tools/setup_helpers/generate_code.py"><code>tools/setup_helpers/generate_code.py</code></a> 中核对。</p>
 
@@ -1748,11 +1748,11 @@ y.sum().backward()</pre>
 
 <p><code>native_functions.yaml</code> 是两条路径之间的共同契约：ATen codegen 用它确定算子及后端实现，autograd codegen 用同一份 schema 将 <code>derivatives.yaml</code> 中的公式绑定到对应 overload。两边生成的文件最终在 dispatcher 注册表中汇合。</p>
 
-<h3 id="zh-sec5-2">5.2 产物清单与对应宏</h3>
+<h3 id="zh-sec5-2">5.2 生成产物</h3>
 
 <p>生成文件主要位于 <code>build/aten/src/ATen/</code> 和 <code>build/.../torch/csrc/autograd/generated/</code>；具体前缀由 build directory 决定。按用途可以分为以下几组:</p>
 
-<h4>(a) C++ API 层: 用户和 kernel 内部都会调</h4>
+<h4>(a) C++ API</h4>
 
 <table>
 <thead><tr><th>产物</th><th>内容</th></tr></thead>
@@ -1765,7 +1765,7 @@ y.sum().backward()</pre>
 </tbody>
 </table>
 
-<h4>(b) Dispatcher 注册：schema 与 kernel 的表项</h4>
+<h4>(b) Dispatcher 注册</h4>
 
 <table>
 <thead><tr><th>产物</th><th>用什么宏</th><th>注册了什么</th></tr></thead>
@@ -1780,7 +1780,7 @@ y.sum().backward()</pre>
 </tbody>
 </table>
 
-<h4>(c) Structured kernel / ufunc 真实数学</h4>
+<h4>(c) Structured Kernel 与 Ufunc</h4>
 
 <table>
 <thead><tr><th>产物</th><th>内容</th></tr></thead>
@@ -1790,7 +1790,7 @@ y.sum().backward()</pre>
 </tbody>
 </table>
 
-<h4>(d) Autograd: 反向相关</h4>
+<h4>(d) Autograd</h4>
 
 <table>
 <thead><tr><th>产物</th><th>用什么宏</th><th>内容</th></tr></thead>
@@ -1802,7 +1802,7 @@ y.sum().backward()</pre>
 </tbody>
 </table>
 
-<h4>(e) Python 绑定层</h4>
+<h4>(e) Python 绑定</h4>
 
 <table>
 <thead><tr><th>产物</th><th>内容</th></tr></thead>
@@ -1833,7 +1833,7 @@ PyTorch 内置算子的 codegen 产物与手写扩展共同使用 <code>TORCH_LI
 
 <p>这些生成产物将在 <code>aten::add</code> 的实际调用路径上依次出现。沿同一条路径观察,可以把 schema 注册、backend wrapper、autograd node 与 Python binding 对应到各自的运行阶段。</p>
 
-<h2 id="zh-sec6">6. 端到端追踪:<code>aten::add</code> on CUDA</h2>
+<h2 id="zh-sec6">6. <code>aten::add</code> 执行路径</h2>
 
 <p><code>aten::add.Tensor</code> 在 Dense CUDA 张量上的前向与反向,把 key 选择、schema、注册接口和 codegen 连接成一条完整执行路径。</p>
 
@@ -1846,7 +1846,7 @@ z.sum().backward()</pre>
 
 <p>在没有额外 mode、autocast 或 tensor subclass,且命中 Dense CUDA 实现的前提下,调用会从 Python 进入 dispatcher,经过 autograd 与 CUDA 实现,反向时由 autograd engine 执行生成的 backward node。下面九小节按 <code>v2.12.0</code> 的源码与 codegen 模板整理这条逻辑路径;生成文件的分片编号、wrapper 名称和实际命中的 kernel 仍可能随构建选项变化。</p>
 
-<h3 id="zh-sec6-1">6.1 起点:YAML 声明与微分公式</h3>
+<h3 id="zh-sec6-1">6.1 YAML 与微分公式</h3>
 
 <p><code>native_functions.yaml</code> 决定 schema 与 structured codegen，<code>derivatives.yaml</code> 提供 autograd 公式。后续示例均以这两处 <code>v2.12.0</code> 声明为依据。</p>
 
@@ -1875,7 +1875,7 @@ z.sum().backward()</pre>
 
 <p>这些声明再加上 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/native/ufunc/add.h"><code>aten/src/ATen/native/ufunc/add.h</code></a> 中的标量运算，构成后续 codegen 的主要输入。设备检查、类型提升与 TensorIterator 行为还来自相应模板和运行时实现，不能只从这几行 YAML 推断。</p>
 
-<h3 id="zh-sec6-2">6.2 Python → C 绑定层</h3>
+<h3 id="zh-sec6-2">6.2 Python/C 绑定</h3>
 
 <p>调用入口是 <code>torch.add(x, y)</code>。CPython 解释器查到 <code>torch.add</code> 是一个 C 函数指针,随后进入 <code>THPVariable_add</code>。"THP" 前缀来自 <strong>T</strong>orch <strong>HP</strong>ython，是 PyTorch Python C 绑定采用的命名约定。它的源码生成在:</p>
 
@@ -1925,7 +1925,7 @@ at::Tensor _ops::add_Tensor::call(const at::Tensor&amp; self, const at::Tensor&a
 <strong>② 它隐藏了 schema lookup 的缓存。</strong><code>at::_ops::add_Tensor::call</code> 在第一次调用时找 schema(<code>create_add_Tensor_typed_handle()</code>),之后缓存。如果每次都 <code>Dispatcher::call</code> 都要先查 schema,性能会差很多。
 </div>
 
-<h3 id="zh-sec6-4">6.4 DispatchKeySet 的现场计算</h3>
+<h3 id="zh-sec6-4">6.4 DispatchKeySet 计算</h3>
 
 <p>进入 <code>Dispatcher::call</code>(<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/core/dispatch/Dispatcher.h"><code>Dispatcher.h:774-828</code></a>),核心两行:</p>
 
@@ -1957,7 +1957,7 @@ TORCH_LIBRARY_IMPL(aten, AutogradCUDA, m) {
 
 <p>以下用“autograd wrapper”称呼这个生成函数，避免把某一次构建中的局部名称当成跨版本接口。</p>
 
-<h3 id="zh-sec6-5">6.5 AutogradCUDA wrapper:建图与 redispatch</h3>
+<h3 id="zh-sec6-5">6.5 AutogradCUDA Wrapper</h3>
 
 <p>autograd wrapper 由 <code>derivatives.yaml</code> 与 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/tools/autograd/gen_variable_type.py#L1579-L1593"><code>gen_variable_type.py</code></a> 中的模板共同生成。下面是保留控制流的伪代码，具体局部变量名会随 codegen 变化：</p>
 
@@ -2005,7 +2005,7 @@ TORCH_LIBRARY_IMPL(aten, AutogradCUDA, m) {
 对这个生成 wrapper 而言，职责是准备反向节点、redispatch 到较低优先级实现，再把结果接入 autograd history；<code>add</code> 的数值计算位于后端实现。不同 backend 会注册到各自的 autograd key，不能据此推断所有算子都共享同一个 wrapper 符号。
 </div>
 
-<h3 id="zh-sec6-6">6.6 CUDA 后端 wrapper</h3>
+<h3 id="zh-sec6-6">6.6 CUDA 后端 Wrapper</h3>
 
 <p><code>at::redispatch::add</code> 把控制权交给 <code>Dispatcher::redispatch</code>。这次位图里 <code>AutogradCUDA</code> 已经清掉(被 <code>guard</code> 和 <code>after_autograd_keyset</code> 双重保险),<code>highestPriorityTypeId()</code> 返回 <code>CUDA</code>。</p>
 
@@ -2041,7 +2041,7 @@ functional wrapper 管理新输出，in-place wrapper 以 <code>self</code> 作�
 }</pre>
 </div>
 
-<h3 id="zh-sec6-7">6.7 Structured kernel 与 ufunc</h3>
+<h3 id="zh-sec6-7">6.7 Structured Kernel 与 Ufunc</h3>
 
 <p>三种 wrapper 最终都会进入同一份 generated structured <code>impl()</code>。以 out 变体为例：</p>
 
@@ -2114,7 +2114,7 @@ CPU 端的 <code>UfuncCPU_add.cpp</code> 同样包含 <code>ufunc/add.h</code>,�
 
 <p>前向<strong>结束</strong>。<code>z</code> 拿到手,它的 <code>.grad_fn</code> 是 <code>AddBackward0</code>。</p>
 
-<h3 id="zh-sec6-8">6.8 反向:<code>AddBackward0::apply</code></h3>
+<h3 id="zh-sec6-8">6.8 <code>AddBackward0::apply</code></h3>
 
 <p>用户接着调 <code>z.sum().backward()</code>。<code>backward()</code> 触发 autograd engine(<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/autograd/engine.cpp"><code>torch/csrc/autograd/engine.cpp</code></a>):</p>
 
@@ -2285,7 +2285,7 @@ other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))</p
 
 <p>源码路径说明了静态结构，运行时工具则用于确认某个构建中实际注册了哪些 kernel、一次调用选择了哪个 key。下面几种方法的观察范围不同，不能把教学 helper 的结果当作真实 C++ dispatcher 的完整 trace。</p>
 
-<h3 id="zh-sec7-1">7.1 观察调用与 redispatch:<code>TORCH_SHOW_DISPATCH_TRACE</code></h3>
+<h3 id="zh-sec7-1">7.1 Dispatch Trace</h3>
 
 <p>该开关在 C++ 侧读取并缓存，适合在启动 Python 进程前设置。v2.12.0 的格式由 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/core/dispatch/Dispatcher.cpp#L18-L34"><code>Dispatcher.cpp</code></a> 与 <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/core/dispatch/Dispatcher.h#L774-L867"><code>Dispatcher.h</code></a> 定义：</p>
 
@@ -2305,7 +2305,7 @@ z = x + y
   <li><code>[redispatch]</code> 表示 wrapper 用裁剪后的 key set 继续到 CUDA backend。</li>
 </ul>
 
-<h3 id="zh-sec7-2">7.2 检查注册表:<code>_dispatch_dump</code> 与 <code>_dispatch_dump_table</code></h3>
+<h3 id="zh-sec7-2">7.2 注册表检查</h3>
 
 <p>验证"某个 op 在 dispatcher 表里有哪些 kernel 注册":</p>
 
@@ -2329,7 +2329,7 @@ aten::add ...
 
 <p>自定义扩展装载后,这组接口可用于核对实际注册的 DispatchKey,并排查宏参数、key 名称或静态初始化是否符合预期。</p>
 
-<h3 id="zh-sec7-3">7.3 教学用 computed table:<code>PythonDispatcher</code></h3>
+<h3 id="zh-sec7-3">7.3 <code>PythonDispatcher</code></h3>
 
 <pre class="code">from torch._python_dispatcher import PythonDispatcher
 
@@ -2339,7 +2339,7 @@ print(dispatcher.computedTable())</pre>
 
 <p><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/_python_dispatcher.py"><code>torch._python_dispatcher.PythonDispatcher</code></a> 是简化的 computed-table 教学工具，不会让用户单步执行真实 C++ dispatch，也不包含某次调用的完整 TLS 与 tensor key set。</p>
 
-<h3 id="zh-sec7-4">7.4 C++ 断点的边界</h3>
+<h3 id="zh-sec7-4">7.4 C++ 断点</h3>
 
 <p>当 Python tracing 不够,需要进 C++ 看具体内存状态时,常用断点:</p>
 
@@ -2356,7 +2356,7 @@ print(dispatcher.computedTable())</pre>
 
 <p class="callout">关于 Python 端的 <code>torch.library</code>、<code>register_fake</code> 与 <code>opcheck</code>，详见 <a href="#zh-sec4">§4</a>。</p>
 
-<h2 id="zh-sec8">8. 历史资料的版本边界</h2>
+<h2 id="zh-sec8">8. 版本差异</h2>
 
 <p>PyTorch dispatcher 的接口和 key 表示经历过多次重构,早期资料中的部分 API 名称已经变化。下面的兼容性表把常见旧称映射到本文采用的 v2.12.0 表述。</p>
 
@@ -2397,7 +2397,7 @@ print(dispatcher.computedTable())</pre>
 
 <div class="lang-en">
 
-<h1>PyTorch Dispatcher: Multidimensional Dispatch and Operator Execution</h1>
+<h1>PyTorch Dispatcher</h1>
 
 <p>Python exposes a single <code>torch.add</code>, yet one invocation may be affected by device, layout, autograd, tensor subclasses, and thread-local modes at the same time. The dispatcher sits between the Python/C++ APIs and concrete kernels, mapping one operator schema onto these composable behavior layers.</p>
 
@@ -2405,11 +2405,11 @@ print(dispatcher.computedTable())</pre>
 
 <p class="small">Implementation details were checked against the public <a href="https://github.com/pytorch/pytorch/tree/v2.12.0">PyTorch <code>v2.12.0</code> source</a>. File names, generated symbols, and internal APIs change across releases. The Chapter 6 call chain is a source-reading model for the stated inputs, not a stable cross-version API or a path covering every tensor layout, mode, and build configuration.</p>
 
-<h2 id="en-sec1">1. Dispatch keys: foundation of runtime multi-dimensional dispatch</h2>
+<h2 id="en-sec1">1. Dispatch keys</h2>
 
 <p>The runtime model has three steps: construct a key set from tensor arguments and thread-local state, select the highest-priority runtime key, and call the kernel registered for that operator and key. A wrapper kernel narrows the key set and redispatches until execution reaches the backend kernel that performs numerical work.</p>
 
-<h3 id="en-sec1-1">1.1 Engineering constraints of multidimensional dispatch</h3>
+<h3 id="en-sec1-1">1.1 Multidimensional dispatch constraints</h3>
 
 <p>An ordinary <code>y = x + 1</code> already contains a runtime device choice. For a dense CPU float32 tensor with no gradient history, the numerical work reduces to <code>y[i] = x[i] + 1</code>. A system supporting only CPU and CUDA could express that single dimension with one branch:</p>
 
@@ -2457,7 +2457,7 @@ Tensor run_op(const Tensor&amp; x, const Tensor&amp; y) {
 A new backend <code>Foo</code> registers kernels for the operators it supports. Operators without a <code>Foo</code> implementation follow an explicit fallback or error path, so extension coverage is represented by registrations rather than branches spread across operator bodies.
 </div>
 
-<h3 id="en-sec1-2">1.2 A key-indexed function table</h3>
+<h3 id="en-sec1-2">1.2 Dispatch table</h3>
 
 <p>PyTorch moves runtime path selection out of operator implementations and into a lookup table indexed by dispatch key.</p>
 
@@ -2556,7 +2556,7 @@ AutocastCUDA         →  fallthrough
 A virtual table selects a method from the dynamic type of one receiver. Dispatcher candidates instead come from the union of all tensor arguments and thread-local state. <code>std::function</code> stores a type-erased callable, but it does not provide operator schemas, key priority, fallback rules, or redispatch. PyTorch therefore needs an operator-level registry with composable runtime selection rather than a particular C++ callable container.
 </div>
 
-<h3 id="en-sec1-3">1.3 The actual DispatchKey enum</h3>
+<h3 id="en-sec1-3">1.3 DispatchKey enumeration</h3>
 
 <p><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/c10/core/DispatchKey.h"><code>c10/core/DispatchKey.h</code></a> defines every dispatch key. The simplified enumeration below shows the functional layers; §1.4 then introduces the actual two-dimensional split between functionality and backend.</p>
 
@@ -2607,7 +2607,7 @@ enum class DispatchKey : uint16_t {
 An ordinary CPU tensor remains autograd-capable even when <code>requires_grad=False</code>, so its runtime path can still select AutogradCPU before CPU. The wrapper then observes that no history is required and redispatches without creating <code>AddBackward0</code>. Changing <code>requires_grad</code> affects graph construction inside the wrapper, not whether the autograd layer exists in the tensor key set.
 </div>
 
-<h3 id="en-sec1-4">1.4 Two-dimensional split: functionality × backend</h3>
+<h3 id="en-sec1-4">1.4 Functionality and backend</h3>
 
 <p>Expanding every behavior/backend pair directly would make the enum grow as the product of both dimensions. Adding Habana (HPU), for example, would require entries such as:</p>
 
@@ -2649,7 +2649,7 @@ A sparse implementation for the Habana (HPU) backend uses the combined <code>(Sp
 ezyang's 2019 <a href="https://blog.ezyang.com/2019/05/pytorch-internals/">PyTorch internals</a> does not have the BackendComponent layer, and neither does the 2020 dispatcher article. The <strong>two-dimensional split described in this section is the post-2022 mechanism</strong>; when reading older articles, note that this has shifted: they treat <code>SparseCUDA</code> as a concrete enum value, whereas in today's code it is the combination <code>(Sparse, CUDABit)</code>.
 </div>
 
-<h3 id="en-sec1-5">1.5 DispatchKeySet: a 64-bit bitmap</h3>
+<h3 id="en-sec1-5">1.5 DispatchKeySet bitmap</h3>
 
 <p><code>DispatchKeySet</code> encodes functionalities and up to 16 <code>BackendComponent</code> values in a <code>uint64_t</code>. Each operator call uses this 64-bit value as its candidate-key set before lookup selects the highest-priority entry.</p>
 
@@ -2733,7 +2733,7 @@ Let <code>x</code> and <code>y</code> be CUDA fp32 tensors, and run <code>z = to
 Compare with the "peeling the onion" diagram in §1.2: this is exactly that diagram's initial bitmap.
 </div>
 
-<h3 id="en-sec1-6">1.6 The priority ladder</h3>
+<h3 id="en-sec1-6">1.6 Key priority</h3>
 
 <p>Given a 64-bit bitmap, the dispatcher uses <code>highestPriorityTypeId()</code> to take "the functionality corresponding to the highest 1 bit." "Highest" means the highest-numbered set bit: <strong>functionality bits are arranged by priority, with bit number = priority</strong>.</p>
 
@@ -2801,7 +2801,7 @@ Compare with the "peeling the onion" diagram in §1.2: this is exactly that diag
 
 <p>Alias registrations participate in computed-table filling and precedence. A concrete lookup still resolves entries such as <code>AutogradCUDA</code> or <code>CUDA</code>. The v2.12.0 rules are implemented in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/core/dispatch/OperatorEntry.cpp#L348-L435"><code>OperatorEntry.cpp</code></a>.</p>
 
-<h3 id="en-sec1-7">1.7 redispatch: cycle-free inter-layer recursion</h3>
+<h3 id="en-sec1-7">1.7 Redispatch</h3>
 
 <p>After a wrapper finishes its work, control must move to the next lower-priority key without selecting the same wrapper again. Redispatch performs that transition with a key set supplied by the caller.</p>
 
@@ -2873,7 +2873,7 @@ Walk through this code for <code>z = x + y</code> (with <code>x, y</code> on CUD
 One operator invocation may select several dispatcher entries. Functionality bit order determines the layers; each wrapper uses an RAII guard and an explicit mask to remove itself before redispatch selects the next highest-priority key.
 </div>
 
-<h2 id="en-sec2">2. Schema: the operator type signature</h2>
+<h2 id="en-sec2">2. Operator schemas</h2>
 
 <p>Runtime key selection requires a stable operator identity and argument contract. A schema records the arguments, return values, overload, aliasing, and mutation semantics of <code>aten::add.Tensor</code>, allowing the dispatcher and its surrounding tools to interpret the same call.</p>
 
@@ -2881,7 +2881,7 @@ One operator invocation may select several dispatcher entries. Functionality bit
 
 <p>This section covers the schema's string grammar, variant naming rules, and concrete representation in YAML.</p>
 
-<h3 id="en-sec2-1">2.1 Schema field semantics</h3>
+<h3 id="en-sec2-1">2.1 Schema fields</h3>
 
 <p>Take a real schema string:</p>
 
@@ -2948,7 +2948,7 @@ The return <strong>has no</strong> alias annotation → it's a freshly allocated
 
 <p>At registration time, this string is parsed by <code>torch::jit::parseSchema</code> into a <code>c10::FunctionSchema</code> struct that records each argument's name, type, alias info, and default value; only then is it registered into the dispatcher's internal op table. So the "schema string" is the source of truth, and <code>FunctionSchema</code> is its in-memory representation.</p>
 
-<h3 id="en-sec2-2">2.2 Three variants: functional / in-place / out</h3>
+<h3 id="en-sec2-2">2.2 Functional, in-place, and out</h3>
 
 <p>Many operators have "side-effect" capabilities (in-place mutation, writing into a preallocated out tensor). PyTorch gives such operators <strong>three schema variants simultaneously</strong>, functionally equivalent but with different interfaces. Look at the three variants of <code>add</code>:</p>
 
@@ -2996,7 +2996,7 @@ Some op authors only write the functional variant and tell codegen to "fill in t
 On seeing <code>autogen:</code>, codegen can generate the requested schemas and wrappers according to the operator family. The direction of delegation depends on the source variant and must not be reduced to a universal "out wraps functional" rule.
 </div>
 
-<h3 id="en-sec2-3">2.3 native_functions.yaml: bulk declaration</h3>
+<h3 id="en-sec2-3">2.3 native_functions.yaml</h3>
 
 <p>Most schemas for PyTorch's built-in operators are declared in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/native/native_functions.yaml"><code>aten/src/ATen/native/native_functions.yaml</code></a>. Each YAML entry includes the schema and metadata consumed by build-time code generation:</p>
 
@@ -3067,7 +3067,7 @@ On seeing <code>autogen:</code>, codegen can generate the requested schemas and 
 Without structured codegen, the functional, in-place, and out variants each repeat output creation, resizing, device checks, and implementation calls. That glue can drift as the variants evolve. A <strong>structured kernel</strong> separates common work into <code>meta()</code> and <code>impl()</code>, then codegen emits a wrapper for each variant. The wrappers share implementation logic and output constraints; the functional schema does not redispatch to the out schema.
 </div>
 
-<h3 id="en-sec2-4">2.4 derivatives.yaml: backward formulas</h3>
+<h3 id="en-sec2-4">2.4 derivatives.yaml</h3>
 
 <p>So far the schema only describes "forward behavior." <strong>Backward (autograd) information lives in another file</strong>: <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/tools/autograd/derivatives.yaml"><code>tools/autograd/derivatives.yaml</code></a>. Each differentiable op gets a backward formula here:</p>
 
@@ -3116,7 +3116,7 @@ The generated expression preserves the YAML formula and adds an output-requireme
 The schema is a shared contract for the dispatcher, autograd, JIT, functionalization, and Python bindings, with alias annotations carrying storage-sharing and mutation semantics. <code>native_functions.yaml</code> records operator declarations and <code>derivatives.yaml</code> records differentiation formulas; the ATen and autograd generators consume them separately and meet in generated registrations and wrappers.
 </div>
 
-<h2 id="en-sec3">3. The C++ registration interface: the TORCH_LIBRARY family</h2>
+<h2 id="en-sec3">3. C++ registration</h2>
 
 <p>Once a schema establishes the operator contract, registration associates that contract with implementations in the dispatcher. The <code>TORCH_LIBRARY</code> family in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/library.h"><code>torch/library.h</code></a> declares schemas, extends namespaces, and attaches kernels to existing operators.</p>
 
@@ -3128,7 +3128,7 @@ Their common mechanism is a file-static initializer that registers information w
 
 <p>The three forms differ in whether they define a namespace and schema, extend an existing namespace, or attach a kernel for a dispatch key. That distinction also provides the context for boxed and unboxed calls, fallback and fallthrough, and the relationship between <code>def</code> and <code>impl</code>.</p>
 
-<h3 id="en-sec3-1">3.1 The three identities of Library: DEF / FRAGMENT / IMPL</h3>
+<h3 id="en-sec3-1">3.1 Library registration types</h3>
 
 <p>The central registration object is <code>torch::Library</code>. Each <code>TORCH_LIBRARY*</code> macro constructs a <code>Library</code> instance whose <code>Kind</code> has three forms (<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/library.h"><code>torch/library.h:551-553</code></a>):</p>
 
@@ -3166,7 +3166,7 @@ Schema and a catch-all kernel may share a DEF block through <code>m.def(...)</co
 The three macros encode different <code>Library::Kind</code> values and argument contracts. DEF declares a namespace and carries no block-level DispatchKey; IMPL normally carries one; FRAGMENT and IMPL use <code>C10_UID</code> so multiple initializers can coexist in a translation unit. Namespace uniqueness is checked when DEF reaches <code>Dispatcher::registerLibrary</code>, while symbol uniquification keeps generated initializer names distinct.
 </div>
 
-<h3 id="en-sec3-2">3.2 TORCH_LIBRARY: opening a new namespace</h3>
+<h3 id="en-sec3-2">3.2 TORCH_LIBRARY</h3>
 
 <p>Look at the actual <code>TORCH_LIBRARY</code> macro (<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/library.h"><code>torch/library.h:982-991</code></a>):</p>
 
@@ -3229,7 +3229,7 @@ Once this code is compiled and linked into the Python process, <code>torch.ops.m
 <strong>Namespace constraint:</strong> a process may contain only one <code>TORCH_LIBRARY(ns, ...)</code> DEF for a namespace. A second DEF triggers an error during registration. Registrations split across multiple .cpp files use <code>TORCH_LIBRARY_FRAGMENT</code>.
 </div>
 
-<h3 id="en-sec3-3">3.3 TORCH_LIBRARY_FRAGMENT: extending the same namespace</h3>
+<h3 id="en-sec3-3">3.3 TORCH_LIBRARY_FRAGMENT</h3>
 
 <p>FRAGMENT addresses the "same namespace across multiple files" need. Look at the macro (<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/library.h"><code>torch/library.h:1001-1023</code></a>, simplified):</p>
 
@@ -3284,7 +3284,7 @@ Both files coexist; each <code>TorchLibraryInit</code> runs before main and adds
 The process still permits at most one <code>TORCH_LIBRARY(myops, ...)</code> DEF. In v2.12.0, FRAGMENT itself may define operators without a preceding DEF; only DEF invokes <code>registerLibrary</code> for namespace uniqueness, while FRAGMENT rejects the wildcard namespace and proceeds with operator registration. The relevant branch is documented in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/core/library.cpp#L82-L114"><code>library.cpp</code></a>.
 </div>
 
-<h3 id="en-sec3-4">3.4 TORCH_LIBRARY_IMPL: attaching a kernel</h3>
+<h3 id="en-sec3-4">3.4 TORCH_LIBRARY_IMPL</h3>
 
 <p>The schema is the "declaration"; the kernel is the "implementation." <code>TORCH_LIBRARY_IMPL</code> is the macro for <strong>attaching a kernel for a given DispatchKey to an existing op</strong> (<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/library.h"><code>torch/library.h:1064-1084</code></a>, simplified):</p>
 
@@ -3339,7 +3339,7 @@ TORCH_LIBRARY_IMPL(_, AutogradCUDA, m) {
 Meaning: for any namespace, an operator without a more specific AutogradCUDA entry can reach this backend fallback. It does not synthesize a correct derivative. The v2.12.0 source explicitly describes it as an error-checking passthrough rather than a proper autograd implementation; custom operators need an autograd formula or a differentiable <code>CompositeImplicitAutograd</code> composition. See <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/core/VariableFallbackKernel.cpp#L5-L16"><code>VariableFallbackKernel.cpp</code></a>.
 </div>
 
-<h3 id="en-sec3-5">3.5 m.def vs m.impl semantics</h3>
+<h3 id="en-sec3-5">3.5 m.def and m.impl</h3>
 
 <p><code>m.def</code> and <code>m.impl</code> are the two most-used methods on the <code>Library</code> object. Their responsibilities are completely different:</p>
 
@@ -3380,7 +3380,7 @@ Tensor(const Tensor&amp;, int): but the schema declares type Tensor(Tensor, Tens
 The schema remains the registration contract, and every kernel signature must be compatible with it.
 </div>
 
-<h3 id="en-sec3-6">3.6 Boxed vs unboxed call paths</h3>
+<h3 id="en-sec3-6">3.6 Boxed and unboxed calls</h3>
 
 <p>Dispatcher lookup returns a <code>KernelFunction</code>, which selects an unboxed or boxed path according to whether the call site has a static type signature. The unboxed path uses typed C++ parameters; the boxed path uses the uniform IValue stack ABI.</p>
 
@@ -3433,7 +3433,7 @@ m.fallback(torch::CppFunction::makeFromBoxedFunction&lt;&amp;my_boxed_fallback&g
 <strong>Operational boundary:</strong> an extension layer can be activated by TLS or tensor keys, while fallthrough registrations identify operators that require no work from that layer. The condition therefore lives in the registration model instead of being repeated at every operator call site.
 </div>
 
-<h3 id="en-sec3-8">3.8 Complete registration path for a custom op</h3>
+<h3 id="en-sec3-8">3.8 Custom-operator registration</h3>
 
 <p>The preceding registration rules combine into a complete operator path. The following custom <code>relu</code> provides CPU, CUDA, and autograd implementations across four .cpp files:</p>
 
@@ -3552,11 +3552,11 @@ TORCH_LIBRARY_IMPL(myops, CompositeImplicitAutograd, m) {
 A composite implementation can reside in one .cpp file because its inner <code>at::clamp_min</code> call goes through the dispatcher and supplies backend routing and autograd behavior. Operators expressed entirely through existing differentiable operators can use this form. A native implementation that directly launches its own CUDA kernel instead needs explicit backend and autograd registrations such as the four-file pattern in §3.8.
 </div>
 
-<h2 id="en-sec4">4. Python registration: <code>torch.library</code> and <code>register_fake</code></h2>
+<h2 id="en-sec4">4. Python registration</h2>
 
 <p>Python's <code>torch.library</code> and the C++ <code>TORCH_LIBRARY</code> family write to the same <code>c10::Dispatcher</code> registry, while exposing different APIs and registration lifetimes. The comparison below connects their entry points and explains the abstract semantics that <code>register_fake</code> supplies to meta inference, Dynamo, export, Inductor, and AOTI.</p>
 
-<h3 id="en-sec4-1">4.1 Two Python APIs: <code>Library</code> and <code>custom_op</code></h3>
+<h3 id="en-sec4-1">4.1 <code>Library</code> and <code>custom_op</code></h3>
 
 <p>PyTorch provides the low-level <code>Library</code> API and the higher-level <code>custom_op</code> API. The latter coordinates several registrations, but its behavior is broader than a line-by-line expansion of the former:</p>
 
@@ -3580,7 +3580,7 @@ A composite implementation can reside in one .cpp file because its inner <code>a
 
 <p>Both APIs write to the same dispatcher. <code>custom_op</code> suits operators whose boundary is a Python callable; <code>Library</code> exposes finer control over library kind, dispatch key, and registration lifetime. The v2.12.0 initialization flow is visible in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/_library/custom_ops.py#L635-L669"><code>custom_ops.py</code></a>.</p>
 
-<h3 id="en-sec4-2">4.2 Schema syntax is shared with C++</h3>
+<h3 id="en-sec4-2">4.2 Schema syntax</h3>
 
 <p>The Python-side schema string and the C++ <code>m.def("...")</code> string go through <strong>the same parser</strong>: <code>torch::jit::parseSchema(str)</code> in <code>aten/src/ATen/core/function_schema_parser.cpp</code>, producing a <code>c10::FunctionSchema</code> that is registered with the dispatcher.</p>
 
@@ -3611,7 +3611,7 @@ lib.define(<span class="cm">"scale_add(Tensor x, float scale, Tensor bias) -&gt;
   </tbody>
 </table>
 
-<h3 id="en-sec4-3">4.3 Three core registrations: <code>register_kernel</code>, <code>register_fake</code>, <code>register_autograd</code></h3>
+<h3 id="en-sec4-3">4.3 Kernel, fake, and autograd registration</h3>
 
 <p>Each maps to a specific DispatchKey, matching the §1.3 / §3.4 tables:</p>
 
@@ -3651,11 +3651,11 @@ lib.define(<span class="cm">"scale_add(Tensor x, float scale, Tensor bias) -&gt;
   </tbody>
 </table>
 
-<h3 id="en-sec4-4">4.4 Abstract execution with Meta and FakeTensor</h3>
+<h3 id="en-sec4-4">4.4 Meta and FakeTensor</h3>
 
 <p>Meta belongs to the Dense backend family alongside CPU and CUDA. A meta tensor carries shape, stride, and dtype information without readable numerical storage. <code>FakeTensorMode</code> intercepts operators in Python and uses Meta kernels, decompositions, or dedicated fake logic to propagate metadata while preserving a simulated device. The discussion here describes the common v2.12.0 path, not the only implementation used by every compiler pass.</p>
 
-<h4>4.4.1 Where Meta sits in the dispatcher table</h4>
+<h4>4.4.1 Meta key</h4>
 
 <p>Following the DispatchKey table from §1.3, Meta is in the same row as CPU / CUDA / XPU, a backend key with value roughly <code>DispatchKey::Meta</code>. It is normal for one op to carry CPU, CUDA, and Meta entries side by side: when a meta tensor passes through the dispatcher, the computed DispatchKeySet's backend bit is Meta, and routing lands on this entry.</p>
 
@@ -3670,7 +3670,7 @@ lib.define(<span class="cm">"scale_add(Tensor x, float scale, Tensor bias) -&gt;
 
 <p>Many structured native operators receive generated Meta wrappers whose <code>meta()</code> logic determines output metadata. Other operators use handwritten Meta kernels or decompositions. Python custom operators normally require a fake implementation, although a small set of schemas can derive trivial fake behavior.</p>
 
-<h4>4.4.2 FakeTensor: a thin wrapper above the Meta key</h4>
+<h4>4.4.2 FakeTensor wrapper</h4>
 
 <p>Compilation and export commonly use <strong><code>FakeTensor</code></strong> (<code>torch._subclasses.fake_tensor.FakeTensor</code>), a <code>__torch_dispatch__</code> tensor subclass managed by <code>FakeTensorMode</code>. Its relationship to a bare meta tensor is summarized below.</p>
 
@@ -3687,7 +3687,7 @@ lib.define(<span class="cm">"scale_add(Tensor x, float scale, Tensor bias) -&gt;
 
 <p>On a common path, FakeTensorMode executes an operator with tensors that carry no real data, using a Meta kernel or decomposition and retaining the simulated device on the result. A Meta kernel is often important for compatibility, but data-dependent shapes, aliasing, and dedicated fake handlers can require additional logic.</p>
 
-<h4>4.4.3 Registration target of <code>register_fake</code></h4>
+<h4>4.4.3 <code>register_fake</code> target</h4>
 
 <p><code>register_fake(fn)</code> stores the Python function in a fake-implementation holder and installs a constructed wrapper at the <strong><code>Meta</code></strong> key:</p>
 
@@ -3701,7 +3701,7 @@ lib.impl(<span class="cm">"myops::scale_add"</span>, constructed_meta_wrapper, <
 
 <p>The API name describes the registered FakeTensor behavior, while the implementation layer attaches its wrapper to Meta. The v2.12.0 registration and conflict checks are in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/_library/fake_impl.py#L35-L85"><code>torch/_library/fake_impl.py</code></a>.</p>
 
-<h4>4.4.4 Metadata propagation in <code>torch.export</code></h4>
+<h4>4.4.4 Metadata propagation</h4>
 
 <p>The following is a simplified view of the FakeTensor-related part of <code>torch.export.export(model, example_inputs)</code>:</p>
 
@@ -3738,7 +3738,7 @@ torch.export.save(exported_program, <span class="cm">"model.pt2"</span>)</pre>
 
 <p><code>torch.export.export</code> and <code>torch.export.save</code> are separate APIs; the latter writes the <code>.pt2</code> archive. The corresponding entry points are visible in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/export/__init__.py#L211-L272"><code>torch/export/__init__.py</code></a>.</p>
 
-<h4>4.4.5 Implementation constraints of <code>register_fake</code></h4>
+<h4>4.4.5 <code>register_fake</code> constraints</h4>
 
 <ul>
   <li><strong>Compose PyTorch operators without reading storage or data.</strong> Calls such as <code>x.mul(2)</code>, <code>torch.add(x, y)</code>, and <code>x * 2</code> continue under FakeTensorMode. Operations such as <code>data_ptr()</code>, <code>.item()</code>, or Python branches driven by tensor values cross the fake implementation boundary. The public API contract requires a fake implementation to consist of PyTorch operations and forbids direct access to input or intermediate tensor storage.</li>
@@ -3758,7 +3758,7 @@ torch.export.save(exported_program, <span class="cm">"model.pt2"</span>)</pre>
   <li><strong>The output dtype must follow the real type-promotion rules.</strong> Use <code>torch.promote_types</code> or equivalent PyTorch operations to derive it; unconditionally returning <code>x.dtype</code> can make the abstract output disagree with the numerical kernel.</li>
 </ul>
 
-<h4>4.4.6 Common failure modes</h4>
+<h4>4.4.6 Common errors</h4>
 
 <pre class="code"><span class="cm"># Incorrect case 1: reading tensor data to determine output shape</span>
 @my_op.register_fake
@@ -3801,7 +3801,7 @@ torch.export.save(exported_program, <span class="cm">"model.pt2"</span>)</pre>
     <span class="kw">return</span> [torch.empty((chunk,) + x.shape[1:], dtype=x.dtype, device=x.device)
             <span class="kw">for</span> _ <span class="kw">in</span> <span class="kw">range</span>(n)]</pre>
 
-<h4>4.4.7 Other Meta-adjacent hooks on the export path</h4>
+<h4>4.4.7 Export extension hooks</h4>
 
 <p>Besides <code>register_fake</code>, there are a few hook points related to Meta inference that are easy to confuse:</p>
 
@@ -3833,7 +3833,7 @@ torch.export.save(exported_program, <span class="cm">"model.pt2"</span>)</pre>
 
 <p>A custom operator that participates in FakeTensor-based tracing normally supplies <code>register_fake</code> rather than modifying FakeTensor's internal tables. Training requires a separate autograd registration, while compiled execution may also require a decomposition or backend lowering; the fake implementation covers abstract semantics only.</p>
 
-<h3 id="en-sec4-5">4.5 Python registration and the shared C++ dispatcher</h3>
+<h3 id="en-sec4-5">4.5 Python and C++ registry</h3>
 
 <p>The Python APIs manage registration handles and Python callables while writing to the same <code>torch::Library</code> and <code>c10::Dispatcher</code> registry used by C++ code. The following sketch preserves the stable boundary without treating internal binding names as public APIs:</p>
 
@@ -3865,7 +3865,7 @@ c10::Dispatcher::singleton().registerImpl(
   <li>Invoking the Python kernel enters the Python runtime and usually adds overhead relative to a pure C++ kernel. A migration decision should be based on operator-level profiling for the target workload. The v2.12.0 boundary from Python <code>Library.impl</code> to its C++ binding is visible in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/library.py#L283-L366"><code>torch/library.py</code></a>.</li>
 </ul>
 
-<h3 id="en-sec4-6">4.6 Complete Python registration of a custom op</h3>
+<h3 id="en-sec4-6">4.6 Python custom operators</h3>
 
 <p>The C++ version of <code>myops::custom_relu</code> in §3.8 registers schema, backend, and autograd behavior separately. Python can express the same operator contract in one file:</p>
 
@@ -3917,7 +3917,7 @@ y.sum().backward()</pre>
   <li>Cannot run outside a Python runtime; AOTI deployment needs an extra C++ shim (see <a href="aoti-cuda-deployment.html">PyTorch AOTI deployment to a CUDA C++ runtime</a>, §9.4).</li>
 </ul>
 
-<h3 id="en-sec4-7">4.7 <code>torch.library.opcheck</code>: automatic invariant verification</h3>
+<h3 id="en-sec4-7">4.7 opcheck validation</h3>
 
 <p>After registering a custom op, run <code>opcheck</code>:</p>
 
@@ -3939,13 +3939,13 @@ y.sum().backward()</pre>
 
 <hr>
 
-<h2 id="en-sec5">5. Build-time automation: torchgen</h2>
+<h2 id="en-sec5">5. Torchgen code generation</h2>
 
 <p>Hand-writing the schema, backend registrations, C++ API, and autograd wrapper for every ATen operator would produce a large volume of repetitive code. PyTorch instead records operator declarations and derivative formulas in YAML and generates the C++ registration and call surfaces at build time.</p>
 
 <p>Two related generators are involved. <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torchgen/gen.py"><code>torchgen/gen.py</code></a> handles ATen schemas, tags, and backend codegen. <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/tools/autograd/gen_autograd.py"><code>tools/autograd/gen_autograd.py</code></a> reads derivative definitions and emits autograd code. The build invokes them in sequence; a single program does not join all three YAML files.</p>
 
-<h3 id="en-sec5-1">5.1 Two generation entry points</h3>
+<h3 id="en-sec5-1">5.1 Generation entry points</h3>
 
 <p>Their inputs and responsibilities can be checked in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/tools/setup_helpers/generate_code.py"><code>tools/setup_helpers/generate_code.py</code></a>:</p>
 
@@ -3961,11 +3961,11 @@ y.sum().backward()</pre>
 
 <p><code>native_functions.yaml</code> is the shared contract between the two paths. ATen codegen uses it to define operators and backend implementations; autograd codegen uses the same schemas to bind entries from <code>derivatives.yaml</code> to the correct overload. Their generated outputs meet in the dispatcher registration table.</p>
 
-<h3 id="en-sec5-2">5.2 Output inventory and corresponding macros</h3>
+<h3 id="en-sec5-2">5.2 Generated artifacts</h3>
 
 <p>Generated files primarily land in <code>build/aten/src/ATen/</code> and <code>build/.../torch/csrc/autograd/generated/</code>; the exact prefix depends on the build directory. They can be grouped by purpose:</p>
 
-<h4>(a) C++ API layer: called by users and by kernels internally</h4>
+<h4>(a) C++ API</h4>
 
 <table>
 <thead><tr><th>Artifact</th><th>Content</th></tr></thead>
@@ -3978,7 +3978,7 @@ y.sum().backward()</pre>
 </tbody>
 </table>
 
-<h4>(b) Dispatcher registration: the artifacts that feed schemas and kernels to the dispatcher</h4>
+<h4>(b) Dispatcher registration</h4>
 
 <table>
 <thead><tr><th>Artifact</th><th>Macro used</th><th>What's registered</th></tr></thead>
@@ -3993,7 +3993,7 @@ y.sum().backward()</pre>
 </tbody>
 </table>
 
-<h4>(c) Structured kernel / ufunc actual math</h4>
+<h4>(c) Structured kernels and ufuncs</h4>
 
 <table>
 <thead><tr><th>Artifact</th><th>Content</th></tr></thead>
@@ -4003,7 +4003,7 @@ y.sum().backward()</pre>
 </tbody>
 </table>
 
-<h4>(d) Autograd: backward-related</h4>
+<h4>(d) Autograd</h4>
 
 <table>
 <thead><tr><th>Artifact</th><th>Macro used</th><th>Content</th></tr></thead>
@@ -4015,7 +4015,7 @@ y.sum().backward()</pre>
 </tbody>
 </table>
 
-<h4>(e) Python binding layer</h4>
+<h4>(e) Python bindings</h4>
 
 <table>
 <thead><tr><th>Artifact</th><th>Content</th></tr></thead>
@@ -4046,7 +4046,7 @@ Code-generated built-in operators and handwritten extensions both reach the disp
 
 <p>These generated artifacts appear at distinct points along the <code>aten::add</code> call path. Following one invocation connects schema registration, backend wrappers, autograd nodes, and Python bindings to their runtime stages.</p>
 
-<h2 id="en-sec6">6. End-to-end trace: <code>aten::add</code> on CUDA</h2>
+<h2 id="en-sec6">6. <code>aten::add</code> execution path</h2>
 
 <p>Forward and backward execution of <code>aten::add.Tensor</code> on Dense CUDA tensors connects key selection, schemas, registration interfaces, and code generation in one concrete path.</p>
 
@@ -4059,7 +4059,7 @@ The trace follows the principal C++ wrappers, dispatcher slots, and CUDA impleme
 
 <p>Assuming no additional mode, autocast, or tensor subclass, and a Dense CUDA implementation, the call enters the dispatcher from Python, passes through autograd and the CUDA implementation, and later reaches a generated backward node through the autograd engine. The nine subsections below organize that logical path from the <code>v2.12.0</code> source and codegen templates; generated shard numbers, wrapper names, and the selected kernel can still vary with build options.</p>
 
-<h3 id="en-sec6-1">6.1 Starting point: YAML declarations and derivative formulas</h3>
+<h3 id="en-sec6-1">6.1 YAML and derivative formulas</h3>
 
 <p><code>native_functions.yaml</code> determines the schema and structured codegen, while <code>derivatives.yaml</code> supplies the autograd formulas. The following v2.12.0 entries anchor the trace.</p>
 
@@ -4088,7 +4088,7 @@ The trace follows the principal C++ wrappers, dispatcher slots, and CUDA impleme
 
 <p>These declarations and <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/native/ufunc/add.h"><code>aten/src/ATen/native/ufunc/add.h</code></a> provide the main codegen inputs. Device checks, type promotion, and TensorIterator behavior also come from templates and runtime code, so the YAML alone is not a complete specification of execution.</p>
 
-<h3 id="en-sec6-2">6.2 Python → C binding layer</h3>
+<h3 id="en-sec6-2">6.2 Python/C bindings</h3>
 
 <p>The call begins at <code>torch.add(x, y)</code>. CPython resolves <code>torch.add</code> to a C function pointer and enters <code>THPVariable_add</code>. The "THP" prefix comes from <strong>T</strong>orch <strong>HP</strong>ython and is PyTorch's naming convention for Python C bindings. Its source is generated at:</p>
 
@@ -4138,7 +4138,7 @@ The forwarding layer has two stable responsibilities:<br>
 <strong>② It hides the schema-lookup cache.</strong> <code>at::_ops::add_Tensor::call</code> looks up the schema on the first call (<code>create_add_Tensor_typed_handle()</code>) and caches it. If every call went straight to <code>Dispatcher::call</code> and had to look up the schema each time, performance would degrade significantly.
 </div>
 
-<h3 id="en-sec6-4">6.4 On-the-fly DispatchKeySet computation</h3>
+<h3 id="en-sec6-4">6.4 DispatchKeySet computation</h3>
 
 <p>Entering <code>Dispatcher::call</code> (<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/core/dispatch/Dispatcher.h"><code>Dispatcher.h:774-828</code></a>), the core is two lines:</p>
 
@@ -4170,7 +4170,7 @@ TORCH_LIBRARY_IMPL(aten, AutogradCUDA, m) {
 
 <p>The rest of this section calls it the “autograd wrapper” rather than treating one generated symbol name as a cross-version interface.</p>
 
-<h3 id="en-sec6-5">6.5 AutogradCUDA wrapper: graph construction and redispatch</h3>
+<h3 id="en-sec6-5">6.5 AutogradCUDA wrapper</h3>
 
 <p>The wrapper combines the <code>derivatives.yaml</code> entry with templates in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/tools/autograd/gen_variable_type.py#L1579-L1593"><code>gen_variable_type.py</code></a>. The following pseudocode preserves the control flow while avoiding build-specific local names:</p>
 
@@ -4218,7 +4218,7 @@ TORCH_LIBRARY_IMPL(aten, AutogradCUDA, m) {
 For this generated wrapper, the responsibilities are to prepare a backward node, redispatch to a lower-priority implementation, and attach the result to autograd history. The numerical work for <code>add</code> resides in the backend implementation. Different backends register their corresponding autograd entries, so this should not be read as a guarantee that every backend shares one wrapper symbol.
 </div>
 
-<h3 id="en-sec6-6">6.6 The CUDA backend wrapper</h3>
+<h3 id="en-sec6-6">6.6 CUDA backend wrapper</h3>
 
 <p><code>at::redispatch::add</code> hands control to <code>Dispatcher::redispatch</code>. This time <code>AutogradCUDA</code> has been cleared from the bitmap (doubly insured by <code>guard</code> and <code>after_autograd_keyset</code>), and <code>highestPriorityTypeId()</code> returns <code>CUDA</code>.</p>
 
@@ -4254,7 +4254,7 @@ The functional wrapper manages a new output, the in-place wrapper uses <code>sel
 }</pre>
 </div>
 
-<h3 id="en-sec6-7">6.7 Structured kernel and ufunc</h3>
+<h3 id="en-sec6-7">6.7 Structured kernels and ufuncs</h3>
 
 <p>All three wrappers eventually enter the same generated structured <code>impl()</code>. The out variant illustrates the wrapper shape:</p>
 
@@ -4327,7 +4327,7 @@ The CPU-side <code>UfuncCPU_add.cpp</code> includes the same header and drives t
 
 <p>Forward <strong>complete</strong>. <code>z</code> is in hand, with its <code>.grad_fn</code> set to <code>AddBackward0</code>.</p>
 
-<h3 id="en-sec6-8">6.8 Backward: <code>AddBackward0::apply</code></h3>
+<h3 id="en-sec6-8">6.8 <code>AddBackward0::apply</code></h3>
 
 <p>The subsequent <code>z.sum().backward()</code> call starts the autograd engine (<a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/csrc/autograd/engine.cpp"><code>torch/csrc/autograd/engine.cpp</code></a>):</p>
 
@@ -4376,7 +4376,7 @@ other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))</p
 
 <p>After <code>grad_inputs</code> returns, the engine follows <code>next_edges</code>. Non-leaf inputs point to the backward node that created them. A leaf that requires gradients has no <code>grad_fn</code>, but its downstream edge targets an internal <code>AccumulateGrad</code> node, which updates the leaf's <code>.grad</code>.</p>
 
-<h3 id="en-sec6-9">6.9 The complete call stack</h3>
+<h3 id="en-sec6-9">6.9 Complete call stack</h3>
 
 <p>The figure summarizes the main path from §6.1 through §6.8. Forward is on the left and backward on the right:</p>
 
@@ -4494,11 +4494,11 @@ other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))</p
 </svg>
 </div>
 
-<h2 id="en-sec7">7. Debugging and verification</h2>
+<h2 id="en-sec7">7. Debugging and validation</h2>
 
 <p>Source reading establishes the static structure; runtime tools show which kernels a particular build registered and which key a call selected. The tools below expose different slices of the system, and the teaching helper should not be mistaken for a complete trace of the C++ dispatcher.</p>
 
-<h3 id="en-sec7-1">7.1 Observe calls and redispatch: <code>TORCH_SHOW_DISPATCH_TRACE</code></h3>
+<h3 id="en-sec7-1">7.1 Dispatch trace</h3>
 
 <p>The C++ side reads and caches this setting, so set it before starting Python. The v2.12.0 format is defined in <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/core/dispatch/Dispatcher.cpp#L18-L34"><code>Dispatcher.cpp</code></a> and <a href="https://github.com/pytorch/pytorch/blob/v2.12.0/aten/src/ATen/core/dispatch/Dispatcher.h#L774-L867"><code>Dispatcher.h</code></a>:</p>
 
@@ -4518,7 +4518,7 @@ z = x + y
   <li><code>[redispatch]</code> continues to CUDA with a reduced key set.</li>
 </ul>
 
-<h3 id="en-sec7-2">7.2 Inspect registrations: <code>_dispatch_dump</code> and <code>_dispatch_dump_table</code></h3>
+<h3 id="en-sec7-2">7.2 Registry inspection</h3>
 
 <p>To verify "which kernels are registered to a given op in the dispatcher table":</p>
 
@@ -4542,7 +4542,7 @@ aten::add ...
 
 <p>After a custom extension is loaded, these interfaces verify the effective DispatchKey registrations and help diagnose macro arguments, key spelling, and static initialization.</p>
 
-<h3 id="en-sec7-3">7.3 Teaching helper for computed tables: <code>PythonDispatcher</code></h3>
+<h3 id="en-sec7-3">7.3 <code>PythonDispatcher</code></h3>
 
 <pre class="code">from torch._python_dispatcher import PythonDispatcher
 
@@ -4552,7 +4552,7 @@ print(dispatcher.computedTable())</pre>
 
 <p><a href="https://github.com/pytorch/pytorch/blob/v2.12.0/torch/_python_dispatcher.py"><code>torch._python_dispatcher.PythonDispatcher</code></a> is a simplified computed-table teaching tool. It does not single-step real C++ dispatch or capture a call's full TLS and tensor key sets.</p>
 
-<h3 id="en-sec7-4">7.4 Boundaries of C++ breakpoints</h3>
+<h3 id="en-sec7-4">7.4 C++ breakpoints</h3>
 
 <p>C++ breakpoints expose concrete key sets and kernel pointers when Python-level tracing lacks that detail:</p>
 
@@ -4569,7 +4569,7 @@ print(dispatcher.computedTable())</pre>
 
 <p class="callout">For Python-side <code>torch.library</code>, <code>register_fake</code>, and <code>opcheck</code>, see <a href="#en-sec4">§4</a>.</p>
 
-<h2 id="en-sec8">8. Version boundaries of older references</h2>
+<h2 id="en-sec8">8. Version differences</h2>
 
 <p>The dispatcher API and key representation have changed across PyTorch releases. The following table maps common terms from older material to the v2.12.0 terminology used here.</p>
 
@@ -4610,6 +4610,6 @@ print(dispatcher.computedTable())</pre>
 
 </main>
 </div>
-<script src="../lang-toggle.js"></script>
+<script src="../lang-toggle.js?v=post-toc-3"></script>
 </body>
 </html>

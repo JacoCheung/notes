@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PyTorch DDP 梯度规约机制：Reducer、Bucket 与 NCCL AllReduce</title>
-<meta name="post:title"           content="PyTorch DDP 梯度规约机制：Reducer、Bucket 与 NCCL AllReduce">
-<meta name="post:title_en"        content="Gradient Reduction in PyTorch DDP: Reducer, Buckets, and NCCL AllReduce">
+<title>PyTorch DDP 梯度规约</title>
+<meta name="post:title"           content="PyTorch DDP 梯度规约">
+<meta name="post:title_en"        content="PyTorch DDP gradient reduction">
 <meta name="post:slug"            content="pytorch-ddp-gradient-reduction">
 <meta name="post:date"            content="2026-08-20">
 <meta name="post:tags"            content="PyTorch, DDP, Reducer, NCCL, AllReduce">
@@ -25,11 +25,11 @@
   };
 </script>
 <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
-<script src="../lang-toggle.js" defer></script>
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
 <style>
   main.content { max-width: 1060px; min-width: 0; padding: 56px 32px 96px; letter-spacing: 0; }
   main.content h1,
@@ -158,29 +158,29 @@
     <div class="toc-title">目录 · TOC</div>
     <div class="lang-zh">
       <ul>
-        <li><a href="#zh-scope">执行模型与版本边界</a></li>
-        <li><a href="#zh-wgrad">从 wgrad 到 bucket</a></li>
-        <li><a href="#zh-trigger">AllReduce 的触发时机</a></li>
-        <li><a href="#zh-count">Collective 与 kernel 数量</a></li>
-        <li><a href="#zh-sum-avg">SUM 与平均梯度</a></li>
-        <li><a href="#zh-scaling">wgrad scaling 的位置</a></li>
-        <li><a href="#zh-other-scales">训练中的其他缩放</a></li>
-        <li><a href="#zh-observe">运行时观测</a></li>
-        <li><a href="#zh-boundary">AllReduce 与 reduce-scatter 的所有权差异</a></li>
+        <li><a href="#zh-scope">执行模型与版本</a></li>
+        <li><a href="#zh-wgrad">wgrad 与 Bucket</a></li>
+        <li><a href="#zh-trigger">AllReduce 触发条件</a></li>
+        <li><a href="#zh-count">Collective 与 Kernel 数量</a></li>
+        <li><a href="#zh-sum-avg">SUM 与梯度平均</a></li>
+        <li><a href="#zh-scaling">wgrad 缩放</a></li>
+        <li><a href="#zh-other-scales">Loss、梯度累积与 AMP</a></li>
+        <li><a href="#zh-observe">Bucket 与 Collective 观测</a></li>
+        <li><a href="#zh-boundary">规约后的梯度所有权</a></li>
         <li><a href="#zh-refs">参考资料</a></li>
       </ul>
     </div>
     <div class="lang-en">
       <ul>
-        <li><a href="#en-scope">Execution model and version scope</a></li>
-        <li><a href="#en-wgrad">From wgrad to buckets</a></li>
-        <li><a href="#en-trigger">When AllReduce starts</a></li>
-        <li><a href="#en-count">Collectives and kernel counts</a></li>
+        <li><a href="#en-scope">Execution model and versions</a></li>
+        <li><a href="#en-wgrad">wgrad and buckets</a></li>
+        <li><a href="#en-trigger">AllReduce triggers</a></li>
+        <li><a href="#en-count">Collective and kernel counts</a></li>
         <li><a href="#en-sum-avg">SUM and gradient averaging</a></li>
-        <li><a href="#en-scaling">Where wgrad scaling occurs</a></li>
-        <li><a href="#en-other-scales">Other scales in training</a></li>
-        <li><a href="#en-observe">Runtime inspection</a></li>
-        <li><a href="#en-boundary">Gradient ownership after collective reduction</a></li>
+        <li><a href="#en-scaling">wgrad scaling</a></li>
+        <li><a href="#en-other-scales">Loss, accumulation, and AMP</a></li>
+        <li><a href="#en-observe">Bucket and collective inspection</a></li>
+        <li><a href="#en-boundary">Gradient ownership after reduction</a></li>
         <li><a href="#en-refs">References</a></li>
       </ul>
     </div>
@@ -190,17 +190,17 @@
 
 <div class="lang-zh">
 
-<h1>PyTorch DDP 梯度规约机制：Reducer、Bucket 与 NCCL AllReduce</h1>
+<h1>PyTorch DDP 梯度规约</h1>
 
 <p class="lead">数据并行训练让每个 rank 独立执行 forward 与 backward，因此 autograd 首先得到的是各 rank 的局部参数梯度。优化器更新之前，这些副本需要形成一致的规约结果。PyTorch DDP 在本地梯度累加与优化器之间放置 <code>Reducer</code>：它把参数梯度组织成 bucket，按就绪顺序启动 collective，并借助异步通信覆盖一部分后续 backward 计算。规约时机、collective 数量和 world-size scaling 都由这条路径共同决定。</p>
 
-<h2 id="zh-scope">执行模型与版本边界</h2>
+<h2 id="zh-scope">执行模型与版本</h2>
 
 <p>本文讨论标准 <code>torch.nn.parallel.DistributedDataParallel</code>，每个 rank 保存完整参数、完整梯度和完整优化器状态。公开 API 语义以 PyTorch 2.12 文档为准，源码说明固定在 PyTorch commit <a href="https://github.com/pytorch/pytorch/tree/9c603a799add5df0195762d18f320b8bf00e848f"><code>9c603a7</code></a>。<code>batched_grad_copy</code>、<code>skip_all_reduce_unused_params</code> 等实现细节属于该版本；自定义 communication hook、<code>join()</code> 和稀疏梯度也会改变部分路径。</p>
 
 <p>标准 DDP 的基本规约单元是梯度 bucket。设一个 DDP 实例在 bucket 重建后包含 \(B\) 个 bucket，常规同步 backward 的默认路径会为每个 ready bucket 发起一次梯度 AllReduce。参数数量、bucket 数量和底层 NCCL kernel 数量由此属于三个不同层次。</p>
 
-<h2 id="zh-wgrad">从 wgrad 到 bucket</h2>
+<h2 id="zh-wgrad">wgrad 与 Bucket</h2>
 
 <p>以 Linear 为例，rank \(r\) 上的 forward 和权重梯度写成：</p>
 
@@ -227,7 +227,7 @@ bucket.pending -= 1</pre>
 
 <p>DDP 的 “gradient ready” 表示该参数在当前 backward 中应接收的本地梯度贡献已经完成 autograd 累加。这个事件把单个参数的求导阶段交接给 bucket 管理阶段。</p>
 
-<h2 id="zh-trigger">AllReduce 的触发时机</h2>
+<h2 id="zh-trigger">AllReduce 触发条件</h2>
 
 <p>每个 bucket 维护一个未就绪参数计数 <code>pending</code>。参数 hook 运行时，<code>Reducer</code> 把梯度写入该参数对应的 bucket view，并将 <code>pending</code> 减一。计数归零说明这个 bucket 已经可以通信。对应源码在 <a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/reducer.cpp#L894-L962"><code>mark_variable_ready()</code></a>。</p>
 
@@ -297,7 +297,7 @@ bucket.pending -= 1</pre>
 
 <p>图中的三个 AllReduce 按 bucket index 发起。这里的 overlap 只表达 NCCL 通信可以与后续 backward 计算交叠；图本身不主张三个 bucket collective 在 GPU 上并发，实际时间关系应以 profiler trace 为准。</p>
 
-<h2 id="zh-count">Collective 与 kernel 数量</h2>
+<h2 id="zh-count">Collective 与 Kernel 数量</h2>
 
 <p>一次 backward 可以从参数、逻辑 collective 和 GPU kernel 三个层次计数。参数先聚合进 bucket，DDP 为 ready bucket 发起 collective，通信 backend 再把 collective 实现为底层 GPU 活动，因此三种数量没有一一对应关系。</p>
 
@@ -353,7 +353,7 @@ bucket.pending -= 1</pre>
   <p>一次 bucket AllReduce 对应一次 <code>ProcessGroup::allreduce</code> 调用。在传统 NCCL host API 路径中，每个 rank 的 profiler 通常会为它显示一个 <code>ncclDevKernel_AllReduce_...</code> 通信 kernel；NCCL 2.31.2 的 <a href="https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2312/user-guide/docs/env.html#nccl-nthreads">环境变量文档</a>说明传统 channel 模型按 channel 启动 CUDA block。这里描述的是常见实现形态，不是 DDP API 对 kernel 数量或名称的保证。NCCL grouping、CUDA Graph、device API 以及其他 backend 都可能改变逻辑 collective 与底层活动的映射。</p>
 </div>
 
-<h2 id="zh-sum-avg">NCCL SUM 与 DDP 平均梯度</h2>
+<h2 id="zh-sum-avg">SUM 与梯度平均</h2>
 
 <p>设 data parallel group 有 \(P\) 个 rank，第 \(r\) 个 rank 的本地梯度是 \(G_r\)。DDP 默认结果为：</p>
 
@@ -377,7 +377,7 @@ G_{\mathrm{DDP}} = \frac{1}{P}\sum_{r=0}^{P-1}G_r
 
 <p><code>div_factor</code> 在普通训练中等于 process group size。使用 DDP <code>join()</code> 处理不均匀输入时，它可以按配置取初始 world size 或仍在参与训练的有效 rank 数量。</p>
 
-<h3>自定义 communication hook 的语义不同</h3>
+<h3>自定义通信 Hook</h3>
 
 <p>注册 <code>register_comm_hook()</code> 后，Reducer 不再预除 <code>world_size</code>。官方 API 文档明确要求 hook 自己负责需要的平均操作。下面这种 hook 只做 SUM，得到的梯度会比默认 DDP 大 \(P\) 倍：</p>
 
@@ -394,7 +394,7 @@ G_{\mathrm{DDP}} = \frac{1}{P}\sum_{r=0}^{P-1}G_r
 
 <p>若要保持默认 DDP 数值语义，应在 hook 中显式除以 group size，或直接参考 PyTorch 的 <a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/distributed/algorithms/ddp_comm_hooks/default_hooks.py#L25-L79"><code>allreduce_hook</code></a>。</p>
 
-<h2 id="zh-scaling">wgrad scaling 的位置</h2>
+<h2 id="zh-scaling">wgrad 缩放</h2>
 
 <p><code>Reducer</code> 在已就绪参数梯度进入 bucket 通信路径时执行 world-size scaling。Linear、Conv 或 attention 的 wgrad kernel 负责产生本地梯度，随后当前实现根据该梯度与 bucket 的存储关系选择缩放路径：</p>
 
@@ -434,7 +434,7 @@ G_{\mathrm{DDP}} = \frac{1}{P}\sum_{r=0}^{P-1}G_r
 
 <p>前两条路径位于 <a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/reducer.cpp#L356-L445"><code>mark_variable_ready_dense()</code></a>。批量复制路径在 <a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/reducer.cpp#L1838-L1882"><code>flush_deferred_copies()</code></a> 中。默认路径在参数梯度就绪时完成缩放；批量路径等整个 bucket 就绪后统一缩放，随后发起 SUM AllReduce。</p>
 
-<h2 id="zh-other-scales">loss reduction、梯度累积与 AMP</h2>
+<h2 id="zh-other-scales">Loss、梯度累积与 AMP</h2>
 
 <p>world-size 平均只是训练数值路径中的一项缩放。loss reduction 决定本地梯度的归一化方式，gradient accumulation 决定多个 microbatch 如何合并，AMP 则在通信前后保留并解除 loss scale。把这些位置分开，才能判断最终 wgrad 的系数。</p>
 
@@ -472,7 +472,7 @@ G_{\mathrm{DDP}} = \frac{1}{P}\sum_{r=0}^{P-1}G_r
 </table>
 </div>
 
-<h3>局部 mean loss</h3>
+<h3>局部 Mean Loss</h3>
 
 <p>若每个 rank 的 local batch 大小都为 \(N\)，本地 loss 是样本均值：</p>
 
@@ -491,7 +491,7 @@ L_r = \frac{1}{N}\sum_{i=1}^{N}\ell_{r,i}
 
 <p>如果各 rank 的有效样本数不同，简单 rank 平均不再等同于按样本数加权的 global mean。DDP 不会从梯度 Tensor 推断各 rank 的样本权重。</p>
 
-<h3><code>no_sync()</code> 与 \(K\) 个 microbatch</h3>
+<h3><code>no_sync()</code> 与 Microbatch</h3>
 
 <p><code>no_sync()</code> 让前 \(K-1\) 个 microbatch 的梯度继续累加在本地 <code>.grad</code> 中，并把通信推迟到离开上下文后的同步 backward。此时规约对象是本地累加结果：</p>
 
@@ -514,7 +514,7 @@ s\left(\frac{1}{P}\sum_{r=0}^{P-1}G_r\right)
 
 <p>随后 <code>GradScaler.unscale_(optimizer)</code> 或 <code>GradScaler.step(optimizer)</code> 在 optimizer step 前除以 \(s\)。AMP inverse scale 位于优化器路径，DDP 的 world-size scaling 位于 bucket 准备路径，两者通过 AllReduce 的线性性质保持可组合。</p>
 
-<h2 id="zh-observe">运行时观测 bucket 与 collective</h2>
+<h2 id="zh-observe">Bucket 与 Collective 观测</h2>
 
 <p>DDP 的诊断数据可以查看最终 bucket 大小。<code>_get_ddp_logging_data()</code> 是内部诊断接口，适合分析，不宜作为训练逻辑依赖：</p>
 
@@ -528,7 +528,7 @@ print(ddp_info.get("prev_iteration_grad_ready_order_indices"))</pre>
 
 <p>GPU trace 中的 <code>ncclDevKernel_AllReduce_...</code> 是传统 NCCL 路径常见而非稳定承诺的 kernel 名。统计 bucket 数时，仍应先数 collective 事件，再展开其中某一次 collective 对应的 GPU 活动。NCCL 2.31.2 文档对 <a href="https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2312/user-guide/docs/env.html#nccl-nthreads">channel 与 CUDA block</a> 的关系有明确说明。</p>
 
-<h2 id="zh-boundary">AllReduce 与 reduce-scatter 的所有权差异</h2>
+<h2 id="zh-boundary">规约后的梯度所有权</h2>
 
 <p>标准 DDP 的参数和梯度在各 rank 上完整复制，因此默认用 AllReduce：规约后每个 rank 都拿到同一份完整梯度。ReduceScatter 则只把规约结果的一段留在每个 rank，适合梯度或优化器状态已经分片的训练方式。</p>
 
@@ -582,17 +582,17 @@ print(ddp_info.get("prev_iteration_grad_ready_order_indices"))</pre>
 
 <div class="lang-en">
 
-<h1>Gradient Reduction in PyTorch DDP: Reducer, Buckets, and NCCL AllReduce</h1>
+<h1>PyTorch DDP gradient reduction</h1>
 
 <p class="lead">In data-parallel training, every rank executes forward and backward independently, so autograd first produces local parameter gradients. Those replicas need a consistent reduced result before the optimizer update. PyTorch DDP places a <code>Reducer</code> between local gradient accumulation and the optimizer: it groups gradients into buckets, starts collectives as buckets become ready, and uses asynchronous communication to overlap part of the remaining backward computation. Reduction timing, collective count, and world-size scaling all follow from this path.</p>
 
-<h2 id="en-scope">Execution model and version scope</h2>
+<h2 id="en-scope">Execution model and versions</h2>
 
 <p>The subject is standard <code>torch.nn.parallel.DistributedDataParallel</code>, where every rank stores full parameters, full gradients, and full optimizer state. Public API semantics follow the PyTorch 2.12 documentation, and source-level statements are pinned to PyTorch commit <a href="https://github.com/pytorch/pytorch/tree/9c603a799add5df0195762d18f320b8bf00e848f"><code>9c603a7</code></a>. Details such as <code>batched_grad_copy</code> and <code>skip_all_reduce_unused_params</code> belong to that version. Custom communication hooks, <code>join()</code>, and sparse gradients can alter parts of the path.</p>
 
 <p>A gradient bucket is the basic reduction unit in standard DDP. Suppose bucket rebuilding leaves a DDP instance with \(B\) buckets. During an ordinary synchronized backward pass, the default path starts one gradient AllReduce for every ready bucket. Parameter count, bucket count, and the number of lower-level NCCL kernels therefore belong to separate layers.</p>
 
-<h2 id="en-wgrad">From wgrad to buckets</h2>
+<h2 id="en-wgrad">wgrad and buckets</h2>
 
 <p>For a Linear layer, the forward computation and weight gradient on rank \(r\) are:</p>
 
@@ -619,7 +619,7 @@ bucket.pending -= 1</pre>
 
 <p>DDP's “gradient ready” event means that autograd has collected the local contributions expected for that parameter in the current backward pass. The event hands the parameter from differentiation to bucket management.</p>
 
-<h2 id="en-trigger">When AllReduce starts</h2>
+<h2 id="en-trigger">AllReduce triggers</h2>
 
 <p>Each bucket maintains a count of parameters whose gradients are not ready. When a parameter hook runs, the <code>Reducer</code> writes the gradient into the matching bucket view and decrements that count. A count of zero makes the bucket eligible for communication. The relevant implementation is <a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/reducer.cpp#L894-L962"><code>mark_variable_ready()</code></a>.</p>
 
@@ -689,7 +689,7 @@ bucket.pending -= 1</pre>
 
 <p>The diagram launches three AllReduce calls in bucket-index order. The overlap shown means that NCCL communication may overlap with later backward computation. It does not claim that the three bucket collectives execute concurrently on the GPU; a profiler trace is needed to establish their actual timing.</p>
 
-<h2 id="en-count">Collectives and kernel counts</h2>
+<h2 id="en-count">Collective and kernel counts</h2>
 
 <p>A backward pass can be counted at three levels: parameters, logical collectives, and GPU kernels. Parameters are packed into buckets, DDP issues a collective for each ready bucket, and the communication backend realizes that collective as lower-level GPU activity. These counts have no one-to-one mapping.</p>
 
@@ -745,7 +745,7 @@ bucket.pending -= 1</pre>
   <p>One bucket AllReduce corresponds to one <code>ProcessGroup::allreduce</code> call. With the traditional NCCL host API path, a profiler on each rank commonly shows one <code>ncclDevKernel_AllReduce_...</code> communication kernel for that call. The NCCL 2.31.2 <a href="https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2312/user-guide/docs/env.html#nccl-nthreads">environment variable documentation</a> states that the traditional channel model launches a CUDA block per channel. This is a common implementation shape, not a DDP API guarantee about kernel count or names. NCCL grouping, CUDA Graphs, the device API, and other backends can change how logical collectives map to lower-level activity.</p>
 </div>
 
-<h2 id="en-sum-avg">NCCL SUM and DDP gradient averaging</h2>
+<h2 id="en-sum-avg">SUM and gradient averaging</h2>
 
 <p>Let the data-parallel group contain \(P\) ranks, with local gradient \(G_r\) on rank \(r\). The default DDP result is:</p>
 
@@ -769,7 +769,7 @@ G_{\mathrm{DDP}} = \frac{1}{P}\sum_{r=0}^{P-1}G_r
 
 <p>In ordinary training, <code>div_factor</code> is the process-group size. When DDP <code>join()</code> handles uneven inputs, configuration determines whether it uses the initial world size or the number of ranks still participating.</p>
 
-<h3>Custom communication hooks have different semantics</h3>
+<h3>Custom communication hooks</h3>
 
 <p>After <code>register_comm_hook()</code> is installed, the Reducer no longer performs the default world-size division. The public API documentation requires the hook to implement any desired averaging. The following hook performs SUM only, so its gradients are \(P\) times larger than default DDP gradients:</p>
 
@@ -786,7 +786,7 @@ G_{\mathrm{DDP}} = \frac{1}{P}\sum_{r=0}^{P-1}G_r
 
 <p>To preserve default DDP numerics, divide by the group size inside the hook or follow PyTorch's <a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/distributed/algorithms/ddp_comm_hooks/default_hooks.py#L25-L79"><code>allreduce_hook</code></a>.</p>
 
-<h2 id="en-scaling">Where wgrad scaling occurs</h2>
+<h2 id="en-scaling">wgrad scaling</h2>
 
 <p>The <code>Reducer</code> applies world-size scaling while a ready parameter gradient enters the bucket communication path. A Linear, convolution, or attention wgrad kernel produces the local gradient first; the current implementation then chooses a scaling path according to the storage relationship between that gradient and its bucket:</p>
 
@@ -826,7 +826,7 @@ G_{\mathrm{DDP}} = \frac{1}{P}\sum_{r=0}^{P-1}G_r
 
 <p>The first two paths are implemented in <a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/reducer.cpp#L356-L445"><code>mark_variable_ready_dense()</code></a>. The batched-copy path is in <a href="https://github.com/pytorch/pytorch/blob/9c603a799add5df0195762d18f320b8bf00e848f/torch/csrc/distributed/c10d/reducer.cpp#L1838-L1882"><code>flush_deferred_copies()</code></a>. Default paths scale when a parameter gradient becomes ready; the batched path waits for the whole bucket, scales the flat buffer, and then starts SUM AllReduce.</p>
 
-<h2 id="en-other-scales">Loss reduction, gradient accumulation, and AMP</h2>
+<h2 id="en-other-scales">Loss, accumulation, and AMP</h2>
 
 <p>World-size averaging is only one scale in the training numerics. Loss reduction determines local-gradient normalization, gradient accumulation combines microbatches, and AMP preserves and later removes a loss scale around communication. Separating these locations makes the final wgrad coefficient explicit.</p>
 
@@ -883,7 +883,7 @@ L_r = \frac{1}{N}\sum_{i=1}^{N}\ell_{r,i}
 
 <p>When ranks contain different numbers of valid samples, a simple rank average no longer equals a sample-weighted global mean. DDP cannot infer per-rank sample weights from gradient tensors.</p>
 
-<h3><code>no_sync()</code> with \(K\) microbatches</h3>
+<h3><code>no_sync()</code> and microbatches</h3>
 
 <p><code>no_sync()</code> keeps gradients from the first \(K-1\) microbatches accumulating in local <code>.grad</code> tensors and defers communication to the synchronized backward pass after the context. The reduction then consumes the locally accumulated result:</p>
 
@@ -906,7 +906,7 @@ s\left(\frac{1}{P}\sum_{r=0}^{P-1}G_r\right)
 
 <p>Before the optimizer step, <code>GradScaler.unscale_(optimizer)</code> or <code>GradScaler.step(optimizer)</code> divides by \(s\). AMP inverse scaling sits on the optimizer path, while DDP world-size scaling sits on the bucket preparation path; linearity of AllReduce lets the two compose.</p>
 
-<h2 id="en-observe">Runtime inspection of buckets and collectives</h2>
+<h2 id="en-observe">Bucket and collective inspection</h2>
 
 <p>DDP's diagnostic data includes final bucket sizes. <code>_get_ddp_logging_data()</code> is an internal diagnostic interface: it is useful for analysis but should not become a dependency of training logic.</p>
 
@@ -920,7 +920,7 @@ print(ddp_info.get("prev_iteration_grad_ready_order_indices"))</pre>
 
 <p><code>ncclDevKernel_AllReduce_...</code> is a common kernel name in traces from the traditional NCCL path, not a stable interface. Count collective events first when determining bucket count, and only then inspect the GPU activity associated with an individual collective. The NCCL 2.31.2 documentation describes the relationship between <a href="https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2312/user-guide/docs/env.html#nccl-nthreads">channels and CUDA blocks</a>.</p>
 
-<h2 id="en-boundary">Gradient ownership after collective reduction</h2>
+<h2 id="en-boundary">Gradient ownership after reduction</h2>
 
 <p>Standard DDP replicates full parameters and gradients on every rank, so its default operation is AllReduce: after reduction, every rank holds the same complete gradient. ReduceScatter retains only one partition of the reduced result on each rank, which suits training systems that already shard gradients or optimizer state.</p>
 

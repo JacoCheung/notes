@@ -1,0 +1,671 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HTTP 代理与 VPN：macOS 设置、SSH 隧道和 SOCKS</title>
+<meta name="post:title" content="HTTP 代理与 VPN：macOS 设置、SSH 隧道和 SOCKS">
+<meta name="post:title_en" content="HTTP proxies and VPNs: macOS, SSH tunnels and SOCKS">
+<meta name="post:slug" content="http-proxy-macos-ssh-socks">
+<meta name="post:date" content="2026-10-12">
+<meta name="post:tags" content="网络, HTTP, macOS, SSH, SOCKS, VPN">
+<meta name="post:tags_en" content="Networking, HTTP, macOS, SSH, SOCKS, VPN">
+<meta name="post:reading" content="25 分钟">
+<meta name="post:reading_en" content="25 min">
+<meta name="post:summary" content="macOS 代理设置的生效范围、HTTP 转发与 CONNECT、Tinyproxy 部署，以及 SSH、SOCKS 和 VPN 的协议层次、加密边界与流量可见性。">
+<meta name="post:summary_en" content="macOS proxy coverage, HTTP forwarding and CONNECT, Tinyproxy deployment, and the protocol layers, encryption boundaries and traffic visibility of SSH, SOCKS and VPNs.">
+<meta name="post:series" content="programmer-essentials">
+<meta name="post:series_title" content="程序员必备清单">
+<meta name="post:series_title_en" content="Programmer Essentials">
+<meta name="post:series_order" content="3">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
+<style>
+  .post-page main.content { max-width: 1000px !important; text-align: left; }
+  .post-page main.content .lead { color: var(--fg-muted); }
+  .table-scroll { max-width: 100%; overflow-x: auto; }
+  .table-scroll table { min-width: 640px; }
+  .proxy-diagram { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .proxy-diagram .diagram-toolbar { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 8px 12px; background: var(--bg-subtle); font: 12px var(--font-sans); }
+  .diagram-toolbar label { display: flex; gap: 6px; align-items: center; }
+  .diagram-toolbar select { background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 3px; }
+  .diagram-scroll { overflow-x: auto; background: #fff; }
+  .diagram-canvas { width: 100%; }
+  .diagram-canvas object { display: block; width: 100%; height: auto; }
+  .post-page main.content .proxy-diagram figcaption { margin: 0; padding: 10px 12px; font: 13px/1.6 var(--font-sans); text-align: left; color: var(--fg-muted); }
+  .post-page main.content .source-note { font-size: 14px; color: var(--fg-muted); }
+  @media (min-width: 1100px) {
+    .post-page main.content { margin-left: max(260px, calc((100vw - 1000px) / 2)) !important; }
+    .post-page aside.toc { left: max(20px, calc((100vw - 1000px) / 2 - 240px)) !important; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+<aside class="toc"><div class="toc-title">目录 · TOC</div></aside>
+<main class="content">
+<div class="lang-zh">
+<h1>HTTP 代理与 VPN：macOS 设置、SSH 隧道和 SOCKS</h1>
+<p class="lead">macOS 的系统代理设置参与应用的连接决策。浏览器可以据此连接代理服务器，而同一台机器上的 curl、SSH 或直接使用 socket 的程序仍可能直连。代理是否生效，取决于应用实际采用的配置；配置界面中的开关本身不能保证覆盖所有网络流量。</p>
+<p>HTTP 代理、SOCKS、SSH 隧道和 VPN 都能改变流量路径，但介入的位置不同：HTTP 代理处理请求或 CONNECT 字节流，SOCKS 为连接指定目标，SSH 为转发的字节提供加密通道，常见的三层 VPN 则承载 IP 包。连接由谁建立、加密在哪结束，决定了应用的配置方式，也决定了目标服务器和沿途网关能看到什么。本文讨论客户端显式使用的正向代理，HTTP 示例采用 HTTP/1.1 握手。</p>
+
+<h2 id="zh-macos">1. macOS 代理配置</h2>
+<h3 id="zh-service">配置作用域</h3>
+<p>代理配置保存在所选的网络服务中。设置入口是「系统设置 → 网络 → Wi-Fi 或以太网等网络服务 → 详细信息 → 代理」，HTTP、HTTPS、SOCKS、自动代理配置（PAC）和绕过域名各有对应选项。Wi-Fi 与以太网分别保存配置，修改其中一项不会同时修改另一项。<a href="https://support.apple.com/en-gb/guide/mac-help/mchlp2591/mac">Apple：更改代理设置</a>。</p>
+<p>应用通过网络库读取这些配置。Apple 的 <code>URLSessionConfiguration.connectionProxyDictionary</code> 默认采用系统代理设置，也允许应用提供自己的配置。因此，即使两个应用运行在同一台 Mac 上，它们也可能选择不同的连接路径。<a href="https://developer.apple.com/documentation/foundation/urlsessionconfiguration/connectionproxydictionary?language=objc">URLSession 文档</a>描述了这一配置关系。</p>
+<div class="table-scroll"><table>
+<thead><tr><th>流量来源</th><th>仅设置 macOS HTTP / HTTPS 代理后的行为</th></tr></thead>
+<tbody>
+<tr><td>使用系统代理配置的浏览器或 URLSession 应用</td><td>按 URL 类型、绕过规则、PAC 等选择代理或直连；应用自身的覆盖配置仍可能改变结果。</td></tr>
+<tr><td>终端中的 curl</td><td>通常需要 <code>--proxy</code> 或 curl 支持的环境变量；不能假设它会读取 GUI 设置。</td></tr>
+<tr><td>直接调用 BSD socket 的程序、普通 ssh 命令</td><td>仍连接程序指定的地址；如需代理，要由程序、转发工具或其他网络机制显式处理。</td></tr>
+<tr><td>ping、任意 UDP 流量</td><td>不会因为启用 HTTP 代理而变成 HTTP 请求。</td></tr>
+</tbody></table></div>
+<p>系统代理的作用范围取决于哪些应用采用这份配置。终端环境变量是另一套配置入口：修改 GUI 不会替 shell 设置 <code>http_proxy</code>，已有的 shell 变量也不会自动更新系统代理。curl 支持的变量见其<a href="https://everything.curl.dev/usingcurl/proxies/env.html">代理环境变量说明</a>。</p>
+
+<h3 id="zh-socket">连接建立</h3>
+<p>访问 <code>https://example.com/docs</code> 时，采用代理配置的应用会根据 URL 和规则选择连接端点。若结果为 <code>proxy.example:18888</code>，应用创建的 TCP socket 就连接该代理。内核按路由表发送目的地址为代理的 IP 包；CONNECT 握手则由应用写入这条连接。</p>
+<pre><code>URL: https://example.com/docs
+  → 应用 / 网络库查询代理规则
+  → 选择 proxy.example:18888
+  → socket.connect(proxy_ip, 18888)
+  → TCP / IP 把字节送到代理
+  → 在这条连接上发送 CONNECT example.com:443</code></pre>
+<p>HTTP 请求和 CONNECT 握手都是应用层数据，内核负责传输这些字节。匹配绕过规则时，应用选择直连；程序未读取代理配置时，连接目标仍由程序自己的逻辑决定。Chromium 的 <a href="https://github.com/chromium/chromium/blob/main/net/proxy_resolution/proxy_config_service_mac.cc">macOS 代理配置读取代码</a>展示了系统配置如何进入应用的代理决策。</p>
+
+<h2 id="zh-wire">2. HTTP 代理机制</h2>
+<p>普通 HTTP 转发需要代理解析请求。HTTPS 经 CONNECT 转发时，代理在握手成功后传递 TLS 字节流。两种模式都会在代理两侧建立独立的 TCP 连接，但代理对应用内容的可见性不同。</p>
+<h3 id="zh-http">HTTP 请求转发</h3>
+<p>HTTP 代理通过请求行中的完整 URL 获得目标地址。例如，访问 <code>http://example.com/docs</code> 时，客户端连接代理并发送以下请求；代理解析 <code>example.com</code>，创建或复用到源站的连接，再转发请求。序列图展示新建连接的情况。</p>
+<pre><code>GET http://example.com/docs HTTP/1.1
+Host: example.com
+
+</code></pre>
+<p>完整 URL 的写法叫 <em>absolute-form</em>。代理连接源站后，通常发送 <code>GET /docs HTTP/1.1</code> 这样的 <em>origin-form</em>。客户端到代理、代理到源站是两条独立的 TCP 连接，各自维护序列号、重传和流量控制；普通 HTTP 内容对代理可见。请求目标的语法见 <a href="https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2">RFC 9112 §3.2</a>。</p>
+<figure class="proxy-diagram">
+<div class="diagram-toolbar"><label>显示 <select aria-label="显示: http-forward"><option value="fit">适配宽度</option><option value="1080">100%</option><option value="1620">150%</option></select></label><a href="../assets/http-proxy-macos-ssh-socks/http-forward.svg" target="_blank" rel="noopener">单独打开 SVG ↗</a></div>
+<div class="diagram-scroll"><div class="diagram-canvas"><object type="image/svg+xml" data="../assets/http-proxy-macos-ssh-socks/http-forward.svg" style="aspect-ratio:1080/760" aria-label="HTTP 请求在代理处被解析，两段 TCP 分别承载客户端请求和代理转发的请求。"><a href="../assets/http-proxy-macos-ssh-socks/http-forward.svg">HTTP 请求在代理处被解析，两段 TCP 分别承载客户端请求和代理转发的请求。</a></object></div></div>
+<figcaption>HTTP 请求在代理处被解析，两段 TCP 分别承载客户端请求和代理转发的请求。</figcaption></figure>
+
+<h3 id="zh-connect">CONNECT 隧道</h3>
+<p>CONNECT 为客户端与源站之间的 TLS 会话建立一条字节通道。客户端通过普通 HTTP 代理访问 HTTPS 站点时，先发送目标主机名和端口：</p>
+<pre><code>CONNECT example.com:443 HTTP/1.1
+Host: example.com:443
+
+</code></pre>
+<p>代理连接 <code>example.com:443</code> 并返回成功的 2xx 响应后，这条连接切换为双向字节转发。客户端随后通过通道与源站完成 TLS 握手，并传输加密的 HTTP 请求。后续 TLS 数据直接进入字节流，无需再包装成 GET 或 POST。<a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6">RFC 9110 §9.3.6</a>定义了这一切换。</p>
+<figure class="proxy-diagram">
+<div class="diagram-toolbar"><label>显示 <select aria-label="显示: https-connect"><option value="fit">适配宽度</option><option value="1080">100%</option><option value="1620">150%</option></select></label><a href="../assets/http-proxy-macos-ssh-socks/https-connect.svg" target="_blank" rel="noopener">单独打开 SVG ↗</a></div>
+<div class="diagram-scroll"><div class="diagram-canvas"><object type="image/svg+xml" data="../assets/http-proxy-macos-ssh-socks/https-connect.svg" style="aspect-ratio:1080/900" aria-label="紫色表示 CONNECT 控制阶段，绿色表示源站 TLS。细长 activation bar 表示处理或转发区间，不代表 CPU 一直占用。"><a href="../assets/http-proxy-macos-ssh-socks/https-connect.svg">紫色表示 CONNECT 控制阶段，绿色表示源站 TLS。细长 activation bar 表示处理或转发区间，不代表 CPU 一直占用。</a></object></div></div>
+<figcaption>紫色表示 CONNECT 控制阶段，绿色表示源站 TLS。细长 activation bar 表示处理或转发区间，不代表 CPU 一直占用。</figcaption></figure>
+<p>TLS 会话由客户端和源站共同维护，代理转发两条 TCP 连接之间的 TLS 字节。代理能看到 CONNECT 中的主机名、端口以及流量大小和时序，但正常转发时没有源站 TLS 会话密钥，无法直接读取 HTTPS 正文。部署额外信任证书的 TLS 检查代理会改变这个加密边界。图中绿色箭头表示 TLS 的逻辑端点，字节仍经过代理两侧的 TCP 连接。参见 <a href="https://www.rfc-editor.org/rfc/rfc8446.html#section-2">TLS 1.3 协议概览</a>。</p>
+
+<h3 id="zh-https-name">HTTPS 代理与 TLS</h3>
+<p>macOS 的「安全 Web 代理（HTTPS）」字段指定<strong>访问 HTTPS URL 时使用的代理</strong>。Chromium 将这项系统配置映射为普通 HTTP 代理，因此字段名称本身不表示客户端到代理的连接使用 TLS。这个命名区别在 <a href="https://github.com/chromium/chromium/blob/main/net/proxy_resolution/proxy_chain_util_apple.cc">GetProxyServerScheme()</a> 中有明确说明。</p>
+<p>curl 的 <code>--proxy https://proxy.example:8443</code> 则指定<strong>使用 TLS 连接代理</strong>。访问 HTTPS 源站时，客户端与代理之间的外层 TLS 承载 CONNECT，通道内部再承载客户端与源站之间的 TLS。两次握手的对端不同。教程采用普通 HTTP 代理地址 <code>http://127.0.0.1:18888</code>，Tinyproxy 的同一个端口同时处理 HTTP 转发和 HTTPS CONNECT。<a href="https://curl.se/docs/manpage.html#-x">curl：代理协议前缀</a>。</p>
+
+<h2 id="zh-server">3. Tinyproxy 部署</h2>
+<p>代理部署包含服务端监听和客户端选路两部分。验证时先用显式指定代理的 curl 请求检查服务，再配置 macOS 应用，可以分别确认代理链路和系统设置是否生效。</p>
+<h3 id="zh-install">监听配置</h3>
+<p>本地示例将 Tinyproxy 绑定到 IPv4 loopback <code>127.0.0.1:18888</code>。该地址可供本机进程访问，包括其他登录用户的进程。macOS 上的安装命令依赖 Homebrew：</p>
+<pre><code class="language-bash">brew install tinyproxy</code></pre>
+<p>Debian / Ubuntu VM 使用对应的系统包。软件包可能同时启动发行版的默认服务；本例使用独立配置和 18888 端口：</p>
+<pre><code class="language-bash">sudo apt-get update
+sudo apt-get install tinyproxy</code></pre>
+<p>在运行代理的机器上创建配置文件，并启动前台进程：</p>
+<pre><code class="language-bash">proxy_demo_dir=&quot;$HOME/.config/tinyproxy-demo&quot;
+mkdir -p &quot;$proxy_demo_dir&quot;
+cat &gt; &quot;$proxy_demo_dir/tinyproxy.conf&quot; &lt;&lt;&#x27;EOF&#x27;
+Port 18888
+Listen 127.0.0.1
+Timeout 600
+Allow 127.0.0.1
+ConnectPort 443
+EOF
+
+tinyproxy -d -c &quot;$proxy_demo_dir/tinyproxy.conf&quot;</code></pre>
+<p><code>Listen</code> 和 <code>Port</code> 确定监听端点，<code>Allow</code> 限制客户端地址。<code>ConnectPort 443</code> 限制 CONNECT 的目标端口；普通 HTTP 转发不受这项端口限制。启动参数 <code>-c</code> 选择配置文件，<code>-d</code> 使进程保持前台运行并输出日志。18888 是非特权端口，启动无需 sudo。参见 <a href="https://formulae.brew.sh/formula/tinyproxy">Homebrew 安装页</a>、<a href="https://tinyproxy.github.io/">Tinyproxy 快速开始</a>和<a href="https://github.com/tinyproxy/tinyproxy/blob/master/docs/man5/tinyproxy.conf.txt.in">配置手册</a>。</p>
+
+<h3 id="zh-verify">请求验证</h3>
+<p>HTTP 请求验证代理能否解析 URL 并转发请求；HTTPS 请求还要验证 CONNECT 之后的 TLS 和源站响应。代理进程保持运行，在另一个终端执行：</p>
+<pre><code class="language-bash">curl --noproxy &quot;&quot; --proxy http://127.0.0.1:18888 \
+  -v http://example.com/ -o /dev/null
+
+curl --noproxy &quot;&quot; --proxy http://127.0.0.1:18888 \
+  -v https://example.com/ -o /dev/null</code></pre>
+<p><code>--proxy</code> 显式选择代理，<code>--noproxy ""</code> 清除本次请求的绕过列表，避免已有 <code>NO_PROXY</code> 影响实验。<code>-v</code> 输出握手，<code>-o /dev/null</code> 丢弃响应正文。</p>
+<p>HTTP 请求行应包含完整 URL，响应状态表示这次请求的结果：</p>
+<pre><code>&gt; GET http://example.com/ HTTP/1.1
+&lt; HTTP/1.1 200 OK</code></pre>
+<p>HTTPS 的日志依次包含 CONNECT 响应、TLS 握手和源站响应。以下是 Tinyproxy 1.11.3 在 Linux 上使用上述配置时的实测节选：</p>
+<pre><code>&gt; CONNECT example.com:443 HTTP/1.1
+&lt; HTTP/1.1 200 Connection established
+* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384
+*  SSL certificate verify ok.
+&gt; GET / HTTP/2
+&lt; HTTP/2 200</code></pre>
+<p><code>200 Connection established</code> 表示代理通道已经建立；TLS 握手、证书校验和源站请求发生在此之后。样例中的 CONNECT 使用 HTTP/1.1，源站连接在 TLS 内协商为 HTTP/2，两者彼此独立。具体协议版本、加密套件和响应状态会随环境变化，验证时应确认各阶段均已完成。</p>
+
+<h3 id="zh-configure">客户端配置</h3>
+<p>macOS 按网络服务保存代理端点。修改前记录服务名称、代理地址、绕过规则和 PAC 设置，便于实验后恢复。命令中的 <code>Wi-Fi</code> 应与第一条命令列出的服务名称一致：</p>
+<pre><code class="language-bash">networksetup -listallnetworkservices
+networksetup -getwebproxy &quot;Wi-Fi&quot;
+networksetup -getsecurewebproxy &quot;Wi-Fi&quot;
+networksetup -getproxybypassdomains &quot;Wi-Fi&quot;
+networksetup -getautoproxyurl &quot;Wi-Fi&quot;
+scutil --proxy</code></pre>
+<p>对于没有需要保留的 PAC 或管理策略的网络服务，以下命令分别设置 HTTP 和 HTTPS 的代理端点：</p>
+<pre><code class="language-bash">sudo networksetup -setwebproxy &quot;Wi-Fi&quot; 127.0.0.1 18888 off
+sudo networksetup -setsecurewebproxy &quot;Wi-Fi&quot; 127.0.0.1 18888 off</code></pre>
+<p>这两条命令会启用对应代理，末尾的 <code>off</code> 表示关闭代理身份认证。GUI 的 HTTP 和 HTTPS 项也应分别填写地址 <code>127.0.0.1</code>、端口 <code>18888</code>；只设置 HTTP 不会同时设置 HTTPS。参数定义见 Mac 上的 <code>networksetup -help</code> 和 Apple 的 <a href="https://support.apple.com/guide/remote-desktop/about-networksetup-apdd0c5a2d5/mac">networksetup 文档</a>。</p>
+<p><code>scutil --proxy</code> 用于核对系统发布的配置，Tinyproxy 日志则用于确认请求确实到达代理。采用系统配置的浏览器访问外部网站后，日志应出现对应请求；若未出现，应检查绕过域名、应用覆盖配置和旧连接复用。</p>
+<p>终端程序使用各自支持的配置入口。curl 除了接受 <code>--proxy</code>，还可以读取当前 shell 的环境变量：</p>
+<pre><code class="language-bash">export http_proxy=http://127.0.0.1:18888
+export https_proxy=http://127.0.0.1:18888</code></pre>
+<p><code>https_proxy</code> 指定 HTTPS 目标使用的代理，值中的 <code>http://</code> 指定连接代理的协议。因此，这两个变量可以使用同一个 HTTP 代理地址。其他程序支持哪些变量，由其自身实现决定。</p>
+<h3 id="zh-restore">配置恢复</h3>
+<p>如果两项系统代理在实验前均为关闭状态，恢复命令为：</p>
+<pre><code class="language-bash">sudo networksetup -setwebproxystate &quot;Wi-Fi&quot; off
+sudo networksetup -setsecurewebproxystate &quot;Wi-Fi&quot; off</code></pre>
+<p>如果原先已有代理，应恢复记录下来的原值。若两个环境变量也是本次新设的，再执行 <code>unset http_proxy https_proxy</code>；原先存在则恢复原值。最后回到 Tinyproxy 的终端按 <kbd>Ctrl-C</kbd> 停止服务。</p>
+
+<h2 id="zh-ssh">4. SSH 与 SOCKS</h2>
+<p>SSH 端口转发通过加密 channel 传送应用字节。<code>-L</code> 在启动命令中固定目标，<code>-D</code> 则由每条连接的 SOCKS 握手提供目标。SOCKS 负责选址，SSH 负责远端连接和加密传输，两者可以组成同一条数据路径。</p>
+<h3 id="zh-forward">本地转发（-L）</h3>
+<p><code>ssh -L</code> 适用于访问一个已知的主机和端口。例如，VM 上的 HTTP 服务只监听 <code>127.0.0.1:8000</code>，Mac 可以将本地 18080 转发到该地址。在 Mac 上执行以下命令，<code>alice@vm.example</code> 替换为实际 SSH 登录地址：</p>
+<pre><code class="language-bash">ssh -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:18080:127.0.0.1:8000 alice@vm.example
+
+# Run in another Mac terminal / 在 Mac 的另一个终端执行
+curl --noproxy &quot;*&quot; http://127.0.0.1:18080/</code></pre>
+<p>第一个 <code>127.0.0.1:18080</code> 是 Mac 上的监听端点；后面的 <code>127.0.0.1:8000</code> 是 <strong>sshd 从 VM 一侧连接的目标</strong>。两个 loopback 地址指向两台不同机器。应用连接本地 18080 后，可以直接发送原来的 HTTP 字节，无需额外发送 SOCKS 或 CONNECT 握手。<a href="https://man.openbsd.org/ssh.1#L">OpenSSH：-L</a>。</p>
+<figure class="proxy-diagram">
+<div class="diagram-toolbar"><label>显示 <select aria-label="显示: ssh-local-forward"><option value="fit">适配宽度</option><option value="1080">100%</option><option value="1620">150%</option></select></label><a href="../assets/http-proxy-macos-ssh-socks/ssh-local-forward.svg" target="_blank" rel="noopener">单独打开 SVG ↗</a></div>
+<div class="diagram-scroll"><div class="diagram-canvas"><object type="image/svg+xml" data="../assets/http-proxy-macos-ssh-socks/ssh-local-forward.svg" style="aspect-ratio:1080/850" aria-label="-L 的目标固定在命令中；琥珀色标出 SSH 加密 channel。客户端不需要代理握手。"><a href="../assets/http-proxy-macos-ssh-socks/ssh-local-forward.svg">-L 的目标固定在命令中；琥珀色标出 SSH 加密 channel。客户端不需要代理握手。</a></object></div></div>
+<figcaption>-L 的目标固定在命令中；琥珀色标出 SSH 加密 channel。客户端不需要代理握手。</figcaption></figure>
+<p>固定目标也可以是 sshd 能访问的其他主机和端口。SSH 客户端把应用数据装进 <code>direct-tcpip</code> channel，经 SSH 连接送到 sshd；sshd 打开目标连接并转发字节。SSH 加密覆盖客户端到 sshd 这一段，sshd 到目标服务是否加密取决于被转发的应用协议。<a href="https://www.rfc-editor.org/rfc/rfc4254.html#section-7.2">RFC 4254 §7.2</a>。</p>
+
+<h3 id="zh-socks">动态转发（-D）</h3>
+<p>SOCKS5 客户端先连接 SOCKS 服务，协商认证方法，然后在 CONNECT 请求中给出目标地址和端口。目标地址可以是 IP，也可以是域名。握手后转发应用字节，因此它可以承载 HTTP、TLS 或其他 TCP 应用协议，无需理解 HTTP URL、header 或 body。<a href="https://www.rfc-editor.org/rfc/rfc1928.html#section-4">RFC 1928</a>定义了这些字段。</p>
+<p><code>ssh -D</code> 在本地启动 SOCKS 入口，由应用为每条连接指定目标：</p>
+<pre><code class="language-bash">ssh -N -o ExitOnForwardFailure=yes \
+  -D 127.0.0.1:1080 alice@vm.example
+
+# Run in another Mac terminal / 在 Mac 的另一个终端执行
+curl --noproxy &quot;&quot; --proxy socks5h://127.0.0.1:1080 https://example.com/</code></pre>
+<p>SOCKS 握手由 Mac 上的 SSH 客户端处理。它读取目标地址，通过已经建立的 SSH 连接请求 VM 上的 sshd 打开目标 socket。VM 无需另外运行 SOCKS 服务，每条新连接也可以选择不同目标。<a href="https://man.openbsd.org/ssh.1#D">OpenSSH：-D</a>。</p>
+<figure class="proxy-diagram">
+<div class="diagram-toolbar"><label>显示 <select aria-label="显示: ssh-socks"><option value="fit">适配宽度</option><option value="1080">100%</option><option value="1620">150%</option></select></label><a href="../assets/http-proxy-macos-ssh-socks/ssh-socks.svg" target="_blank" rel="noopener">单独打开 SVG ↗</a></div>
+<div class="diagram-scroll"><div class="diagram-canvas"><object type="image/svg+xml" data="../assets/http-proxy-macos-ssh-socks/ssh-socks.svg" style="aspect-ratio:1080/1100" aria-label="紫色 SOCKS 握手在 Mac 的 SSH 客户端结束；琥珀色 SSH 加密在 VM 的 sshd 结束；绿色源站 TLS 到目标服务器才结束。"><a href="../assets/http-proxy-macos-ssh-socks/ssh-socks.svg">紫色 SOCKS 握手在 Mac 的 SSH 客户端结束；琥珀色 SSH 加密在 VM 的 sshd 结束；绿色源站 TLS 到目标服务器才结束。</a></object></div></div>
+<figcaption>紫色 SOCKS 握手在 Mac 的 SSH 客户端结束；琥珀色 SSH 加密在 VM 的 sshd 结束；绿色源站 TLS 到目标服务器才结束。</figcaption></figure>
+<p>命令中的 <code>socks5h://</code> 让 curl 把目标域名交给代理。在这条 SSH 路径上，最终由 VM 一侧解析目标域名。若写 <code>socks5://</code>，curl 先在本机解析，再把 IP 交给 SOCKS 服务。这个区别是 curl 的选项语义，不能假设所有应用都提供相同开关。<a href="https://curl.se/docs/manpage.html#--socks5-hostname">curl：SOCKS5 hostname</a>。</p>
+<p>上面的 SSH 命令都使用 <code>-N</code> 保持转发而不运行远程命令，按 <kbd>Ctrl-C</kbd> 结束。<code>ExitOnForwardFailure=yes</code> 会在本地监听等转发设置失败时退出；它并不预先验证每个最终目标是否可达。远端 sshd 也必须允许相应的 TCP forwarding。<a href="https://man.openbsd.org/ssh_config.5#ExitOnForwardFailure">OpenSSH 配置说明</a>。</p>
+
+<h3 id="zh-combine">HTTP 代理与 SSH</h3>
+<p>应用只支持 HTTP 代理时，<code>ssh -L</code> 可以将远端代理映射为本地端口。假设 Tinyproxy 监听 VM 的 <code>127.0.0.1:18888</code>，Mac 上的本地入口可设为 <code>127.0.0.1:18889</code>。代理保持运行，在 Mac 上建立以下转发：</p>
+<pre><code class="language-bash">ssh -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:18889:127.0.0.1:18888 alice@vm.example
+
+# Run in another Mac terminal / 在 Mac 的另一个终端执行
+curl --noproxy &quot;&quot; --proxy http://127.0.0.1:18889 https://example.com/</code></pre>
+<pre><code>Mac 应用
+  → HTTP 代理协议 → Mac 127.0.0.1:18889
+  → SSH 加密 channel → VM sshd
+  → VM 127.0.0.1:18888 上的 Tinyproxy
+  → 目标站点</code></pre>
+<p>macOS 的 HTTP 和 HTTPS 代理字段使用本地入口 <code>127.0.0.1:18889</code>。应用仍发送 HTTP 代理请求，SSH 将其送到 VM，由 Tinyproxy 解析并连接源站。这个组合保留了 HTTP 代理接口，使远端代理可以继续只监听 loopback，并加密 Mac 到 VM 的传输。</p>
+
+<h2 id="zh-stack">5. 协议栈对比</h2>
+<p>HTTP、SOCKS 和 SSH 转发应用字节流，三层 VPN 承载完整 IP 包。转发单位不同，TCP 状态的维护者、可承载的协议和应用需要提供的配置也随之不同。</p>
+<h3 id="zh-layer-map">协议分层</h3>
+<p>本文的 HTTP/1.1 代理和 SSH 建立在 TCP 之上，属于应用层协议。SOCKS 同样通过上层握手请求连接服务；按 TCP/IP 模型归入应用层，按 OSI 功能常归为 L5 会话层。三层 VPN 的分层描述则针对其承载的 IP 包。比较时，需要同时标出协议的位置和实际转发的数据单位。</p>
+<figure class="proxy-diagram">
+<div class="diagram-toolbar"><label>显示 <select aria-label="显示: protocol-stack-zh"><option value="fit">适配宽度</option><option value="1080">100%</option><option value="1620">150%</option></select></label><a href="../assets/http-proxy-macos-ssh-socks/protocol-stack-zh.svg" target="_blank" rel="noopener">单独打开 SVG ↗</a></div>
+<div class="diagram-scroll"><div class="diagram-canvas"><object type="image/svg+xml" data="../assets/http-proxy-macos-ssh-socks/protocol-stack-zh.svg" style="aspect-ratio:1080/860" aria-label="HTTP、SOCKS5 与 SSH 的协议栈：三者都位于 TCP 之上；下方依次为 TCP 传输层、IP 网络层和链路层。"><a href="../assets/http-proxy-macos-ssh-socks/protocol-stack-zh.svg">HTTP、SOCKS5 与 SSH 的协议栈</a></object></div></div>
+<figcaption>每列对应一段实际连接：客户端到 HTTP / SOCKS 代理，或 SSH 客户端到 sshd。应用层框内的两段表示先后发生的握手与数据传输。HTTP CONNECT、SOCKS5 请求和 SSH channel 的规范链接可直接在图中打开。</figcaption></figure>
+<div class="table-scroll"><table>
+<thead><tr><th>机制</th><th>协议栈位置</th><th>实际处理的数据</th><th>应用需要配合什么</th></tr></thead>
+<tbody>
+<tr><td>HTTP proxy</td><td><strong>应用层，OSI L7</strong>，建立在 TCP 之上；HTTPS proxy 的外层另有 TLS</td><td>HTTP 请求 / 响应；CONNECT 成功后可转发任意获准的 TCP 字节流</td><td>使用代理配置并发送 HTTP 代理请求</td></tr>
+<tr><td>SOCKS5</td><td><strong>TCP/IP 应用层</strong>；按 OSI 功能常归为 L5 会话层。RFC 称其位于应用层与传输层之间的 shim</td><td>目标地址与会话握手，随后转发流；UDP 需单独的 UDP ASSOCIATE</td><td>发送 SOCKS 握手</td></tr>
+<tr><td>SSH tunnel，本文的 -L / -D</td><td><strong>应用层，OSI L7</strong> 的 SSH 协议，通常运行在 TCP 上</td><td>SSH channel 中的应用字节流</td><td>-L 连接本地端口；-D 使用本地 SOCKS 入口</td></tr>
+<tr><td>常见的 packet VPN，如 WireGuard / TUN 模式</td><td>在<strong>网络层，OSI L3</strong> 接入并承载 IP 包；隧道外层协议另算</td><td>完整内层 IP 包，包括其中的 TCP、UDP 或 ICMP</td><td>应用通常照常 connect，由路由 / VPN 策略选入隧道</td></tr>
+</tbody></table></div>
+<p><a href="https://www.rfc-editor.org/rfc/rfc1928.html#section-1">RFC 1928 §1</a>将 SOCKS 描述为应用层与传输层之间的 shim。它请求转发 TCP 连接，握手本身仍在 TCP 之上。VPN 也有不同形态：TUN 承载 IP 包，TAP 可承载 L2 以太网帧，部分以 VPN 命名的产品提供应用代理。具体层次取决于实现；<a href="https://www.kernel.org/doc/html/latest/networking/tuntap.html">Linux TUN/TAP 文档</a>明确区分了这两种接口。</p>
+
+<h3 id="zh-vpn">VPN 数据路径</h3>
+<p>三层 VPN 接入 IP 路由路径。应用照常连接目标服务器，例如 <code>connect(origin_ip, 443)</code>；匹配 VPN 路由的数据包进入隧道接口，由 VPN 加密封装并送往网关。网关解封装后把内层包路由到目标，返回包沿相反方向传递。应用无需发送 HTTP 代理请求或 SOCKS 握手。</p>
+<pre><code>内层：IP[客户端隧道地址 → 源站] / TCP / TLS / HTTP
+                          ↓ VPN 加密封装
+外层：IP[Mac 网络地址 → VPN 网关] / UDP / WireGuard 加密数据
+                          ↓ VPN 网关解封装、路由，可能做 NAT
+源站：收到内层连接的数据包，看不到外层 WireGuard 封装</code></pre>
+<figure class="proxy-diagram">
+<div class="diagram-toolbar"><label>显示 <select aria-label="显示: vpn-packets"><option value="fit">适配宽度</option><option value="1080">100%</option><option value="1620">150%</option></select></label><a href="../assets/http-proxy-macos-ssh-socks/vpn-packets.svg" target="_blank" rel="noopener">单独打开 SVG ↗</a></div>
+<div class="diagram-scroll"><div class="diagram-canvas"><object type="image/svg+xml" data="../assets/http-proxy-macos-ssh-socks/vpn-packets.svg" style="aspect-ratio:1080/1020" aria-label="VPN 搬运 IP 包；内层 TCP 由客户端与源站维护。琥珀色是到 VPN 网关的外层加密传输，图中省略独立的 VPN 建隧道握手。"><a href="../assets/http-proxy-macos-ssh-socks/vpn-packets.svg">VPN 搬运 IP 包；内层 TCP 由客户端与源站维护。琥珀色是到 VPN 网关的外层加密传输，图中省略独立的 VPN 建隧道握手。</a></object></div></div>
+<figcaption>VPN 搬运 IP 包；内层 TCP 由客户端与源站维护。琥珀色是到 VPN 网关的外层加密传输，图中省略独立的 VPN 建隧道握手。</figcaption></figure>
+<p>WireGuard 使用 UDP 传送加密后的 IP 包，因此外层存在 UDP，内层仍可承载 TCP。仅负责路由或 NAT 的 VPN 网关不接受应用 TCP 连接再新建另一条连接：TCP 状态由客户端与源站维护，NAT 按映射改写地址或端口。CONNECT 和 SOCKS 代理则通常在代理两侧维护独立的 TCP 连接。<a href="https://www.wireguard.com/protocol/">WireGuard 协议说明</a>给出了外层封装。</p>
+<p>进入 VPN 的流量由路由及产品策略决定。Split tunnel 选择部分目标或网段；full tunnel 将默认出口导入隧道，实际覆盖仍取决于 IPv4、IPv6、例外路由和 DNS 配置；per-app VPN 按应用限定范围。Apple 的<a href="https://support.apple.com/guide/deployment/vpn-overview-depae3d361d0/1/web/1.0">部署指南</a>和<a href="https://developer.apple.com/documentation/networkextension/routing-your-vpn-network-traffic">VPN 路由说明</a>介绍了这些部署方式。</p>
+
+<h3 id="zh-layers">加密边界</h3>
+<p>转发方式与加密范围是两个独立属性。CONNECT 规定连接成功后的字节转发，SOCKS 规定目标选择与代理交互；SSH 和 VPN 则在各自端点之间提供加密。应用自己的 TLS 会话还可以跨越这些转发节点，延伸到源站。</p>
+<div class="table-scroll"><table>
+<thead><tr><th>机制</th><th>自带的加密区间</th><th>访问 HTTPS 源站时</th></tr></thead>
+<tbody>
+<tr><td>普通 HTTP 代理 / CONNECT</td><td>普通 HTTP 代理连接不自带 TLS；CONNECT 本身只建立字节通道</td><td>客户端与源站通过 CONNECT 建立 TLS</td></tr>
+<tr><td>使用 TLS 连接的 HTTP 代理</td><td>客户端到代理的外层 TLS</td><td>源站 TLS 位于 CONNECT 通道内部，与外层 TLS 独立</td></tr>
+<tr><td>SOCKS5 CONNECT</td><td>SOCKS5 名称本身不保证加密；取决于认证方法及额外封装</td><td>应用的 TLS 可以延伸到源站</td></tr>
+<tr><td>SSH <code>-L</code> / <code>-D</code></td><td>SSH 客户端到 sshd；sshd 后的链路取决于应用协议</td><td>源站 TLS 可跨越 SSH 转发路径</td></tr>
+<tr><td>L3 packet VPN</td><td>VPN 客户端到 VPN 网关</td><td>源站 TLS 承载在内层连接中，继续延伸到源站</td></tr>
+</tbody></table></div>
+<p>HTTPS 经 <code>ssh -D</code> 访问时，Mac 到 VM 的 SSH channel 承载源站 TLS 字节：</p>
+<pre><code>链路帧
+  IP：Mac → VM
+    TCP：SSH 客户端 → sshd
+      SSH 加密传输
+        SSH channel data
+          应用与 example.com 之间的 TLS 字节
+            TLS 解密后才是 HTTP 请求 / 响应</code></pre>
+<p>sshd 解密 SSH channel 后，得到的仍是源站 TLS 字节，并将其写入另一条到源站的 TCP 连接。应用的 TCP 包没有整体封装进这个 channel；两侧 socket 分别维护 TCP 状态。SSH 传输层的加密和完整性保护见 <a href="https://www.rfc-editor.org/rfc/rfc4253.html#section-6">RFC 4253 §6</a>。</p>
+<p>选型时，固定服务可以使用 <code>-L</code> 暴露本地端口，多个动态目标可以交给 <code>-D</code> 的 SOCKS 入口；仅支持 HTTP 代理的应用需要 HTTP 代理接口。应用无代理支持、又需要按 IP 路由承载流量时，packet VPN 提供的是另一层的接入方式。</p>
+
+<h3 id="zh-dns-udp">DNS 与 UDP</h3>
+<div class="table-scroll"><table>
+<thead><tr><th>本文路径</th><th>源站域名由谁解析</th></tr></thead>
+<tbody>
+<tr><td>HTTP URL / CONNECT 中携带主机名</td><td>通常由 HTTP 代理解析。</td></tr>
+<tr><td>curl <code>socks5://</code></td><td>curl 本地解析，再向 SOCKS 服务发送 IP。</td></tr>
+<tr><td>curl <code>socks5h://</code></td><td>域名交给 SOCKS 服务；<code>ssh -D</code> 的目标解析发生在 SSH 远端。</td></tr>
+<tr><td>SSH <code>-L local:target:port</code></td><td>目标 target 从 SSH 服务端一侧解析和访问。</td></tr>
+<tr><td>Packet VPN</td><td>通常仍是客户端解析器发起查询；查询是否进隧道、用哪个 DNS 服务器，取决于 VPN / DNS 配置。</td></tr>
+</tbody></table></div>
+<p>源站与代理自身的域名可以在不同位置解析。即使源站域名交给远端解析，连接 <code>proxy.example</code> 或 <code>vm.example</code> 仍可能依赖本地 DNS，PAC 也可能为选择路径而发起查询。不同浏览器还可能采用不同的 SOCKS DNS 策略，参见 <a href="https://chromium.googlesource.com/chromium/src/+/main/net/docs/proxy.md">Chromium 代理文档</a>。</p>
+<p>SOCKS5 标准包含 <code>UDP ASSOCIATE</code>，但具体实现不一定支持。OpenSSH 的动态转发只处理 SOCKS CONNECT，并未因此成为通用 UDP 代理。本文的 HTTP/1.1 CONNECT 和 SSH <code>-L</code> / <code>-D</code> 都不转发 ping 的 ICMP 包，也不自动接管 QUIC / HTTP/3。参见 <a href="https://www.rfc-editor.org/rfc/rfc1928.html#section-7">SOCKS5 的 UDP 规范</a>和 <a href="https://github.com/openssh/openssh-portable/blob/master/channels.c">OpenSSH 的 channel_decode_socks5()</a>。</p>
+<p>Packet VPN 可以承载 TCP、UDP 和 ICMP；具体部署仍可在隧道两端按协议或目标过滤流量。</p>
+
+<h2 id="zh-origin">6. 源站可见性</h2>
+<p>目标服务器能直接观察连接来源和收到的应用数据。已经在中间节点结束的 CONNECT、SOCKS、SSH 或 VPN 封装不会随请求自动到达源站。判断请求是否经过代理，需要区分协议直接提供的证据与基于出口地址的推断。</p>
+<h3 id="zh-origin-visible">连接与请求信息</h3>
+<p>本节的观察点是站点对外接受连接的服务器。如果站点使用 CDN 或负载均衡，后端直接连接的对端是该中间节点，需要通过可信的转发信息还原外部连接来源。</p>
+<div class="table-scroll"><table>
+<thead><tr><th>访问方式</th><th>目标站点直接看到什么</th><th>不会自动收到什么</th></tr></thead>
+<tbody>
+<tr><td>普通 HTTP 正向代理</td><td>代理出口或其上游 NAT 的地址；代理转发的 HTTP 请求，可能含转发相关 header</td><td>代理之前所有节点的完整链路记录</td></tr>
+<tr><td>HTTPS 经普通 CONNECT / SOCKS</td><td>代理出口地址，以及客户端送来的 TLS 握手和 TLS 内的请求</td><td>CONNECT 或 SOCKS 握手本身；它们在代理处结束</td></tr>
+<tr><td>SSH -L / -D</td><td>sshd 一侧目标连接的来源地址；若 HTTPS 未被中途终止，仍收到客户端的 TLS</td><td>SSH 协议头和 SSH 加密 channel；它们在 sshd 处结束</td></tr>
+<tr><td>VPN，经出口 NAT 上网</td><td>VPN 出口 NAT 地址，以及客户端的应用流量</td><td>客户端到 VPN 网关之间的外层 VPN 封装</td></tr>
+<tr><td>VPN，路由部署而不做 NAT</td><td>被路由的客户端源地址，例如企业分配的隧道地址</td><td>外层 VPN 协议头及隧道握手</td></tr>
+</tbody></table></div>
+<p>HTTP 规范要求代理在转发的 HTTP 消息中添加 <code>Via</code>，记录中间节点；<code>Forwarded</code> 或常见的 <code>X-Forwarded-For</code> 则可按实现和配置传递客户端信息。服务器接受这类信息需要可信的代理关系，客户端自行填写的 header 不能证明真实路径。部署中也可能存在省略这些字段的代理，因此字段缺失不能证明请求直连。参见 <a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-7.6.3">Via 规范</a>和 <a href="https://www.rfc-editor.org/rfc/rfc7239.html#section-8.1">Forwarded 的可信度限制</a>。</p>
+<p>保持端到端 TLS 的 CONNECT 代理无法修改其中的 HTTP header 而不破坏 TLS 完整性校验，packet VPN 本身也不生成 HTTP 转发头。源站仍会收到应用主动发送的账号、cookie 和其他请求数据；出口地址改变并不会移除这些身份信息。</p>
+
+<h3 id="zh-origin-infer">出口 IP 识别</h3>
+<p>互联网请求没有一个通用字段声明其经过 VPN、SOCKS 或 SSH。服务器可以将源地址与已知 VPN、公共代理或托管机房网段比较，再结合账号和访问行为作判断。MaxMind 的<a href="https://dev.maxmind.com/geoip/docs/databases/anonymous-ip/binary/">匿名 IP 数据库</a>提供这些分类，也说明部分 VPN 网段可能只被标为 hosting provider。</p>
+<p>出口 IP 分类描述地址的归属或已知用途，无法单独还原具体转发协议。保持端到端 TLS 的代理通常还会保留客户端握手特征，因此 TLS 指纹也不能简单视为代理程序的指纹。确认完整路径需要客户端配置、可信代理或 VPN 日志等额外证据。目标服务器的一条访问日志通常只能支持有限推断。</p>
+
+<h2 id="zh-policy">7. 网关访问控制</h2>
+<h3 id="zh-policy-view">协议可见性</h3>
+<p>HTTP 代理不可用而 SSH 可用，可能源于两条连接匹配了不同规则。例如，允许连接某台 VM 的 SSH、同时阻止明文 HTTP 代理请求的网关，会对以下路径作出不同处理：</p>
+<pre><code>直接使用 HTTP 代理：
+Mac → 网关 → proxy:18888
+             可见 TCP 目标，以及明文 GET absolute-URL / CONNECT host:port
+
+经 SSH 搬运 HTTP 代理流量：
+Mac → 网关 → VM:ssh-port
+             可见 SSH 连接；密钥交换后，channel 内容被 SSH 加密
+             HTTP 代理握手在 SSH channel 里面
+VM sshd → Tinyproxy → 源站</code></pre>
+<p>直接使用 HTTP 代理时，网关可以检查目标地址、端口以及明文 HTTP 字段。将同样的请求放入 SSH channel 后，未终止或解密 SSH、也没有端点可见性的网关，无法继续用明文 HTTP 规则检查其中的握手。网关仍能看到 SSH 连接的端点与流量特征；加密前交换的 <code>SSH-2.0-...</code> 版本标识也提供了协议识别线索。<a href="https://www.rfc-editor.org/rfc/rfc4253.html#section-4.2">RFC 4253 §4.2</a>。</p>
+<p>SSH 连接本身经企业 VPN 传输时，本地链路上的观察者看到 VPN 外层，企业 VPN 网关解封装后看到 SSH。VPN 解密只移除 VPN 这一层封装，SSH channel 仍受独立的 SSH 加密保护。</p>
+
+<h3 id="zh-policy-rules">访问控制规则</h3>
+<div class="table-scroll"><table>
+<thead><tr><th>拦截点 / 规则</th><th>HTTP 代理与 SSH 可能表现不同的原因</th></tr></thead>
+<tbody>
+<tr><td>只限制 GUI 代理配置或特定应用</td><td>它约束的是配置或应用行为；另一个进程的 socket 可能适用不同规则。</td></tr>
+<tr><td>阻止某代理 IP 或 TCP 端口</td><td>SSH 使用不同目的端点时，可能不匹配该规则；若同一 IP 被整体封禁，换协议也无效。</td></tr>
+<tr><td>识别明文 HTTP / CONNECT</td><td>SSH channel 内的请求不再以明文 HTTP 出现在这一观察点；HTTPS proxy 的外层 TLS 也会改变可见性。</td></tr>
+<tr><td>禁止 SSH 或加密隧道应用</td><td>SSH 同样可能被拦；应用识别不必只依赖默认 22 端口。</td></tr>
+<tr><td>强制所有应用经受管出口、端点过滤或默认拒绝</td><td>SSH 不会自动获得例外，具体由进程、路由、目的地和应用策略共同决定。</td></tr>
+<tr><td>远端出口或目标服务器封禁</td><td>本地 SSH 建连成功，也不能保证远端能连接代理或目标。</td></tr>
+</tbody></table></div>
+<p>防火墙可通过签名、协议解析和启发式分析识别应用流量，并结合已配置的解密策略检查内容。更换默认端口不会消除协议特征。<a href="https://docs.paloaltonetworks.com/ngfw/administration/app-id/app-id-overview">Palo Alto App-ID 文档</a>描述了这些分类机制。</p>
+<p>SSH 成功仅能说明这条 SSH 路径在当时可用。要把 HTTP 代理失败归因于策略拦截，还需要对应的拒绝日志、规则命中记录或连接阶段证据。监听地址错误、代理 ACL、认证失败和远端 DNS 故障也会产生代理不可用的现象。</p>
+
+<h2 id="zh-debug">8. 故障排查</h2>
+<p>代理请求依赖本地监听、代理到源站的连接，以及最终应用协议。最早失败的阶段决定排查范围。在运行 Tinyproxy 的 Mac 上，监听状态可由以下命令确认：</p>
+<pre><code>lsof -nP -iTCP:18888 -sTCP:LISTEN</code></pre>
+<p>Linux VM 上对应的检查命令是 <code>ss -ltnp 'sport = :18888'</code>。监听正常后，<a href="#zh-verify">HTTP 与 HTTPS 验证请求</a>可将失败范围缩小到代理握手、远端连接或 TLS。结合前台日志判断具体原因：</p>
+<div class="table-scroll"><table>
+<thead><tr><th>观察结果</th><th>优先检查</th></tr></thead>
+<tbody>
+<tr><td>连接代理时 connection refused</td><td>进程是否在运行、端口是否正确、监听地址是否可达；Mac 与 VM 的 127.0.0.1 不是同一个地址。</td></tr>
+<tr><td>连代理超时</td><td>到代理的路由、防火墙、监听接口；能 ping 通只说明 ICMP 可达，不能证明该 TCP 端口可达。</td></tr>
+<tr><td>407 Proxy Authentication Required</td><td>代理已响应；检查客户端凭据和代理认证配置。</td></tr>
+<tr><td>CONNECT 被拒绝或返回非 2xx</td><td>客户端 Allow 规则、ConnectPort、代理到目标的 DNS / TCP；根据日志判断，不能只凭状态码认定原因。</td></tr>
+<tr><td>CONNECT 200 后 TLS 失败</td><td>目标证书、信任链、主机名和协议；不要用 <code>-k</code> 掩盖证书问题来宣告配置成功。</td></tr>
+<tr><td>浏览器成功，终端程序失败</td><td>分别确认它们实际读取的代理配置，检查环境变量和绕过列表。</td></tr>
+<tr><td>curl 成功，浏览器似乎没走代理</td><td>当前网络服务、HTTPS 字段、PAC、例外域名和浏览器自己的设置；发起新连接并看代理日志。</td></tr>
+</tbody></table></div>
+<p><code>curl -v</code> 记录客户端侧的连接和协议进度，代理日志记录请求处理与目标连接，SSH 的 <code>-v</code> 补充隧道建立信息。将同一次请求的这些日志对齐，可以定位失败的连接段，再检查该段的配置与访问策略。</p>
+<p class="source-note">验证范围：教程中的 Tinyproxy 配置及 HTTP / HTTPS curl 请求已在 Linux 上以 Tinyproxy 1.11.3 实测；macOS GUI 和 networksetup 命令按 Apple 文档说明，未在 Mac 上执行。序列图为本文绘制，默认适配宽度，可放大；消息文字可点击查看协议来源。</p>
+</div>
+
+<div class="lang-en">
+<h1>HTTP proxies and VPNs: macOS, SSH tunnels and SOCKS</h1>
+<p class="lead">macOS proxy settings participate in an application's connection decisions. A browser may use them to connect through a proxy while curl, SSH or a program using sockets directly continues to connect without one. Coverage depends on the configuration each application actually uses.</p>
+<p>HTTP proxies, SOCKS, SSH tunnels and VPNs intervene at different points in that path. HTTP proxies handle requests or CONNECT streams; SOCKS supplies a destination for a connection; SSH encrypts forwarded bytes; common layer-3 VPNs carry IP packets. Connection ownership and encryption endpoints determine both application configuration and what servers and gateways can observe. This article covers explicit forward proxies, using HTTP/1.1 for the proxy handshake examples.</p>
+
+<h2 id="en-macos">1. macOS proxy settings</h2>
+<h3 id="en-service">Configuration scope</h3>
+<p>Proxy settings belong to the selected network service. System Settings → Network → Wi-Fi or Ethernet → Details → Proxies provides separate HTTP, HTTPS, SOCKS, PAC and bypass entries. Wi-Fi and Ethernet retain separate configurations. <a href="https://support.apple.com/en-gb/guide/mac-help/mchlp2591/mac">Apple proxy settings guide</a>.</p>
+<p>Applications read that policy through their networking libraries. Apple's <code>URLSessionConfiguration.connectionProxyDictionary</code> uses system settings by default and allows an application to supply its own configuration. Two applications on the same Mac can therefore select different connection paths. <a href="https://developer.apple.com/documentation/foundation/urlsessionconfiguration/connectionproxydictionary?language=objc">URLSession documentation</a>.</p>
+<div class="table-scroll"><table>
+<thead><tr><th>Traffic source</th><th>Effect of setting only the macOS HTTP / HTTPS proxy</th></tr></thead>
+<tbody>
+<tr><td>Browser or URLSession app using system policy</td><td>Selects a proxy or direct access according to URL scheme, bypass rules and PAC, subject to application overrides.</td></tr>
+<tr><td>Command-line curl</td><td>Normally needs <code>--proxy</code> or supported environment variables. Do not assume it reads the GUI setting.</td></tr>
+<tr><td>Raw BSD sockets or a normal ssh invocation</td><td>Connects to the address the program specifies. Proxying needs explicit support or a separate forwarding mechanism.</td></tr>
+<tr><td>ping or arbitrary UDP</td><td>Does not turn into HTTP traffic.</td></tr>
+</tbody></table></div>
+<p>System proxy coverage depends on which applications adopt the configuration. Shell environment variables are a separate input: changing the GUI does not set <code>http_proxy</code> in a terminal, and setting that variable does not update the system proxy. curl documents the variables it supports in its <a href="https://everything.curl.dev/usingcurl/proxies/env.html">proxy environment reference</a>.</p>
+
+<h3 id="en-socket">Connection setup</h3>
+<p>For <code>https://example.com/docs</code>, an application using proxy policy evaluates the URL and rules before selecting an endpoint. If it selects <code>proxy.example:18888</code>, it opens a TCP socket to that address. The kernel routes packets to the proxy; the application writes the CONNECT handshake to the connection.</p>
+<pre><code>URL: https://example.com/docs
+  → application / network library evaluates proxy policy
+  → selects proxy.example:18888
+  → socket.connect(proxy_ip, 18888)
+  → TCP / IP delivers bytes to the proxy
+  → application sends CONNECT example.com:443</code></pre>
+<p>HTTP requests and CONNECT handshakes are application data carried by the kernel. A bypass match selects a direct connection. A program that does not read proxy settings retains its own destination-selection logic. Chromium's <a href="https://github.com/chromium/chromium/blob/main/net/proxy_resolution/proxy_config_service_mac.cc">macOS configuration reader</a> shows how system settings enter an application's proxy policy.</p>
+
+<h2 id="en-wire">2. HTTP proxy mechanics</h2>
+<p>HTTP forwarding requires the proxy to parse requests. HTTPS through CONNECT switches to relaying TLS bytes after setup. Both modes use separate TCP connections on either side of the proxy, but expose different application data to it.</p>
+<h3 id="en-http">HTTP forwarding</h3>
+<p>An HTTP proxy obtains the destination from the full URL in the request line. For <code>http://example.com/docs</code>, the client connects to the proxy and sends the request below. The proxy resolves <code>example.com</code>, opens or reuses an origin connection, and forwards the request. The diagram shows new connections.</p>
+<pre><code>GET http://example.com/docs HTTP/1.1
+Host: example.com
+
+</code></pre>
+<p>This request target is called <em>absolute-form</em>. Toward the origin, the proxy typically sends <code>GET /docs HTTP/1.1</code>, using <em>origin-form</em>. The two TCP connections have independent sequence numbers, retransmissions and flow control. Plain HTTP content is visible to the proxy. See <a href="https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2">RFC 9112 §3.2</a>.</p>
+<figure class="proxy-diagram">
+<div class="diagram-toolbar"><label>Size <select aria-label="Size: http-forward"><option value="fit">Fit width</option><option value="1080">100%</option><option value="1620">150%</option></select></label><a href="../assets/http-proxy-macos-ssh-socks/http-forward.svg" target="_blank" rel="noopener">Open SVG ↗</a></div>
+<div class="diagram-scroll"><div class="diagram-canvas"><object type="image/svg+xml" data="../assets/http-proxy-macos-ssh-socks/http-forward.svg" style="aspect-ratio:1080/760" aria-label="The proxy parses HTTP, with separate TCP connections to the client and origin."><a href="../assets/http-proxy-macos-ssh-socks/http-forward.svg">The proxy parses HTTP, with separate TCP connections to the client and origin.</a></object></div></div>
+<figcaption>The proxy parses HTTP, with separate TCP connections to the client and origin.</figcaption></figure>
+
+<h3 id="en-connect">CONNECT tunneling</h3>
+<p>CONNECT establishes a byte stream for a TLS session between client and origin. Through an ordinary HTTP proxy, the client requests a destination hostname and port:</p>
+<pre><code>CONNECT example.com:443 HTTP/1.1
+Host: example.com:443
+
+</code></pre>
+<p>After connecting to <code>example.com:443</code>, the proxy returns a successful 2xx response and switches to bidirectional byte forwarding. The client completes its TLS handshake with the origin through that stream, then sends encrypted HTTP requests. Those TLS bytes need no additional GET or POST wrapper. <a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6">RFC 9110 §9.3.6</a> defines the transition.</p>
+<figure class="proxy-diagram">
+<div class="diagram-toolbar"><label>Size <select aria-label="Size: https-connect"><option value="fit">Fit width</option><option value="1080">100%</option><option value="1620">150%</option></select></label><a href="../assets/http-proxy-macos-ssh-socks/https-connect.svg" target="_blank" rel="noopener">Open SVG ↗</a></div>
+<div class="diagram-scroll"><div class="diagram-canvas"><object type="image/svg+xml" data="../assets/http-proxy-macos-ssh-socks/https-connect.svg" style="aspect-ratio:1080/900" aria-label="Purple marks CONNECT setup; green marks origin TLS. Activation bars show handling or relay intervals, not continuous CPU use."><a href="../assets/http-proxy-macos-ssh-socks/https-connect.svg">Purple marks CONNECT setup; green marks origin TLS. Activation bars show handling or relay intervals, not continuous CPU use.</a></object></div></div>
+<figcaption>Purple marks CONNECT setup; green marks origin TLS. Activation bars show handling or relay intervals, not continuous CPU use.</figcaption></figure>
+<p>Client and origin maintain the TLS session while the proxy relays its bytes between two TCP connections. The proxy sees the CONNECT hostname and port, traffic sizes and timing. Normal forwarding gives it no origin TLS session keys and no direct access to the HTTPS body. TLS inspection using an additional trusted certificate changes this encryption boundary. The green arrows identify logical TLS endpoints; the bytes still traverse both TCP legs. <a href="https://www.rfc-editor.org/rfc/rfc8446.html#section-2">TLS 1.3 overview</a>.</p>
+
+<h3 id="en-https-name">HTTPS proxies and TLS</h3>
+<p>The macOS Secure Web Proxy (HTTPS) field selects the proxy for <strong>HTTPS destination URLs</strong>. Chromium maps this setting to an ordinary HTTP proxy, so the field name does not establish TLS on the client-to-proxy connection. <a href="https://github.com/chromium/chromium/blob/main/net/proxy_resolution/proxy_chain_util_apple.cc">GetProxyServerScheme()</a> explains the naming distinction.</p>
+<p>curl's <code>--proxy https://proxy.example:8443</code> instead specifies <strong>TLS to the proxy</strong>. For an HTTPS origin, that outer TLS session carries CONNECT and the inner TLS session between client and origin. The two handshakes have different peers. The tutorial uses <code>http://127.0.0.1:18888</code>, where one Tinyproxy listener handles HTTP forwarding and HTTPS CONNECT. <a href="https://curl.se/docs/manpage.html#-x">curl proxy prefixes</a>.</p>
+
+<h2 id="en-server">3. Tinyproxy deployment</h2>
+<p>A working proxy requires both a listener and clients configured to use it. Explicit curl requests test the service independently of macOS settings; application configuration can then be verified against that working connection path.</p>
+<h3 id="en-install">Listener setup</h3>
+<p>The local example binds Tinyproxy to IPv4 loopback <code>127.0.0.1:18888</code>. Local processes, including those of other logged-in users, can reach this address. Installation on macOS uses Homebrew:</p>
+<pre><code class="language-bash">brew install tinyproxy</code></pre>
+<p>Debian / Ubuntu VMs use the distribution package. Installation may also start a default service; this example uses its own configuration and port 18888:</p>
+<pre><code class="language-bash">sudo apt-get update
+sudo apt-get install tinyproxy</code></pre>
+<p>Create the configuration and start the foreground process on the machine hosting the proxy:</p>
+<pre><code class="language-bash">proxy_demo_dir=&quot;$HOME/.config/tinyproxy-demo&quot;
+mkdir -p &quot;$proxy_demo_dir&quot;
+cat &gt; &quot;$proxy_demo_dir/tinyproxy.conf&quot; &lt;&lt;&#x27;EOF&#x27;
+Port 18888
+Listen 127.0.0.1
+Timeout 600
+Allow 127.0.0.1
+ConnectPort 443
+EOF
+
+tinyproxy -d -c &quot;$proxy_demo_dir/tinyproxy.conf&quot;</code></pre>
+<p><code>Listen</code> and <code>Port</code> select the listening endpoint; <code>Allow</code> restricts client addresses. <code>ConnectPort 443</code> restricts CONNECT destinations, without applying that port restriction to ordinary HTTP forwarding. <code>-c</code> selects the configuration file and <code>-d</code> keeps the process in the foreground with terminal logs. Port 18888 requires no root privileges. Sources: <a href="https://formulae.brew.sh/formula/tinyproxy">Homebrew formula</a>, <a href="https://tinyproxy.github.io/">Tinyproxy quick start</a>, <a href="https://github.com/tinyproxy/tinyproxy/blob/master/docs/man5/tinyproxy.conf.txt.in">configuration manual</a>.</p>
+
+<h3 id="en-verify">Request verification</h3>
+<p>The HTTP request tests URL parsing and forwarding. HTTPS also tests TLS and the origin response after CONNECT. With the proxy running, execute these requests in another terminal:</p>
+<pre><code class="language-bash">curl --noproxy &quot;&quot; --proxy http://127.0.0.1:18888 \
+  -v http://example.com/ -o /dev/null
+
+curl --noproxy &quot;&quot; --proxy http://127.0.0.1:18888 \
+  -v https://example.com/ -o /dev/null</code></pre>
+<p><code>--proxy</code> selects the endpoint explicitly. <code>--noproxy ""</code> clears the bypass list for this invocation, including effects from an existing <code>NO_PROXY</code>. <code>-v</code> shows protocol details; <code>-o /dev/null</code> discards the body.</p>
+<p>The HTTP request line contains the full URL, followed by the response status:</p>
+<pre><code>&gt; GET http://example.com/ HTTP/1.1
+&lt; HTTP/1.1 200 OK</code></pre>
+<p>The HTTPS log contains a CONNECT response, a TLS handshake and an origin response. This excerpt was recorded with Tinyproxy 1.11.3 on Linux using the configuration above:</p>
+<pre><code>&gt; CONNECT example.com:443 HTTP/1.1
+&lt; HTTP/1.1 200 Connection established
+* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384
+*  SSL certificate verify ok.
+&gt; GET / HTTP/2
+&lt; HTTP/2 200</code></pre>
+<p><code>200 Connection established</code> confirms the proxy tunnel. TLS negotiation, certificate validation and the origin request follow it. The sample uses HTTP/1.1 for CONNECT and HTTP/2 negotiated with the origin inside TLS; those versions are independent. Versions, cipher suites and response codes can vary, so verification checks completion of each stage.</p>
+
+<h3 id="en-configure">Client configuration</h3>
+<p>macOS stores proxy endpoints per network service. Record the service name, proxy values, bypass rules and PAC configuration before changing them so the original state can be restored. Replace <code>Wi-Fi</code> with the name listed by the first command:</p>
+<pre><code class="language-bash">networksetup -listallnetworkservices
+networksetup -getwebproxy &quot;Wi-Fi&quot;
+networksetup -getsecurewebproxy &quot;Wi-Fi&quot;
+networksetup -getproxybypassdomains &quot;Wi-Fi&quot;
+networksetup -getautoproxyurl &quot;Wi-Fi&quot;
+scutil --proxy</code></pre>
+<p>For a service without an existing PAC or managed policy to preserve, set the HTTP and HTTPS endpoints separately:</p>
+<pre><code class="language-bash">sudo networksetup -setwebproxy &quot;Wi-Fi&quot; 127.0.0.1 18888 off
+sudo networksetup -setsecurewebproxy &quot;Wi-Fi&quot; 127.0.0.1 18888 off</code></pre>
+<p>These setters enable their respective proxies. The trailing <code>off</code> disables proxy authentication. The GUI likewise needs address <code>127.0.0.1</code> and port <code>18888</code> in both HTTP and HTTPS entries; setting HTTP alone leaves HTTPS unchanged. Parameter definitions are available in <code>networksetup -help</code> and Apple's <a href="https://support.apple.com/guide/remote-desktop/about-networksetup-apdd0c5a2d5/mac">networksetup documentation</a>.</p>
+<p><code>scutil --proxy</code> verifies the published system configuration; Tinyproxy logs establish that a request reached the proxy. An external website request from a browser using system policy should appear in those logs. Missing requests call for checking bypass rules, application overrides and reused connections.</p>
+<p>Terminal programs use their own configuration inputs. In addition to <code>--proxy</code>, curl accepts environment variables from the current shell:</p>
+<pre><code class="language-bash">export http_proxy=http://127.0.0.1:18888
+export https_proxy=http://127.0.0.1:18888</code></pre>
+<p><code>https_proxy</code> selects the proxy for HTTPS destinations, while <code>http://</code> in its value selects the protocol used to connect to the proxy. Both variables can therefore name the same HTTP proxy. Support in other programs depends on their implementation.</p>
+<h3 id="en-restore">Configuration restoration</h3>
+<p>If both system proxy entries were disabled before the experiment, restore that state with:</p>
+<pre><code class="language-bash">sudo networksetup -setwebproxystate &quot;Wi-Fi&quot; off
+sudo networksetup -setsecurewebproxystate &quot;Wi-Fi&quot; off</code></pre>
+<p>If a proxy was already configured, restore its recorded values instead. Run <code>unset http_proxy https_proxy</code> only if those variables were newly introduced; otherwise restore their earlier values. Finally press <kbd>Ctrl-C</kbd> in the Tinyproxy terminal.</p>
+
+<h2 id="en-ssh">4. SSH and SOCKS</h2>
+<p>SSH port forwarding carries application bytes through encrypted channels. <code>-L</code> fixes the destination in the command; <code>-D</code> obtains it from each connection's SOCKS handshake. SOCKS selects the destination while SSH provides the remote connection and encrypted transport.</p>
+<h3 id="en-forward">Local forwarding (-L)</h3>
+<p><code>ssh -L</code> exposes a known host and port through a local listener. For an HTTP service listening on the VM's <code>127.0.0.1:8000</code>, the Mac can forward local port 18080 to that service. Run this on the Mac, replacing <code>alice@vm.example</code> with the actual SSH login:</p>
+<pre><code class="language-bash">ssh -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:18080:127.0.0.1:8000 alice@vm.example
+
+# Run in another Mac terminal / 在 Mac 的另一个终端执行
+curl --noproxy &quot;*&quot; http://127.0.0.1:18080/</code></pre>
+<p>The first address, <code>127.0.0.1:18080</code>, listens on the Mac. The second, <code>127.0.0.1:8000</code>, is reached <strong>from sshd on the VM</strong>. These loopback addresses refer to different machines. The application sends its original protocol to port 18080 without a SOCKS or CONNECT handshake. <a href="https://man.openbsd.org/ssh.1#L">OpenSSH -L</a>.</p>
+<figure class="proxy-diagram">
+<div class="diagram-toolbar"><label>Size <select aria-label="Size: ssh-local-forward"><option value="fit">Fit width</option><option value="1080">100%</option><option value="1620">150%</option></select></label><a href="../assets/http-proxy-macos-ssh-socks/ssh-local-forward.svg" target="_blank" rel="noopener">Open SVG ↗</a></div>
+<div class="diagram-scroll"><div class="diagram-canvas"><object type="image/svg+xml" data="../assets/http-proxy-macos-ssh-socks/ssh-local-forward.svg" style="aspect-ratio:1080/850" aria-label="The -L target is fixed in the command. Amber marks encrypted SSH channel data; the application needs no proxy handshake."><a href="../assets/http-proxy-macos-ssh-socks/ssh-local-forward.svg">The -L target is fixed in the command. Amber marks encrypted SSH channel data; the application needs no proxy handshake.</a></object></div></div>
+<figcaption>The -L target is fixed in the command. Amber marks encrypted SSH channel data; the application needs no proxy handshake.</figcaption></figure>
+<p>The fixed target can also be another host reachable by sshd. The client carries application bytes in a <code>direct-tcpip</code> channel over SSH; sshd opens the target socket and relays them. SSH encrypts the SSH client-to-server hop. Encryption from sshd to the final service depends on the application protocol. <a href="https://www.rfc-editor.org/rfc/rfc4254.html#section-7.2">RFC 4254 §7.2</a>.</p>
+
+<h3 id="en-socks">Dynamic forwarding (-D)</h3>
+<p>A SOCKS5 client connects to the proxy, negotiates an authentication method, then sends a CONNECT request containing an IP address or hostname and a port. After setup, the proxy relays application bytes. It can carry HTTP, TLS or another TCP application without understanding URLs or HTTP headers. <a href="https://www.rfc-editor.org/rfc/rfc1928.html#section-4">RFC 1928</a>.</p>
+<p><code>ssh -D</code> opens a local SOCKS listener, allowing the application to specify a destination for each connection:</p>
+<pre><code class="language-bash">ssh -N -o ExitOnForwardFailure=yes \
+  -D 127.0.0.1:1080 alice@vm.example
+
+# Run in another Mac terminal / 在 Mac 的另一个终端执行
+curl --noproxy &quot;&quot; --proxy socks5h://127.0.0.1:1080 https://example.com/</code></pre>
+<p>The Mac's SSH client processes the SOCKS handshake. It reads the requested destination and asks sshd on the VM to open the target socket over the established SSH connection. The VM needs no separate SOCKS daemon, and each new connection can select a different destination. <a href="https://man.openbsd.org/ssh.1#D">OpenSSH -D</a>.</p>
+<figure class="proxy-diagram">
+<div class="diagram-toolbar"><label>Size <select aria-label="Size: ssh-socks"><option value="fit">Fit width</option><option value="1080">100%</option><option value="1620">150%</option></select></label><a href="../assets/http-proxy-macos-ssh-socks/ssh-socks.svg" target="_blank" rel="noopener">Open SVG ↗</a></div>
+<div class="diagram-scroll"><div class="diagram-canvas"><object type="image/svg+xml" data="../assets/http-proxy-macos-ssh-socks/ssh-socks.svg" style="aspect-ratio:1080/1100" aria-label="The local SSH client handles purple SOCKS setup. Amber SSH encryption ends at sshd; green origin TLS ends at the destination."><a href="../assets/http-proxy-macos-ssh-socks/ssh-socks.svg">The local SSH client handles purple SOCKS setup. Amber SSH encryption ends at sshd; green origin TLS ends at the destination.</a></object></div></div>
+<figcaption>The local SSH client handles purple SOCKS setup. Amber SSH encryption ends at sshd; green origin TLS ends at the destination.</figcaption></figure>
+<p>curl's <code>socks5h://</code> passes the hostname to the proxy; along this SSH path, destination resolution happens on the VM. With <code>socks5://</code>, curl resolves locally and sends an IP address. This distinction belongs to curl's interface; other clients may expose different DNS controls. <a href="https://curl.se/docs/manpage.html#--socks5-hostname">curl SOCKS5 hostname option</a>.</p>
+<p>Both SSH commands use <code>-N</code> to forward without running a remote command. Stop them with <kbd>Ctrl-C</kbd>. <code>ExitOnForwardFailure=yes</code> catches forwarding setup failures, such as inability to bind a listener, but does not preflight every final destination. The server must permit the requested TCP forwarding. <a href="https://man.openbsd.org/ssh_config.5#ExitOnForwardFailure">OpenSSH configuration</a>.</p>
+
+<h3 id="en-combine">HTTP proxies over SSH</h3>
+<p>For an application that supports HTTP proxies, <code>ssh -L</code> can expose a remote proxy on a local port. Tinyproxy listening on the VM's <code>127.0.0.1:18888</code> can be reached through <code>127.0.0.1:18889</code> on the Mac. With Tinyproxy running, create this forward on the Mac:</p>
+<pre><code class="language-bash">ssh -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:18889:127.0.0.1:18888 alice@vm.example
+
+# Run in another Mac terminal / 在 Mac 的另一个终端执行
+curl --noproxy &quot;&quot; --proxy http://127.0.0.1:18889 https://example.com/</code></pre>
+<pre><code>Mac application
+  → HTTP proxy protocol → Mac 127.0.0.1:18889
+  → encrypted SSH channel → VM sshd
+  → Tinyproxy on VM 127.0.0.1:18888
+  → destination</code></pre>
+<p>The macOS HTTP and HTTPS proxy fields use the local endpoint <code>127.0.0.1:18889</code>. The application sends HTTP proxy requests through SSH; Tinyproxy parses them on the VM and connects to the origin. The application retains its HTTP proxy interface, the remote proxy remains on loopback, and SSH encrypts the Mac-to-VM hop.</p>
+
+<h2 id="en-stack">5. Protocol stack comparison</h2>
+<p>The forwarding unit separates stream proxies from packet VPNs. Receiving application bytes or receiving complete IP packets leads to different TCP ownership, protocol coverage and application requirements.</p>
+<h3 id="en-layer-map">Protocol layers</h3>
+<p>The HTTP/1.1 proxy and SSH examples here use application protocols over TCP. SOCKS also uses a handshake above TCP to request a connection service: it belongs to the TCP/IP application layer and is often assigned to OSI L5 by function. A layer-3 VPN is classified by the IP packets it carries. Layer assignments therefore need to be read alongside the forwarding unit.</p>
+<figure class="proxy-diagram">
+<div class="diagram-toolbar"><label>Size <select aria-label="Size: protocol-stack-en"><option value="fit">Fit width</option><option value="1080">100%</option><option value="1620">150%</option></select></label><a href="../assets/http-proxy-macos-ssh-socks/protocol-stack-en.svg" target="_blank" rel="noopener">Open SVG ↗</a></div>
+<div class="diagram-scroll"><div class="diagram-canvas"><object type="image/svg+xml" data="../assets/http-proxy-macos-ssh-socks/protocol-stack-en.svg" style="aspect-ratio:1080/860" aria-label="HTTP, SOCKS5 and SSH above TCP, followed by the IP and link layers."><a href="../assets/http-proxy-macos-ssh-socks/protocol-stack-en.svg">HTTP, SOCKS5 and SSH in the protocol stack</a></object></div></div>
+<figcaption>Each column shows one connection leg: client to HTTP / SOCKS proxy, or SSH client to sshd. The two application-layer sections represent successive setup and data-transfer phases. Links in the diagram open the HTTP CONNECT, SOCKS5 and SSH channel specifications.</figcaption></figure>
+<div class="table-scroll"><table>
+<thead><tr><th>Mechanism</th><th>Protocol-stack position</th><th>Data handled</th><th>Application cooperation</th></tr></thead>
+<tbody>
+<tr><td>HTTP proxy</td><td><strong>Application layer, OSI L7</strong>, over TCP; HTTPS proxy transport adds TLS</td><td>HTTP messages, or a permitted TCP byte stream after CONNECT</td><td>Select a proxy and send its HTTP handshake</td></tr>
+<tr><td>SOCKS5</td><td><strong>TCP/IP application layer</strong>; often placed at OSI L5 by function. The RFC calls it a shim between application and transport</td><td>Target selection and stream relay; UDP uses a separate UDP ASSOCIATE mechanism</td><td>Send a SOCKS handshake</td></tr>
+<tr><td>SSH tunnel, -L / -D here</td><td><strong>Application layer, OSI L7</strong>, normally over TCP</td><td>Application bytes in SSH channels</td><td>Connect to the -L port or speak SOCKS to -D</td></tr>
+<tr><td>Common packet VPN, such as WireGuard / TUN</td><td>Handles inner packets at the <strong>network layer, OSI L3</strong>; the outer transport is a separate choice</td><td>Whole inner IP packets containing TCP, UDP or ICMP</td><td>Usually connect normally; routing / VPN policy selects traffic</td></tr>
+</tbody></table></div>
+<p><a href="https://www.rfc-editor.org/rfc/rfc1928.html#section-1">RFC 1928 §1</a> describes SOCKS as a shim between application and transport. It requests TCP forwarding through a handshake above TCP. VPN implementations also differ: TUN carries IP packets, TAP can carry L2 Ethernet frames, and some VPN-branded products expose application proxies. The kernel's <a href="https://www.kernel.org/doc/html/latest/networking/tuntap.html">TUN/TAP documentation</a> distinguishes the two interface types.</p>
+
+<h3 id="en-vpn">VPN data path</h3>
+<p>A layer-3 VPN participates in IP routing. The application connects to its destination normally, for example with <code>connect(origin_ip, 443)</code>. Matching packets enter a tunnel interface, are encrypted and encapsulated to the VPN gateway, then decapsulated and routed to the origin. Return packets follow the reverse path. The application needs no HTTP proxy request or SOCKS handshake.</p>
+<pre><code>Inner: IP[client tunnel address → origin] / TCP / TLS / HTTP
+                           ↓ VPN encryption and encapsulation
+Outer: IP[Mac network address → VPN gateway] / UDP / encrypted WireGuard data
+                           ↓ decapsulation, routing, optional NAT
+Origin: receives inner connection packets, not the outer WireGuard wrapper</code></pre>
+<figure class="proxy-diagram">
+<div class="diagram-toolbar"><label>Size <select aria-label="Size: vpn-packets"><option value="fit">Fit width</option><option value="1080">100%</option><option value="1620">150%</option></select></label><a href="../assets/http-proxy-macos-ssh-socks/vpn-packets.svg" target="_blank" rel="noopener">Open SVG ↗</a></div>
+<div class="diagram-scroll"><div class="diagram-canvas"><object type="image/svg+xml" data="../assets/http-proxy-macos-ssh-socks/vpn-packets.svg" style="aspect-ratio:1080/1020" aria-label="The VPN carries IP packets; client and origin maintain inner TCP. Amber marks outer encrypted VPN transport. The separate VPN setup handshake is omitted."><a href="../assets/http-proxy-macos-ssh-socks/vpn-packets.svg">The VPN carries IP packets; client and origin maintain inner TCP. Amber marks outer encrypted VPN transport. The separate VPN setup handshake is omitted.</a></object></div></div>
+<figcaption>The VPN carries IP packets; client and origin maintain inner TCP. Amber marks outer encrypted VPN transport. The separate VPN setup handshake is omitted.</figcaption></figure>
+<p>WireGuard carries encrypted IP packets over UDP, so an outer UDP transport can carry inner TCP traffic. A gateway performing only routing or NAT leaves TCP state at the client and origin; NAT rewrites addresses or ports according to its mappings. CONNECT and SOCKS proxies normally maintain separate TCP connections on either side. The <a href="https://www.wireguard.com/protocol/">WireGuard protocol description</a> documents the outer encapsulation.</p>
+<p>Routing and product policy determine VPN coverage. Split tunneling selects destinations or networks. Full tunneling directs the default exit through the tunnel, with coverage still dependent on IPv4, IPv6, exceptions and DNS. Per-app VPN restricts coverage by application. Apple's <a href="https://support.apple.com/guide/deployment/vpn-overview-depae3d361d0/1/web/1.0">deployment guide</a> and <a href="https://developer.apple.com/documentation/networkextension/routing-your-vpn-network-traffic">VPN routing documentation</a> describe these deployments.</p>
+
+<h3 id="en-layers">Encryption boundaries</h3>
+<p>Forwarding behavior and encryption coverage are separate properties. CONNECT specifies byte forwarding after setup; SOCKS specifies target selection and proxy interaction. SSH and VPNs encrypt between their own endpoints. An application's TLS session can span those forwarding nodes and continue to the origin.</p>
+<div class="table-scroll"><table>
+<thead><tr><th>Mechanism</th><th>Encryption supplied by the mechanism</th><th>For an HTTPS origin</th></tr></thead>
+<tbody>
+<tr><td>Plain HTTP proxy / CONNECT</td><td>No TLS on the plain proxy connection; CONNECT establishes a byte stream</td><td>Client and origin establish TLS through CONNECT</td></tr>
+<tr><td>HTTP proxy reached over TLS</td><td>Outer TLS between client and proxy</td><td>Origin TLS runs inside CONNECT, independently of outer TLS</td></tr>
+<tr><td>SOCKS5 CONNECT</td><td>The SOCKS5 name does not guarantee encryption; methods and wrappers determine it</td><td>Application TLS can continue to the origin</td></tr>
+<tr><td>SSH <code>-L</code> / <code>-D</code></td><td>SSH client to sshd; encryption beyond sshd depends on the application protocol</td><td>Origin TLS can span the forwarded path</td></tr>
+<tr><td>L3 packet VPN</td><td>VPN client to VPN gateway</td><td>Origin TLS remains within the inner connection and continues to the origin</td></tr>
+</tbody></table></div>
+<p>For HTTPS through <code>ssh -D</code>, the Mac-to-VM SSH channel carries origin TLS bytes:</p>
+<pre><code>Link frame
+  IP: Mac → VM
+    TCP: SSH client → sshd
+      Encrypted SSH transport
+        SSH channel data
+          TLS bytes between application and example.com
+            HTTP request / response after origin TLS decryption</code></pre>
+<p>After decrypting the SSH channel, sshd still has origin TLS bytes and writes them to a separate TCP connection to the origin. The channel does not encapsulate the application's complete TCP packets; its endpoint sockets maintain separate TCP state. <a href="https://www.rfc-editor.org/rfc/rfc4253.html#section-6">RFC 4253 §6</a> describes SSH transport encryption and integrity.</p>
+<p>A fixed service can use a local <code>-L</code> listener, while dynamic destinations can use the SOCKS interface from <code>-D</code>. Applications supporting only HTTP proxies need an HTTP proxy endpoint. A packet VPN provides a different integration point when applications lack proxy support and traffic needs to follow IP routing.</p>
+
+<h3 id="en-dns-udp">DNS and UDP</h3>
+<div class="table-scroll"><table>
+<thead><tr><th>Path in this article</th><th>Origin hostname resolution</th></tr></thead>
+<tbody>
+<tr><td>Hostname in an HTTP URL or CONNECT</td><td>Normally performed by the HTTP proxy.</td></tr>
+<tr><td>curl <code>socks5://</code></td><td>curl resolves locally and sends an IP.</td></tr>
+<tr><td>curl <code>socks5h://</code></td><td>Hostname is passed to the proxy. With <code>ssh -D</code>, resolution happens at the SSH remote end.</td></tr>
+<tr><td>SSH <code>-L local:target:port</code></td><td>The SSH server resolves and reaches target.</td></tr>
+<tr><td>Packet VPN</td><td>The client resolver usually makes the query. VPN / DNS policy selects the resolver and whether the query enters the tunnel.</td></tr>
+</tbody></table></div>
+<p>Origin and proxy hostnames can be resolved at different locations. Even with remote origin resolution, connecting to <code>proxy.example</code> or <code>vm.example</code> can require local DNS, and PAC scripts can query DNS while selecting a path. Browser SOCKS resolution policies also differ; see <a href="https://chromium.googlesource.com/chromium/src/+/main/net/docs/proxy.md">Chromium's proxy documentation</a>.</p>
+<p>SOCKS5 specifies <code>UDP ASSOCIATE</code>, but implementations need not support it. OpenSSH dynamic forwarding accepts SOCKS CONNECT, so <code>ssh -D</code> is not a general UDP proxy. The HTTP/1.1 CONNECT and SSH forwards described here do not transport ping's ICMP packets or automatically capture QUIC / HTTP/3. See <a href="https://www.rfc-editor.org/rfc/rfc1928.html#section-7">SOCKS5 UDP</a> and OpenSSH's <a href="https://github.com/openssh/openssh-portable/blob/master/channels.c">channel_decode_socks5()</a>.</p>
+<p>A packet VPN can carry TCP, UDP and ICMP, with deployment policy still able to filter protocols or destinations at either end.</p>
+
+<h2 id="en-origin">6. Origin visibility</h2>
+<p>A destination directly observes the connection source and the application data it receives. CONNECT, SOCKS, SSH and VPN encapsulation end at their respective intermediaries. Identifying a proxied request therefore involves distinguishing protocol evidence from inferences about the source address.</p>
+<h3 id="en-origin-visible">Connection and request data</h3>
+<p>The observation point here is the server accepting the site's public connections. With a CDN or load balancer, a backend instead sees that intermediary as its immediate peer and needs trusted forwarding information to identify the external connection source.</p>
+<div class="table-scroll"><table>
+<thead><tr><th>Access path</th><th>Directly visible to the destination</th><th>Not automatically delivered</th></tr></thead>
+<tbody>
+<tr><td>Plain HTTP forward proxy</td><td>Proxy egress or upstream NAT address; forwarded HTTP, possibly with forwarding headers</td><td>A complete record of all preceding network hops</td></tr>
+<tr><td>HTTPS through ordinary CONNECT / SOCKS</td><td>Proxy egress address and the client's TLS handshake and enclosed requests</td><td>The CONNECT or SOCKS handshake, which ends at the proxy</td></tr>
+<tr><td>SSH -L / -D</td><td>The source of sshd's target-side connection, including client TLS when preserved end to end</td><td>SSH headers or encrypted channels, which end at sshd</td></tr>
+<tr><td>VPN with internet egress NAT</td><td>VPN egress NAT address and client application traffic</td><td>The outer VPN encapsulation between client and gateway</td></tr>
+<tr><td>Routed VPN without NAT</td><td>The routed client source, such as its assigned corporate tunnel address</td><td>Outer VPN headers and tunnel setup exchanges</td></tr>
+</tbody></table></div>
+<p>HTTP requires proxies to append <code>Via</code> to forwarded HTTP messages. <code>Forwarded</code> or <code>X-Forwarded-For</code> can additionally carry client information, depending on implementation and configuration. Accepting those fields requires a trusted proxy relationship: client-supplied headers do not establish the actual route. Deployed proxies may also omit such fields, so their absence does not prove a direct connection. See <a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-7.6.3">Via semantics</a> and <a href="https://www.rfc-editor.org/rfc/rfc7239.html#section-8.1">Forwarded trust considerations</a>.</p>
+<p>A CONNECT relay preserving origin TLS cannot change enclosed HTTP headers without breaking TLS integrity. A packet VPN generates no HTTP forwarding headers itself. Accounts, cookies and other data sent by the application still reach the site; changing the exit address does not remove that identity information.</p>
+
+<h3 id="en-origin-infer">Exit IP classification</h3>
+<p>Internet requests carry no universal field declaring the use of VPN, SOCKS or SSH. Servers can compare source addresses against known VPN, public proxy and hosting networks, then combine those classifications with account and behavioral signals. MaxMind's <a href="https://dev.maxmind.com/geoip/docs/databases/anonymous-ip/binary/">Anonymous IP fields</a> provide these categories and note that some VPN ranges may appear only as hosting providers.</p>
+<p>An exit-address category describes ownership or known use, without establishing the forwarding protocol. A relay preserving origin TLS normally also preserves the client's handshake characteristics, so its TLS fingerprint does not simply become the proxy's fingerprint. Confirming the complete route requires additional evidence such as client configuration or trusted proxy and VPN logs. A destination access log usually supports a narrower inference.</p>
+
+<h2 id="en-policy">7. Gateway access control</h2>
+<h3 id="en-policy-view">Protocol visibility</h3>
+<p>HTTP proxy failure alongside SSH success can result from different rule matches. For example, a gateway allowing SSH to a VM while blocking cleartext HTTP proxy requests would treat these paths differently:</p>
+<pre><code>Direct HTTP proxy:
+Mac → gateway → proxy:18888
+      visible: TCP destination and cleartext absolute URL / CONNECT target
+
+HTTP proxy carried over SSH:
+Mac → gateway → VM:ssh-port
+      visible: SSH connection; channel data is encrypted after key exchange
+      the HTTP proxy handshake travels inside that channel
+VM sshd → Tinyproxy → origin</code></pre>
+<p>Direct HTTP proxying exposes the destination endpoint and cleartext HTTP fields to the gateway. Inside an SSH channel, those fields are unavailable to a gateway without SSH termination, decryption or endpoint visibility. The gateway still sees SSH endpoints and traffic characteristics. The initial <code>SSH-2.0-...</code> version identification is exchanged before encryption and provides a protocol-identification signal. <a href="https://www.rfc-editor.org/rfc/rfc4253.html#section-4.2">RFC 4253 §4.2</a>.</p>
+<p>When SSH itself crosses a corporate VPN, a local-path observer sees the VPN wrapper. The corporate VPN gateway sees SSH after decapsulation. Removing VPN encryption leaves the independently encrypted SSH channel intact.</p>
+
+<h3 id="en-policy-rules">Access control rules</h3>
+<div class="table-scroll"><table>
+<thead><tr><th>Rule / enforcement point</th><th>Why behavior can differ</th></tr></thead>
+<tbody>
+<tr><td>GUI proxy policy or application-specific restriction</td><td>A configuration or app rule may differ from the rule applied to another process's sockets.</td></tr>
+<tr><td>Blocked proxy IP or TCP port</td><td>A different SSH endpoint might not match. Blocking the entire same IP also blocks SSH to it.</td></tr>
+<tr><td>Cleartext HTTP / CONNECT inspection</td><td>Requests inside SSH are encrypted at this point. Outer TLS to an HTTPS proxy likewise changes visibility.</td></tr>
+<tr><td>SSH or encrypted-tunnel application block</td><td>SSH can be blocked too; identification need not rely on port 22.</td></tr>
+<tr><td>Managed egress, endpoint filtering or default deny</td><td>SSH has no automatic exemption. Process, routing, destination and application policies all matter.</td></tr>
+<tr><td>Remote egress or destination restriction</td><td>A successful SSH connection does not prove remote access to the proxy or origin.</td></tr>
+</tbody></table></div>
+<p>Firewalls can identify application traffic using signatures, protocol decoding and heuristics, alongside configured decryption policies. Changing a default port does not remove protocol characteristics. <a href="https://docs.paloaltonetworks.com/ngfw/administration/app-id/app-id-overview">Palo Alto's App-ID documentation</a> describes these classification mechanisms.</p>
+<p>Successful SSH establishes that this SSH path was available at that time. Attributing HTTP proxy failure to enforcement requires supporting evidence: denial logs, rule matches or observations of the failing connection stage. Listener errors, proxy ACLs, authentication failures and remote DNS errors can also make a proxy unavailable.</p>
+
+<h2 id="en-debug">8. Troubleshooting</h2>
+<p>A proxied request depends on a local listener, the proxy's origin connection and the final application protocol. The earliest failing stage determines where to investigate. On a Mac hosting Tinyproxy, inspect the listener with:</p>
+<pre><code>lsof -nP -iTCP:18888 -sTCP:LISTEN</code></pre>
+<p>On a Linux VM, the equivalent check is <code>ss -ltnp 'sport = :18888'</code>. Once the listener is available, the <a href="#en-verify">HTTP and HTTPS verification requests</a> narrow failures to proxy negotiation, the remote connection or TLS. Correlate the result with the proxy's foreground log:</p>
+<div class="table-scroll"><table>
+<thead><tr><th>Observation</th><th>First checks</th></tr></thead>
+<tbody>
+<tr><td>Connection to proxy refused</td><td>Process, port and bind address. Mac and VM loopback addresses name different machines.</td></tr>
+<tr><td>Connection to proxy times out</td><td>Route, firewall and listening interface. A successful ping does not establish TCP port reachability.</td></tr>
+<tr><td>407 Proxy Authentication Required</td><td>The proxy responded; inspect client credentials and proxy authentication settings.</td></tr>
+<tr><td>CONNECT returns non-2xx</td><td>Allow rules, ConnectPort, proxy-side DNS and target TCP access. Use logs rather than inferring the cause from one status code.</td></tr>
+<tr><td>TLS fails after CONNECT 200</td><td>Certificate, trust chain, hostname and protocol. <code>-k</code> hides certificate failures and is not a successful verification.</td></tr>
+<tr><td>Browser works, terminal tool fails</td><td>Each program's actual configuration, environment and bypass list.</td></tr>
+<tr><td>curl works, browser bypasses proxy</td><td>Active network service, HTTPS field, PAC, exceptions and browser overrides; create a new connection and inspect logs.</td></tr>
+</tbody></table></div>
+<p><code>curl -v</code> records client-side connection and protocol progress. Proxy logs describe request handling and origin connections; SSH's <code>-v</code> adds tunnel setup information. Correlating those observations for one request locates the failing segment and the configuration or access policy to inspect.</p>
+<p class="source-note">Validation: the Tinyproxy configuration and both curl requests were exercised with Tinyproxy 1.11.3 on Linux. macOS GUI and networksetup instructions were checked against Apple documentation, not executed on a Mac. Diagrams are original, fit the available width by default, and link their message labels to protocol references.</p>
+</div>
+</main>
+</div>
+<script>
+document.querySelectorAll('.diagram-toolbar select').forEach(function (select) {
+  select.addEventListener('change', function () {
+    const canvas = select.closest('figure').querySelector('.diagram-canvas');
+    canvas.style.width = select.value === 'fit' ? '100%' : select.value + 'px';
+  });
+});
+</script>
+</body>
+</html>

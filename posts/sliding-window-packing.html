@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sliding Window Attention 的 Packing 边界与样本隔离</title>
-<meta name="post:title"           content="Sliding Window Attention 的 Packing 边界与样本隔离">
-<meta name="post:title_en"        content="Packing Boundaries and Sample Isolation in Sliding Window Attention">
+<title>SWA Packing 与样本隔离</title>
+<meta name="post:title"           content="SWA Packing 与样本隔离">
+<meta name="post:title_en"        content="SWA packing and sample isolation">
 <meta name="post:slug"            content="sliding-window-packing">
 <meta name="post:date"            content="2026-06-04">
 <meta name="post:tags"            content="LLM, Attention, 训练, FlashAttention">
@@ -28,8 +28,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css">
-<script src="../lang-toggle.js" defer></script>
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <style>
   main.content { max-width: 920px; padding: 56px 32px 96px; }
   @media (max-width: 920px) { main.content { padding: 48px 20px 80px; } }
@@ -128,10 +128,10 @@
     <div class="lang-zh">
     <ul>
       <li><a href="#zh-intro">1. 问题设定</a></li>
-      <li><a href="#zh-single">2. 单层窗口的直接感受野</a></li>
-      <li><a href="#zh-multi">3. 层间传播与有效感受野</a></li>
-      <li><a href="#zh-formula">4. 感受野上界</a></li>
-      <li><a href="#zh-packing">5. Packing 训练中的跨样本污染</a></li>
+      <li><a href="#zh-single">2. 单层感受野</a></li>
+      <li><a href="#zh-multi">3. 层间传播</a></li>
+      <li><a href="#zh-formula">4. 多层感受野上界</a></li>
+      <li><a href="#zh-packing">5. 跨样本污染</a></li>
       <li><a href="#zh-docmask">6. 文档边界编码</a></li>
       <li><a href="#zh-check">7. 等价性验证</a></li>
       <li><a href="#zh-refs">参考资料</a></li>
@@ -140,11 +140,11 @@
     <div class="lang-en">
     <ul>
       <li><a href="#en-intro">1. Problem setting</a></li>
-      <li><a href="#en-single">2. Direct receptive field</a></li>
+      <li><a href="#en-single">2. Single-layer receptive field</a></li>
       <li><a href="#en-multi">3. Cross-layer propagation</a></li>
-      <li><a href="#en-formula">4. Receptive-field bound</a></li>
-      <li><a href="#en-packing">5. Packed training: cross-sample contamination</a></li>
-      <li><a href="#en-docmask">6. Encoding document boundaries</a></li>
+      <li><a href="#en-formula">4. Multilayer receptive-field bound</a></li>
+      <li><a href="#en-packing">5. Cross-sample contamination</a></li>
+      <li><a href="#en-docmask">6. Document-boundary encoding</a></li>
       <li><a href="#en-check">7. Equivalence checks</a></li>
       <li><a href="#en-refs">References</a></li>
     </ul>
@@ -170,7 +170,7 @@
 <!-- ===================== ZH ===================== -->
 <div class="lang-zh">
 
-<h1>Sliding Window Attention 的 Packing 边界与样本隔离</h1>
+<h1>SWA Packing 与样本隔离</h1>
 
 <p class="lead">Sequence packing 把多条短样本拼入同一个 token buffer，以提高有效 token 比例；Sliding Window Attention（SWA）把每层的注意力限制在局部窗口内。训练系统同时采用两者时，需要保留一项基本语义：每条样本的输出与梯度只能依赖本样本。SWA 描述局部位置关系，packing 则引入文档边界，两种约束作用在不同层面。</p>
 
@@ -187,7 +187,7 @@
 <!-- ===================== EN ===================== -->
 <div class="lang-en">
 
-<h1>Packing Boundaries and Sample Isolation in Sliding Window Attention</h1>
+<h1>SWA packing and sample isolation</h1>
 
 <p class="lead">Sequence packing concatenates short samples into one token buffer to raise the fraction of useful tokens. Sliding Window Attention (SWA) restricts attention in each layer to a local neighborhood. A training system that combines them must preserve a basic semantic invariant: the outputs and gradients of one sample may depend only on that sample. SWA describes positional locality, whereas packing introduces document boundaries; the two constraints operate at different levels.</p>
 
@@ -206,7 +206,7 @@
 <!-- ===================== ZH ===================== -->
 <div class="lang-zh">
 
-<h2 id="zh-single">2. 单层窗口的直接感受野</h2>
+<h2 id="zh-single">2. 单层感受野</h2>
 
 <p>设序列为 <code>abcdef</code>，窗口 \(W=3\)，并采用因果 mask。一层 SWA 把输入 activation \(\mathrm{act}_0\) 变成 \(\mathrm{act}_1\)。位置 4 的 <code>d</code> 直接读取 \(\mathrm{act}_0\) 中的 \(\{b,c,d\}\)，这三个位置构成它在该层的直接感受野。</p>
 
@@ -214,7 +214,7 @@
 
 <div class="lang-en">
 
-<h2 id="en-single">2. The direct receptive field of one layer</h2>
+<h2 id="en-single">2. Single-layer receptive field</h2>
 
 <p>Consider <code>abcdef</code> with \(W=3\) and a causal mask. One SWA layer maps the input activation \(\mathrm{act}_0\) to \(\mathrm{act}_1\). Position 4, <code>d</code>, reads \(\{b,c,d\}\) from \(\mathrm{act}_0\); these three positions form its direct receptive field in that layer.</p>
 
@@ -368,7 +368,7 @@
 <!-- ===================== ZH ===================== -->
 <div class="lang-zh">
 
-<h2 id="zh-multi">3. 层间传播与有效感受野</h2>
+<h2 id="zh-multi">3. 层间传播</h2>
 
 <p>第二层把 <code>act₁</code> 变成 <code>act₂</code>。此时 <code>d</code> 仍只直接读取 <code>act₁</code> 的 $\{b,c,d\}$，窗口宽度没有变化。不过，<code>act₁</code> 中的 <code>b</code> 已在上一层读取 <code>act₀</code> 的 $\{a,b\}$。沿着 \(a \rightarrow b \rightarrow d\) 这条两跳路径，<code>a</code> 的信息进入了 <code>act₂</code> 的 <code>d</code>。</p>
 
@@ -378,7 +378,7 @@
 
 <div class="lang-en">
 
-<h2 id="en-multi">3. Cross-layer propagation and the effective receptive field</h2>
+<h2 id="en-multi">3. Cross-layer propagation</h2>
 
 <p>A second layer maps <code>act₁</code> to <code>act₂</code>. Position <code>d</code> still reads only $\{b,c,d\}$ directly from <code>act₁</code>, so the per-layer window remains unchanged. However, <code>b</code> in <code>act₁</code> already read $\{a,b\}$ from <code>act₀</code>. The two-hop path \(a \rightarrow b \rightarrow d\) therefore carries information from <code>a</code> into <code>d</code> at <code>act₂</code>.</p>
 
@@ -458,7 +458,7 @@
 <!-- ===================== ZH ===================== -->
 <div class="lang-zh">
 
-<h2 id="zh-formula">4. \(L\) 层 SWA 的感受野上界</h2>
+<h2 id="zh-formula">4. 多层感受野上界</h2>
 
 <p>每一层最多把依赖范围向前扩展 \(W-1\) 个位置。忽略序列起点截断后，堆叠 \(L\) 层得到的最大理论感受野为：</p>
 
@@ -484,7 +484,7 @@
 
 <div class="lang-en">
 
-<h2 id="en-formula">4. The receptive-field bound for \(L\) layers</h2>
+<h2 id="en-formula">4. Multilayer receptive-field bound</h2>
 
 <p>Each layer can extend dependency reach by at most \(W-1\) positions. Ignoring truncation at the start of the sequence, \(L\) stacked layers have the following maximum theoretical receptive field:</p>
 
@@ -511,7 +511,7 @@
 <!-- ===================== ZH ===================== -->
 <div class="lang-zh">
 
-<h2 id="zh-packing">5. Packing 训练中的跨样本污染</h2>
+<h2 id="zh-packing">5. 跨样本污染</h2>
 
 <p>把两条独立样本 <code>ABC</code> 与 <code>BCD</code> 拼成 <code>ABCBCD</code>，并分别只在末尾 token 上计算 loss，便得到与前文同样长度的 6-token 例子。现在使用 \(W=3\) 的因果 SWA 运行两层，并把第二条样本在 <code>act₂</code> 中的 <code>D</code> 作为目标。样本边界位于位置 3 与位置 4 之间。</p>
 
@@ -519,7 +519,7 @@
 
 <div class="lang-en">
 
-<h2 id="en-packing">5. Packed training: where the contamination happens</h2>
+<h2 id="en-packing">5. Cross-sample contamination</h2>
 
 <p>Concatenate two independent samples, <code>ABC</code> and <code>BCD</code>, into <code>ABCBCD</code>, and compute loss only at the final token of each sample. This produces the same six-token length used above. Run two layers of causal SWA with \(W=3\), taking the <code>D</code> of the second sample at <code>act₂</code> as the target. The sample boundary lies between positions 3 and 4.</p>
 
@@ -643,7 +643,7 @@
 <!-- ===================== ZH ===================== -->
 <div class="lang-zh">
 
-<h2 id="zh-docmask">6. 文档边界编码：document mask 与 <code>cu_seqlens</code></h2>
+<h2 id="zh-docmask">6. 文档边界编码</h2>
 
 <p>Document mask 是按样本归属限制 attention edge 的 mask。它把每条样本对应的因果 attention 子矩阵放在对角块内，并把跨块分数设为 \(-\infty\)。于是 softmax 后的跨样本权重为零，packed attention 在边界处保持断开。</p>
 
@@ -681,7 +681,7 @@ out = flash_attn_varlen_func(
 
 <div class="lang-en">
 
-<h2 id="en-docmask">6. Encoding document boundaries with masks and <code>cu_seqlens</code></h2>
+<h2 id="en-docmask">6. Document-boundary encoding</h2>
 
 <p>A document mask restricts attention edges by sample ownership. It places the causal attention matrix of each sample in a diagonal block and sets cross-block scores to \(-\infty\). Their softmax weights become zero, leaving the packed attention graph disconnected at every boundary.</p>
 

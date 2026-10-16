@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GPU Occupancy 的驻留资源模型与性能含义</title>
-<meta name="post:title"           content="GPU Occupancy 的驻留资源模型与性能含义">
-<meta name="post:title_en"        content="GPU Occupancy: Residency Resource Model and Performance Interpretation">
+<title>GPU Occupancy 与资源约束</title>
+<meta name="post:title"           content="GPU Occupancy 与资源约束">
+<meta name="post:title_en"        content="GPU occupancy and resource limits">
 <meta name="post:slug"            content="gpu-occupancy-resource-limits">
 <meta name="post:date"            content="2026-08-26">
 <meta name="post:tags"            content="GPU, CUDA, Occupancy, Nsight Compute">
@@ -25,11 +25,11 @@
   };
 </script>
 <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
-<script src="../lang-toggle.js" defer></script>
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
 <style>
   main.content { max-width: 1060px; min-width: 0; padding: 56px 32px 96px; letter-spacing: 0; }
   main.content h1, main.content h2, main.content h3 { letter-spacing: 0; }
@@ -84,29 +84,29 @@
     <div class="toc-title">目录 · TOC</div>
     <div class="lang-zh">
     <ul>
-      <li><a href="#zh-definition">1. Occupancy 的统计范围</a></li>
-      <li><a href="#zh-example">2. H100 的 25% 算例</a></li>
-      <li><a href="#zh-model">资源预算与计算模型</a></li>
-      <li><a href="#zh-ncu">3. 寄存器变化与 NCU limiter</a></li>
-      <li><a href="#zh-packing-effect">4. Block size 与整数装箱</a></li>
-      <li><a href="#zh-achieved">5. 理论值与平均驻留</a></li>
-      <li><a href="#zh-performance">6. 性能判断与验证</a></li>
+      <li><a href="#zh-definition">1. Occupancy 定义</a></li>
+      <li><a href="#zh-example">2. H100 驻留资源算例</a></li>
+      <li><a href="#zh-model">资源预算模型</a></li>
+      <li><a href="#zh-ncu">3. 寄存器限制与瓶颈转移</a></li>
+      <li><a href="#zh-packing-effect">4. Block Size 与资源装箱</a></li>
+      <li><a href="#zh-achieved">5. 理论与实测 Occupancy</a></li>
+      <li><a href="#zh-performance">6. 性能影响</a></li>
       <li><a href="#zh-specs">附录 A：GPU 驻留上限</a></li>
-      <li><a href="#zh-query">附录 B：查询与指标速查</a></li>
+      <li><a href="#zh-query">附录 B：资源查询接口</a></li>
       <li><a href="#zh-refs">参考资料</a></li>
     </ul>
     </div>
     <div class="lang-en">
     <ul>
-      <li><a href="#en-definition">1. What occupancy counts</a></li>
-      <li><a href="#en-example">2. The H100 25% example</a></li>
-      <li><a href="#en-model">Resource calculation</a></li>
-      <li><a href="#en-ncu">3. Registers and NCU limiters</a></li>
-      <li><a href="#en-packing-effect">4. Block-size packing</a></li>
-      <li><a href="#en-achieved">5. Capacity and runtime residency</a></li>
-      <li><a href="#en-performance">6. Performance decisions</a></li>
-      <li><a href="#en-specs">Appendix A: GPU limits</a></li>
-      <li><a href="#en-query">Appendix B: Queries and metrics</a></li>
+      <li><a href="#en-definition">1. Occupancy definition</a></li>
+      <li><a href="#en-example">2. H100 residency example</a></li>
+      <li><a href="#en-model">Resource-budget model</a></li>
+      <li><a href="#en-ncu">3. Register limits and bottleneck shifts</a></li>
+      <li><a href="#en-packing-effect">4. Block size and resource packing</a></li>
+      <li><a href="#en-achieved">5. Theoretical and achieved occupancy</a></li>
+      <li><a href="#en-performance">6. Performance impact</a></li>
+      <li><a href="#en-specs">Appendix A: GPU residency limits</a></li>
+      <li><a href="#en-query">Appendix B: Resource-query interfaces</a></li>
       <li><a href="#en-refs">References</a></li>
     </ul>
     </div>
@@ -114,21 +114,21 @@
 </details>
 
 <div class="lang-zh">
-<h1>GPU Occupancy 的驻留资源模型与性能含义</h1>
+<h1>GPU Occupancy 与资源约束</h1>
 
 <p class="lead">CUDA kernel 启动后，grid 中的 thread block 分批进入 SM。一个 SM 可以同时保留多个 block；当某个 warp 等待访存或前一条指令的结果时，scheduler 可以发射其他已就绪 warp 的指令。要增加这批可交替执行的 warp，SM 必须先为新的完整 block 分配资源。这里会遇到一个具体限制：shared memory 还有空余，warp 数也远未达到架构上限，寄存器却已经放不下下一个 block。Occupancy 的分析就从这次分配开始。</p>
 
 <nav class="reading-guide" aria-label="文章快速索引">
   <p>快速索引</p>
   <ul>
-    <li><a href="#zh-example">计算驻留数量：H100 的 25% 算例</a></li>
-    <li><a href="#zh-ncu">定位资源限制：寄存器减少后发生什么</a></li>
-    <li><a href="#zh-packing-effect">解释装箱突降：352、384 与 416 threads</a></li>
-    <li><a href="#zh-performance">决定是否继续优化：发射机会与运行时间</a></li>
+    <li><a href="#zh-example">2. H100 驻留资源算例</a></li>
+    <li><a href="#zh-ncu">3. 寄存器限制与瓶颈转移</a></li>
+    <li><a href="#zh-packing-effect">4. Block Size 与资源装箱</a></li>
+    <li><a href="#zh-performance">6. 性能影响</a></li>
   </ul>
 </nav>
 
-<h2 id="zh-definition">1. Occupancy 统计已经驻留的 warp</h2>
+<h2 id="zh-definition">1. Occupancy 定义</h2>
 
 <p>一个 warp 获得 SM 上的执行上下文后，在释放这些资源之前属于 <em>resident warp</em>。Nsight Compute 在 occupancy 指标中也称它为 <em>active warp</em>。设一个 SM 当前驻留了 $W_{\mathrm{resident}}$ 个 warp，架构允许的最大数量为 $W_{\max}$，则：</p>
 
@@ -139,7 +139,7 @@
 <p>这个比例数的是占用中的 warp slot。等待数据的 warp 仍然驻留，也仍计入 occupancy；它能否发射下一条指令，需要 scheduler 另行判断。<a href="https://docs.nvidia.com/cuda/archive/13.1.1/cuda-programming-guide/02-basics/writing-cuda-kernels.html#kernel-launch-and-occupancy">CUDA Programming Guide 的 occupancy 定义</a>给出了这一统计范围。调优中需要先算清楚驻留上限，再检查这批 warp 能提供多少发射机会。</p>
 
 <span id="zh-h100-slots" class="anchor-alias"></span>
-<h2 id="zh-example">2. H100 上只能驻留两个 block 的算例</h2>
+<h2 id="zh-example">2. H100 驻留资源算例</h2>
 
 <p>考虑一组用于手算的 kernel 资源配置：每个 block 有 256 个线程，每线程使用 96 个寄存器，每 block 使用 48 KiB shared memory。这里的寄存器数量指编译结果，shared memory 指程序申请的静态与动态用量之和。这组数值是教学设定，尚未对应某个 kernel 的性能测量。</p>
 
@@ -171,7 +171,7 @@ W_{\mathrm{resident}}=2\times8=16,\qquad
 \mathrm{Occupancy}_{\mathrm{theoretical}}=\frac{16}{64}=25\%.
 \]</p>
 
-<h3 id="zh-model">从资源预算归纳计算模型</h3>
+<h3 id="zh-model">资源预算模型</h3>
 
 <p>SM 必须同时满足各项资源的分配条件。对于普通 CTA，把 warp、寄存器、shared memory、block slot 和 barrier 各自允许的 block 数记作 $B_{\mathrm{warps}}$、$B_{\mathrm{registers}}$、$B_{\mathrm{smem}}$、$B_{\mathrm{blocks}}$ 和 $B_{\mathrm{barriers}}$，可接纳的数量取其中最小值：</p>
 
@@ -202,7 +202,7 @@ B_{\mathrm{warps}}=\left\lfloor\frac{W_{\max}}{W_{\mathrm{block}}}\right\rfloor,
   <p>H100 的 228 KiB 是最大 shared-memory carveout，单 block 最多可供程序使用 227 KiB。静态分配仍限于 48 KiB，更大的动态分配需要显式 opt-in。容量配置与每 block 的 1 KiB 保留量见 <a href="https://docs.nvidia.com/cuda/archive/13.1.1/hopper-tuning-guide/index.html#unified-shared-memory-l1-texture-cache">Hopper shared-memory 说明</a>。使用 Thread Block Cluster 的 kernel 还要满足 cluster placement 约束，应通过 <code>cudaOccupancyMaxActiveClusters()</code>计算并发 cluster 数。</p>
 </div>
 
-<h2 id="zh-ncu">3. 减少寄存器后，限制项如何变化</h2>
+<h2 id="zh-ncu">3. 寄存器限制与瓶颈转移</h2>
 
 <p>既然这组配置先耗尽寄存器预算，可以继续推算寄存器减少后的驻留情况。保持 256 threads/block 和 48 KiB 用户 shared memory 不变，把编译后的寄存器数量依次设为 96、64 和 32。这里改变的是资源参数；代码能否产生这些编译结果，以及改动会不会加快执行，仍需单独验证。</p>
 
@@ -210,7 +210,7 @@ B_{\mathrm{warps}}=\left\lfloor\frac{W_{\max}}{W_{\mathrm{block}}}\right\rfloor,
 
 <p>继续降到 32 registers/thread，寄存器已经允许八个 block，shared memory 却仍然只够四个。第五个 block 需要把 shared-memory 总量推到 $5\times49=245$ KiB，超过 228 KiB。寄存器数量又减半，理论 occupancy 仍停在 50%。这时继续围绕寄存器寻找驻留收益，就选错了资源。</p>
 
-<h3 id="zh-ncu-limiters">用 NCU limiter 对照这次推导</h3>
+<h3 id="zh-ncu-limiters">NCU Limiter 对照</h3>
 
 <p>Nsight Compute 的 Occupancy section 会分别显示各项资源允许的 block 数。名称为 <code>launch__occupancy_limit_*</code> 的这组指标以 <code>block</code> 为单位。将它们与上面的手算对照，表格应当这样读；这些是算例对应的理论数值，并非一次 NCU 采集输出：</p>
 
@@ -232,7 +232,7 @@ B_{\mathrm{warps}}=\left\lfloor\frac{W_{\max}}{W_{\mathrm{block}}}\right\rfloor,
 
 <p>这组对应关系见 <a href="https://archive.docs.nvidia.com/nsight-compute/2025.3/ProfilingGuide/index.html#metrics-ref-launch">NCU 2025.3 Launch Metrics</a>。实际报告还需检查 <code>Block Limit Barriers</code>；本算例假定它允许至少八个 block。完整 metric 名称与参数扫描指标列在<a href="#zh-metrics">附录的速查表</a>。</p>
 
-<h2 id="zh-packing-effect">4. Block size 引起的整数装箱与突降</h2>
+<h2 id="zh-packing-effect">4. Block Size 与资源装箱</h2>
 
 <p>前面的三次计算保持 block size 不变。现在只改变 block size，并暂时放宽寄存器、shared memory 和 barrier 的限制，观察完整 block 的准入粒度会怎样影响驻留。这个简化条件把装箱效应单独分离出来，不能直接当作原来那个 48 KiB/block 配置的参数扫描结果。</p>
 
@@ -332,7 +332,7 @@ W_{\mathrm{resident}}=5\times11=55,\qquad
 
 <p>这些转折由整数除法决定，间隔并不固定。真实 kernel 中，寄存器和 shared memory 的用量及分配粒度还会形成自己的台阶。分析 NCU 的 block-size 曲线时，需要把装箱变化与 limiter 的变化放在一起读。</p>
 
-<h2 id="zh-achieved">5. 理论上限与运行中的平均驻留</h2>
+<h2 id="zh-achieved">5. 理论与实测 Occupancy</h2>
 
 <p>回到 64 registers/thread 的配置。资源预算允许每个 SM 驻留四个 block，也就是 32 个 warp，理论 occupancy 为 50%。执行期间是否一直驻留这么多 warp，还取决于 grid 能否持续提供 block，以及已经进入 SM 的工作何时结束。</p>
 
@@ -364,19 +364,19 @@ W_{\mathrm{resident}}=5\times11=55,\qquad
 
 <p>同样的资源配置可以得到不同的运行平均值。在一个 SM 上，若四个 block 中的三个先完成，又没有后续 block 补入，剩余一个 block 就会形成类似图中的低驻留区间。不同 warp 提前退出或不同 block 执行时间不均衡，也会改变这条时间曲线。</p>
 
-<h3 id="zh-active-cycles">NCU 的 active-cycle 统计口径</h3>
+<h3 id="zh-active-cycles">Active-Cycle 统计口径</h3>
 
 <p>NCU 的 <code>Achieved Active Warps per SM</code> 对应 <code>sm__warps_active.avg.per_cycle_active</code>，归一化后的 <code>Achieved Occupancy</code> 对应 <code>sm__warps_active.avg.pct_of_peak_sustained_active</code>。前者统计 SM active cycles 内的平均 active warp 数，后者按架构最大 resident warps/SM 表示为百分比。上面的单 SM 场景只用于解释时间加权，完整 GPU 的实例聚合交给 profiler 处理。</p>
 
 <p><code>active</code> 和 <code>elapsed</code> 的区别会影响小 grid 的判断。一个 SM 完全闲置的周期不属于它的 active cycles；仅凭 achieved occupancy，无法判断所有 SM 是否都充分参与执行。要检查 grid 对设备的覆盖，还需查看 <code>sm__cycles_active.avg.pct_of_peak_sustained_elapsed</code> 等活动周期指标。分母定义见 <a href="https://archive.docs.nvidia.com/nsight-compute/2025.3/ProfilingGuide/index.html#metrics-structure">NCU Metrics Structure</a>，上述 achieved 指标与静态理论值的区别见 <a href="https://forums.developer.nvidia.com/t/what-does-achieved-active-warps-per-sm-in-nsight-means-and-how-to-calculate-it/128256">NVIDIA 的说明</a>。</p>
 
-<h3 id="zh-grid-tail">Grid waves 与尾部工作</h3>
+<h3 id="zh-grid-tail">Grid Waves 与尾部效应</h3>
 
 <p>给定每 SM 的驻留 block 上限，把所有 SM 同时能够接纳的 block 看作一波工作的容量，有助于分析 grid 的供给。Grid 太小，可能既覆盖不了全部 SM，也填不满每个工作 SM 的驻留空间；最后一波剩余 block 不足，则会让部分 SM 提前结束。即便 block 数量足够，负载不均衡也可能让少量运行较久的 block 拖长 kernel 尾部，这就是分析 tail effect 时需要检查的时间分布。</p>
 
 <p>因此，理论值低时应先确定静态 limiter；理论值较高而 achieved 明显偏低时，则应检查 grid 规模、<code>launch__waves_per_multiprocessor</code>、block 完成时间和负载分布。Cluster placement、并发 kernel、MPS 或资源分区还会改变工作的分布或可用资源，应根据实际运行环境纳入判断。</p>
 
-<h2 id="zh-performance">6. 把驻留分析落实到性能判断</h2>
+<h2 id="zh-performance">6. 性能影响</h2>
 
 <p>到这里，资源算例已经回答了为何只能驻留两个 block，以及寄存器减少后为何在四个 block 处停止增长。还没有回答的是，这些变化会让 kernel 快多少。判断驻留数量是否值得增加，需要观察 scheduler 如何使用已经驻留的 warp。</p>
 
@@ -388,7 +388,7 @@ W_{\mathrm{resident}}=5\times11=55,\qquad
 
 <p>不同结果对应不同的后续工作：资源上限已经够用时，可以沿着 <a href="gpu-warp-stall-nsight-compute.html">Warp Stall 分析</a>寻找发射受阻的位置；若观察到 <a href="gpu-mio-throttle-nsight-compute.html">MIO Throttle</a>，则应继续检查具体指令和下游接收压力。在这些判断中，保留 kernel 时间作为最终评价，同时用 occupancy 解释资源预算怎样影响了可供调度的工作。</p>
 
-<h2 id="zh-specs">附录 A：不同 GPU 的驻留上限</h2>
+<h2 id="zh-specs">附录 A：GPU 驻留上限</h2>
 
 <p>迁移到其他 GPU 时，需要重新代入架构容量。下表的 warp、thread 和 block 上限来自 <a href="https://docs.nvidia.com/cuda/archive/13.1.1/cuda-programming-guide/05-appendices/compute-capabilities.html#compute-capabilities-table-device-and-streaming-multiprocessor-sm-information-per-compute-capability">CUDA 13.1.1 的 compute capability 规格表</a>，代表型号与 compute capability 的对应关系来自 <a href="https://developer.nvidia.com/cuda-gpus">NVIDIA CUDA GPU 页面</a>。</p>
 
@@ -410,7 +410,7 @@ W_{\mathrm{resident}}=5\times11=55,\qquad
 </table>
 </div>
 
-<h2 id="zh-query">附录 B：查询设备、kernel 和 limiter</h2>
+<h2 id="zh-query">附录 B：资源查询接口</h2>
 
 <p>设备型号与 compute capability 可以用下面的命令记录：</p>
 
@@ -469,21 +469,21 @@ device__attribute_limits_max_cta_per_sm</pre>
 
 
 <div class="lang-en">
-<h1>GPU Occupancy: Residency Resource Model and Performance Interpretation</h1>
+<h1>GPU occupancy and resource limits</h1>
 
 <p class="lead">After a CUDA kernel launches, its grid of thread blocks enters the SMs in batches. An SM can retain several blocks at once. When one warp waits for memory or a preceding instruction's result, the scheduler can issue instructions from other ready warps. Adding to this pool first requires enough resources for another complete block. That admission can fail while shared memory still has room and the warp count remains well below the architectural limit: the remaining registers cannot hold the next block. Occupancy analysis starts with this allocation decision.</p>
 
 <nav class="reading-guide" aria-label="Article quick links">
   <p>Quick links</p>
   <ul>
-    <li><a href="#en-example">Calculate residency: the H100 25% example</a></li>
-    <li><a href="#en-ncu">Find the limiter: reduce the register budget</a></li>
-    <li><a href="#en-packing-effect">Explain a drop: 352, 384, and 416 threads</a></li>
-    <li><a href="#en-performance">Decide what to optimize: issue activity and runtime</a></li>
+    <li><a href="#en-example">2. H100 residency example</a></li>
+    <li><a href="#en-ncu">3. Register limits and bottleneck shifts</a></li>
+    <li><a href="#en-packing-effect">4. Block size and resource packing</a></li>
+    <li><a href="#en-performance">6. Performance impact</a></li>
   </ul>
 </nav>
 
-<h2 id="en-definition">1. Occupancy counts resident warps</h2>
+<h2 id="en-definition">1. Occupancy definition</h2>
 
 <p>A warp is <em>resident</em> after it obtains an execution context on an SM and until those resources are released. Nsight Compute also calls it an <em>active warp</em> in occupancy metrics. If an SM currently holds $W_{\mathrm{resident}}$ warps and the architecture permits at most $W_{\max}$, then:</p>
 
@@ -494,7 +494,7 @@ device__attribute_limits_max_cta_per_sm</pre>
 <p>This ratio counts allocated warp slots. A warp waiting for data is still resident and still contributes to occupancy. The scheduler separately determines whether it can issue its next instruction. The <a href="https://docs.nvidia.com/cuda/archive/13.1.1/cuda-programming-guide/02-basics/writing-cuda-kernels.html#kernel-launch-and-occupancy">CUDA Programming Guide definition</a> establishes this counting scope. Tuning requires both a residency calculation and an examination of the issue opportunities those resident warps provide.</p>
 
 <span id="en-h100-slots" class="anchor-alias"></span>
-<h2 id="en-example">2. An H100 example limited to two resident blocks</h2>
+<h2 id="en-example">2. H100 residency example</h2>
 
 <p>Consider a resource configuration for a worked calculation: 256 threads per block, 96 registers per thread, and 48 KiB of shared memory per block. The register count refers to the compiled kernel; shared memory is the sum of the program's static and dynamic allocation. These are teaching inputs, not measurements from a particular kernel.</p>
 
@@ -526,7 +526,7 @@ W_{\mathrm{resident}}=2\times8=16,\qquad
 \mathrm{Occupancy}_{\mathrm{theoretical}}=\frac{16}{64}=25\%.
 \]</p>
 
-<h3 id="en-model">Generalizing the resource calculation</h3>
+<h3 id="en-model">Resource-budget model</h3>
 
 <p>An SM must satisfy all resource requirements at once. For ordinary CTAs, let $B_{\mathrm{warps}}$, $B_{\mathrm{registers}}$, $B_{\mathrm{smem}}$, $B_{\mathrm{blocks}}$, and $B_{\mathrm{barriers}}$ be the block limits imposed by warp capacity, registers, shared memory, block slots, and barriers. The smallest determines residency:</p>
 
@@ -557,7 +557,7 @@ B_{\mathrm{warps}}=\left\lfloor\frac{W_{\max}}{W_{\mathrm{block}}}\right\rfloor,
   <p>H100's 228 KiB is the maximum shared-memory carveout. A single block can address up to 227 KiB, while static allocations remain limited to 48 KiB and larger dynamic allocations require explicit opt-in. The <a href="https://docs.nvidia.com/cuda/archive/13.1.1/hopper-tuning-guide/index.html#unified-shared-memory-l1-texture-cache">Hopper shared-memory documentation</a> specifies these capacities and the 1 KiB reservation per block. Thread Block Cluster kernels also have placement constraints; use <code>cudaOccupancyMaxActiveClusters()</code> to calculate concurrent clusters.</p>
 </div>
 
-<h2 id="en-ncu">3. How the limiter changes as register use falls</h2>
+<h2 id="en-ncu">3. Register limits and bottleneck shifts</h2>
 
 <p>Because registers limit the initial configuration, we can calculate what lower register counts would permit. Keep 256 threads per block and 48 KiB of user shared memory, and set the compiled register count to 96, 64, and 32 in turn. These changes vary the resource inputs. Whether code can produce each compiled configuration, and whether that code runs faster, requires separate verification.</p>
 
@@ -565,7 +565,7 @@ B_{\mathrm{warps}}=\left\lfloor\frac{W_{\max}}{W_{\mathrm{block}}}\right\rfloor,
 
 <p>At 32 registers per thread, registers permit eight blocks but shared memory still permits four. A fifth block would require a total of $5\times49=245$ KiB, exceeding 228 KiB. The register count has halved again, yet theoretical occupancy stays at 50%. Further reducing registers cannot remove the remaining shared-memory limit.</p>
 
-<h3 id="en-ncu-limiters">Read the same calculation through NCU limiters</h3>
+<h3 id="en-ncu-limiters">NCU limiter comparison</h3>
 
 <p>The Occupancy section in Nsight Compute displays the block count permitted by each resource. Metrics named <code>launch__occupancy_limit_*</code> use <code>block</code> as their unit. The table below maps those values to the worked calculation. It contains theoretical values for the example, not captured NCU output:</p>
 
@@ -587,7 +587,7 @@ B_{\mathrm{warps}}=\left\lfloor\frac{W_{\max}}{W_{\mathrm{block}}}\right\rfloor,
 
 <p>The metric definitions are in <a href="https://archive.docs.nvidia.com/nsight-compute/2025.3/ProfilingGuide/index.html#metrics-ref-launch">NCU 2025.3 Launch Metrics</a>. An actual report also requires checking <code>Block Limit Barriers</code>; this example assumes it permits at least eight blocks. The appendix provides the <a href="#en-metrics">full metric names and parameter-sweep metrics</a>.</p>
 
-<h2 id="en-packing-effect">4. Integer packing and block-size drops</h2>
+<h2 id="en-packing-effect">4. Block size and resource packing</h2>
 
 <p>The preceding calculations kept block size fixed. Now vary block size while assuming registers, shared memory, and barriers do not limit residency. This isolates the effect of admitting complete blocks. It is a different model from a parameter sweep of the original configuration with 48 KiB per block.</p>
 
@@ -687,7 +687,7 @@ W_{\mathrm{resident}}=5\times11=55,\qquad
 
 <p>Integer division determines these transition points, so their spacing is uneven. A real kernel's register and shared-memory usage and allocation granularities introduce further steps. Read NCU's block-size curve together with changes in the resource limiters.</p>
 
-<h2 id="en-achieved">5. Theoretical capacity and average runtime residency</h2>
+<h2 id="en-achieved">5. Theoretical and achieved occupancy</h2>
 
 <p>Return to the configuration with 64 registers per thread. Its resource budget permits four blocks, or 32 warps, per SM, for 50% theoretical occupancy. Maintaining that residency throughout execution also requires the grid to keep supplying blocks as admitted work finishes.</p>
 
@@ -719,19 +719,19 @@ W_{\mathrm{resident}}=5\times11=55,\qquad
 
 <p>The same resource configuration can produce different runtime averages. If three of four blocks on an SM finish first and no further blocks arrive, the remaining block creates a low-residency interval like the one in the figure. Early warp exits and unequal block execution times can also change the shape of this timeline.</p>
 
-<h3 id="en-active-cycles">NCU's active-cycle denominator</h3>
+<h3 id="en-active-cycles">Active-cycle denominator</h3>
 
 <p>NCU's <code>Achieved Active Warps per SM</code> corresponds to <code>sm__warps_active.avg.per_cycle_active</code>, and the normalized <code>Achieved Occupancy</code> corresponds to <code>sm__warps_active.avg.pct_of_peak_sustained_active</code>. The first measures average active warps during SM active cycles; the second expresses the result as a percentage of the architectural resident-warp capacity. The single-SM example above illustrates time weighting. The profiler handles aggregation across instances for a complete GPU.</p>
 
 <p>The distinction between <code>active</code> and <code>elapsed</code> matters for small grids. Cycles when an SM is entirely idle do not belong to its active cycles, so achieved occupancy alone cannot tell whether the grid kept every SM busy. To inspect device coverage, also check activity metrics such as <code>sm__cycles_active.avg.pct_of_peak_sustained_elapsed</code>. Denominator definitions are in <a href="https://archive.docs.nvidia.com/nsight-compute/2025.3/ProfilingGuide/index.html#metrics-structure">NCU Metrics Structure</a>; <a href="https://forums.developer.nvidia.com/t/what-does-achieved-active-warps-per-sm-in-nsight-means-and-how-to-calculate-it/128256">NVIDIA's explanation of achieved metrics</a> distinguishes their runtime measurement from static theoretical values.</p>
 
-<h3 id="en-grid-tail">Grid waves and work at the tail</h3>
+<h3 id="en-grid-tail">Grid waves and tail effects</h3>
 
 <p>Given the resident-block limit per SM, the number of blocks that all SMs can admit at once provides a useful notion of a wave of work. A small grid may fail to cover every SM or fill the residency available on the SMs that do receive work. An incomplete final wave lets some SMs finish earlier than others. Even with enough blocks, load imbalance can leave a few long-running blocks extending the kernel tail. This distribution of completion times is what a tail-effect analysis must examine.</p>
 
 <p>For a low theoretical value, first identify the static limiter. When the theoretical value is relatively high but achieved occupancy is much lower, inspect grid size, <code>launch__waves_per_multiprocessor</code>, block completion times, and load distribution. Cluster placement, concurrent kernels, MPS, or resource partitioning can also change work distribution or available resources; include them when the execution environment calls for it.</p>
 
-<h2 id="en-performance">6. Turn residency analysis into a performance decision</h2>
+<h2 id="en-performance">6. Performance impact</h2>
 
 <p>The resource example now explains why only two blocks fit initially and why reducing registers stops increasing residency at four blocks. It has not established a speedup. Deciding whether more residency would help requires observing how the scheduler uses the warps already present.</p>
 
@@ -743,7 +743,7 @@ W_{\mathrm{resident}}=5\times11=55,\qquad
 
 <p>The result determines the next investigation. Once the resource ceiling is sufficient, <a href="gpu-warp-stall-nsight-compute.html">Warp Stall Analysis</a> can help locate the blocked issue opportunities. If the report shows <a href="gpu-mio-throttle-nsight-compute.html">MIO Throttle</a>, examine the affected instructions and downstream acceptance pressure. Keep kernel time as the final measure, and use occupancy to explain how resource budgets changed the work available to the scheduler.</p>
 
-<h2 id="en-specs">Appendix A: Residency limits across GPUs</h2>
+<h2 id="en-specs">Appendix A: GPU residency limits</h2>
 
 <p>Moving to another GPU requires replacing the architectural capacities. Warp, thread, and block limits below come from the <a href="https://docs.nvidia.com/cuda/archive/13.1.1/cuda-programming-guide/05-appendices/compute-capabilities.html#compute-capabilities-table-device-and-streaming-multiprocessor-sm-information-per-compute-capability">CUDA 13.1.1 compute-capability table</a>. Representative GPU models and their compute capabilities are listed on the <a href="https://developer.nvidia.com/cuda-gpus">NVIDIA CUDA GPU page</a>.</p>
 
@@ -765,7 +765,7 @@ W_{\mathrm{resident}}=5\times11=55,\qquad
 </table>
 </div>
 
-<h2 id="en-query">Appendix B: Query devices, kernels, and limiters</h2>
+<h2 id="en-query">Appendix B: Resource-query interfaces</h2>
 
 <p>Record the device model and compute capability with:</p>
 

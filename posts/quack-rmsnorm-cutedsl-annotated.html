@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>QuACK CuTeDSL RMSNorm 前向 Kernel：线程映射、规约与逐行注释</title>
-<meta name="post:title" content="QuACK CuTeDSL RMSNorm 前向 Kernel：线程映射、规约与逐行注释">
-<meta name="post:title_en" content="QuACK CuTeDSL RMSNorm Forward Kernel: Thread Mapping, Reduction, and Line-by-Line Commentary">
+<title>QuACK RMSNorm：CuTeDSL 源码解析</title>
+<meta name="post:title" content="QuACK RMSNorm：CuTeDSL 源码解析">
+<meta name="post:title_en" content="QuACK RMSNorm in CuTeDSL">
 <meta name="post:slug" content="quack-rmsnorm-cutedsl-annotated">
 <meta name="post:date" content="2026-08-31">
 <meta name="post:tags" content="GPU, CUDA, CuTe DSL, QuACK, RMSNorm, 源码分析">
@@ -25,11 +25,11 @@
   };
 </script>
 <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
-<script src="../lang-toggle.js" defer></script>
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&amp;family=Geist+Mono:wght@400;500&amp;display=swap">
-<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
 <style>
   main.content { max-width: 1120px; min-width: 0; padding: 56px 32px 96px; letter-spacing: 0; }
   main.content h1,
@@ -160,35 +160,35 @@
     <div class="toc-title">目录 · TOC</div>
     <div class="lang-zh">
     <ul>
-      <li><a href="#zh-naming">变量命名图例</a></li>
-      <li><a href="#zh-scope">0. 源码边界与调用位置</a></li>
+      <li><a href="#zh-naming">变量命名</a></li>
+      <li><a href="#zh-scope">0. 源码范围与调用路径</a></li>
       <li><a href="#zh-model">1. 数学与执行模型</a></li>
-      <li><a href="#zh-example">2. N=760 的 tile 实例</a></li>
+      <li><a href="#zh-example">2. N=760 Tile 示例</a></li>
       <li><a href="#zh-signature">3.1 入口与线程坐标</a></li>
-      <li><a href="#zh-tiles">3.2 Shared memory 与 CTA tile</a></li>
-      <li><a href="#zh-partitions">3.3 线程分片与寄存器 fragment</a></li>
-      <li><a href="#zh-load">3.4 异步搬运与 residual</a></li>
-      <li><a href="#zh-layernorm">3.5 LayerNorm 特化分支</a></li>
-      <li><a href="#zh-rmsnorm">3.6 RMSNorm 规约与统计量</a></li>
-      <li><a href="#zh-epilogue">3.7 Reload 与 affine epilogue</a></li>
-      <li><a href="#zh-reading">4. 阅读结论</a></li>
+      <li><a href="#zh-tiles">3.2 共享内存与 CTA Tile</a></li>
+      <li><a href="#zh-partitions">3.3 线程分片与尾部掩码</a></li>
+      <li><a href="#zh-load">3.4 cp.async 与 Residual 融合</a></li>
+      <li><a href="#zh-layernorm">3.5 LayerNorm 编译分支</a></li>
+      <li><a href="#zh-rmsnorm">3.6 平方和规约与 rstd</a></li>
+      <li><a href="#zh-epilogue">3.7 归一化与 Epilogue</a></li>
+      <li><a href="#zh-reading">4. 执行模型总结</a></li>
       <li><a href="#zh-refs">参考资料</a></li>
     </ul>
     </div>
     <div class="lang-en">
     <ul>
-      <li><a href="#en-naming">Variable naming legend</a></li>
-      <li><a href="#en-scope">0. Source boundary and call path</a></li>
-      <li><a href="#en-model">1. Mathematical and execution model</a></li>
-      <li><a href="#en-example">2. A tile instance for N=760</a></li>
+      <li><a href="#en-naming">Variable names</a></li>
+      <li><a href="#en-scope">0. Source scope and call path</a></li>
+      <li><a href="#en-model">1. Math and execution model</a></li>
+      <li><a href="#en-example">2. N=760 tile example</a></li>
       <li><a href="#en-signature">3.1 Entry and thread coordinates</a></li>
       <li><a href="#en-tiles">3.2 Shared memory and CTA tiles</a></li>
-      <li><a href="#en-partitions">3.3 Thread partitions and register fragments</a></li>
-      <li><a href="#en-load">3.4 Asynchronous loads and residual fusion</a></li>
-      <li><a href="#en-layernorm">3.5 LayerNorm specialization branch</a></li>
-      <li><a href="#en-rmsnorm">3.6 RMSNorm reduction and statistics</a></li>
-      <li><a href="#en-epilogue">3.7 Reload and affine epilogue</a></li>
-      <li><a href="#en-reading">4. Reading conclusions</a></li>
+      <li><a href="#en-partitions">3.3 Thread partitions and tail masks</a></li>
+      <li><a href="#en-load">3.4 cp.async and residual fusion</a></li>
+      <li><a href="#en-layernorm">3.5 LayerNorm compile-time branch</a></li>
+      <li><a href="#en-rmsnorm">3.6 Square-sum reduction and rstd</a></li>
+      <li><a href="#en-epilogue">3.7 Normalization and epilogue</a></li>
+      <li><a href="#en-reading">4. Execution model summary</a></li>
       <li><a href="#en-refs">References</a></li>
     </ul>
     </div>
@@ -198,11 +198,11 @@
 
 <div class="lang-zh">
 
-<h1>QuACK CuTeDSL RMSNorm 前向 Kernel：线程映射、规约与逐行注释</h1>
+<h1>QuACK RMSNorm：CuTeDSL 源码解析</h1>
 
 <p class="lead">QuACK 的公开 <code>rmsnorm()</code> 先把 batch 维压成行，再把每行 hidden features 交给一个 CuTeDSL reduction kernel。这个 kernel 还可以融合 residual、保存 prenorm 结果、应用 weight 与 bias，并在宽行上让一个 CTA cluster 分担 feature 维。RMSNorm 本身只需要平方和与一次缩放；源码的主要篇幅在描述数据由哪个 CTA、warp 和 thread 持有，以及它在 global memory、shared memory 与 registers 之间何时移动。读这 213 行时，应先固定 tile 所有权，再沿数据流追踪一次完整的行规约。</p>
 
-<h2 id="zh-naming">变量命名图例</h2>
+<h2 id="zh-naming">变量命名</h2>
 
 <p>这些前缀描述 tensor 的作用域、存储层级或用途。NVIDIA 的 <a href="https://docs.nvidia.com/cutlass/4.7.0/media/docs/cpp/cute/0x_gemm_tutorial.html">CuTe GEMM tutorial</a> 先用 <code>mA/mB/mC</code> 表示完整 tensor，再把 CTA tile 命名为 <code>gA/gB/gC</code>；QuACK 延续了这套习惯。参数是输入还是输出，以函数签名中的 <code>[输入]</code>、<code>[输出]</code> 和 <code>[配置]</code> 标记为准。</p>
 
@@ -223,7 +223,7 @@
 
 <p><code>tXgW</code> 可以读作 partitioning pattern <code>tX</code> 作用于 global-memory tensor <code>gW</code>。名称尾部表示数据角色：<code>X</code> 是 input，<code>Res</code> 是 residual，<code>W</code> 是 weight，<code>B</code> 是 bias，<code>O</code> 是 output。<code>Rstd</code> 与 <code>Mean</code> 分别表示 reciprocal standard deviation 和 row mean。<code>tXrRstd</code> 与 <code>tXrMean</code> 是例外：它们由 <code>partition_D(gRstd/gMean)</code> 得到，实际是 global destination partitions，并非同名 register fragments。</p>
 
-<h2 id="zh-scope">0. 源码边界与调用位置</h2>
+<h2 id="zh-scope">0. 源码范围与调用路径</h2>
 
 <p>本文只分析 <a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L150-L362">QuACK commit <code>14b0b71</code> 的 <code>RMSNorm.kernel</code> 第 150 至 362 行</a>。该 revision 声明依赖 <code>nvidia-cutlass-dsl&gt;=4.7</code>；API 语义以 CuTe DSL 4.7.0 文档辅助解释。QuACK 后续 revision 可以调整 layout、heuristic 或 API 拼写，因此本文的逐行结论不是跨版本接口承诺。</p>
 
@@ -305,7 +305,7 @@ y_j = (z_j\operatorname{rstd})(w_j+\delta)+b_j.
   </svg>
 </div>
 
-<h2 id="zh-example">2. <code>N=760</code> 的 tile 实例</h2>
+<h2 id="zh-example">2. <code>N=760</code> Tile 示例</h2>
 
 <p>取 <code>x.dtype=bf16</code>、<code>weight.dtype=fp32</code>、普通 RMSNorm、无 cluster。<a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm_config.py#L47-L91">默认 heuristic</a> 选择 128 threads 和 32 threads per row。最宽 dtype 为 32 bit，因此 <code>vecsize=gcd(760, 128/32)=4</code>。令 (B_N) 表示 feature 方向的 vector-block 组数，<a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/reduction_base.py#L42-L50"><code>_get_tiled_copy()</code></a> 随后得到：</p>
 
@@ -328,7 +328,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
 </table>
 </div>
 
-<h2>3. 第 150 至 362 行逐行注释</h2>
+<h2>3. Kernel 逐行注释</h2>
 
 <p>下面采用<a href="https://mirror.math.princeton.edu/pub/oldlinux/download/clk011c-1.9.6pre.pdf">《Linux 内核完全注释》</a>的源码阅读编排：保留固定 commit 的完整代码与原有英文注释，不改动也不省略；新增解释直接插在相关语句之前，并以 <code># L行号:</code> 开头。这样可以沿连续控制流阅读，同时随时回到原仓库核对对应行。</p>
 
@@ -395,7 +395,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
         tv_layout = tiled_copy.layout_tv_tiled
 
 </code></pre>
-<h3 id="zh-tiles">3.2 Shared memory、head slicing 与 CTA tile</h3>
+<h3 id="zh-tiles">3.2 共享内存与 CTA Tile</h3>
 <p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L171-L201">source L171-L201</a></p>
 
 <pre class="annotated-code" data-source-start="171" data-source-end="201"><code>
@@ -466,7 +466,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
 
 </code></pre>
 
-<h3 id="zh-partitions">3.3 线程分片、register fragments 与尾部 predicate</h3>
+<h3 id="zh-partitions">3.3 线程分片与尾部掩码</h3>
 <p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L202-L236">source L202-L236</a></p>
 
 <pre class="annotated-code" data-source-start="202" data-source-end="236"><code>
@@ -552,7 +552,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
 
 <p>当 <code>N</code> 变宽，<code>threads_per_row</code> 可以大于 32，<code>row_reduce</code> 会增加 shared-memory block reduction；当 <code>cluster_n&gt;1</code>，同一行的 feature tile 还会拆给多个 CTA，通过 remote shared-memory store 与 mbarrier 合并。<a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/reduce.py#L202-L267"><code>row_reduce</code></a> 把这三层差异封装在同一个调用中。</p>
 
-<h3 id="zh-load">3.4 <code>cp.async</code> staging、weight load 与 residual 融合</h3>
+<h3 id="zh-load">3.4 <code>cp.async</code> 与 Residual 融合</h3>
 <p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L237-L261">source L237-L261</a></p>
 
 <pre class="annotated-code" data-source-start="237" data-source-end="261"><code>
@@ -619,7 +619,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
 
 </code></pre>
 
-<h3 id="zh-layernorm">3.5 LayerNorm compile-time 分支</h3>
+<h3 id="zh-layernorm">3.5 LayerNorm 编译分支</h3>
 <p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L262-L312">source L262-L312</a></p>
 
 <p>这一节仍逐行解释，但普通 RMSNorm specialization 会删除第 263 至 311 行的 body，只保留第 312 行的 <code>else</code> 所属路径。共用实现需要两个 reduction slots：LayerNorm 先规约均值，再规约 centered square；RMSNorm 只用 slot 0。</p>
@@ -746,7 +746,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
         else:
 </code></pre>
 
-<h3 id="zh-rmsnorm">3.6 RMSNorm 平方和规约、<code>rstd</code> 与延迟参数加载</h3>
+<h3 id="zh-rmsnorm">3.6 平方和规约与 <code>rstd</code></h3>
 <p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L313-L337">source L313-L337</a></p>
 
 <pre class="annotated-code" data-source-start="313" data-source-end="337"><code>
@@ -809,7 +809,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
                 copy(tXgB, tXrB)
 </code></pre>
 
-<h3 id="zh-epilogue">3.7 Input reload、归一化与 affine epilogue</h3>
+<h3 id="zh-epilogue">3.7 归一化与 Epilogue</h3>
 <p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L338-L362">source L338-L362</a></p>
 
 <pre class="annotated-code" data-source-start="338" data-source-end="362"><code>
@@ -873,7 +873,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
             copy(tXrO, tXgO)
 </code></pre>
 
-<h2 id="zh-reading">4. 阅读结论</h2>
+<h2 id="zh-reading">4. 执行模型总结</h2>
 
 <p>这段 kernel 可以压缩成四个所有权转换。<code>local_tile</code> 先把完整 tensor 分给 CTA，<code>ThrCopy.partition_S/D</code> 再把 CTA tile 分给 threads，<code>make_rmem_tensor_like</code> 为每个 thread 建立同构 register storage，<code>row_reduce</code> 最后沿同一 row group 把分散值合并。CuTe layout 只描述映射，数据移动发生在 copy、load、store 与 reduction helper 内。</p>
 
@@ -899,11 +899,11 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
 
 <div class="lang-en">
 
-<h1>QuACK CuTeDSL RMSNorm Forward Kernel: Thread Mapping, Reduction, and Line-by-Line Commentary</h1>
+<h1>QuACK RMSNorm in CuTeDSL</h1>
 
 <p class="lead">QuACK's public <code>rmsnorm()</code> flattens the batch dimensions into rows and sends the hidden features of each row to a CuTeDSL reduction kernel. The kernel can also fuse a residual, preserve a prenorm result, apply weight and bias, and split a wide feature dimension across a CTA cluster. RMSNorm itself requires only a sum of squares and a scale. Most of the 213 source lines describe which CTA, warp, and thread owns each value, along with when that value moves through global memory, shared memory, and registers. The useful entry point is therefore tile ownership, followed by one complete row-reduction data path.</p>
 
-<h2 id="en-naming">Variable naming legend</h2>
+<h2 id="en-naming">Variable names</h2>
 
 <p>These prefixes describe a tensor's scope, storage level, or purpose. NVIDIA's <a href="https://docs.nvidia.com/cutlass/4.7.0/media/docs/cpp/cute/0x_gemm_tutorial.html">CuTe GEMM tutorial</a> uses <code>mA/mB/mC</code> for complete tensors, then names their CTA tiles <code>gA/gB/gC</code>. QuACK follows the same convention. The <code>[input]</code>, <code>[output]</code>, and <code>[configuration]</code> labels in the function signature determine parameter direction.</p>
 
@@ -924,7 +924,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
 
 <p><code>tXgW</code> reads as partitioning pattern <code>tX</code> applied to global-memory tensor <code>gW</code>. Name suffixes identify data roles: <code>X</code> is the input, <code>Res</code> the residual, <code>W</code> the weight, <code>B</code> the bias, and <code>O</code> the output. <code>Rstd</code> and <code>Mean</code> denote reciprocal standard deviation and row mean. <code>tXrRstd</code> and <code>tXrMean</code> are exceptions: they come from <code>partition_D(gRstd/gMean)</code> and are global destination partitions, not same-named register fragments.</p>
 
-<h2 id="en-scope">0. Source boundary and call path</h2>
+<h2 id="en-scope">0. Source scope and call path</h2>
 
 <p>This article analyzes only <a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L150-L362"><code>RMSNorm.kernel</code>, lines 150 through 362, at QuACK commit <code>14b0b71</code></a>. That revision declares <code>nvidia-cutlass-dsl&gt;=4.7</code>; CuTe DSL 4.7.0 documentation supplies supporting API semantics. A later QuACK revision may change layouts, heuristics, or API spellings, so the commentary is not a cross-version interface contract.</p>
 
@@ -941,7 +941,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
   <p><code>is_layernorm</code>, optional-tensor presence, <code>reload_from</code>, <code>delay_w_load</code>, and <code>weight_offset</code> all participate in compile-time specialization. In an ordinary RMSNorm build, <code>is_layernorm=False</code>. Lines 263 through 312 do not remain as a runtime LayerNorm branch; lines 313 through 324 provide the selected sum-of-squares path.</p>
 </div>
 
-<h2 id="en-model">1. Mathematical and execution model</h2>
+<h2 id="en-model">1. Math and execution model</h2>
 
 <p>For an input row of length (N), define the FP32 value after optional residual fusion as:</p>
 
@@ -1006,7 +1006,7 @@ y_j = (z_j\operatorname{rstd})(w_j+\delta)+b_j.
   </svg>
 </div>
 
-<h2 id="en-example">2. A tile instance for <code>N=760</code></h2>
+<h2 id="en-example">2. <code>N=760</code> tile example</h2>
 
 <p>Consider <code>x.dtype=bf16</code>, <code>weight.dtype=fp32</code>, ordinary RMSNorm, and no cluster. The <a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm_config.py#L47-L91">default heuristic</a> selects 128 threads and 32 threads per row. The widest dtype is 32 bits, so <code>vecsize=gcd(760, 128/32)=4</code>. Let (B_N) denote the number of vector-block groups along the feature dimension. The <a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/reduction_base.py#L42-L50"><code>_get_tiled_copy()</code></a> calculation is:</p>
 
@@ -1031,7 +1031,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
 
 <p>As <code>N</code> grows, <code>threads_per_row</code> can exceed 32 and <code>row_reduce</code> adds a shared-memory block reduction. When <code>cluster_n&gt;1</code>, peer CTAs receive separate feature tiles of the same row and combine them through remote shared-memory stores and an mbarrier. The <a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/reduce.py#L202-L267"><code>row_reduce</code></a> interface hides those three cases behind one call site.</p>
 
-<h2>3. Commentary for every line from 150 through 362</h2>
+<h2>3. Annotated kernel</h2>
 
 <p>The listing below follows the source-reading format used by Zhao Jiong's <a href="https://mirror.math.princeton.edu/pub/oldlinux/download/clk011c-1.9.6pre.pdf"><cite>Fully Annotated Linux Kernel</cite></a>. It preserves every line and original comment from the fixed commit, then inserts commentary immediately before the relevant statement with a <code># Lline:</code> prefix. The control flow therefore remains continuous and directly comparable with the upstream file.</p>
 
@@ -1108,7 +1108,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
 
 </code></pre>
 
-<h3 id="en-tiles">3.2 Shared memory, head slicing, and CTA tiles</h3>
+<h3 id="en-tiles">3.2 Shared memory and CTA tiles</h3>
 <p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L171-L201">source L171-L201</a></p>
 
 <pre class="annotated-code" data-source-start="171" data-source-end="201"><code>
@@ -1184,7 +1184,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
 
 </code></pre>
 
-<h3 id="en-partitions">3.3 Thread partitions, register fragments, and tail predicates</h3>
+<h3 id="en-partitions">3.3 Thread partitions and tail masks</h3>
 <p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L202-L236">source L202-L236</a></p>
 
 <pre class="annotated-code" data-source-start="202" data-source-end="236"><code>
@@ -1271,7 +1271,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
 
 </code></pre>
 
-<h3 id="en-load">3.4 <code>cp.async</code> staging, parameter loads, and residual fusion</h3>
+<h3 id="en-load">3.4 <code>cp.async</code> and residual fusion</h3>
 <p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L237-L261">source L237-L261</a></p>
 
 <pre class="annotated-code" data-source-start="237" data-source-end="261"><code>
@@ -1480,7 +1480,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
         else:
 </code></pre>
 
-<h3 id="en-rmsnorm">3.6 RMSNorm square-sum reduction, <code>rstd</code>, and delayed parameter loads</h3>
+<h3 id="en-rmsnorm">3.6 Square-sum reduction and <code>rstd</code></h3>
 <p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L313-L337">source L313-L337</a></p>
 
 <pre class="annotated-code" data-source-start="313" data-source-end="337"><code>
@@ -1546,7 +1546,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
                 copy(tXgB, tXrB)
 </code></pre>
 
-<h3 id="en-epilogue">3.7 Input reload, normalization, and affine epilogue</h3>
+<h3 id="en-epilogue">3.7 Normalization and epilogue</h3>
 <p class="source-range"><a href="https://github.com/Dao-AILab/quack/blob/14b0b7122e252a4df40a0b762c7ffd0f8b67a015/quack/rmsnorm.py#L338-L362">source L338-L362</a></p>
 
 <pre class="annotated-code" data-source-start="338" data-source-end="362"><code>
@@ -1614,7 +1614,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
             copy(tXrO, tXgO)
 </code></pre>
 
-<h2 id="en-reading">4. Reading conclusions</h2>
+<h2 id="en-reading">4. Execution model summary</h2>
 
 <p>The kernel can be reduced to four ownership transformations. <code>local_tile</code> assigns a complete tensor to CTAs, <code>ThrCopy.partition_S/D</code> divides each CTA tile among threads, <code>make_rmem_tensor_like</code> creates isomorphic per-thread register storage, and <code>row_reduce</code> combines distributed values along the same row group. A CuTe layout is a mapping description. Copies, loads, stores, and reduction helpers perform the data movement.</p>
 

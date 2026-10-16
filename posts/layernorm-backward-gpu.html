@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LayerNorm 反向传播：数学推导、CUDA 规约与 Triton 融合实现</title>
-<meta name="post:title"           content="LayerNorm 反向传播：数学推导、CUDA 规约与 Triton 融合实现">
-<meta name="post:title_en"        content="LayerNorm Backpropagation: Derivation, CUDA Reductions, and Triton Fusion">
+<title>LayerNorm 反向传播与 GPU 实现</title>
+<meta name="post:title"           content="LayerNorm 反向传播与 GPU 实现">
+<meta name="post:title_en"        content="LayerNorm backward on GPUs">
 <meta name="post:slug"            content="layernorm-backward-gpu">
 <meta name="post:date"            content="2026-08-24">
 <meta name="post:tags"            content="LLM, 训练系统, LayerNorm, CUDA, Triton">
@@ -25,11 +25,11 @@
   };
 </script>
 <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
-<script src="../lang-toggle.js" defer></script>
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
 <style>
   main.content { max-width: 1060px; min-width: 0; padding: 56px 32px 96px; letter-spacing: 0; }
   main.content h1,
@@ -131,11 +131,11 @@
       <li><a href="#zh-shape">0. 形状与记号</a></li>
       <li><a href="#zh-forward">1. 前向定义</a></li>
       <li><a href="#zh-dx">2. 输入梯度推导</a></li>
-      <li><a href="#zh-param-grad">3. 参数梯度与规约轴</a></li>
-      <li><a href="#zh-native">4. PyTorch native CUDA</a></li>
-      <li><a href="#zh-fused">5. Triton fused 实现</a></li>
-      <li><a href="#zh-compare">6. 两种实现的边界</a></li>
-      <li><a href="#zh-precision">7. 精度与正确性验证</a></li>
+      <li><a href="#zh-param-grad">3. 参数梯度规约</a></li>
+      <li><a href="#zh-native">4. PyTorch CUDA 实现</a></li>
+      <li><a href="#zh-fused">5. Triton 融合实现</a></li>
+      <li><a href="#zh-compare">6. 实现对比</a></li>
+      <li><a href="#zh-precision">7. 精度与正确性</a></li>
       <li><a href="#zh-refs">参考资料</a></li>
     </ul>
     </div>
@@ -144,11 +144,11 @@
       <li><a href="#en-shape">0. Shapes and notation</a></li>
       <li><a href="#en-forward">1. Forward definition</a></li>
       <li><a href="#en-dx">2. Input-gradient derivation</a></li>
-      <li><a href="#en-param-grad">3. Parameter gradients and reduction axes</a></li>
-      <li><a href="#en-native">4. PyTorch native CUDA</a></li>
+      <li><a href="#en-param-grad">3. Parameter-gradient reduction</a></li>
+      <li><a href="#en-native">4. PyTorch CUDA implementation</a></li>
       <li><a href="#en-fused">5. Triton fused implementation</a></li>
-      <li><a href="#en-compare">6. Implementation tradeoffs</a></li>
-      <li><a href="#en-precision">7. Precision and validation</a></li>
+      <li><a href="#en-compare">6. Implementation comparison</a></li>
+      <li><a href="#en-precision">7. Precision and correctness</a></li>
       <li><a href="#en-refs">References</a></li>
     </ul>
     </div>
@@ -158,7 +158,7 @@
 
 <div class="lang-zh">
 
-<h1>LayerNorm 反向传播：数学推导、CUDA 规约与 Triton 融合实现</h1>
+<h1>LayerNorm 反向传播与 GPU 实现</h1>
 
 <p class="lead">Transformer block 通常把每个 token 的 hidden features 作为一组执行 LayerNorm。反向传播需要同时生成输入梯度 <code>dX</code>，以及共享 affine 参数的 <code>dγ</code> 和 <code>dβ</code>。前者在单个 token 的 feature 维内规约，后两者则跨 token 规约；这两个互相垂直的方向决定了 GPU kernel 的组织方式。本文从闭式梯度出发，对照 PyTorch native CUDA 的分离实现与 generative-recommenders 的 Triton 融合实现，说明公式中的规约如何落到 block、临时缓冲区和 kernel launch 上。</p>
 
@@ -281,7 +281,7 @@ dX = (rstd[:, None] / H) * (H * h - s1 - xhat * s2)</pre>
   <p><code>eps</code> 通过 forward 保存的 <code>rstd</code> 进入 backward 公式。反向计算需要该 <code>rstd</code> 与对应的 <code>mean</code>，二者共同恢复归一化时使用的行统计量。</p>
 </div>
 
-<h2 id="zh-param-grad">3. 参数梯度与规约轴</h2>
+<h2 id="zh-param-grad">3. 参数梯度规约</h2>
 
 <p>记完整矩阵上的上游梯度为 $G_{rj}=\partial L/\partial Y_{rj}$。$\gamma$ 和 $\beta$ 在所有行之间共享，因此参数梯度沿 $R$ 规约：</p>
 
@@ -345,11 +345,11 @@ dX = (rstd[:, None] / H) * (H * h - s1 - xhat * s2)</pre>
 
 <p><code>dX</code> 的每一行互不依赖，适合一个 CUDA block 负责一行。<code>dγ</code> 和 <code>dβ</code> 要跨行求和；当 $R$ 很大时，一个 block 顺序扫完所有行会缺少并行度，因此常见实现先产生 partial sum，再做第二级规约。</p>
 
-<h2 id="zh-native">4. PyTorch native CUDA 实现</h2>
+<h2 id="zh-native">4. PyTorch CUDA 实现</h2>
 
 <p>以下说明以 PyTorch main commit <a href="https://github.com/pytorch/pytorch/tree/f772fda46b402b0b4a5082966e77bfafeeddfd40"><code>f772fda</code></a> 为基准。<a href="https://github.com/pytorch/pytorch/blob/f772fda46b402b0b4a5082966e77bfafeeddfd40/aten/src/ATen/native/cuda/layer_norm_kernel.cu#L1918-L1990"><code>layer_norm_backward_cuda()</code></a> 根据 <code>grad_input_mask</code> 分配 <code>dX</code>、<code>dgamma</code> 和 <code>dbeta</code>，再进入 <code>LayerNormBackwardKernelImpl()</code>。如果某个梯度没有被请求，对应 Tensor 保持 undefined，kernel 路径也会跳过。</p>
 
-<h3>dX：一个 block 处理一行</h3>
+<h3>dX 行内规约</h3>
 
 <p>CUDA 路径为 $R$ 行启动 $R$ 个 block。每个线程以步进方式读取该行的 $X$、<code>dY</code> 和 $\gamma$，先累加：</p>
 
@@ -373,7 +373,7 @@ dX = (rstd[:, None] / H) * (H * h - s1 - xhat * s2)</pre>
 
 <p>当 $H$ 能被 4 整除、数据类型受支持且几个 buffer 满足对齐条件时，dispatcher 选择四元素向量化 load/store；否则回到标量版本。分支条件在 <a href="https://github.com/pytorch/pytorch/blob/f772fda46b402b0b4a5082966e77bfafeeddfd40/aten/src/ATen/native/cuda/layer_norm_kernel.cu#L1680-L1760"><code>LayerNormBackwardKernelImplInternal()</code></a> 中。</p>
 
-<h3>dγ 与 dβ：沿行维规约</h3>
+<h3>dγ 与 dβ 跨行规约</h3>
 
 <p>参数梯度的访存方向不同。相邻线程负责相邻 feature，因此读取 $X$ 和 <code>dY</code> 时仍然保持 coalesced；每个线程或线程组沿 $R$ 累加自己的列。<a href="https://github.com/pytorch/pytorch/blob/f772fda46b402b0b4a5082966e77bfafeeddfd40/aten/src/ATen/native/cuda/layer_norm_kernel.cu#L797-L900"><code>GammaBetaBackwardCUDAKernelTemplate</code></a> 同时计算：</p>
 
@@ -384,7 +384,7 @@ dbeta[j]  += dY[r, j]</pre>
 
 <p>还有一个专门处理 $R\gg H$ 且 $H$ 很小的分支。它沿行维启动多个 block，先写出形状为 $[\text{num partials},H]$ 的临时结果，再调用 <code>sum(0)</code> 完成第二级规约。多一次 kernel 和一次临时 buffer 读写，换来更多并行 block。源码把这个分支限制在 $R&gt;64\mathrm{K}$ 且列方向不足以占满一半 SM 的情形。</p>
 
-<h3>常见 kernel 数量</h3>
+<h3>Kernel 数量</h3>
 
 <div class="table-scroll">
 <table class="note-table">
@@ -401,7 +401,7 @@ dbeta[j]  += dY[r, j]</pre>
 
 <p>这里按源码中的逻辑 launch 计数。编译器、CUDA Graph 或底层 reduction 实现可能让 profiler 中的活动名称有所不同，但不会改变两个 reduction axis。</p>
 
-<h2 id="zh-fused">5. Triton fused 实现</h2>
+<h2 id="zh-fused">5. Triton 融合实现</h2>
 
 <p>generative-recommenders 的实现先由 <a href="https://github.com/meta-recsys/generative-recommenders/blob/2a4fa9256aff3b6e21decab8738b6f1872891f4f/generative_recommenders/ops/triton/triton_layer_norm.py#L188-L270"><code>_weighted_layer_norm_fwd()</code></a> 计算 forward：一个 Triton program 完成 mean、variance、normalization 和 affine。其 <code>IS_SWISH</code> 分支定义为 <code>X * sigmoid(LayerNorm(X) * W + B)</code>，因此融合边界还包含原始输入 $X$；它与通常写作 <code>SiLU(Y)</code> 的算子不同。对应的 learnable backward 入口是 <code>_weighted_layer_norm_bwd_dx()</code>。</p>
 
@@ -434,7 +434,7 @@ partial_db += sum(dy, axis=row)</pre>
 
 <p>该实现要求每行能放进 fused feature block。<a href="https://github.com/meta-recsys/generative-recommenders/blob/2a4fa9256aff3b6e21decab8738b6f1872891f4f/generative_recommenders/ops/triton/triton_layer_norm.py#L502-L545"><code>compute_BLOCK_D()</code></a> 把上限设为每行 64 KiB，并将 feature width 向上取到 2 的幂。超出上限会直接报错。</p>
 
-<h2 id="zh-compare">6. 两种实现的边界</h2>
+<h2 id="zh-compare">6. 实现对比</h2>
 
 <div class="table-scroll">
 <table class="note-table">
@@ -454,7 +454,7 @@ partial_db += sum(dy, axis=row)</pre>
 
 <p>两种实现把成本放在不同位置。PyTorch native 拆开行规约与列规约，可以分别选择 launch shape；Triton 路径复用主数据读取，同时承担更复杂的 tile、FP32 partial buffer 和收尾规约。$R$ 较小时，第二阶段的固定成本可能占据较大比例；$H$ 较大时，融合 kernel 的寄存器需求也可能压低 occupancy。因此，路径选择需要结合实际的 $R,H$、dtype 和目标 GPU 测量。</p>
 
-<h2 id="zh-precision">7. 精度与正确性验证</h2>
+<h2 id="zh-precision">7. 精度与正确性</h2>
 
 <p>LayerNorm backward 的误差主要来自 reduction 顺序。PyTorch native 用 <code>acc_type&lt;T, true&gt;</code> 选择累加类型；CUDA 上的 FP16 和 BF16 输入通常用 FP32 保存 <code>mean</code>、<code>rstd</code> 和规约中间值。Triton 实现也把 $X$、<code>dY</code>、weight 以及 partial <code>dweight/dbias</code> 转成 FP32，写最终输出时再转回目标 dtype。</p>
 
@@ -498,7 +498,7 @@ torch.testing.assert_close(db, b_ref.grad.to(db.dtype), rtol=..., atol=...)</pre
 
 <div class="lang-en">
 
-<h1>LayerNorm Backpropagation: Derivation, CUDA Reductions, and Triton Fusion</h1>
+<h1>LayerNorm backward on GPUs</h1>
 
 <p class="lead">Transformer blocks commonly apply LayerNorm to the hidden features of each token. Backpropagation must produce the input gradient <code>dX</code> together with <code>dγ</code> and <code>dβ</code> for the shared affine parameters. The first computation reduces within each token's feature dimension, while the other two reduce across tokens. These orthogonal axes determine how a GPU implementation organizes blocks, temporary storage, and kernel launches. Starting from the closed-form gradients, this article traces that structure through PyTorch native CUDA and the fused Triton implementation in generative-recommenders.</p>
 
@@ -621,7 +621,7 @@ dX = (rstd[:, None] / H) * (H * h - s1 - xhat * s2)</pre>
   <p><code>eps</code> enters backward through the <code>rstd</code> saved by forward. Backward uses that value together with the corresponding <code>mean</code> to recover the row statistics used during normalization.</p>
 </div>
 
-<h2 id="en-param-grad">3. Parameter gradients and reduction axes</h2>
+<h2 id="en-param-grad">3. Parameter-gradient reduction</h2>
 
 <p>Let the upstream gradient over the full matrix be $G_{rj}=\partial L/\partial Y_{rj}$. Because $\gamma$ and $\beta$ are shared across rows, their gradients reduce over $R$:</p>
 
@@ -685,11 +685,11 @@ dX = (rstd[:, None] / H) * (H * h - s1 - xhat * s2)</pre>
 
 <p>Rows of <code>dX</code> are independent, so one CUDA block can handle one row. <code>dγ</code> and <code>dβ</code> must sum across rows. When $R$ is large, having one block scan every row serially does not expose enough parallelism, so implementations often produce partial sums before a second reduction stage.</p>
 
-<h2 id="en-native">4. PyTorch native CUDA implementation</h2>
+<h2 id="en-native">4. PyTorch CUDA implementation</h2>
 
 <p>This section uses PyTorch main commit <a href="https://github.com/pytorch/pytorch/tree/f772fda46b402b0b4a5082966e77bfafeeddfd40"><code>f772fda</code></a> as its source snapshot. <a href="https://github.com/pytorch/pytorch/blob/f772fda46b402b0b4a5082966e77bfafeeddfd40/aten/src/ATen/native/cuda/layer_norm_kernel.cu#L1918-L1990"><code>layer_norm_backward_cuda()</code></a> allocates <code>dX</code>, <code>dgamma</code>, and <code>dbeta</code> according to <code>grad_input_mask</code>, then enters <code>LayerNormBackwardKernelImpl()</code>. If a gradient was not requested, its tensor stays undefined and the corresponding kernel path is skipped.</p>
 
-<h3>dX: one block per row</h3>
+<h3>Row-wise dX reduction</h3>
 
 <p>The CUDA path launches $R$ blocks for $R$ rows. Threads step through the row and read $X$, <code>dY</code>, and $\gamma$, accumulating:</p>
 
@@ -713,7 +713,7 @@ dX = (rstd[:, None] / H) * (H * h - s1 - xhat * s2)</pre>
 
 <p>When $H$ is divisible by four, the data type is supported, and the relevant buffers satisfy alignment requirements, the dispatcher selects four-element vectorized loads and stores. Otherwise, it uses the scalar implementation. The conditions appear in <a href="https://github.com/pytorch/pytorch/blob/f772fda46b402b0b4a5082966e77bfafeeddfd40/aten/src/ATen/native/cuda/layer_norm_kernel.cu#L1680-L1760"><code>LayerNormBackwardKernelImplInternal()</code></a>.</p>
 
-<h3>dγ and dβ: reduction across rows</h3>
+<h3>Cross-row dγ and dβ reduction</h3>
 
 <p>Parameter gradients use the other memory direction. Neighboring threads own neighboring features, preserving coalesced reads of $X$ and <code>dY</code>, while each thread or thread group accumulates its column over $R$. <a href="https://github.com/pytorch/pytorch/blob/f772fda46b402b0b4a5082966e77bfafeeddfd40/aten/src/ATen/native/cuda/layer_norm_kernel.cu#L797-L900"><code>GammaBetaBackwardCUDAKernelTemplate</code></a> computes both:</p>
 
@@ -724,7 +724,7 @@ dbeta[j]  += dY[r, j]</pre>
 
 <p>A separate branch handles $R\gg H$ with small $H$. It launches several blocks along the row dimension, writes a temporary result of shape $[\text{num partials},H]$, then calls <code>sum(0)</code> for the second reduction stage. The extra kernel and buffer traffic buy more parallel blocks. In this source snapshot, the branch requires $R&gt;64\mathrm{K}$ and too few columns to occupy half the SMs.</p>
 
-<h3>Typical kernel counts</h3>
+<h3>Kernel counts</h3>
 
 <div class="table-scroll">
 <table class="note-table">
@@ -774,7 +774,7 @@ partial_db += sum(dy, axis=row)</pre>
 
 <p>The implementation requires each row to fit in one fused feature block. <a href="https://github.com/meta-recsys/generative-recommenders/blob/2a4fa9256aff3b6e21decab8738b6f1872891f4f/generative_recommenders/ops/triton/triton_layer_norm.py#L502-L545"><code>compute_BLOCK_D()</code></a> limits a row to 64 KiB and rounds the feature width up to a power of two. Wider rows raise an error.</p>
 
-<h2 id="en-compare">6. Implementation tradeoffs</h2>
+<h2 id="en-compare">6. Implementation comparison</h2>
 
 <div class="table-scroll">
 <table class="note-table">
@@ -794,7 +794,7 @@ partial_db += sum(dy, axis=row)</pre>
 
 <p>The two implementations place costs in different parts of the operation. PyTorch native separates row and column reductions, allowing each to use its own launch shape. The Triton path reuses the main-data loads while adding more involved tiling, FP32 partial buffers, and a final reduction. For small $R$, that second stage can occupy a large fraction of runtime; for large $H$, register demand in the fused kernel may reduce occupancy. Choosing between them therefore requires measurements at the actual $R,H$, dtype, and target GPU.</p>
 
-<h2 id="en-precision">7. Precision and correctness validation</h2>
+<h2 id="en-precision">7. Precision and correctness</h2>
 
 <p>Reduction order is the main source of numerical differences in LayerNorm backward. PyTorch native uses <code>acc_type&lt;T, true&gt;</code> to choose the accumulator type. For FP16 and BF16 inputs on CUDA, <code>mean</code>, <code>rstd</code>, and reduction intermediates are normally FP32. The Triton implementation also converts $X$, <code>dY</code>, weight, and partial <code>dweight/dbias</code> values to FP32, then casts final outputs back to the target dtype.</p>
 

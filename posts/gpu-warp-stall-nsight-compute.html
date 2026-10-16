@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GPU Warp Stall 分析：调度状态、Nsight Compute 指标与源码归因</title>
-<meta name="post:title"           content="GPU Warp Stall 分析：调度状态、Nsight Compute 指标与源码归因">
-<meta name="post:title_en"        content="GPU Warp Stall Analysis: Scheduler States, Nsight Compute Metrics, and Source Attribution">
+<title>Nsight Compute Warp Stall 分析</title>
+<meta name="post:title"           content="Nsight Compute Warp Stall 分析">
+<meta name="post:title_en"        content="Warp stall analysis in Nsight Compute">
 <meta name="post:slug"            content="gpu-warp-stall-nsight-compute">
 <meta name="post:date"            content="2026-08-27">
 <meta name="post:tags"            content="GPU, CUDA, Nsight Compute, Warp Scheduling, Performance">
@@ -25,11 +25,11 @@
   };
 </script>
 <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" defer></script>
-<script src="../lang-toggle.js" defer></script>
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="../assets/site.css">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
 <style>
 .lead{margin:-6px 0 26px;color:var(--fg-muted);font-size:17px;line-height:1.85}
 .reading-guide{margin:26px 0 34px;padding:12px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
@@ -72,70 +72,70 @@ main.content mjx-container[display="true"]{max-width:100%;padding-bottom:2px;ove
 <details class="article-toc" open>
 <summary><span class="lang-zh">目录与系列</span><span class="lang-en">Contents and series</span></summary>
 <aside class="toc"><div class="toc-title">目录 · TOC</div><div class="lang-zh"><ul>
-<li><a href="#zh-scheduler">1. 发射空档与候选 warp</a>
+<li><a href="#zh-scheduler">1. Scheduler 发射状态</a>
 </li>
-<li><a href="#zh-causal-chain">2. Long Scoreboard 案例</a>
-<ul><li><a href="#zh-consumer">采样停在 FFMA</a></li><li><a href="#zh-producer">回到 load producer</a></li><li><a href="#zh-change">独立指令重排</a></li></ul>
+<li><a href="#zh-causal-chain">2. Long Scoreboard 归因</a>
+<ul><li><a href="#zh-consumer">2.1 FFMA 采样位置</a></li><li><a href="#zh-producer">2.2 Producer 指令定位</a></li><li><a href="#zh-change">2.3 SASS 对照验证</a></li></ul>
 </li>
-<li><a href="#zh-diagnosis">3. 判读改动结果</a>
+<li><a href="#zh-diagnosis">3. 实验结果分析</a>
 </li>
-<li><a href="#zh-dependencies">4. 其他等待的调查对象</a>
+<li><a href="#zh-dependencies">4. 其他 Stall 类型</a>
 </li>
-<li><a href="#zh-sampling">附录 A：采样与单位</a>
-<ul><li><a href="#zh-sample-counts">All 与 Not-issued</a></li><li><a href="#zh-normalization">归一化的分母</a></li></ul>
+<li><a href="#zh-sampling">附录 A：采样与统计单位</a>
+<ul><li><a href="#zh-sample-counts">采样集合与 Producer 归因</a></li><li><a href="#zh-normalization">Warp Cycles 指标</a></li></ul>
 </li>
-<li><a href="#zh-taxonomy">附录 B：Reason 索引</a>
+<li><a href="#zh-taxonomy">附录 B：Stall Reason 索引</a>
 </li>
-<li><a href="#zh-collect">附录 C：采集命令</a>
-<ul><li><a href="#zh-build">CUDA C++ 构建</a></li><li><a href="#zh-processes">Python 与 replay</a></li></ul>
+<li><a href="#zh-collect">附录 C：构建与采集命令</a>
+<ul><li><a href="#zh-build">CUDA C++ 采集</a></li><li><a href="#zh-processes">Python 采集与 Replay</a></li></ul>
 </li>
 <li><a href="#zh-refs">参考资料</a>
 </li>
 </ul></div><div class="lang-en"><ul>
-<li><a href="#en-scheduler">1. Issue gaps and candidates</a>
+<li><a href="#en-scheduler">1. Scheduler issue state</a>
 </li>
-<li><a href="#en-causal-chain">2. Long Scoreboard example</a>
-<ul><li><a href="#en-consumer">The sampled FFMA</a></li><li><a href="#en-producer">Trace the load producer</a></li><li><a href="#en-change">Reorder independent work</a></li></ul>
+<li><a href="#en-causal-chain">2. Long Scoreboard attribution</a>
+<ul><li><a href="#en-consumer">2.1 FFMA sampling location</a></li><li><a href="#en-producer">2.2 Producer instruction attribution</a></li><li><a href="#en-change">2.3 SASS comparison</a></li></ul>
 </li>
-<li><a href="#en-diagnosis">3. Interpret the result</a>
+<li><a href="#en-diagnosis">3. Experimental findings</a>
 </li>
-<li><a href="#en-dependencies">4. Other wait objects</a>
+<li><a href="#en-dependencies">4. Other stall types</a>
 </li>
-<li><a href="#en-sampling">Appendix A: Sampling</a>
-<ul><li><a href="#en-sample-counts">All and Not-issued</a></li><li><a href="#en-normalization">Normalization</a></li></ul>
+<li><a href="#en-sampling">Appendix A: Sampling and statistical units</a>
+<ul><li><a href="#en-sample-counts">Sample sets and producer attribution</a></li><li><a href="#en-normalization">Warp-cycle metrics</a></li></ul>
 </li>
-<li><a href="#en-taxonomy">Appendix B: Reasons</a>
+<li><a href="#en-taxonomy">Appendix B: Stall-reason index</a>
 </li>
-<li><a href="#en-collect">Appendix C: Collection</a>
-<ul><li><a href="#en-build">CUDA C++ build</a></li><li><a href="#en-processes">Python and replay</a></li></ul>
+<li><a href="#en-collect">Appendix C: Build and collection commands</a>
+<ul><li><a href="#en-build">CUDA C++ collection</a></li><li><a href="#en-processes">Python collection and replay</a></li></ul>
 </li>
 <li><a href="#en-refs">References</a>
 </li>
 </ul></div></aside>
 </details>
 <div class="lang-zh">
-<h1>GPU Warp Stall 分析：调度状态、Nsight Compute 指标与源码归因</h1>
+<h1>Nsight Compute Warp Stall 分析</h1>
 <p class="lead">一个 CUDA kernel 可以让许多 warp 同时驻留，但它们推进到不同位置后，能发射的指令也会不同。做乘加运算的 warp 可能正在等刚才的 global load，另一个 warp 则还有独立算术可做。分析性能时，Nsight Compute 会把这些等待列为 warp stall。报告中的高值说明某类等待经常出现；接下来要找到它是否留下了发射空档，以及代码中的哪项工作值得改变。</p>
 <p>最容易走偏的是看到 <code>long_scoreboard</code>，就直接去改显存访问。这个名称先说明一条指令正在等 L1TEX 路径上的结果。它可能等在乘加指令上，真正发出请求的 load 却在前面几行。下面从这段 load-use 关系进入报告，把 scheduler、采样位置、producer 和一次具体改动接起来。</p>
-<nav class="reading-guide" aria-label="阅读入口"><p><strong>快速索引：</strong><a href="#zh-scheduler">判断是否有发射空档</a> · <a href="#zh-causal-chain">跟读 Long Scoreboard 案例</a> · <a href="#zh-diagnosis">解释改动结果</a> · <a href="#zh-taxonomy">查其他 stall reason</a> · <a href="#zh-collect">采集报告</a></p></nav>
+<nav class="reading-guide" aria-label="阅读入口"><p><strong>快速索引：</strong><a href="#zh-scheduler">1. Scheduler 发射状态</a> · <a href="#zh-causal-chain">2. Long Scoreboard 归因</a> · <a href="#zh-diagnosis">3. 实验结果分析</a> · <a href="#zh-taxonomy">附录 B：Stall Reason 索引</a> · <a href="#zh-collect">附录 C：构建与采集命令</a></p></nav>
 
-<h2 id="zh-scheduler">1. 先看 scheduler 是否还有工作可发射</h2>
+<h2 id="zh-scheduler">1. Scheduler 发射状态</h2>
 <p>已经获得 SM 执行资源、尚未释放这些资源的 warp 属于 active 集合。对一次调度机会而言，下一条指令能够发射的候选称为 <em>eligible warp</em>，其余处于等待状态。Scheduler 从候选中选择 warp；<code>selected</code> 表示本次成功发射，<code>not_selected</code> 表示已经就绪但没有被选中。以这组状态观察当前候选，可以写成：</p>
 <p>\[ W_{\mathrm{active}}=W_{\mathrm{stalled}}+W_{\mathrm{eligible}},\qquad W_{\mathrm{eligible}}=W_{\mathrm{selected}}+W_{\mathrm{not\ selected}}. \]</p>
 <p>例如，Warp A 因 load 结果未返回而等待，Warp B 发射一条加法，Warp C 也已就绪但没有被选中。这次调度同时出现 stalled、selected 和 not selected，发射机会却得到了利用。如果所有候选都不能发射，这次机会才会空置，形成 <em>issue gap</em>。这些状态按 <a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#sections-and-rules">NCU 2026.1 Scheduler Statistics</a> 的视角组织；它们不能直接当作 kernel 时间的几个互斥百分比。</p>
 <p>在 <strong>Details → Scheduler Statistics</strong> 中先看发射空档和 Eligible Warps Per Scheduler。如果 Active 很高而 Eligible 很低，增加 resident warp 未必能解决问题，现有 warp 可能在等待同一类结果；如果 Active 本身偏低，则需要结合<a href="gpu-occupancy-resource-limits.html">Occupancy 的资源预算与 grid 供给</a>查明原因。Warp State Statistics 随后用来选择值得回溯的等待类型。只有发射统计和等待分布放在一起，才有优化优先级。</p>
 
 <span id="zh-ui" class="legacy-anchor"></span>
-<h2 id="zh-causal-chain">2. 沿一个 Long Scoreboard 热点回到 load</h2>
+<h2 id="zh-causal-chain">2. Long Scoreboard 归因</h2>
 <p>考虑循环中的一个片段：从 global memory 读取一个值，用它更新 accumulator，同时推进两项独立的整数状态。下面是<strong>教学用 SASS 示意</strong>，省略地址准备、控制字段和周围循环。L、A、C、B 是本文的指令标签，不是实测 PC。除 L 产生的 <code>R8</code> 外，假定其他输入均已就绪；两条整数加法也不改变 load 地址或乘加结果。</p>
 <pre class="code"><code>L: LDG.E R8, [R2]
 A: IADD3 R12, R12, 0x1, RZ
 C: FFMA R16, R8, R20, R16
 B: IADD3 R24, R24, 0x1, RZ</code></pre>
-<h3 id="zh-consumer">2.1 采样可能停在 FFMA</h3>
+<h3 id="zh-consumer">2.1 FFMA 采样位置</h3>
 <p>L 发射后，内存请求继续执行。A 不读取 <code>R8</code>，因此可以继续推进；轮到 C 时，若 <code>R8</code> 还没有返回，C 会等待这个 producer。按 <a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#warp-stall-reasons">Long Scoreboard 的定义</a>，这是对 L1TEX 操作结果的依赖。B 虽然独立，却排在 C 后面；在固定的这段 SASS 中，它不能绕过 C 来填补等待。</p>
 <p>现在给诊断设定一个明确入口：Scheduler Statistics 显示发射空档，而 Source 页的 <strong>Warp Stall Sampling (Not-issued Samples)</strong> 把 Long Scoreboard 热点定位到 C。在这组假设下，C 是值得调查的 stalled consumer。它并不表示 FFMA 的算术延迟很长，也还没有说明 L 的数据来自哪一级缓存或显存。</p>
-<h3 id="zh-producer">2.2 用依赖视图寻找产生 R8 的指令</h3>
+<h3 id="zh-producer">2.2 Producer 指令定位</h3>
 <p>选中 C 后，查看 <strong>Input Scoreboard Dependencies</strong>。在本例只有 <code>R8</code> 这一项未完成依赖的设定下，依赖会回到 L。<strong>Attributed Stalls</strong> 则把相关 Long/Short Scoreboard 的 Not-issued 样本归到产生依赖的指令位置，方便从 producer 一侧排序。<a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/NsightCompute/index.html#source-page">NCU Source 文档</a>明确区分了这两个位置。</p>
 <figure class="diagram-frame"><svg class="diagram-svg" viewBox="0 0 900 330" role="img" aria-labelledby="zh-stall-case-title zh-stall-case-desc">
 <title id="zh-stall-case-title">从停住的 consumer 回到产生结果的 producer</title><desc id="zh-stall-case-desc">Not-issued 样本指向等待 R8 的 FFMA 指令 C；scoreboard 依赖回到产生 R8 的 LDG 指令 L。A 和 B 是独立算术。字母表示指令位置，不是真实报告地址。</desc>
@@ -152,7 +152,7 @@ B: IADD3 R24, R24, 0x1, RZ</code></pre>
 <text class="muted" x="24" y="310" font-size="13">依赖关系示意；没有实测采样数或延迟。</text>
 </svg><figcaption>从停住的 consumer 回到产生结果的 producer</figcaption></figure>
 <p>这一步把调查对象从 C 的乘加转移到 L 的读取及其使用时机。若真实指令还依赖多个未完成的 load，依赖视图可能列出多个 producer，不能凭一个寄存器名字就选定原因。分析更复杂的控制字段与依赖标识时，可继续阅读<a href="gpu-scoreboard-dependency-mechanism.html">GPU Scoreboard 机制</a>。</p>
-<h3 id="zh-change">2.3 选择一个能在 SASS 上确认的改动</h3>
+<h3 id="zh-change">2.3 SASS 对照验证</h3>
 <p>先沿 L 检查地址与工作量。如果访存不合并，同样的有效数据可能需要更多 sector；若实际 producer 是 local-memory load，并伴随 spill，问题就回到寄存器使用。Cache hit、访问 sector 与相应层级的吞吐帮助区分这些情况。接近可持续上限的 DRAM 吞吐可以支持带宽受限的判断，Long Scoreboard 本身没有给出这个结论。</p>
 <p>本例选取另一个可检验方向：保留同一次 load 和全部算术，只把 B 放到 C 前面。由于设定中 B 与 L、A、C 没有相关的数据或控制依赖，这个重排保持计算语义，目标顺序变为：</p>
 <pre class="code"><code>L: LDG.E R8, [R2]
@@ -162,7 +162,7 @@ C: FFMA R16, R8, R20, R16</code></pre>
 <p>现在 L 与 C 之间有两条独立指令，原来只有一条。可从这个静态对照确定的是：同一 warp 在碰到 consumer 前多了一项可执行工作，load 次数和算术次数保持不变。它既没有降低内存访问量，也没有证明 load 会更快返回。如果编译器本来就生成了这个顺序，源代码改写没有形成新的实验条件；应以两份实际 SASS 为准。</p>
 <p>真实代码中可以通过调整循环中的独立计算、增加独立 accumulator 或预取距离来争取这种重叠。不过源码顺序不能强制最终排布，增加独立状态还可能拉长寄存器 live range。实际尝试应先验证结果，再检查反汇编和资源用量，确认得到的究竟是不是预期变体。</p>
 
-<h2 id="zh-diagnosis">3. 改动结果能支持什么判断</h2>
+<h2 id="zh-diagnosis">3. 实验结果分析</h2>
 <p>前面的例子已经确定了 consumer、producer 和候选改动，运行时结果仍需要采集。把原报告设为 baseline，先比较同样工作量下的 kernel duration，再检查发射统计、动态指令次数和热点分布。几种结果会把下一步带向不同方向：</p>
 <div class="table-scroll"><table class="note-table"><thead><tr><th>对照结果</th><th>可以作出的判断</th><th>继续检查</th></tr></thead><tbody>
 <tr><td>SASS 顺序没有改变</td><td>尚未形成扩大 load-use 距离的对照</td><td>实际指令排布，以及是否存在其他可移动工作</td></tr>
@@ -173,7 +173,7 @@ C: FFMA R16, R8, R20, R16</code></pre>
 <p>即便改动缩短了 kernel 时间，若访问量、缓存行为和寄存器数也一起变化，就仍有多个可能机制。报告应该写清楚哪些观察与解释一致，哪些尚未分离。对这个教学片段，可靠结论先止于依赖关系和指令间隔；表中的任何运行时结果都不是本文声称已经取得的测量。</p>
 <p>复测时固定输入、launch 配置和测量边界，记录 GPU、软件版本与编译选项，完成预热并进行重复计时。保持时钟策略和并发 GPU 工作可比。这样保留下来的变化，才有条件推广到完整 kernel，而不只是让某一列数据变小。</p>
 
-<h2 id="zh-dependencies">4. 热点属于其他等待时，调查对象随之改变</h2>
+<h2 id="zh-dependencies">4. 其他 Stall 类型</h2>
 <p>上面的 C 等待已经发出的 load。若热点位于 L 自身，reason 是 <code>lg_throttle</code>，等待对象变成了接收新请求的队列空间。此时应检查新内存指令的数量、宽度和提交密度；提前发射更多 load 还可能增加压力。区分等待发生在 producer 发射的哪一侧，可以避免把同一个改动套到相反的问题上。</p>
 <div class="table-scroll"><table class="note-table"><thead><tr><th>对照</th><th>第一类等待</th><th>第二类等待</th></tr></thead><tbody>
 <tr><td><code>long_scoreboard</code> / <code>lg_throttle</code></td><td>Consumer 等已有 L1TEX 操作完成</td><td>新 local/global 指令等接收空间</td></tr>
@@ -184,7 +184,7 @@ C: FFMA R16, R8, R20, R16</code></pre>
 <p>若 producer 属于 shared memory，wavefront、bank conflict 和访问宽度会成为相关证据；<a href="gpu-mio-throttle-nsight-compute.html">MIO Throttle</a> 一文给出了独立的访问对照。若热点是 barrier，则要沿控制流检查较晚到达的参与者为何延迟；静态 named-barrier 资源还可能限制驻留，这部分见<a href="cuda-named-barrier-occupancy.html">CUDA Named Barrier</a>。其他 reason 可从下面的分类索引进入。</p>
 
 <h2 id="zh-sampling">附录 A：采样与统计单位</h2>
-<h3 id="zh-sample-counts">All、Not-issued 与 producer attribution</h3>
+<h3 id="zh-sample-counts">采样集合与 Producer 归因</h3>
 <p><a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#warp-sampling">Warp Sampling</a> 在固定 cycle 间隔选择一个 active warp，记录其 PC 和 scheduler state。同一时刻 scheduler 可能发射另一个 warp，因而 All Samples 包含被其他工作覆盖的等待。Not-issued Samples 限定在 scheduler 没有发射指令的采样周期。两组数据可能来自不同 replay pass，不能逐项相减、相除或换算成节省时间。</p>
 <div class="table-scroll"><table class="note-table"><thead><tr><th>Source 页内容</th><th>用途</th></tr></thead><tbody>
 <tr><td>Warp Stall Sampling (All Samples)</td><td>定位经常观察到等待的 PC</td></tr>
@@ -193,11 +193,11 @@ C: FFMA R16, R8, R20, R16</code></pre>
 <tr><td>Input Scoreboard Dependencies</td><td>从当前 consumer 寻找未完成的 producer</td></tr>
 <tr><td>Instructions Executed</td><td>检查该源码位置或 SASS 的动态执行量</td></tr>
 </tbody></table></div>
-<h3 id="zh-normalization">Warp cycles per issued instruction</h3>
+<h3 id="zh-normalization">Warp Cycles 指标</h3>
 <p>Warp State Statistics 把状态汇总为每条已发射指令对应的平均 warp cycles，描述一个 warp 的相邻发射之间怎样等待。这个单位与 kernel wall time 百分比不同。增加指令数可能压低归一化比值，缩短 kernel 也可能减少原始样本量；解释前后变化时，两者都需要结合动态工作量与耗时。</p>
 <p>选中指标后，<strong>Metric Details</strong> 给出名称、单位和定义；Raw 页可查看原始计数。源码关联需要匹配二进制的行号信息，同时查看 SASS，避免把经过移动、合并或消除的源码操作直接当成机器指令。</p>
 
-<h2 id="zh-taxonomy">附录 B：Stall reason 分类索引</h2>
+<h2 id="zh-taxonomy">附录 B：Stall Reason 索引</h2>
 <p>下面按调查对象整理 <a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#warp-stall-reasons">NCU 2026.1 的 reason</a>。类别只是阅读索引，不代表同名物理模块。实际报告提供的 reason 集合取决于 GPU 与工具版本；<code>selected</code> 和 <code>not_selected</code> 是调度状态，已在第 1 节解释。</p>
 <div class="table-scroll">
 <table class="note-table">
@@ -227,7 +227,7 @@ C: FFMA R16, R8, R20, R16</code></pre>
 </div>
 
 <h2 id="zh-collect">附录 C：构建与采集命令</h2>
-<h3 id="zh-build">CUDA C++ 的最小采集范围</h3>
+<h3 id="zh-build">CUDA C++ 采集</h3>
 <p>下面以已有的 <code>kernel.cu</code> 和可执行程序为命令示例。<code>-lineinfo</code> 保留源码行号，不启用完整调试模式；section 则覆盖前文使用的 scheduler、状态、Source 和访存信息：</p>
 <pre class="code"><code>nvcc -O3 -lineinfo kernel.cu -o kernel
 
@@ -245,7 +245,7 @@ ncu-ui stalls.ncu-rep</code></pre>
 <pre class="code"><code>ncu --list-sections
 ncu --query-metrics --query-metrics-mode suffix \
   --metrics smsp__pcsamp_warps_issue_stalled_long_scoreboard</code></pre>
-<h3 id="zh-processes">限定 Python workload 与 replay 范围</h3>
+<h3 id="zh-processes">Python 采集与 Replay</h3>
 <p>对会启动子进程的 workload，可以按 kernel 名称和 launch 次数缩小采集范围。下面的 <code>kernel_name</code> 与 <code>workload.py</code> 需要替换成实际目标。<code>--set full</code> 适合初次调查，通常会增加采集时间和 replay 次数：</p>
 <pre class="code"><code>ncu \
   --target-processes all \
@@ -261,28 +261,28 @@ ncu --query-metrics --query-metrics-mode suffix \
 </div>
 
 <div class="lang-en">
-<h1>GPU Warp Stall Analysis: Scheduler States, Nsight Compute Metrics, and Source Attribution</h1>
+<h1>Warp stall analysis in Nsight Compute</h1>
 <p class="lead">Many warps can reside in a CUDA kernel at once, but they reach different points in their instruction streams. A warp doing multiply-add work may be waiting for a global load while another still has independent arithmetic to issue. Nsight Compute reports these waits as warp stalls. A high value identifies a frequently observed wait; the next task is to establish whether it leaves issue gaps and which work in the code is worth changing.</p>
 <p>A common wrong turn is to see <code>long_scoreboard</code> and immediately start changing device-memory accesses. The name first establishes that an instruction awaits a result from the L1TEX path. Sampling may stop at a multiply-add, while the load that made the request is several lines earlier. The load-use example below connects scheduler activity, the sampled location, its producer, and one concrete change.</p>
-<nav class="reading-guide" aria-label="Reading guide"><p><strong>Quick access:</strong> <a href="#en-scheduler">Check for issue gaps</a> · <a href="#en-causal-chain">Follow the Long Scoreboard example</a> · <a href="#en-diagnosis">Interpret the change</a> · <a href="#en-taxonomy">Look up other reasons</a> · <a href="#en-collect">Collect a report</a></p></nav>
+<nav class="reading-guide" aria-label="Reading guide"><p><strong>Quick access:</strong> <a href="#en-scheduler">1. Scheduler issue state</a> · <a href="#en-causal-chain">2. Long Scoreboard attribution</a> · <a href="#en-diagnosis">3. Experimental findings</a> · <a href="#en-taxonomy">Appendix B: Stall-reason index</a> · <a href="#en-collect">Appendix C: Build and collection commands</a></p></nav>
 
-<h2 id="en-scheduler">1. Check whether the scheduler has work to issue</h2>
+<h2 id="en-scheduler">1. Scheduler issue state</h2>
 <p>A warp belongs to the active set while it holds execution resources on the SM. At an issue opportunity, candidates able to issue their next instruction are <em>eligible warps</em>; the others are waiting. The scheduler chooses among the candidates. <code>selected</code> records a successful issue, while <code>not_selected</code> records a ready warp that was not chosen. This view of the current candidates gives:</p>
 <p>\[ W_{\mathrm{active}}=W_{\mathrm{stalled}}+W_{\mathrm{eligible}},\qquad W_{\mathrm{eligible}}=W_{\mathrm{selected}}+W_{\mathrm{not\ selected}}. \]</p>
 <p>For example, Warp A waits for a load result, Warp B issues an addition, and Warp C is ready but not selected. Stalled, selected, and not selected all appear at this opportunity, yet the issue slot is used. If no candidate can issue, the opportunity is unused: an <em>issue gap</em>. These states follow the perspective of <a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#sections-and-rules">NCU 2026.1 Scheduler Statistics</a>. They are not mutually exclusive percentages of kernel time.</p>
 <p>Start with issue gaps and Eligible Warps Per Scheduler in <strong>Details → Scheduler Statistics</strong>. High Active with low Eligible may mean that existing warps wait on the same class of results, so adding resident warps need not solve the problem. Low Active calls for inspecting <a href="gpu-occupancy-resource-limits.html">occupancy resource limits and grid supply</a>. Warp State Statistics then helps choose the wait to trace. Issue activity and the wait distribution together establish priority.</p>
 
 <span id="en-ui" class="legacy-anchor"></span>
-<h2 id="en-causal-chain">2. Follow a Long Scoreboard hotspot back to its load</h2>
+<h2 id="en-causal-chain">2. Long Scoreboard attribution</h2>
 <p>Consider a loop fragment that loads a value from global memory, uses it to update an accumulator, and advances two independent integer states. The following is <strong>teaching SASS</strong>, omitting address preparation, control fields, and the surrounding loop. L, A, C, and B are instruction labels, not measured PCs. Assume all inputs except the <code>R8</code> produced by L are ready, and that neither integer addition changes the load address or multiply-add result.</p>
 <pre class="code"><code>L: LDG.E R8, [R2]
 A: IADD3 R12, R12, 0x1, RZ
 C: FFMA R16, R8, R20, R16
 B: IADD3 R24, R24, 0x1, RZ</code></pre>
-<h3 id="en-consumer">2.1 Sampling can stop at the FFMA</h3>
+<h3 id="en-consumer">2.1 FFMA sampling location</h3>
 <p>After L issues, its memory request continues executing. A can proceed because it does not read <code>R8</code>. At C, a pending <code>R8</code> makes the consumer wait for its producer. This matches the <a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#warp-stall-reasons">Long Scoreboard definition</a>: dependence on an L1TEX operation. Although B is independent, it follows C and cannot bypass it in this fixed SASS sequence.</p>
 <p>Give the diagnostic walkthrough a specific entry condition: Scheduler Statistics shows issue gaps, and <strong>Warp Stall Sampling (Not-issued Samples)</strong> on the Source page locates the Long Scoreboard hotspot at C. Under these assumptions, C is a stalled consumer worth investigating. That does not mean the FFMA arithmetic has high latency, and it does not yet establish whether L obtained its data from a cache or device memory.</p>
-<h3 id="en-producer">2.2 Find the instruction producing R8</h3>
+<h3 id="en-producer">2.2 Producer instruction attribution</h3>
 <p>Select C and inspect <strong>Input Scoreboard Dependencies</strong>. With <code>R8</code> as the only outstanding dependency in this example, the dependency leads back to L. <strong>Attributed Stalls</strong> assigns the related Long/Short Scoreboard Not-issued samples to the producer location, providing a way to rank the work that created dependencies. The <a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/NsightCompute/index.html#source-page">NCU Source documentation</a> distinguishes these locations.</p>
 <figure class="diagram-frame"><svg class="diagram-svg" viewBox="0 0 900 330" role="img" aria-labelledby="en-stall-case-title en-stall-case-desc">
 <title id="en-stall-case-title">Locate the consumer, then trace its producer</title><desc id="en-stall-case-desc">The Not-issued sample points to C, the FFMA waiting on R8. The scoreboard dependency leads to L, the LDG producing R8. A and B are independent arithmetic. Labels name instructions rather than measured addresses.</desc>
@@ -299,7 +299,7 @@ B: IADD3 R24, R24, 0x1, RZ</code></pre>
 <text class="muted" x="24" y="310" font-size="13">Schematic dependency view; no sample counts or measured latency.</text>
 </svg><figcaption>Locate the consumer, then trace its producer</figcaption></figure>
 <p>The investigation has now moved from C's arithmetic to L's access and its use distance. If an actual instruction depends on several outstanding loads, the dependency view may list multiple producers; a register name alone does not choose the cause. <a href="gpu-scoreboard-dependency-mechanism.html">GPU Scoreboard Mechanism</a> develops the control fields and dependency identifiers in more detail.</p>
-<h3 id="en-change">2.3 Choose a change that can be checked in SASS</h3>
+<h3 id="en-change">2.3 SASS comparison</h3>
 <p>First inspect L's addresses and work. Uncoalesced access can require more sectors for the same useful data. If the actual producer is a local-memory load with spill evidence, the investigation returns to register use. Cache hits, sectors, and throughput at the relevant level help separate these possibilities. DRAM throughput near its sustainable limit supports a bandwidth-bound interpretation; Long Scoreboard alone does not establish it.</p>
 <p>This example tests a different direction: retain the same load and arithmetic, but move B ahead of C. Under the stated absence of data or control dependencies between B and the other instructions, the reorder preserves computation. The target sequence becomes:</p>
 <pre class="code"><code>L: LDG.E R8, [R2]
@@ -309,7 +309,7 @@ C: FFMA R16, R8, R20, R16</code></pre>
 <p>Two independent instructions now separate L and C, where there was one before. The static comparison establishes one additional piece of work available to this warp before it reaches the consumer, with unchanged load and arithmetic counts. It neither reduces memory traffic nor establishes that the load returns faster. If the compiler already produces this order, the source edit has not created a new experimental condition. Compare actual SASS from both binaries.</p>
 <p>In a real loop, rearranging independent computations, using independent accumulators, or increasing prefetch distance can expose this overlap. Source order does not force final scheduling, and additional independent state can lengthen register live ranges. Validate output, then inspect disassembly and resource use to establish what variant was actually produced.</p>
 
-<h2 id="en-diagnosis">3. What the change can establish</h2>
+<h2 id="en-diagnosis">3. Experimental findings</h2>
 <p>The example has identified a consumer, its producer, and a candidate change. Runtime results still need collection. Set the original report as the baseline, compare kernel duration for the same amount of work, and then inspect issue activity, dynamic instruction counts, and hotspot distributions. Different results lead to different next steps:</p>
 <div class="table-scroll"><table class="note-table"><thead><tr><th>Comparison result</th><th>Supported interpretation</th><th>Check next</th></tr></thead><tbody>
 <tr><td>SASS order is unchanged</td><td>The intended increase in load-use distance did not materialize</td><td>Actual instruction order and other movable work</td></tr>
@@ -320,7 +320,7 @@ C: FFMA R16, R8, R20, R16</code></pre>
 <p>Even a faster kernel can leave several candidate explanations if traffic, cache behavior, and register use change together. Report which observations support the interpretation and which effects remain coupled. For this teaching fragment, the established result stops at dependencies and instruction spacing. None of the runtime outcomes in the table is presented as a measurement obtained here.</p>
 <p>Keep inputs, launch configuration, and timing boundaries fixed. Record GPU, software versions, and compiler options; warm up and repeat the timing. Keep clock policy and competing GPU activity comparable. These checks determine whether a change belongs in the complete kernel rather than merely improving one report column.</p>
 
-<h2 id="en-dependencies">4. Other waits change the object of investigation</h2>
+<h2 id="en-dependencies">4. Other stall types</h2>
 <p>C waits for a load that has already issued. If the hotspot is instead at L with <code>lg_throttle</code>, the wait concerns queue space for a new request. Inspect memory-instruction count, width, and submission density. Issuing more loads early could increase that pressure. Locating the wait on the appropriate side of producer issue avoids applying one change to opposing problems.</p>
 <div class="table-scroll"><table class="note-table"><thead><tr><th>Pair</th><th>First wait</th><th>Second wait</th></tr></thead><tbody>
 <tr><td><code>long_scoreboard</code> / <code>lg_throttle</code></td><td>A consumer awaits an issued L1TEX operation</td><td>A new local/global instruction awaits queue space</td></tr>
@@ -331,7 +331,7 @@ C: FFMA R16, R8, R20, R16</code></pre>
 <p>For a shared-memory producer, wavefronts, bank conflicts, and access width become relevant evidence; <a href="gpu-mio-throttle-nsight-compute.html">MIO Throttle</a> provides a separate access comparison. For a barrier hotspot, follow control flow to find why some participants arrive late. Static named-barrier resources can also restrict residency, as explained in <a href="cuda-named-barrier-occupancy.html">CUDA Named Barriers</a>. The reference below provides entry points for the remaining reasons.</p>
 
 <h2 id="en-sampling">Appendix A: Sampling and statistical units</h2>
-<h3 id="en-sample-counts">All, Not-issued, and producer attribution</h3>
+<h3 id="en-sample-counts">Sample sets and producer attribution</h3>
 <p><a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#warp-sampling">Warp Sampling</a> selects an active warp at a fixed cycle interval and records its PC and scheduler state. The scheduler may issue another warp at that instant, so All Samples includes waits covered by other work. Not-issued Samples restricts observation to cycles without an issued instruction. The groups may come from different replay passes and cannot be subtracted, divided, or converted into recoverable time entry by entry.</p>
 <div class="table-scroll"><table class="note-table"><thead><tr><th>Source view</th><th>Use</th></tr></thead><tbody>
 <tr><td>Warp Stall Sampling (All Samples)</td><td>Locate PCs where waiting is observed frequently</td></tr>
@@ -340,11 +340,11 @@ C: FFMA R16, R8, R20, R16</code></pre>
 <tr><td>Input Scoreboard Dependencies</td><td>Trace the selected consumer to outstanding producers</td></tr>
 <tr><td>Instructions Executed</td><td>Inspect dynamic execution counts at a source or SASS location</td></tr>
 </tbody></table></div>
-<h3 id="en-normalization">Warp cycles per issued instruction</h3>
+<h3 id="en-normalization">Warp-cycle metrics</h3>
 <p>Warp State Statistics presents average warp cycles per issued instruction, describing states between a warp's successive issues. This unit differs from a percentage of kernel wall time. More instructions can lower a normalized ratio, and a shorter kernel can also produce fewer raw samples. Interpret changes alongside dynamic work and duration.</p>
 <p><strong>Metric Details</strong> provides the selected metric's name, unit, and definition; Raw exposes the underlying values. Source correlation needs line information matching the binary. Inspect SASS alongside it, since source operations may have been moved, merged, or eliminated.</p>
 
-<h2 id="en-taxonomy">Appendix B: Stall-reason reference</h2>
+<h2 id="en-taxonomy">Appendix B: Stall-reason index</h2>
 <p>The following organizes <a href="https://archive.docs.nvidia.com/nsight-compute/2026.1/ProfilingGuide/index.html#warp-stall-reasons">NCU 2026.1 reasons</a> by the object being investigated. These categories are reading aids, not named physical modules. The available set depends on GPU and tool version. <code>selected</code> and <code>not_selected</code> are scheduling states, covered in Section 1.</p>
 <div class="table-scroll">
 <table class="note-table">
@@ -374,7 +374,7 @@ C: FFMA R16, R8, R20, R16</code></pre>
 </div>
 
 <h2 id="en-collect">Appendix C: Build and collection commands</h2>
-<h3 id="en-build">A focused CUDA C++ collection</h3>
+<h3 id="en-build">CUDA C++ collection</h3>
 <p>The command example assumes an existing <code>kernel.cu</code> and executable. <code>-lineinfo</code> preserves source lines without enabling full debug mode. The sections cover the scheduler, state, Source, and memory information used above:</p>
 <pre class="code"><code>nvcc -O3 -lineinfo kernel.cu -o kernel
 
@@ -392,7 +392,7 @@ ncu-ui stalls.ncu-rep</code></pre>
 <pre class="code"><code>ncu --list-sections
 ncu --query-metrics --query-metrics-mode suffix \
   --metrics smsp__pcsamp_warps_issue_stalled_long_scoreboard</code></pre>
-<h3 id="en-processes">Limit Python workload and replay scope</h3>
+<h3 id="en-processes">Python collection and replay</h3>
 <p>For a workload that starts child processes, kernel-name and launch-count filters narrow the collection. Replace <code>kernel_name</code> and <code>workload.py</code> below with the actual targets. <code>--set full</code> is useful for an initial survey, usually at the cost of longer collection and more replay passes:</p>
 <pre class="code"><code>ncu \
   --target-processes all \
