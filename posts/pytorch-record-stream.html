@@ -12,8 +12,8 @@
 <meta name="post:tags_en"         content="PyTorch, CUDA, Stream, Memory Management">
 <meta name="post:reading"         content="10 分钟">
 <meta name="post:reading_en"      content="10 min">
-<meta name="post:summary"         content="CUDA 异步执行可能让 Tensor 生命周期早于 GPU 对 storage 的最后访问，形成跨 stream 复用风险。record_stream 向 caching allocator 登记 side-stream 使用，使 block 等待 event 完成后再复用；wait_stream 另行约束执行顺序。">
-<meta name="post:summary_en"      content="CUDA's asynchronous execution can end a tensor's Python lifetime before the GPU's final access to its storage, creating a cross-stream reuse hazard. record_stream reports side-stream use to the native caching allocator so the block remains pending until recorded events complete; wait_stream or CUDA events separately establish execution order.">
+<meta name="post:summary"         content="PyTorch caching allocator 的跨 stream 显存生命周期，record_stream 与 wait_stream 的职责及提前复用风险。">
+<meta name="post:summary_en"      content="Cross-stream memory lifetime in the PyTorch caching allocator, the roles of record_stream and wait_stream, and premature-reuse risks.">
 <meta name="post:series"          content="pytorch-internals">
 <meta name="post:series_title"    content="PyTorch 内部机制">
 <meta name="post:series_title_en" content="PyTorch Internals">
@@ -90,7 +90,7 @@
 
 <h1>PyTorch <code>record_stream</code> 与显存复用</h1>
 
-<p class="lead">CUDA kernel 排队后，Python 可以继续执行，Tensor 的语言层生命周期因此可能早于 GPU 对其 storage 的最后一次访问。<code>record_stream</code> 解决的是这段生命周期差异：它把 side stream 的使用记录交给 allocator，延迟显存复用，但不建立 stream 之间的执行顺序。</p>
+<p class="lead">PyTorch 的异步 CUDA 执行需要协调 Tensor 生命周期与显存复用，跨 stream 使用同一块 storage 时尤其如此。本文介绍 caching allocator 如何跟踪使用情况与完成事件，解释 <code>record_stream</code> 和 <code>wait_stream</code> 的职责，分析提前复用的风险，并比较自动记录与显式同步的生命周期管理方式。</p>
 
 <h2 id="zh-1">1. 语义边界</h2>
 
@@ -279,7 +279,7 @@ x.record_stream(s2)</pre>
 
 <h1>PyTorch <code>record_stream</code> and memory reuse</h1>
 
-<p class="lead">Python can continue after a CUDA kernel has been queued, so a tensor's language-level lifetime may end before the GPU's final access to its storage. <code>record_stream</code> addresses that lifetime gap. It reports side-stream use to the allocator and delays memory reuse, but it does not establish execution order between streams.</p>
+<p class="lead">Asynchronous CUDA execution in PyTorch requires coordination between tensor lifetime and memory reuse, especially when storage is used across streams. This article explains how the caching allocator tracks use and completion events, distinguishes the roles of <code>record_stream</code> and <code>wait_stream</code>, analyzes premature reuse, and compares recorded use with explicit synchronization for lifetime management.</p>
 
 <h2 id="en-1">1. Semantic scope</h2>
 

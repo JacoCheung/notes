@@ -16,8 +16,8 @@
 <meta name="post:series_title" content="PyTorch 内部机制">
 <meta name="post:series_title_en" content="PyTorch Internals">
 <meta name="post:series_order" content="1">
-<meta name="post:summary"    content="设备、layout、autograd 与 mode 会共同改变同一 ATen 算子的运行时语义。v2.12.0 以 schema 固定契约，由 DispatchKeySet 选取实现，再经 redispatch 进入 backend；aten::add.Tensor 的 CUDA 前后向路径验证该模型。">
-<meta name="post:summary_en" content="One ATen operator can be governed simultaneously by device, layout, autograd, tensor-subclass, and thread-local mode semantics. In PyTorch v2.12.0, schemas fix the operator contract, ordered DispatchKeySets select registered implementations, and redispatch composes wrapper layers with the backend; the CUDA forward and backward path of aten::add.Tensor identifies where generated code enters execution.">
+<meta name="post:summary"    content="PyTorch Dispatcher 的 schema、DispatchKey、注册与 redispatch，结合 torchgen 和 aten::add 的 CUDA 执行路径。">
+<meta name="post:summary_en" content="PyTorch dispatcher schemas, dispatch keys, registration and redispatch, with torchgen and the CUDA execution paths of aten::add.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
@@ -187,9 +187,9 @@
 
 <h1>PyTorch Dispatcher 机制</h1>
 
-<p>Python 只暴露一个 <code>torch.add</code>，一次实际调用却可能同时受设备、layout、autograd、张量子类和线程局部 mode 影响。Dispatcher 位于 Python/C++ API 与具体 kernel 之间，负责把同一个 operator schema 映射到这些可组合的行为层。</p>
+<p>PyTorch Dispatcher 是算子接口与具体实现之间的调度系统，负责组合设备、Tensor layout、autograd 和运行时 mode 的行为。本文介绍 operator schema、DispatchKey、注册与 redispatch 的关系，说明 C++/Python 注册接口和 torchgen 的代码生成，并以 <code>aten::add.Tensor</code> 的 CUDA 前向与反向路径展示算子调用的解析过程。</p>
 
-<p>PyTorch 通过 schema 固定算子契约，通过注册表关联 operator 与各个 dispatch key 的实现，再由有序 <code>DispatchKeySet</code> 和 redispatch 串联包装层与 backend kernel。调用点因此只表达“执行哪个 operator”，设备与 mode 的组合由 dispatcher 在运行时解析。后文先建立这套运行时模型，再沿 <code>aten::add.Tensor</code> 的 CUDA 前向与反向路径连接 schema、注册、torchgen 和数值实现。</p>
+<p>Schema 定义算子契约，注册表关联 operator 与 dispatch key 的实现，有序的 <code>DispatchKeySet</code> 和 redispatch 则连接包装层与 backend kernel。调用点指定 operator，设备与 mode 的组合由 dispatcher 在运行时解析；torchgen 将算子声明与所需的生成接口关联起来。</p>
 
 <p class="small">实现说明按公开的 <a href="https://github.com/pytorch/pytorch/tree/v2.12.0">PyTorch <code>v2.12.0</code> 源码</a>核对。源码文件名、生成符号和内部 API 会随版本变化；第 6 章的调用链是针对文中输入条件、根据源码与 codegen 模板整理的阅读模型，不是跨版本稳定 API，也不覆盖所有 tensor layout、mode 或编译配置。</p>
 
@@ -2399,9 +2399,9 @@ print(dispatcher.computedTable())</pre>
 
 <h1>PyTorch Dispatcher</h1>
 
-<p>Python exposes a single <code>torch.add</code>, yet one invocation may be affected by device, layout, autograd, tensor subclasses, and thread-local modes at the same time. The dispatcher sits between the Python/C++ APIs and concrete kernels, mapping one operator schema onto these composable behavior layers.</p>
+<p>The PyTorch dispatcher connects operator interfaces to implementations and combines behavior from devices, tensor layouts, autograd and runtime modes. This article explains schemas, dispatch keys, registration and redispatch, covers C++ and Python registration and torchgen code generation, and uses the CUDA forward and backward paths of <code>aten::add.Tensor</code> to illustrate call resolution.</p>
 
-<p>PyTorch fixes the operator contract in a schema, associates implementations with dispatch keys in a registry, and uses an ordered <code>DispatchKeySet</code> plus redispatch to connect wrappers with a backend kernel. Call sites name the operator; the dispatcher resolves the device and mode combination at runtime. The article first establishes that runtime model, then traces <code>aten::add.Tensor</code> through CUDA forward and backward execution to connect schemas, registration, torchgen, and numerical implementation.</p>
+<p>Schemas define operator contracts, registries associate implementations with dispatch keys, and ordered <code>DispatchKeySet</code> values and redispatch connect wrappers with backend kernels. Call sites specify operators while the dispatcher resolves devices and modes at runtime; torchgen connects operator declarations to generated interfaces.</p>
 
 <p class="small">Implementation details were checked against the public <a href="https://github.com/pytorch/pytorch/tree/v2.12.0">PyTorch <code>v2.12.0</code> source</a>. File names, generated symbols, and internal APIs change across releases. The Chapter 6 call chain is a source-reading model for the stated inputs, not a stable cross-version API or a path covering every tensor layout, mode, and build configuration.</p>
 

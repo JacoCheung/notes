@@ -12,8 +12,8 @@
 <meta name="post:tags_en"         content="GPU, CUDA, Nsight Compute, Scoreboard, SASS">
 <meta name="post:reading"         content="16 分钟">
 <meta name="post:reading_en"      content="16 min">
-<meta name="post:summary"         content="沿 LDG 到 FFMA 的依赖链解释 scoreboard 如何挂起和恢复 warp，接着读取 SASS 控制、RAW/WAR 与 Long/Short 分类。NCU 的 consumer 采样位置和 producer 归因位置帮助定位改动，并与寄存器代价及运行时间一起验证。">
-<meta name="post:summary_en"      content="A load-to-FFMA dependency explains how scoreboarding blocks and releases a warp. SASS controls, RAW/WAR hazards, and Long/Short classes lead to an NCU diagnosis that separates consumer sampling from producer attribution and checks changes against register costs and runtime.">
+<meta name="post:summary"         content="GPU Scoreboard 的依赖跟踪、SASS 控制与 warp 等待恢复，以及 Long/Short Scoreboard 的 NCU 采样归因。">
+<meta name="post:summary_en"      content="GPU dependency scoreboarding, SASS controls, warp waiting and resumption, and NCU attribution of Long and Short Scoreboard stalls.">
 <meta name="post:series"          content="gpu-programming-basics">
 <meta name="post:series_title"    content="GPU Programming Basics">
 <meta name="post:series_title_en" content="GPU Programming Basics">
@@ -194,8 +194,8 @@
 </details>
 <div class="lang-zh">
 <h1>GPU Scoreboard 与依赖跟踪</h1>
-<p class="lead">CUDA kernel 读入数据后，通常还要用这些值做乘加、计算地址或判断分支。Load 已经发射，结果却未必已经回到寄存器；同一个 warp 在这段时间里还可能有别的指令可做。硬件需要分清哪些工作能够继续，哪些工作必须等结果。Scoreboard 就出现在这条 load 到后续指令的依赖关系上。</p>
-<p>分析报告时，这段等待可能落在一条 <code>FFMA</code> 上。它所在的行有很多 Long Scoreboard 样本，值得检查的 producer 却是前面那条 <code>LDG</code>。要从报告找对改动位置，需要同时理解指令的先后关系、编译器留下的依赖控制，以及 profiler 如何记录和归因等待。</p>
+<p class="lead">Scoreboard 用于跟踪 GPU 指令之间的结果依赖，用于解释 warp 等待和访存延迟。本文介绍 producer/consumer 关系、SASS 依赖控制和 warp 的等待恢复，区分 Long 与 Short Scoreboard 的观察范围，并解释 Nsight Compute 如何采样和归因这些等待，以支持依赖链分析与优化。</p>
+<p>等待样本可能归因到消费结果的 <code>FFMA</code>，而产生结果的指令是更早的 <code>LDG</code>。指令顺序、编译器生成的依赖控制与 profiler 的采样归因共同决定这类报告的解释，单个源码行的样本数不能独立标识延迟来源。</p>
 <nav class="reading-guide" aria-label="文章快速索引"><p>快速索引</p><ul>
 <li><a href="#zh-definition">1. Producer/Consumer 依赖</a></li>
 <li><a href="#zh-sass">3. SASS 依赖控制</a></li>
@@ -300,8 +300,8 @@ MOV R8, RZ          // wait on SB1 before overwriting R8</code></pre>
 </div>
 <div class="lang-en">
 <h1>GPU Scoreboard and dependency tracking</h1>
-<p class="lead">After a CUDA kernel loads data, it usually uses those values in arithmetic, address calculations, or a branch decision. A load can have issued while its result is still unavailable in a register. The same warp may have other instructions it can execute during that interval. Hardware must distinguish work that can proceed from work that needs the result. Scoreboarding manages the dependency between that load and the instructions that follow it.</p>
-<p>In a profiling report, this wait may appear on an <code>FFMA</code>. The line has many Long Scoreboard samples, but the producer worth investigating is an earlier <code>LDG</code>. Finding the right place to change requires the instruction order, the dependency controls left by the compiler, and the profiler's distinction between sampling and attribution.</p>
+<p class="lead">Scoreboarding tracks result dependencies between GPU instructions and helps explain warp waits and memory latency. This article covers producer-consumer relationships, SASS dependency controls and warp waiting and resumption. It distinguishes Long and Short Scoreboard and explains Nsight Compute sampling and attribution as a basis for dependency-chain analysis and optimization.</p>
+<p>Wait samples can be attributed to an <code>FFMA</code> consumer even when an earlier <code>LDG</code> produces the required result. Instruction order, compiler-generated dependency controls and profiler attribution jointly determine how to interpret such a report. A source-line sample count alone does not identify the origin of the latency.</p>
 <nav class="reading-guide" aria-label="Article quick links"><p>Quick links</p><ul>
 <li><a href="#en-definition">1. Producer/consumer dependencies</a></li>
 <li><a href="#en-sass">3. SASS dependency control</a></li>

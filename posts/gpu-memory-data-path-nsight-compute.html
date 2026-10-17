@@ -12,8 +12,8 @@
 <meta name="post:tags_en"         content="GPU, CUDA, Nsight Compute, Memory Hierarchy, L1TEX, L2 Cache">
 <meta name="post:reading"         content="16 分钟">
 <meta name="post:reading_en"      content="16 min">
-<meta name="post:summary"         content="同样读取 32 个 float，连续访问需要 4 个 sector，跨步访问需要 32 个。沿这个算例追踪 L1TEX、L2 和显存流量，区分请求放大、缓存命中与实际性能瓶颈。">
-<meta name="post:summary_en"      content="A warp reading 32 floats can request 4 sectors or 32, depending on layout. Follow this worked example through L1TEX, L2, and device memory to distinguish traffic amplification, cache reuse, and a measured bottleneck.">
+<meta name="post:summary"         content="Warp 访存合并、sector 粒度及 L1TEX/L2/显存路径，结合布局对照与 NCU 指标分析请求放大、缓存和瓶颈。">
+<meta name="post:summary_en"      content="Warp coalescing, sectors and the L1TEX/L2/device-memory path, with layout comparisons and NCU metrics for request amplification, caches and bottlenecks.">
 <meta name="post:series"          content="gpu-programming-basics">
 <meta name="post:series_title"    content="GPU Programming Basics">
 <meta name="post:series_title_en" content="GPU Programming Basics">
@@ -185,7 +185,7 @@
 <div class="lang-zh">
 
 <h1>GPU 访存路径与 Nsight Compute</h1>
-<p class="lead">处理矩阵的一列和一行，可能执行同样数量的 load，运行时间却差很多。区别往往从 warp 内的地址分布开始：线程各要一个 float，硬件实际搬运的数据按 sector 组织；这些请求随后还要经过缓存。有的流量止于 L1，有的穿过 L2 才到显存。要解释一段 kernel 的访存成本，需要把这几步连起来看。</p>
+<p class="lead">GPU 访存性能取决于线程地址的组织方式、请求经过的缓存层级以及各层实际搬运的数据量。本文介绍 warp 访存合并、sector 粒度和 L1TEX、L2、显存之间的数据路径，通过连续与跨步访问的对照说明请求放大与缓存命中的区别，并给出 Nsight Compute 指标的解释和 kernel 访存分析方法。</p>
 <div class="reading-guide">
 <p><strong>快速索引</strong> · <a href="#zh-granularity">4 个与 32 个 sector 的算例</a> · <a href="#zh-global-path">请求经过哪些层级</a> · <a href="#zh-diagnosis">在 NCU 中验证改动</a> · <a href="#zh-units">硬件缩写速查</a></p>
 <p>阅读前只需了解 thread、warp 和 global/shared memory。正文围绕一次 global load 展开；shared、atomic 和远端内存的差异放在后半篇。</p>
@@ -336,7 +336,7 @@ ncu --section MemoryWorkloadAnalysis_Chart ./app</code></pre>
 <div class="lang-en">
 
 <h1>GPU memory paths in Nsight Compute</h1>
-<p class="lead">Reading a matrix column and reading a row can execute the same number of loads yet take very different amounts of time. The difference often starts with the addresses inside each warp: every thread wants one float, but hardware handles the data in sectors. Those requests then pass through caches. Some traffic stops at L1; some reaches device memory after missing in L2. Explaining a kernel's memory cost means connecting those steps.</p>
+<p class="lead">GPU memory performance depends on thread address patterns, the cache levels traversed and the traffic at each level. This article explains warp coalescing, sector granularity and the path through L1TEX, L2 and device memory. Contiguous and strided accesses distinguish request amplification from cache behavior, followed by guidance on interpreting Nsight Compute metrics and analyzing kernel memory costs.</p>
 <div class="reading-guide">
 <p><strong>Quick links</strong> · <a href="#en-granularity">The 4-sector versus 32-sector example</a> · <a href="#en-global-path">Following a request</a> · <a href="#en-diagnosis">Testing a change in NCU</a> · <a href="#en-units">Hardware abbreviations</a></p>
 <p>This article assumes familiarity with threads, warps, and global/shared memory. The main example follows one global load; shared memory, atomics, and remote memory are covered afterward.</p>

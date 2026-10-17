@@ -12,8 +12,8 @@
 <meta name="post:tags_en"         content="GPU, CUDA, Nsight Compute, MIO Throttle, Performance">
 <meta name="post:reading"         content="18 分钟">
 <meta name="post:reading_en"      content="18 min">
-<meta name="post:summary"         content="从 shared tile 的读取场景进入 MIO Throttle 诊断：先确认发射损失，再用标量与宽访问的教学对照区分指令数、bank conflict 和实际耗时，附 NCU 指标与队列模型。">
-<meta name="post:summary_en"      content="A shared-tile example connects MIO Throttle to scheduler issue loss, scalar and wide loads, bank conflicts, and timing. Includes a worked code/SASS comparison, NCU metric reference, and a bounded queue model.">
+<meta name="post:summary"         content="MIO Throttle 的指标含义与诊断方法，结合 shared tile 访问对照分析指令数量、bank conflict 和 kernel 耗时。">
+<meta name="post:summary_en"      content="MIO Throttle interpretation and diagnosis, with shared-tile access comparisons separating instruction count, bank conflicts and kernel time.">
 <meta name="post:series"          content="gpu-programming-basics">
 <meta name="post:series_title"    content="GPU Programming Basics">
 <meta name="post:series_title_en" content="GPU Programming Basics">
@@ -154,8 +154,8 @@
 
 <div class="lang-zh">
 <h1>GPU MIO Throttle 分析</h1>
-<p class="lead">在分块计算中，CUDA kernel 会先把数据放进 shared memory，再由多个 warp 读取，用于转置、归约或后续运算。这样安排是为了在 block 内交换和复用数据。搬运完成后，读取这个 tile 本身仍然需要指令：多个 warp 接连执行 shared-memory load 时，发射端也可能出现等待。Nsight Compute 中的 MIO Throttle 就是分析这段等待的一个入口。</p>
-<p>假设一份报告把 MIO Throttle 列在显眼的位置，shared-memory 访问也恰好集中在同一段循环。此时还不能选定优化方法：是发射了过多窄访问，还是一次访问产生了额外的 bank conflict；这段等待是否已经被其他 warp 的工作覆盖？这几个判断会决定改动落在代码、layout，还是根本无需优先处理这里。下面用一个 shared tile 的读取片段，把这些判断连起来。</p>
+<p class="lead">MIO Throttle 是 Nsight Compute 中与指令发射等待有关的一类 warp stall 指标，shared-memory 密集的 kernel 是其常见分析场景。本文说明该指标的观察范围与性能含义，通过 shared tile 的标量和宽访问对照，区分指令数量、bank conflict 与实际耗时，并给出热点定位、指标采集和优化验证的方法。</p>
+<p>Shared-memory 热点可能同时包含频繁的窄访问、bank conflict 和已被其他 warp 覆盖的等待。文中的 shared tile 对照分别检查这些因素及其对发射机会的影响，用相同工作量下的 kernel 耗时评估代码与 layout 改动的价值。</p>
 <nav class="reading-guide" aria-label="阅读入口">
 <p><strong>阅读重点：</strong>先判断 scheduler 是否失去发射机会，再把 MIO 样本定位到具体指令。变体的价值最终由相同工作量下的 kernel 耗时决定。</p>
 <p><strong>快速索引：</strong><a href="#zh-diagnosis">2. 性能影响评估</a> · <a href="#zh-example">3. Shared Tile 读取对照</a> · <a href="#zh-bank">3.3 后端工作量差异</a> · <a href="#zh-results">3.4 实验结论与边界</a> · <a href="#zh-metrics">附录 A：指标采集</a></p>
@@ -313,8 +313,8 @@ l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum</code></pre>
 
 <div class="lang-en">
 <h1>GPU MIO Throttle analysis</h1>
-<p class="lead">A tiled CUDA kernel stages data in shared memory so that several warps can exchange or reuse it during a transpose, reduction, or later computation. Once the tile has arrived, reading it still requires instructions. When several warps execute shared-memory loads close together, they can encounter a wait at instruction issue. MIO Throttle in Nsight Compute is one way to investigate that part of execution.</p>
-<p>Suppose a report shows substantial MIO Throttle and the kernel contains a dense region of shared-memory accesses. That is not yet enough to choose an optimization. The region might issue too many narrow accesses, individual accesses might generate bank conflicts, or other warps might already cover the wait. Those possibilities lead to different changes, or to a decision to work elsewhere first. A shared-tile example below connects the report to that decision.</p>
+<p class="lead">MIO Throttle is a Nsight Compute warp-stall metric associated with instruction-issue waits, often investigated in shared-memory-intensive kernels. This article explains its scope and performance implications, compares scalar and wider shared-tile accesses to separate instruction count, bank conflicts and elapsed time, and provides methods for locating hotspots, collecting metrics and validating changes.</p>
+<p>A shared-memory hotspot can combine frequent narrow accesses, bank conflicts and waits already covered by other warps. The shared-tile comparison examines these factors and their effect on issue opportunities, using kernel time for equal work to assess code and layout changes.</p>
 <nav class="reading-guide" aria-label="Reading guide">
 <p><strong>Reading focus:</strong> Check whether the scheduler loses issue opportunities, then locate MIO samples at specific instructions. Judge a variant by kernel time for the same amount of work.</p>
 <p><strong>Quick access:</strong> <a href="#en-diagnosis">2. Performance impact</a> · <a href="#en-example">3. Shared-tile access comparison</a> · <a href="#en-bank">3.3 Backend work differences</a> · <a href="#en-results">3.4 Findings and limits</a> · <a href="#en-metrics">Appendix A: Metric collection</a></p>

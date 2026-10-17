@@ -12,8 +12,8 @@
 <meta name="post:tags_en" content="PyTorch, CUDA Graph, AMP, Autocast, Autograd">
 <meta name="post:reading" content="15 分钟">
 <meta name="post:reading_en" content="15 min">
-<meta name="post:summary" content="Backward 应沿用 forward 确定的精度路径。把 make_graphed_callables 放进 autocast 会让内部 backward 再次触发 cast，破坏 FP32 计算语义；若 autograd worker 未继承 cache_enabled=False，还可能让 graph 引用退出 context 后失效的缓存张量，导致错误结果或 illegal memory access。">
-<meta name="post:summary_en" content="Backward should follow the precision path established by forward. Wrapping make_graphed_callables in autocast can recast backward operations and break FP32 semantics. If the autograd worker does not inherit cache_enabled=False, graph replay can also reference expired cached tensors, causing incorrect results or illegal memory access.">
+<meta name="post:summary" content="CUDA Graph 中的 autocast 作用域：backward 的额外 cast、worker cast cache 生命周期及 make_graphed_callables 捕获边界。">
+<meta name="post:summary_en" content="Autocast boundaries in CUDA Graphs: extra backward casts, worker cast-cache lifetime and backward capture inside make_graphed_callables.">
 <meta name="post:series" content="pytorch-internals">
 <meta name="post:series_title" content="PyTorch 内部机制">
 <meta name="post:series_title_en" content="PyTorch Internals">
@@ -69,7 +69,7 @@
 <div class="lang-zh">
 
 <h1>CUDA Graph 的 autocast 边界</h1>
-<p class="lead">Autocast 应只包住 forward 和 loss 计算，backward 应在启用的 autocast context 之外执行。这条规则也适用于 CUDA Graph capture。<code>make_graphed_callables()</code> 内部也会执行 backward。若调用这个 API 时 autocast 开着，backward 就可能在错误的精度环境下被捕获；之后即使在 autocast 外调用 <code>loss.backward()</code>，仍会重放这张已经捕获的图。在 autocast 下执行 backward 会带来两个不同层面的副作用：一是重新 cast backward 的操作数，改变梯度计算的精度；二是在 autograd worker 上意外启用 cast cache，使 graph 依赖一个可能在 replay 前失效的张量地址。</p>
+<p class="lead">混合精度训练与 CUDA Graph 分别改变算子的执行精度和 GPU 工作的提交方式，两者结合时需要一致的 autocast 作用域。本文分析 backward 应在启用的 autocast context 之外执行的原因，涵盖额外 cast 引起的梯度精度偏差，以及 autograd worker 的 cast cache 生命周期可能导致的 replay 非法访存，并说明 <code>make_graphed_callables()</code> 内部 backward 的捕获边界与验证方法。</p>
 
 <h2 id="zh-rule">Forward 与 Backward 精度</h2>
 <p>PyTorch 的 <a href="https://docs.pytorch.org/docs/2.12/amp.html#torch.autocast">AMP 文档</a>建议只对 forward 和 loss 开启 autocast。常规写法的边界非常明确：</p>
@@ -302,7 +302,7 @@ with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
 
 <div class="lang-en">
 <h1>Autocast boundaries in CUDA Graphs</h1>
-<p class="lead">Autocast should cover forward and loss computation; backward should run outside an enabled autocast context. The same boundary matters during CUDA Graph capture. <code>make_graphed_callables()</code> also executes backward internally. If autocast is enabled when this API is called, backward may be captured under the wrong precision settings. A later <code>loss.backward()</code> outside autocast still replays that captured graph. Running backward under autocast can have two effects: backward operands are cast again, changing gradient precision; and an autograd worker can unexpectedly enable the cast cache, leaving the graph dependent on storage that may expire before replay.</p>
+<p class="lead">Mixed-precision training and CUDA Graphs affect operation precision and GPU work submission, respectively. Combining them requires consistent autocast boundaries. This article explains why backward should run outside an enabled autocast context, examining gradient-precision changes from extra casts and possible illegal replay accesses caused by cast-cache lifetime on an autograd worker. It also covers backward capture inside <code>make_graphed_callables()</code> and methods for checking the boundary.</p>
 
 <h2 id="en-rule">Forward and backward precision</h2>
 <p>The <a href="https://docs.pytorch.org/docs/2.12/amp.html#torch.autocast">PyTorch AMP documentation</a> recommends limiting autocast to forward and loss computation:</p>

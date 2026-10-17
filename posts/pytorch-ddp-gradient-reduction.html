@@ -12,8 +12,8 @@
 <meta name="post:tags_en"         content="PyTorch, DDP, Reducer, NCCL, AllReduce">
 <meta name="post:reading"         content="14 分钟">
 <meta name="post:reading_en"      content="14 min">
-<meta name="post:summary"         content="标准 DDP 需把各 rank 的局部梯度变成一致的完整副本。PyTorch 2.12 Reducer 以 bucket 为 collective 单位，预除 div_factor 后发起 SUM AllReduce；bucket 数对应逻辑 collective 数，NCCL kernel 数、custom hook 缩放和分片语义须另行判断。">
-<meta name="post:summary_en"      content="Standard DDP must turn independently computed local parameter gradients into identical full gradients on every rank. In PyTorch 2.12, the Reducer launches one logical collective per ready bucket in a consistent order and divides by div_factor before SUM AllReduce; bucket count, lower-level NCCL kernel count, custom-hook scaling, and sharded-gradient ownership remain distinct concerns.">
+<meta name="post:summary"         content="PyTorch DDP 的 Reducer、bucket 就绪与 AllReduce 触发，及 world-size scaling、梯度累积和 AMP 的影响。">
+<meta name="post:summary_en"      content="PyTorch DDP Reducer buckets, readiness and AllReduce launch, including world-size scaling, gradient accumulation and AMP.">
 <meta name="post:series"          content="pytorch-internals">
 <meta name="post:series_title"    content="PyTorch 内部机制">
 <meta name="post:series_title_en" content="PyTorch Internals">
@@ -192,7 +192,7 @@
 
 <h1>PyTorch DDP 梯度规约</h1>
 
-<p class="lead">数据并行训练让每个 rank 独立执行 forward 与 backward，因此 autograd 首先得到的是各 rank 的局部参数梯度。优化器更新之前，这些副本需要形成一致的规约结果。PyTorch DDP 在本地梯度累加与优化器之间放置 <code>Reducer</code>：它把参数梯度组织成 bucket，按就绪顺序启动 collective，并借助异步通信覆盖一部分后续 backward 计算。规约时机、collective 数量和 world-size scaling 都由这条路径共同决定。</p>
+<p class="lead">PyTorch DistributedDataParallel（DDP）通过梯度规约协调各 rank 的模型更新，并利用异步通信与 backward 重叠。本文分析 Reducer 的 bucket 组织、梯度就绪与 collective 触发过程，说明 AllReduce、world-size scaling 和梯度所有权，并讨论 loss reduction、梯度累积及 AMP 对规约语义与观测结果的影响。</p>
 
 <h2 id="zh-scope">执行模型与版本</h2>
 
@@ -584,7 +584,7 @@ print(ddp_info.get("prev_iteration_grad_ready_order_indices"))</pre>
 
 <h1>PyTorch DDP gradient reduction</h1>
 
-<p class="lead">In data-parallel training, every rank executes forward and backward independently, so autograd first produces local parameter gradients. Those replicas need a consistent reduced result before the optimizer update. PyTorch DDP places a <code>Reducer</code> between local gradient accumulation and the optimizer: it groups gradients into buckets, starts collectives as buckets become ready, and uses asynchronous communication to overlap part of the remaining backward computation. Reduction timing, collective count, and world-size scaling all follow from this path.</p>
+<p class="lead">PyTorch DistributedDataParallel (DDP) coordinates model updates through gradient reduction and overlaps asynchronous communication with backward computation. This article examines Reducer buckets, gradient readiness and collective launch, explains AllReduce, world-size scaling and gradient ownership, and discusses the effects of loss reduction, gradient accumulation and AMP on reduction semantics and observations.</p>
 
 <h2 id="en-scope">Execution model and versions</h2>
 

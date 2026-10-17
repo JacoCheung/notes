@@ -12,8 +12,8 @@
 <meta name="post:tags_en"         content="PyTorch, DDP, Autograd, AccumulateGrad, CUDA Stream">
 <meta name="post:reading"         content="15 分钟">
 <meta name="post:reading_en"      content="15 min">
-<meta name="post:summary"         content="DDP 构造 Reducer 时会取得并持有叶子参数的 AccumulateGrad；节点若在此时创建，其 InputMetadata 会记录当前 CUDA stream。backward 执行节点和 Reducer hook 前，autograd Engine 恢复该 stream，并在梯度来自其他 stream 时插入 event 依赖。CUDA Graph capture 还可通过 InputBuffer 临时覆盖 stale stream，而不修改节点原有的 stream metadata。">
-<meta name="post:summary_en"      content="During Reducer construction, DDP obtains and retains each leaf parameter's AccumulateGrad node. When the node is created at this point, its InputMetadata records the current CUDA stream. Before running the node and its Reducer hook in backward, the autograd Engine restores that stream and inserts event dependencies when the incoming gradient was produced elsewhere. During CUDA Graph capture, InputBuffer can temporarily override a stale stream without mutating the node's original stream metadata.">
+<meta name="post:summary"         content="DDP 中 AccumulateGrad 的创建与 stream 绑定、autograd 的执行恢复，以及自定义 stream 和 CUDA Graph 的初始化约束。">
+<meta name="post:summary_en"      content="AccumulateGrad creation and stream binding in DDP, restoration by autograd, and initialization constraints for custom streams and CUDA Graphs.">
 <meta name="post:series"          content="pytorch-internals">
 <meta name="post:series_title"    content="PyTorch 内部机制">
 <meta name="post:series_title_en" content="PyTorch Internals">
@@ -141,7 +141,7 @@
 
 <h1>DDP AccumulateGrad 的 Stream 绑定</h1>
 
-<p class="lead">单进程单 GPU 的 DDP 训练通常按固定顺序初始化：选择本地 CUDA device，把模型参数放到该 device，再用 <code>DistributedDataParallel</code> 包装模型。这个顺序还会确定 autograd 的执行 stream。DDP 在构造期间取得叶子参数的 <code>AccumulateGrad</code>；节点若在此时创建，便会记录当时的 CUDA current stream。以后梯度到达参数时，autograd Engine 会切换到该 stream，执行梯度累加和 DDP 注册的 hook。默认 stream 训练很少显露这项机制，自定义 stream 和 CUDA Graph capture 则会直接受到它的约束。</p>
+<p class="lead">PyTorch DDP 的梯度累加与通信依赖 autograd 节点记录的 CUDA stream，这使模型初始化与后续 backward 的执行环境产生联系。本文分析 <code>AccumulateGrad</code> 的创建、stream 记录和 Engine 恢复机制，梳理它与 Reducer、NCCL stream 的关系，并讨论参数放置、自定义 stream 和 CUDA Graph capture 中的初始化约束及 mismatch 诊断。</p>
 
 <h2 id="zh-scope">执行范围与术语</h2>
 
@@ -412,7 +412,7 @@ finally:
 
 <h1>DDP AccumulateGrad stream binding</h1>
 
-<p class="lead">Single-process, single-GPU DDP training usually follows a fixed initialization order: select the local CUDA device, place the model parameters on that device, and then wrap the model with <code>DistributedDataParallel</code>. This order also establishes an autograd execution stream. During construction, DDP obtains each leaf parameter's <code>AccumulateGrad</code> node. If the node is created at that point, it records the current CUDA stream. When a gradient later reaches the parameter, the autograd Engine switches to the recorded stream before running gradient accumulation and the DDP hook. Default-stream training rarely exposes this behavior; custom streams and CUDA Graph capture make it an explicit constraint.</p>
+<p class="lead">PyTorch DDP gradient accumulation and communication depend on the CUDA streams recorded by autograd nodes, connecting model initialization to later backward execution. This article examines <code>AccumulateGrad</code> creation, stream recording and restoration by the Engine, its relationship with Reducer and NCCL streams, and initialization constraints and mismatch diagnostics for parameter placement, custom streams and CUDA Graph capture.</p>
 
 <h2 id="en-scope">Scope and terminology</h2>
 

@@ -12,8 +12,8 @@
 <meta name="post:tags_en" content="GPU, CUDA, CuTe DSL, QuACK, RMSNorm, Source Analysis">
 <meta name="post:reading" content="35 分钟">
 <meta name="post:reading_en" content="35 min">
-<meta name="post:summary" content="以 QuACK commit 14b0b71 为边界，逐行解释 RMSNorm/LayerNorm 共用前向 kernel 从装饰器开始的 213 行源码，建立从 CuTe layout、线程分片、cp.async staging、跨 warp/CTA 行规约到融合 affine epilogue 的完整执行模型。">
-<meta name="post:summary_en" content="A line-by-line reading of the 213-line unified RMSNorm/LayerNorm forward kernel from its decorator at QuACK commit 14b0b71, covering CuTe layouts, thread partitions, cp.async staging, row reduction across warps and CTA clusters, and the fused affine epilogue.">
+<meta name="post:summary" content="QuACK RMSNorm 的 213 行 CuTeDSL 源码注释，涵盖 tile 所有权、异步搬运、跨 warp/CTA 规约与融合输出。">
+<meta name="post:summary_en" content="An annotated 213-line QuACK RMSNorm kernel covering CuTeDSL tile ownership, asynchronous staging, warp/CTA reductions and fused output.">
 <meta name="post:series" content="kernel-dsl">
 <meta name="post:series_title" content="Kernel DSL">
 <meta name="post:series_title_en" content="Kernel DSL">
@@ -200,7 +200,7 @@
 
 <h1>QuACK RMSNorm：CuTeDSL 源码解析</h1>
 
-<p class="lead">QuACK 的公开 <code>rmsnorm()</code> 先把 batch 维压成行，再把每行 hidden features 交给一个 CuTeDSL reduction kernel。这个 kernel 还可以融合 residual、保存 prenorm 结果、应用 weight 与 bias，并在宽行上让一个 CTA cluster 分担 feature 维。RMSNorm 本身只需要平方和与一次缩放；源码的主要篇幅在描述数据由哪个 CTA、warp 和 thread 持有，以及它在 global memory、shared memory 与 registers 之间何时移动。读这 213 行时，应先固定 tile 所有权，再沿数据流追踪一次完整的行规约。</p>
+<p class="lead">QuACK 的 RMSNorm 前向实现将行规约与 residual、affine 等操作融合在一个 CuTeDSL kernel 中，其执行方式由 tile 布局和线程间的数据分配共同决定。本文对固定版本的 213 行源码逐行注释，解释 CuTe layout、global/shared/register 数据流、跨 warp 与 CTA 的规约，以及融合输出的组织方式，并用具体 tile 示例对应数学运算与线程工作。</p>
 
 <h2 id="zh-naming">变量命名</h2>
 
@@ -901,7 +901,7 @@ B_N=\left\lceil\frac{760/4}{32}\right\rceil=6,
 
 <h1>QuACK RMSNorm in CuTeDSL</h1>
 
-<p class="lead">QuACK's public <code>rmsnorm()</code> flattens the batch dimensions into rows and sends the hidden features of each row to a CuTeDSL reduction kernel. The kernel can also fuse a residual, preserve a prenorm result, apply weight and bias, and split a wide feature dimension across a CTA cluster. RMSNorm itself requires only a sum of squares and a scale. Most of the 213 source lines describe which CTA, warp, and thread owns each value, along with when that value moves through global memory, shared memory, and registers. The useful entry point is therefore tile ownership, followed by one complete row-reduction data path.</p>
+<p class="lead">QuACK implements RMSNorm forward as a CuTeDSL kernel that combines row reduction with operations such as residual addition and affine transforms. Tile layout and data ownership determine its execution. This article annotates 213 lines from a fixed revision, explaining CuTe layouts, global/shared/register data movement, warp and CTA reductions, and the fused output stage, with a concrete tile example connecting the mathematics to thread-level work.</p>
 
 <h2 id="en-naming">Variable names</h2>
 

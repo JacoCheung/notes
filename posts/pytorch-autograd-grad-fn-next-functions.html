@@ -12,8 +12,8 @@
 <meta name="post:tags_en"         content="PyTorch, Autograd, DDP, Megatron">
 <meta name="post:reading"         content="18 分钟">
 <meta name="post:reading_en"      content="18 min">
-<meta name="post:summary"         content="分支计算会让多份梯度汇入同一 Node，而 leaf Tensor 仍保持 grad_fn=None。PyTorch 2.12 eager autograd 按 next_functions 槽位完成 fan-in 累加，再由 AccumulateGrad 写入 leaf.grad；固定版本 Megatron-Core 借临时 view 挂接 DDP hook。">
-<meta name="post:summary_en"      content="Branched computations and shared tensors send multiple gradient contributions to one upstream node, while leaf tensors retain grad_fn=None. PyTorch 2.12 eager autograd aggregates fan-in contributions through the node-and-slot relationships exposed by next_functions, then writes leaf gradients through AccumulateGrad; the pinned Megatron-Core implementation reaches that node through a temporary non-leaf view to attach its DDP hook.">
+<meta name="post:summary"         content="PyTorch Autograd 的 Node、边与梯度槽位，结合 grad_fn、next_functions、fan-in 和 AccumulateGrad 解释反向执行。">
+<meta name="post:summary_en"      content="PyTorch Autograd nodes, edges and gradient slots, with grad_fn, next_functions, fan-in and AccumulateGrad explaining backward execution.">
 <meta name="post:series"          content="pytorch-internals">
 <meta name="post:series_title"    content="PyTorch 内部机制">
 <meta name="post:series_title_en" content="PyTorch Internals">
@@ -178,7 +178,7 @@
 
 <h1>PyTorch Autograd 反向图</h1>
 
-<p class="lead">PyTorch eager 模式在执行 forward 运算的同时，记录 backward 所需的反向关系。模型一旦出现分支、共享 Tensor 或参数 hook，只看 forward Tensor 已经无法解释梯度沿哪条路径回传，以及何时写入 leaf 的 <code>.grad</code>。Python 暴露的 <code>grad_fn</code> 与 <code>next_functions</code> 提供了进入这张反向图的观察入口；沿着这些对象，可以建立 Node、梯度槽位、fan-in 累加和 <code>AccumulateGrad</code> 之间的完整关系。</p>
+<p class="lead">PyTorch Autograd 在 forward 期间构建反向图，用于组织梯度传播、分支汇合和叶子参数的梯度累加。本文通过 <code>grad_fn</code> 与 <code>next_functions</code> 解释 Node、边和梯度槽位的关系，分析 fan-in 规约与 Engine 的依赖顺序，并结合 <code>AccumulateGrad</code> 和参数 hook 说明梯度写入与观测方式。</p>
 
 <h2 id="zh-scope">图模型与版本</h2>
 
@@ -685,7 +685,7 @@ if param.requires_grad:
 
 <h1>PyTorch Autograd reverse graph</h1>
 
-<p class="lead">PyTorch eager mode records the reverse relationships required by backward while it executes forward operations. Once a model contains branches, shared tensors, or parameter hooks, forward tensors alone no longer explain where gradients travel or when they reach a leaf's <code>.grad</code>. The Python-visible <code>grad_fn</code> and <code>next_functions</code> objects provide an entry point into that reverse graph and connect its nodes, gradient slots, fan-in accumulation, and <code>AccumulateGrad</code> endpoints.</p>
+<p class="lead">PyTorch Autograd builds a reverse graph during forward execution to organize gradient propagation, branch convergence and accumulation at leaf parameters. This article uses <code>grad_fn</code> and <code>next_functions</code> to explain nodes, edges and gradient slots, examines fan-in reduction and Engine dependencies, and shows how <code>AccumulateGrad</code> and parameter hooks participate in gradient storage and observation.</p>
 
 <h2 id="en-scope">Graph model and versions</h2>
 
