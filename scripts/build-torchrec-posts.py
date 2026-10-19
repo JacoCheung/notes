@@ -426,7 +426,7 @@ def figure(key, lang):
     height = svg.attrib['height']
     width = svg.attrib['width']
     return f'''<figure class="sequence" id="{lang}-fig-{display_key}">
-<div class="diagram-toolbar"><span>{'图' if lang == 'zh' else 'Fig.'} {number:02} · {'滚动查看完整序列' if lang == 'zh' else 'Scroll for full sequence'}</span><button type="button" data-zoom="fit" aria-pressed="true">{'适应宽度' if lang == 'zh' else 'Fit'}</button><button type="button" data-zoom="1" aria-pressed="false">100%</button><button type="button" data-zoom="1.5" aria-pressed="false">150%</button><a href="{path}" target="_blank" rel="noopener">{'单独打开图表' if lang == 'zh' else 'Open SVG'} ↗</a></div>
+<div class="diagram-toolbar"><span>{'图' if lang == 'zh' else 'Fig.'} {number:02} · {'调用序列' if lang == 'zh' else 'Call sequence'}</span><div class="diagram-zoom" role="group" aria-label="{'图表缩放' if lang == 'zh' else 'Diagram zoom'}"><button type="button" data-zoom="fit" aria-pressed="true">{'适应宽度' if lang == 'zh' else 'Fit'}</button><button type="button" data-zoom="1" aria-pressed="false">100%</button><button type="button" data-zoom="1.5" aria-pressed="false">150%</button></div><a href="{path}" target="_blank" rel="noopener">{'单独打开' if lang == 'zh' else 'Open SVG'} ↗</a></div>
 <div class="diagram-viewport" tabindex="0" role="region" aria-label="{escape(title)}"><object class="sequence-svg" data="{path}" type="image/svg+xml" width="{width}" height="{height}" style="aspect-ratio: {width} / {height}" aria-label="{escape(title)}"><a href="{path}" target="_blank" rel="noopener">{escape(title)}: {'打开交互式序列图' if lang == 'zh' else 'Open interactive sequence diagram'}</a></object></div>
 <figcaption><strong>{'图' if lang == 'zh' else 'Fig.'} {number} · {title}</strong><span class="figure-sources">{'源码：' if lang == 'zh' else 'Source: '}{' · '.join(source(k, lang) for k in sources)}</span></figcaption></figure>'''
 
@@ -500,16 +500,26 @@ main.content h1, main.content h2, main.content h3 { letter-spacing: 0; }
 .table-scroll table { width: 100%; min-width: 680px; border-collapse: collapse; font-size: 13.5px; }
 .table-scroll th, .table-scroll td { padding: 11px 13px; border: 1px solid var(--border); text-align: left; vertical-align: top; }
 .table-scroll th { background: var(--bg-elevated); }
-.sequence { margin: 28px 0 34px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
-.diagram-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 9px 12px; background: var(--bg-elevated); border-bottom: 1px solid var(--border); font-size: 12px; }
-.diagram-toolbar span { margin-right: auto; color: var(--fg-muted); font-family: var(--font-mono); }
-.diagram-toolbar button { padding: 4px 9px; font: inherit; color: var(--fg); border: 1px solid var(--border-strong); border-radius: 4px; background: var(--bg); cursor: pointer; }
-.diagram-toolbar button:hover, .diagram-toolbar button[aria-pressed="true"] { border-color: var(--accent); }
-.diagram-toolbar button:focus-visible, .diagram-viewport:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.sequence { --diagram-paper: #fdfdfe; --diagram-control: #f1f3f6; --diagram-ink: #283344; --diagram-muted: #526071; --diagram-line: #dce1e7; margin: 32px 0 40px; border: 1px solid var(--diagram-line); border-radius: 8px; overflow: hidden; background: var(--diagram-paper); font-family: var(--font-sans); }
+html[data-theme="dark"] .sequence { --diagram-paper: #171b22; --diagram-control: #252e3b; --diagram-ink: #e7ebf1; --diagram-muted: #aeb9c9; --diagram-line: #343d4b; }
+.diagram-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; padding: 12px 18px; background: var(--diagram-paper); border-bottom: 1px solid var(--diagram-line); font-size: 12px; line-height: 1.4; }
+.diagram-toolbar > span { margin-right: auto; color: var(--diagram-muted); font-weight: 500; }
+.diagram-zoom { display: flex; align-items: center; gap: 2px; padding: 3px; border-radius: 6px; background: var(--diagram-control); }
+.diagram-toolbar button { min-height: 32px; padding: 5px 11px; font: inherit; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--diagram-muted); border: 0; border-radius: 4px; background: transparent; cursor: pointer; }
+.diagram-toolbar button:hover { color: var(--diagram-ink); background: var(--diagram-paper); }
+.diagram-toolbar button[aria-pressed="true"] { color: var(--diagram-paper); background: var(--diagram-ink); }
+.diagram-toolbar button:active { transform: translateY(1px); }
+.post-page main.content .diagram-toolbar a { color: var(--diagram-muted); font: inherit; white-space: nowrap; text-decoration: none; }
+.post-page main.content .diagram-toolbar a:hover { color: var(--diagram-ink); text-decoration: underline; text-underline-offset: 3px; }
+.diagram-toolbar button:focus-visible, .diagram-toolbar a:focus-visible, .diagram-viewport:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .pipeline-timeline { display: block; width: 100%; border: 0; background: #fff; }
-.diagram-viewport { overflow: auto; max-height: 84vh; background: #fff; }
+.diagram-viewport { overflow: auto; max-height: 84vh; background: var(--diagram-paper); scrollbar-color: var(--diagram-line) var(--diagram-paper); }
 .diagram-viewport .sequence-svg { display: block; width: 100%; min-width: 0; max-width: none; height: auto; }
-.sequence figcaption { padding: 13px 16px; font-size: 13px; line-height: 1.75; background: var(--bg-elevated); }
+.post-page main.content .sequence figcaption { margin: 0; padding: 16px 20px 18px; border-top: 1px solid var(--diagram-line); font-family: var(--font-sans); font-size: 13px; line-height: 1.75; text-align: left; color: var(--diagram-muted); background: var(--diagram-paper); }
+.sequence figcaption strong { color: var(--diagram-ink); font-weight: 500; }
+.post-page main.content .sequence .figure-sources a { color: var(--diagram-muted); text-decoration: underline; text-decoration-color: var(--diagram-line); text-underline-offset: 3px; }
+.post-page main.content .sequence .figure-sources a:hover { color: var(--diagram-ink); }
+@media (max-width: 640px) { .diagram-toolbar { gap: 10px; padding: 10px 12px; } .diagram-toolbar > span { width: 100%; } .diagram-toolbar > a { margin-left: auto; } .diagram-toolbar button { min-height: 36px; } .post-page main.content .sequence figcaption { padding: 14px; } }
 .seq-key { display: inline-block; padding: 1px 6px; border-radius: 3px; border: 1px solid; }
 .seq-h2d { color: #1d4ed8; background: #eff6ff; border-color: #93c5fd; }
 .seq-host { color: #b91c1c; background: #fef2f2; border-color: #fca5a5; }
@@ -529,17 +539,23 @@ main.content h1, main.content h2, main.content h3 { letter-spacing: 0; }
 
 FOOT = '''</main></div>
 <script>
-// Keep the standalone timeline's height and theme aligned with this article.
+// Keep diagrams and the standalone timeline aligned with the article theme.
 const pipelineFrames = Array.from(document.querySelectorAll('iframe.pipeline-timeline'));
+const sequenceObjects = Array.from(document.querySelectorAll('object.sequence-svg'));
 function syncTimelineTheme() {
   const theme = document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
+  sequenceObjects.forEach(object => {
+    object.contentDocument?.documentElement.setAttribute('data-theme', theme);
+  });
   pipelineFrames.forEach(frame => {
     frame.contentWindow?.postMessage({type: 'torchrec-pipeline-theme', theme}, location.origin);
     frame.contentWindow?.postMessage({type: 'torchrec-pipeline-resize'}, location.origin);
   });
 }
 pipelineFrames.forEach(frame => frame.addEventListener('load', syncTimelineTheme));
+sequenceObjects.forEach(object => object.addEventListener('load', syncTimelineTheme));
 new MutationObserver(syncTimelineTheme).observe(document.documentElement, {attributes: true, attributeFilter: ['data-theme', 'lang']});
+syncTimelineTheme();
 window.addEventListener('message', function (event) {
   if (event.origin !== location.origin || event.data?.type !== 'torchrec-pipeline-timeline-height') return;
   const frame = pipelineFrames.find(item => item.contentWindow === event.source);
