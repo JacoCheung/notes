@@ -37,9 +37,18 @@ two-level, collapsible TOC.
 
 ## Preserved assets and behavior
 
-- Matplotlib displays both original SVGs with their referenced PNGs and offers
-  the original PDF. These assets are copied byte for byte. The SVG files contain
-  raster backgrounds and selectable text layers; they are not redrawn vectors.
+- Matplotlib renders all 38 original sections directly in the article, with
+  native headings and code blocks, inline SVG figures, and all 63 source links.
+  Wide screens retain the original five columns; smaller screens reflow the
+  panels to three, two, or one. The source is still the archived 3.5.0 PDF,
+  including its historical API examples and styles. Typography-only code
+  quotes are normalized. Attribution and the original CC BY 4.0 license are
+  retained. Rebuild with `scripts/build-matplotlib-cheatsheet.py` (PyMuPDF 2.0).
+  The tiny pcolormesh illustration is rendered from the source PDF at 6 px/pt
+  to avoid expanding its shading mesh into roughly 70,000 SVG paths. Other
+  illustrations retain the PDF's vectors or original embedded images.
+  Original full-page SVG/PNG/PDF assets remain archived and are not loaded
+  by the article.
 - Chrome shortcuts are native bilingual HTML tables, grouped by action, with
   Windows/Linux and macOS columns, semantic keyboard labels, and a stacked
   mobile layout. The page no longer embeds or links to attachments. Its original
