@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>判别模型与生成模型</title>
+  <meta name="post:title" content="判别模型与生成模型">
+  <meta name="post:title_en" content="Discriminative and generative models">
+  <meta name="post:slug" content="discriminative-generative-models">
+  <meta name="post:date" content="2026-10-20">
+  <meta name="post:tags" content="深度学习, 机器学习, 概率模型, 朴素贝叶斯">
+  <meta name="post:tags_en" content="Deep Learning, Machine Learning, Probabilistic Models, Naive Bayes">
+  <meta name="post:reading" content="12 分钟">
+  <meta name="post:reading_en" content="12 min">
+  <meta name="post:summary" content="以垃圾邮件分类为例，对照判别模型与生成模型的建模对象，通过朴素贝叶斯计算与交互实验解释生成模型如何用于分类。">
+  <meta name="post:summary_en" content="Compare what discriminative and generative models learn through spam filtering, a worked naive Bayes example, and an interactive prior experiment.">
+  <meta name="post:series" content="deep-learning-basics">
+  <meta name="post:series_title" content="深度学习入门">
+  <meta name="post:series_title_en" content="Deep Learning Fundamentals">
+  <meta name="post:series_order" content="1">
+  <link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
+  <link rel="stylesheet" href="../assets/visualization-tools/vendor/katex-0.16.11/katex.min.css">
+  <link rel="stylesheet" href="../assets/deep-learning-basics/models.css">
+  <script src="../lang-toggle.js?v=post-toc-3" defer></script>
+  <script src="../assets/visualization-tools/vendor/katex-0.16.11/katex.min.js" defer></script>
+  <script src="../assets/deep-learning-basics/models.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="toc"><div class="toc-title">目录 · TOC</div></aside>
+  <main class="content">
+    <div class="lang-zh">
+      <h1>判别模型与生成模型</h1>
+      <p class="lead">本文以垃圾邮件分类为例，介绍判别模型与生成模型的区别。判别模型直接学习邮件内容与标签的对应关系；生成模型学习各类邮件的内容分布，再据此推断标签。它们都能完成分类，但所学习的概率分布不同。这个区别也适用于深度学习：模型属于哪一类，取决于建模对象与训练目标，而不只是最终是否输出文字或图片。</p>
+
+      <h2 id="zh-task">1. 邮件与标签</h2>
+      <h3 id="zh-input">输入与特征</h3>
+      <p>设 <span class="dl-math">x</span> 是邮件内容，<span class="dl-math">y</span> 是标签：<span class="dl-math">y=1</span> 表示垃圾邮件，<span class="dl-math">y=0</span> 表示正常邮件。训练集由已经标注的邮件组成；收到一封新邮件时，过滤器需要根据内容预测标签。</p>
+      <p>为了把计算写清楚，例子只保留两个二值特征：是否出现“免费”，以及是否出现“会议”。后面的公式用编码后的 <span class="dl-math">x=(x_1,x_2)</span> 表示邮件。这个简化会丢掉词序、语气和上下文，只用于说明两种建模方式。</p>
+      <div class="dl-table"><table>
+        <thead><tr><th scope="col">示例邮件</th><th scope="col">免费 <span class="dl-math">x_1</span></th><th scope="col">会议 <span class="dl-math">x_2</span></th><th scope="col">标签</th></tr></thead>
+        <tbody>
+          <tr><td>限时免费领取奖品</td><td>1</td><td>0</td><td>垃圾邮件</td></tr>
+          <tr><td>明天下午召开项目会议</td><td>0</td><td>1</td><td>正常邮件</td></tr>
+          <tr><td>你报名的免费会议即将开始</td><td>1</td><td>1</td><td>正常邮件</td></tr>
+        </tbody>
+      </table></div>
+      <p>“免费”可以是有用的线索，却不能单独决定标签。模型要从一批样本中学习统计规律，而不是把某个词永久等同于垃圾邮件。</p>
+
+      <h3 id="zh-objects">两种建模对象</h3>
+      <p>判别模型直接学习“看到这个输入，应该给出什么判断”。概率形式是 <span class="dl-math">p(y\mid x)</span>：邮件已经给定，标签仍然未知。生成式分类器学习 <span class="dl-math">p(x\mid y)</span> 和 <span class="dl-math">p(y)</span>：每类邮件的内容分布，以及每类邮件的比例。两者共同组成联合分布 <span class="dl-math">p(x,y)</span>。<a href="https://cs229.stanford.edu/notes2019fall/cs229-notes2.pdf">CS229 生成式学习讲义，第 1 至 2 页</a>。</p>
+      <div class="dl-paths" role="group" aria-label="判别与生成两条分类路径">
+        <div class="dl-path">
+          <p class="dl-path-title">判别路径</p>
+          <ol>
+            <li>训练：直接拟合内容与标签的关系<br><span class="dl-math">p(y\mid x)</span></li>
+            <li>推断：输入一封邮件 <span class="dl-math">x</span></li>
+            <li>直接得到标签概率，再作出判断</li>
+          </ol>
+        </div>
+        <div class="dl-path">
+          <p class="dl-path-title">生成路径</p>
+          <ol>
+            <li>训练：拟合各类邮件的分布与比例<br><span class="dl-math">p(x\mid y),\ p(y)</span></li>
+            <li>推断：分别计算这封邮件在各类下的得分</li>
+            <li>用贝叶斯公式得到标签概率，再作出判断</li>
+          </ol>
+        </div>
+      </div>
+      <p class="dl-caption">两条路径可以使用同一批带标签邮件，最终也可以输出同样的两个标签。区别发生在训练所拟合的对象上。</p>
+
+      <h2 id="zh-discriminative">2. 判别模型</h2>
+      <h3 id="zh-direct">直接预测标签</h3>
+      <p>逻辑回归是一个简单的判别模型。它给邮件特征加权，把结果转换成垃圾邮件概率：</p>
+      <div class="dl-equation"><span class="dl-math">p_\theta(y=1\mid x)=\sigma(b+w_1x_1+w_2x_2)</span></div>
+      <p>其中 <span class="dl-math">w_1,w_2</span> 是特征权重，<span class="dl-math">b</span> 是偏置，合起来记作参数 <span class="dl-math">\theta</span>。Sigmoid 函数 <span class="dl-math">\sigma(z)=1/(1+e^{-z})</span> 把分数映射到 0 与 1 之间。训练时，模型根据已知标签调整这些参数，使正确标签获得更高的概率。</p>
+      <p>对于“免费领取奖品”，模型用 <span class="dl-math">x=(1,0)</span> 直接计算标签概率。这个过程不要求它计算整封邮件出现的概率，也不要求它学会写出一封垃圾邮件。逻辑回归的条件概率建模可参见 <a href="https://www.cs.cmu.edu/~tom/mlbook/NBayesLogReg.pdf">Mitchell 的朴素贝叶斯与逻辑回归讲义</a>。</p>
+
+      <h3 id="zh-boundary">概率与决策</h3>
+      <p>概率预测之后，还需要决策规则。取 50% 为阈值时，概率达到阈值就判为垃圾邮件；等于阈值的位置形成决策边界。实际过滤器往往更在意误删正常邮件的代价，因此可以选用更高的阈值，并通过验证集确定。</p>
+      <p>判别方法也不一定输出概率。支持向量机等方法可以直接学习分类分数或决策边界。它们的共同点是围绕输入到标签的预测关系进行学习。这里用逻辑回归，是为了方便与生成式分类器的概率计算对照。</p>
+
+      <h2 id="zh-generative">3. 生成模型</h2>
+      <h3 id="zh-distributions">每类邮件的分布</h3>
+      <p>生成式方法把注意力放在各类邮件内部：垃圾邮件中，“免费”出现得多频繁？正常邮件中，“会议”有多常见？假设训练集有 100 封邮件，得到下面的计数。<strong>这些是教学用的假设数据，不是实际邮箱的测量结果。</strong></p>
+      <div class="dl-table"><table>
+        <thead><tr><th scope="col">统计量</th><th scope="col">垃圾邮件 <span class="dl-math">y=1</span></th><th scope="col">正常邮件 <span class="dl-math">y=0</span></th></tr></thead>
+        <tbody>
+          <tr><th scope="row">邮件数量</th><td>40</td><td>60</td></tr>
+          <tr><th scope="row">类别比例 <span class="dl-math">p(y)</span></th><td>40 / 100 = 0.40</td><td>60 / 100 = 0.60</td></tr>
+          <tr><th scope="row">出现“免费”</th><td>30 / 40 = 0.75</td><td>6 / 60 = 0.10</td></tr>
+          <tr><th scope="row">出现“会议”</th><td>4 / 40 = 0.10</td><td>30 / 60 = 0.50</td></tr>
+        </tbody>
+      </table></div>
+      <p><span class="dl-math">p(y)</span> 称为先验概率，描述尚未阅读内容时的类别比例。表中的 0.75 则是 <span class="dl-math">p(x_1=1\mid y=1)</span>，意思是“垃圾邮件中有 75% 包含免费”。它不是“包含免费的邮件有 75% 是垃圾邮件”：两者条件的方向不同。</p>
+
+      <h3 id="zh-independence">朴素贝叶斯假设</h3>
+      <p>两个特征各自的出现概率，还不足以确定它们共同出现的概率。伯努利朴素贝叶斯增加一个假设：<strong>给定类别后，特征之间条件独立</strong>。于是可以相乘：</p>
+      <div class="dl-equation"><span class="dl-math">p(x_1,x_2\mid y)=p(x_1\mid y)\,p(x_2\mid y)</span></div>
+      <p>这里的“独立”是模型假设，不是语言事实。“免费”和“领取”在同一类邮件中也可能关联。伯努利版本同时考虑词语出现与缺席：垃圾邮件中不出现“会议”的概率是 <span class="dl-math">1-0.10=0.90</span>。<a href="https://scikit-learn.org/stable/modules/naive_bayes.html#bernoulli-naive-bayes">scikit-learn 的伯努利朴素贝叶斯说明</a>给出了相同的二值特征模型。</p>
+      <p>若某个词在一类训练邮件中从未出现，直接使用频率会产生零概率。实际训练通常加入平滑，避免一个未见过的特征把整类得分变成零。本例所有概率都非零，为了便于手算，保留表中的原始频率。</p>
+
+      <h2 id="zh-classification">4. 用生成模型分类</h2>
+      <h3 id="zh-bayes">贝叶斯公式</h3>
+      <p>学到各类的内容分布后，就能反过来推断标签。贝叶斯公式把“这一类会出现什么内容”转换成“这段内容属于哪一类”：</p>
+      <div class="dl-equation"><span class="dl-math">p(y\mid x)=\frac{p(x\mid y)\,p(y)}{\sum_{c\in\{0,1\}}p(x\mid y=c)\,p(y=c)}</span></div>
+      <p>分子是内容与类别共同出现的概率。分母把所有类别的分子相加，使两个后验概率的总和等于 1。对于同一封邮件，两个类别共用这个分母；若只比较标签，直接比较 <span class="dl-math">p(x\mid y)p(y)</span> 即可。</p>
+
+      <h3 id="zh-example">一封邮件的计算</h3>
+      <p>待分类邮件包含“免费”，不包含“会议”，所以 <span class="dl-math">x=(1,0)</span>。利用前面的统计量，先计算内容在两类下的概率，再乘各类先验：</p>
+      <div class="dl-table"><table>
+        <thead><tr><th scope="col">计算步骤</th><th scope="col">垃圾邮件</th><th scope="col">正常邮件</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">内容概率 <span class="dl-math">p(x\mid y)</span></th><td>0.75 × 0.90 = 0.675</td><td>0.10 × 0.50 = 0.050</td></tr>
+          <tr><th scope="row">乘以先验 <span class="dl-math">p(y)</span></th><td>0.675 × 0.40 = 0.270</td><td>0.050 × 0.60 = 0.030</td></tr>
+          <tr><th scope="row">归一化后的标签概率</th><td>0.270 / 0.300 = 90%</td><td>0.030 / 0.300 = 10%</td></tr>
+        </tbody>
+      </table></div>
+      <p>按 50% 的阈值，这封邮件会被判为垃圾邮件。整个分类过程没有生成任何新邮件；它使用的是生成模型所学到的分布。90% 是这个简化模型给出的后验概率，不能直接当作真实邮件系统的可靠性保证。</p>
+
+      <h3 id="zh-prior">先验如何影响判断</h3>
+      <p>如果两类内部的词语分布保持不变，但垃圾邮件比例从 40% 降到 5%，同样的 <span class="dl-math">x=(1,0)</span> 会得到：</p>
+      <div class="dl-equation"><span class="dl-math">\frac{0.675\times0.05}{0.675\times0.05+0.050\times0.95}\approx41.5\%</span></div>
+      <p>内容仍然更像垃圾邮件，但垃圾邮件本身变得稀少，后验概率因此降到 50% 以下。这也解释了为什么只比较两类的 <span class="dl-math">p(x\mid y)</span> 会漏掉信息。</p>
+
+      <section class="dl-lab" data-language="zh" aria-label="垃圾邮件贝叶斯交互实验">
+        <p class="dl-lab-title">交互实验：内容与先验</p>
+        <p class="dl-lab-note">词语在各类中的概率固定为上表数值。改变邮件特征或先验，查看贝叶斯推断；这里没有重新训练模型。</p>
+        <fieldset><legend>邮件特征 <span data-value="vector">x = (1, 0)</span></legend>
+          <div class="dl-features">
+            <label><input type="checkbox" data-input="free" checked>包含“免费”</label>
+            <label><input type="checkbox" data-input="meeting">包含“会议”</label>
+          </div>
+        </fieldset>
+        <label class="dl-prior-label" for="zh-prior-input">垃圾邮件先验 p(y=1)：<output data-value="prior" for="zh-prior-input">40%</output></label>
+        <input id="zh-prior-input" type="range" data-input="prior" min="1" max="99" value="40" step="1">
+        <button type="button">恢复示例</button>
+        <table><thead><tr><th scope="col">计算量</th><th scope="col">垃圾邮件</th><th scope="col">正常邮件</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">内容概率 p(x|y)</th><td data-value="spam-likelihood">0.6750</td><td data-value="ham-likelihood">0.0500</td></tr>
+            <tr><th scope="row">先验 p(y)</th><td data-value="spam-prior">0.40</td><td data-value="ham-prior">0.60</td></tr>
+            <tr><th scope="row">相乘 p(x,y)</th><td data-value="spam-score">0.2700</td><td data-value="ham-score">0.0300</td></tr>
+          </tbody>
+        </table>
+        <div class="dl-result" aria-live="polite" aria-atomic="true">
+          <output class="dl-posterior" data-value="posterior">垃圾邮件概率 90.0%</output>
+          <div class="dl-result-bar" aria-hidden="true"><span></span></div>
+          <div class="dl-result-legend" aria-hidden="true"><span>垃圾邮件</span><span>正常邮件</span></div>
+          <p class="dl-lab-note"><span data-value="calculation">0.2700 / (0.2700 + 0.0300)</span><br><span data-value="decision">按 50% 阈值：判为垃圾邮件。</span></p>
+        </div>
+        <noscript><p>交互实验需要 JavaScript；上方表格保留了默认示例的完整计算。</p></noscript>
+      </section>
+      <p>这个实验对应“只改变类别比例”的假设。如果垃圾邮件的话术也变了，原来的 <span class="dl-math">p(x\mid y)</span> 就可能失效，仅更新先验并不足够。判别模型同样会受到分布变化的影响，只是它通常没有独立的先验参数供直接替换。</p>
+
+      <h2 id="zh-generation">5. 从分布到生成</h2>
+      <h3 id="zh-sampling">按类别采样</h3>
+      <p>同一个模型还可以沿着另一个方向使用：先指定类别，再按该类别的特征概率随机采样。指定“垃圾邮件”时，以 75% 的概率让“免费”出现，以 10% 的概率让“会议”出现；在条件独立假设下，分别采样这两个特征即可。</p>
+      <div class="dl-table"><table>
+        <thead><tr><th scope="col">生成的特征 <span class="dl-math">x</span></th><th scope="col">含义</th><th scope="col"><span class="dl-math">p(x\mid y=1)</span></th></tr></thead>
+        <tbody>
+          <tr><td>(1, 0)</td><td>有“免费”，无“会议”</td><td>0.75 × 0.90 = 67.5%</td></tr>
+          <tr><td>(1, 1)</td><td>两个词都有</td><td>0.75 × 0.10 = 7.5%</td></tr>
+          <tr><td>(0, 0)</td><td>两个词都没有</td><td>0.25 × 0.90 = 22.5%</td></tr>
+          <tr><td>(0, 1)</td><td>无“免费”，有“会议”</td><td>0.25 × 0.10 = 2.5%</td></tr>
+        </tbody>
+      </table></div>
+      <p>四种结果的概率加起来是 100%。如果还要生成类别，就先按 <span class="dl-math">p(y)</span> 抽取垃圾或正常，再按 <span class="dl-math">p(x\mid y)</span> 抽取特征，得到一对 <span class="dl-math">(x,y)</span>。</p>
+      <p>这个模型生成的是<strong>两个词是否出现的特征向量</strong>。它没有学习词序、句法或其他词汇，所以不能据此写出完整、通顺的邮件。“生成”能做到什么，受到所建模的数据表示和分布的限制；一个用于分类的生成模型也不必在产品中提供生成入口。</p>
+
+      <h3 id="zh-limit">统计分布与真实过程</h3>
+      <p>“学习数据如何产生”在这里是指建立一个可产生样本的统计模型。它不意味着恢复了发件人的动机，或发现了真实世界的因果过程。朴素贝叶斯的独立采样规则显然不是人类写邮件的方式，但仍然能构成可用于分类的概率模型。</p>
+
+      <h2 id="zh-comparison">6. 建模对象与任务</h2>
+      <div class="dl-table"><table>
+        <thead><tr><th scope="col">比较维度</th><th scope="col">判别式分类</th><th scope="col">生成式分类</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">学习对象</th><td><span class="dl-math">p(y\mid x)</span>，或直接学习分类分数、边界</td><td><span class="dl-math">p(x,y)=p(x\mid y)p(y)</span></td></tr>
+          <tr><th scope="row">对新邮件的处理</th><td>直接预测标签</td><td>比较各类下的内容概率与先验，再推断标签</td></tr>
+          <tr><th scope="row">本例中的代表</th><td>逻辑回归</td><td>伯努利朴素贝叶斯</td></tr>
+          <tr><th scope="row">生成邮件特征</th><td>仅有标签预测关系不足以确定邮件分布</td><td>可以按所建模的特征分布采样</td></tr>
+          <tr><th scope="row">是否需要深度网络</th><td>不需要；也可以使用神经网络分类器</td><td>不需要；也可以使用深度生成模型</td></tr>
+        </tbody>
+      </table></div>
+      <h3 id="zh-deep">与深度学习的关系</h3>
+      <p>逻辑回归和朴素贝叶斯都不是深度模型，却能把两种思路解释清楚。换成神经网络后，仍然要看训练目标：用网络直接预测垃圾邮件标签，是判别式学习；用网络描述某一类邮件的文本分布，则是生成式建模。网络层数和模型名称不能替代这项判断。</p>
+      <p>生成建模的范围也比本文的分类例子更广。它可以学习没有标签的数据分布 <span class="dl-math">p(x)</span>，或在提示、类别等条件 <span class="dl-math">c</span> 下生成数据 <span class="dl-math">p(x\mid c)</span>。有些模型通过采样机制隐式表示分布，并不提供容易计算的样本概率，例如 <a href="https://arxiv.org/abs/1406.2661">GAN</a>。因此，本文的贝叶斯分类计算适用于能够求出相应类别得分的模型，不能原样套到所有生成模型上。</p>
+      <p>同样，看到一个条件概率公式，也不能只凭竖线左右的字母分类。邮件例子中的 <span class="dl-math">y</span> 是类别标签；文本生成中的输出变量可以是一整段文本。应先明确变量代表什么，再判断模型究竟在学习标签关系，还是数据本身的分布。</p>
+
+      <h3 id="zh-choice">分类效果与模型选择</h3>
+      <p>对于邮件过滤，最终要比较的是未见邮件上的误报、漏报和运行成本。“生成式”不会自动带来更好的分类效果。朴素贝叶斯的独立性假设简化了估计，也可能忽略有用的词语关联；判别方法可以把训练目标直接放在标签预测上，但结果仍受数据量、特征和正则化影响。</p>
+      <p><a href="https://proceedings.neurips.cc/paper/2001/hash/7b7a53e239400a13bd6be6c91c4f6c4e-Abstract.html">Ng 与 Jordan 对逻辑回归和朴素贝叶斯的比较</a>展示了随训练数据量变化，两类方法可能各有优势的情形。那是对特定模型和条件的分析，不能推广成所有判别模型或生成模型的性能排序。</p>
+      <p>一套模型可以采用生成式建模方式，承担判别任务。垃圾邮件例子中的朴素贝叶斯正是如此：训练时学习各类内容分布，使用时输出垃圾或正常。<strong>任务描述模型用来做什么，建模对象描述模型学到了什么。</strong></p>
+
+      <h2 id="zh-references">参考资料</h2>
+      <ul>
+        <li><a href="https://cs229.stanford.edu/notes2019fall/cs229-notes2.pdf">Andrew Ng：CS229，Generative learning algorithms</a>。生成式分类与贝叶斯推断。</li>
+        <li><a href="https://www.cs.cmu.edu/~tom/mlbook/NBayesLogReg.pdf">Tom Mitchell：Generative and discriminative classifiers</a>。朴素贝叶斯与逻辑回归的关系。</li>
+        <li><a href="https://scikit-learn.org/stable/modules/naive_bayes.html">scikit-learn：Naive Bayes</a>。条件独立假设、平滑与伯努利特征模型。</li>
+        <li><a href="https://proceedings.neurips.cc/paper/2001/hash/7b7a53e239400a13bd6be6c91c4f6c4e-Abstract.html">Ng &amp; Jordan，2001：On discriminative vs. generative classifiers</a>。特定分类器的数据量与误差比较。</li>
+        <li><a href="https://arxiv.org/abs/1406.2661">Goodfellow 等，2014：Generative adversarial networks</a>。通过生成器隐式表示数据分布的例子。</li>
+      </ul>
+    </div>
+
+    <div class="lang-en">
+      <h1>Discriminative and generative models</h1>
+      <p class="lead">This article uses spam classification to explain the difference between discriminative and generative models. A discriminative model learns the relationship between an email and its label directly. A generative model learns how email content is distributed within each class, then uses those distributions to infer the label. Both can classify emails, but they fit different probability distributions. The distinction also applies to deep learning: it concerns the modeling target and training objective, not simply whether the final output is text or an image.</p>
+
+      <h2 id="en-task">1. Emails and labels</h2>
+      <h3 id="en-input">Inputs and features</h3>
+      <p>Let <span class="dl-math">x</span> represent email content and <span class="dl-math">y</span> its label: <span class="dl-math">y=1</span> for spam and <span class="dl-math">y=0</span> for legitimate email. Training examples contain both content and known labels. At prediction time, the filter must assign a label to a new email.</p>
+      <p>To keep the arithmetic small, the example uses two binary features: whether the email contains “free” and whether it contains “meeting.” In the calculations, <span class="dl-math">x=(x_1,x_2)</span> denotes this encoded representation. It discards word order, tone, and context; it is a teaching model rather than a complete spam filter.</p>
+      <div class="dl-table"><table>
+        <thead><tr><th scope="col">Example email</th><th scope="col">Free <span class="dl-math">x_1</span></th><th scope="col">Meeting <span class="dl-math">x_2</span></th><th scope="col">Label</th></tr></thead>
+        <tbody>
+          <tr><td>Claim your free prize today</td><td>1</td><td>0</td><td>Spam</td></tr>
+          <tr><td>Project meeting tomorrow afternoon</td><td>0</td><td>1</td><td>Legitimate</td></tr>
+          <tr><td>Your free meeting starts soon</td><td>1</td><td>1</td><td>Legitimate</td></tr>
+        </tbody>
+      </table></div>
+      <p>“Free” can provide evidence without determining the label by itself. Learning means estimating patterns across examples, rather than treating a particular word as an infallible rule.</p>
+
+      <h3 id="en-objects">Two modeling targets</h3>
+      <p>A discriminative model directly learns which judgment to make for an observed input. Its probabilistic form is <span class="dl-math">p(y\mid x)</span>: the email is given, and the label is unknown. A generative classifier learns <span class="dl-math">p(x\mid y)</span> and <span class="dl-math">p(y)</span>: the content distribution within each class and the class proportions. Together, these specify the joint distribution <span class="dl-math">p(x,y)</span>. See pages 1 and 2 of the <a href="https://cs229.stanford.edu/notes2019fall/cs229-notes2.pdf">CS229 generative learning notes</a>.</p>
+      <div class="dl-paths" role="group" aria-label="Discriminative and generative classification paths">
+        <div class="dl-path">
+          <p class="dl-path-title">Discriminative path</p>
+          <ol>
+            <li>Training: fit the label relationship directly<br><span class="dl-math">p(y\mid x)</span></li>
+            <li>Inference: supply an email <span class="dl-math">x</span></li>
+            <li>Predict label probabilities and make a decision</li>
+          </ol>
+        </div>
+        <div class="dl-path">
+          <p class="dl-path-title">Generative path</p>
+          <ol>
+            <li>Training: fit content distributions and class proportions<br><span class="dl-math">p(x\mid y),\ p(y)</span></li>
+            <li>Inference: score the email under each class</li>
+            <li>Apply Bayes’ rule to obtain label probabilities and decide</li>
+          </ol>
+        </div>
+      </div>
+      <p class="dl-caption">Both paths can use the same labeled training emails and return the same two labels. The distinction is what training fits.</p>
+
+      <h2 id="en-discriminative">2. Discriminative models</h2>
+      <h3 id="en-direct">Predicting labels directly</h3>
+      <p>Logistic regression is a simple discriminative model. It weights the input features and converts the resulting score into a spam probability:</p>
+      <div class="dl-equation"><span class="dl-math">p_\theta(y=1\mid x)=\sigma(b+w_1x_1+w_2x_2)</span></div>
+      <p>The feature weights <span class="dl-math">w_1,w_2</span> and bias <span class="dl-math">b</span> form the parameters <span class="dl-math">\theta</span>. The sigmoid function <span class="dl-math">\sigma(z)=1/(1+e^{-z})</span> maps a score to a value between 0 and 1. Training adjusts the parameters using known labels so that correct labels receive higher probabilities.</p>
+      <p>For “Claim your free prize,” the model uses <span class="dl-math">x=(1,0)</span> to compute a label probability directly. It need not estimate how probable the email itself is, or learn to write spam. <a href="https://www.cs.cmu.edu/~tom/mlbook/NBayesLogReg.pdf">Mitchell’s notes on naive Bayes and logistic regression</a> describe this conditional model.</p>
+
+      <h3 id="en-boundary">Probabilities and decisions</h3>
+      <p>A probability still needs a decision rule. With a 50% threshold, the filter labels an email as spam when its predicted probability reaches the threshold. Inputs exactly at the threshold form the decision boundary. A real filter may use a higher threshold to reduce the risk of losing legitimate messages, choosing the threshold on validation data.</p>
+      <p>Discriminative methods need not produce probabilities. Methods such as support vector machines can learn scores or decision boundaries directly. They share a focus on predicting labels from inputs. Logistic regression makes a convenient example because its probabilities can be compared with the calculations of a generative classifier.</p>
+
+      <h2 id="en-generative">3. Generative models</h2>
+      <h3 id="en-distributions">Distributions within each class</h3>
+      <p>A generative approach examines the content of each class: how often does spam contain “free,” and how often do legitimate emails mention a meeting? Suppose a training set of 100 emails gives the counts below. <strong>These are hypothetical teaching data, not measurements from a real mailbox.</strong></p>
+      <div class="dl-table"><table>
+        <thead><tr><th scope="col">Statistic</th><th scope="col">Spam <span class="dl-math">y=1</span></th><th scope="col">Legitimate <span class="dl-math">y=0</span></th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Email count</th><td>40</td><td>60</td></tr>
+          <tr><th scope="row">Class proportion <span class="dl-math">p(y)</span></th><td>40 / 100 = 0.40</td><td>60 / 100 = 0.60</td></tr>
+          <tr><th scope="row">Contains “free”</th><td>30 / 40 = 0.75</td><td>6 / 60 = 0.10</td></tr>
+          <tr><th scope="row">Contains “meeting”</th><td>4 / 40 = 0.10</td><td>30 / 60 = 0.50</td></tr>
+        </tbody>
+      </table></div>
+      <p>The prior <span class="dl-math">p(y)</span> describes class proportions before reading the content. The entry 0.75 is <span class="dl-math">p(x_1=1\mid y=1)</span>: 75% of spam emails contain “free.” It does not say that 75% of emails containing “free” are spam. Those probabilities condition on different events.</p>
+
+      <h3 id="en-independence">The naive Bayes assumption</h3>
+      <p>Individual occurrence rates do not determine how frequently two features occur together. Bernoulli naive Bayes adds an assumption: <strong>features are conditionally independent given the class</strong>. Their probabilities can then be multiplied:</p>
+      <div class="dl-equation"><span class="dl-math">p(x_1,x_2\mid y)=p(x_1\mid y)\,p(x_2\mid y)</span></div>
+      <p>This is a modeling assumption, not a fact about language. Words such as “free” and “claim” may remain associated within a class. The Bernoulli version accounts for absence as well as presence: the probability that spam does not contain “meeting” is <span class="dl-math">1-0.10=0.90</span>. The <a href="https://scikit-learn.org/stable/modules/naive_bayes.html#bernoulli-naive-bayes">scikit-learn Bernoulli naive Bayes documentation</a> describes this binary feature model.</p>
+      <p>A feature never observed in one class would receive zero probability under raw frequency estimation. Practical training commonly uses smoothing so an unseen feature does not zero out the entire class score. All probabilities in this example are nonzero; the raw frequencies keep the arithmetic transparent.</p>
+
+      <h2 id="en-classification">4. Classification with a generative model</h2>
+      <h3 id="en-bayes">Bayes’ rule</h3>
+      <p>After learning the content distributions, the model can infer a label from an email. Bayes’ rule reverses the conditioning direction:</p>
+      <div class="dl-equation"><span class="dl-math">p(y\mid x)=\frac{p(x\mid y)\,p(y)}{\sum_{c\in\{0,1\}}p(x\mid y=c)\,p(y=c)}</span></div>
+      <p>The numerator is the joint probability of content and class. The denominator sums these quantities across classes so the two posterior probabilities add to 1. For a fixed email, both classes share the denominator; predicting only the label requires comparing <span class="dl-math">p(x\mid y)p(y)</span>.</p>
+
+      <h3 id="en-example">A worked email</h3>
+      <p>The new email contains “free” but not “meeting,” so <span class="dl-math">x=(1,0)</span>. Compute its content probability under each class, then multiply by the prior:</p>
+      <div class="dl-table"><table>
+        <thead><tr><th scope="col">Step</th><th scope="col">Spam</th><th scope="col">Legitimate</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Content probability <span class="dl-math">p(x\mid y)</span></th><td>0.75 × 0.90 = 0.675</td><td>0.10 × 0.50 = 0.050</td></tr>
+          <tr><th scope="row">Multiply by prior <span class="dl-math">p(y)</span></th><td>0.675 × 0.40 = 0.270</td><td>0.050 × 0.60 = 0.030</td></tr>
+          <tr><th scope="row">Normalize to label probabilities</th><td>0.270 / 0.300 = 90%</td><td>0.030 / 0.300 = 10%</td></tr>
+        </tbody>
+      </table></div>
+      <p>At a 50% threshold, the decision is spam. No new email was generated during classification: the decision used the distributions learned by a generative model. The 90% figure is a posterior under this simplified model, not a guarantee of reliability in a deployed filter.</p>
+
+      <h3 id="en-prior">The effect of the prior</h3>
+      <p>Suppose the content distributions within each class stay fixed, but the spam proportion falls from 40% to 5%. The same <span class="dl-math">x=(1,0)</span> now gives:</p>
+      <div class="dl-equation"><span class="dl-math">\frac{0.675\times0.05}{0.675\times0.05+0.050\times0.95}\approx41.5\%</span></div>
+      <p>The content still fits the spam distribution better, but spam is now rare enough that its posterior falls below 50%. Comparing only <span class="dl-math">p(x\mid y)</span> would miss that information.</p>
+
+      <section class="dl-lab" data-language="en" aria-label="Interactive spam Bayes experiment">
+        <p class="dl-lab-title">Experiment: content and prior</p>
+        <p class="dl-lab-note">Word probabilities within each class stay fixed at the values above. Change the email features or prior to inspect Bayesian inference; the model is not retrained.</p>
+        <fieldset><legend>Email features <span data-value="vector">x = (1, 0)</span></legend>
+          <div class="dl-features">
+            <label><input type="checkbox" data-input="free" checked>Contains “free”</label>
+            <label><input type="checkbox" data-input="meeting">Contains “meeting”</label>
+          </div>
+        </fieldset>
+        <label class="dl-prior-label" for="en-prior-input">Spam prior p(y=1): <output data-value="prior" for="en-prior-input">40%</output></label>
+        <input id="en-prior-input" type="range" data-input="prior" min="1" max="99" value="40" step="1">
+        <button type="button">Reset example</button>
+        <table><thead><tr><th scope="col">Quantity</th><th scope="col">Spam</th><th scope="col">Legitimate</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Content p(x|y)</th><td data-value="spam-likelihood">0.6750</td><td data-value="ham-likelihood">0.0500</td></tr>
+            <tr><th scope="row">Prior p(y)</th><td data-value="spam-prior">0.40</td><td data-value="ham-prior">0.60</td></tr>
+            <tr><th scope="row">Product p(x,y)</th><td data-value="spam-score">0.2700</td><td data-value="ham-score">0.0300</td></tr>
+          </tbody>
+        </table>
+        <div class="dl-result" aria-live="polite" aria-atomic="true">
+          <output class="dl-posterior" data-value="posterior">Spam probability 90.0%</output>
+          <div class="dl-result-bar" aria-hidden="true"><span></span></div>
+          <div class="dl-result-legend" aria-hidden="true"><span>Spam</span><span>Legitimate</span></div>
+          <p class="dl-lab-note"><span data-value="calculation">0.2700 / (0.2700 + 0.0300)</span><br><span data-value="decision">At a 50% threshold: spam.</span></p>
+        </div>
+        <noscript><p>The interactive controls require JavaScript. The table above retains the complete default calculation.</p></noscript>
+      </section>
+      <p>This experiment assumes only the class proportions change. If spam content changes too, the old <span class="dl-math">p(x\mid y)</span> may no longer fit, and replacing the prior alone is insufficient. Discriminative models also face distribution shifts, though they usually lack a separate prior parameter that can be replaced directly.</p>
+
+      <h2 id="en-generation">5. From distributions to generation</h2>
+      <h3 id="en-sampling">Sampling within a class</h3>
+      <p>The same model supports another operation: choose a class, then sample features from its distribution. Given the spam class, include “free” with probability 75% and “meeting” with probability 10%. Under the conditional independence assumption, sample these features independently.</p>
+      <div class="dl-table"><table>
+        <thead><tr><th scope="col">Generated features <span class="dl-math">x</span></th><th scope="col">Meaning</th><th scope="col"><span class="dl-math">p(x\mid y=1)</span></th></tr></thead>
+        <tbody>
+          <tr><td>(1, 0)</td><td>Free present; meeting absent</td><td>0.75 × 0.90 = 67.5%</td></tr>
+          <tr><td>(1, 1)</td><td>Both words present</td><td>0.75 × 0.10 = 7.5%</td></tr>
+          <tr><td>(0, 0)</td><td>Both words absent</td><td>0.25 × 0.90 = 22.5%</td></tr>
+          <tr><td>(0, 1)</td><td>Free absent; meeting present</td><td>0.25 × 0.10 = 2.5%</td></tr>
+        </tbody>
+      </table></div>
+      <p>The four outcomes sum to 100%. To sample the class as well, first draw spam or legitimate from <span class="dl-math">p(y)</span>, then draw features from <span class="dl-math">p(x\mid y)</span>. The result is a pair <span class="dl-math">(x,y)</span>.</p>
+      <p>This model generates <strong>a feature vector specifying whether two words occur</strong>. It has learned neither word order nor syntax nor other vocabulary, so it cannot write a complete, fluent email. What generation produces depends on the representation and distribution being modeled. A generative model used for classification also need not expose any generation feature in its product interface.</p>
+
+      <h3 id="en-limit">Statistics and real processes</h3>
+      <p>“Learning how data is produced” here means constructing a statistical model capable of producing samples. It does not establish the sender’s motives or recover a causal account of the world. Independent feature sampling is plainly not how people compose emails, yet it defines a probability model that can be used for classification.</p>
+
+      <h2 id="en-comparison">6. Modeling targets and tasks</h2>
+      <div class="dl-table"><table>
+        <thead><tr><th scope="col">Dimension</th><th scope="col">Discriminative classification</th><th scope="col">Generative classification</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">What is learned</th><td><span class="dl-math">p(y\mid x)</span>, or classification scores or boundaries directly</td><td><span class="dl-math">p(x,y)=p(x\mid y)p(y)</span></td></tr>
+          <tr><th scope="row">Processing a new email</th><td>Predict its label directly</td><td>Combine content probabilities and priors to infer its label</td></tr>
+          <tr><th scope="row">Example here</th><td>Logistic regression</td><td>Bernoulli naive Bayes</td></tr>
+          <tr><th scope="row">Generating email features</th><td>The label relationship alone does not determine an email distribution</td><td>Sample from the modeled feature distribution</td></tr>
+          <tr><th scope="row">Requires a deep network</th><td>No; a neural classifier is also an option</td><td>No; deep generative models are also possible</td></tr>
+        </tbody>
+      </table></div>
+      <h3 id="en-deep">The connection to deep learning</h3>
+      <p>Neither logistic regression nor naive Bayes is a deep model, but they expose the distinction clearly. Replacing them with neural networks leaves the training objective central: directly predicting spam labels is discriminative learning; modeling the text distribution of a class is generative modeling. Layer counts and architecture names do not settle the question.</p>
+      <p>Generative modeling also extends beyond this classification example. It can model unlabeled data through <span class="dl-math">p(x)</span> or data conditioned on a prompt or class through <span class="dl-math">p(x\mid c)</span>. Some models represent distributions implicitly through sampling rather than providing tractable sample probabilities, as in <a href="https://arxiv.org/abs/1406.2661">GANs</a>. The explicit Bayesian classification calculation here therefore requires a model that provides the relevant class scores; it is not a universal recipe for every generative model.</p>
+      <p>A conditional probability formula alone is also insufficient for categorization. In the email example, <span class="dl-math">y</span> is a class label; in text generation, the output variable may represent an entire passage. Establish what the variables mean before deciding whether the model learns a label relationship or a distribution of data.</p>
+
+      <h3 id="en-choice">Accuracy and model selection</h3>
+      <p>A spam filter should ultimately be evaluated on false positives, missed spam, and operating cost for unseen emails. Generative modeling does not automatically improve classification. Naive Bayes simplifies estimation through independence assumptions that can discard useful word relationships. Discriminative methods train directly for label prediction, but their results still depend on data, features, and regularization.</p>
+      <p><a href="https://proceedings.neurips.cc/paper/2001/hash/7b7a53e239400a13bd6be6c91c4f6c4e-Abstract.html">Ng and Jordan’s comparison of logistic regression and naive Bayes</a> demonstrates regimes in which each can have an advantage as training set size changes. Its conclusions concern particular classifiers and assumptions, not a universal ranking of all discriminative and generative models.</p>
+      <p>A model can learn generatively and perform a classification task. The naive Bayes filter does exactly that: it learns content distributions during training and returns spam or legitimate at prediction time. <strong>The task describes what the model is used for; the modeling target describes what it learns.</strong></p>
+
+      <h2 id="en-references">References</h2>
+      <ul>
+        <li><a href="https://cs229.stanford.edu/notes2019fall/cs229-notes2.pdf">Andrew Ng: CS229, Generative learning algorithms</a>. Generative classification and Bayesian inference.</li>
+        <li><a href="https://www.cs.cmu.edu/~tom/mlbook/NBayesLogReg.pdf">Tom Mitchell: Generative and discriminative classifiers</a>. The relationship between naive Bayes and logistic regression.</li>
+        <li><a href="https://scikit-learn.org/stable/modules/naive_bayes.html">scikit-learn: Naive Bayes</a>. Conditional independence, smoothing, and Bernoulli features.</li>
+        <li><a href="https://proceedings.neurips.cc/paper/2001/hash/7b7a53e239400a13bd6be6c91c4f6c4e-Abstract.html">Ng &amp; Jordan, 2001: On discriminative vs. generative classifiers</a>. Data size and error for specific classifiers.</li>
+        <li><a href="https://arxiv.org/abs/1406.2661">Goodfellow et al., 2014: Generative adversarial networks</a>. An example of implicit distribution modeling through a generator.</li>
+      </ul>
+    </div>
+  </main>
+</div>
+</body>
+</html>
