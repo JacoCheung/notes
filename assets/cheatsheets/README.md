@@ -37,9 +37,14 @@ two-level, collapsible TOC.
 
 ## Preserved assets and behavior
 
-- Matplotlib and Chrome retain both original SVGs, their referenced PNGs, and
-  the PDF. These assets are copied byte for byte. The SVG files contain raster
-  backgrounds and selectable text layers; they are not newly redrawn vectors.
+- Matplotlib displays both original SVGs with their referenced PNGs and offers
+  the original PDF. These assets are copied byte for byte. The SVG files contain
+  raster backgrounds and selectable text layers; they are not redrawn vectors.
+- Chrome shortcuts are native bilingual HTML tables, grouped by action, with
+  Windows/Linux and macOS columns, semantic keyboard labels, and a stacked
+  mobile layout. The page no longer embeds or links to attachments. Its original
+  SVG/PNG/PDF assets remain archived here. Attribution to the original 2019
+  MakeUseOf sheet and primary references for corrected entries are in the page.
 - Codex retains search and browser printing.
 - Claude Code retains fuzzy search, result highlighting, platform selection,
   and printing. Its script is scoped to avoid a global variable collision with
