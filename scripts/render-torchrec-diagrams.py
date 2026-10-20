@@ -85,7 +85,8 @@ def annotation_layout(row, width):
     tag=None;label_top=28
     if row['kind'] in TAGS:
         heading,detail=TAGS[row['kind']][1].split(' · ',1)
-        headings=wrap_to(row.get('tag_heading',heading),width-56,8.0)
+        badge_width=max(36,len(row.get('tag',''))*8+12)
+        headings=wrap_to(row.get('tag_heading',heading),width-badge_width-20,8.0)
         # Definitions live in the shared legend and event tooltip. Only custom
         # per-step data (e.g. the input/output collective counts) repeats here.
         details=wrap_to(row.get('tag_detail',''),width-10,7.7)
@@ -95,7 +96,7 @@ def annotation_layout(row, width):
         if row.get('also_comm'):
             comm_lines=wrap_to('Then AllToAll: lengths + ID payloads',width-18,7.8)
             tag_bottom=comm_top+20*(len(comm_lines)-1)+6
-        tag=dict(headings=headings,details=details,detail_top=detail_top,
+        tag=dict(badge_width=badge_width,headings=headings,details=details,detail_top=detail_top,
                  comm_lines=comm_lines,comm_top=comm_top)
         label_top=tag_bottom+32
     labels=wrap_message(row['label'],width-10)
@@ -118,7 +119,7 @@ def annotation_layout(row, width):
                    +[len(line)*8+4 for line in details]
                    +[sx+bw for _,_,sx,_,bw in sources])
     if tag:
-        used_width=max([used_width]+[48+len(line)*8+4 for line in tag['headings']]
+        used_width=max([used_width]+[tag['badge_width']+12+len(line)*8+4 for line in tag['headings']]
                        +[len(line)*7.7+4 for line in tag['details']]
                        +[len(line)*7.8+14 for line in tag['comm_lines']])
     return dict(tag=tag,label_top=label_top,labels=labels,details=details,sources=sources,arrow=arrow,
@@ -262,10 +263,11 @@ def render(d):
         n=item['number'];ann=item['annotation'];a,b=row['a'],row['b'];color=COLORS[k];fill=FILLS.get(k,'var(--surface)')
         if k in TAGS:
             tag=ann['tag']
-            out.append(f'<g class="event-tag"><title>{escape(TAGS[k][1])}</title><rect x="{lx}" y="{ry+10}" width="36" height="24" rx="4" fill="{color}"/><text class="mono" x="{lx+18}" y="{ry+27}" text-anchor="middle" font-size="13" font-weight="600" fill="var(--tag-ink)">{item["tag"]}</text>')
+            badge_width=tag['badge_width']
+            out.append(f'<g class="event-tag"><title>{escape(TAGS[k][1])}</title><rect x="{lx}" y="{ry+10}" width="{badge_width}" height="24" rx="4" fill="{color}"/><text class="mono" x="{lx+badge_width//2}" y="{ry+27}" text-anchor="middle" font-size="13" font-weight="600" fill="var(--tag-ink)">{item["tag"]}</text>')
             for idx,line in enumerate(tag['headings']):
                 ty=ry+28+20*idx
-                out.append(f'<rect class="annotation-bg" x="{lx+46}" y="{ty-14}" width="{len(line)*8+4}" height="19" fill="{fill}"/><text x="{lx+48}" y="{ty}" font-size="13" font-weight="600" fill="{color}">{escape(line)}</text>')
+                out.append(f'<rect class="annotation-bg" x="{lx+badge_width+10}" y="{ty-14}" width="{len(line)*8+4}" height="19" fill="{fill}"/><text x="{lx+badge_width+12}" y="{ty}" font-size="13" font-weight="600" fill="{color}">{escape(line)}</text>')
             for idx,line in enumerate(tag['details']):
                 ty=ry+tag['detail_top']+20*idx
                 out.append(f'<rect class="annotation-bg" x="{lx-2}" y="{ty-14}" width="{len(line)*7.7+4}" height="19" fill="{fill}"/><text x="{lx}" y="{ty}" font-size="14" fill="{color}">{escape(line)}</text>')

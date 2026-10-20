@@ -28,6 +28,11 @@ SOURCES = {
  'fused_validation': ('distributed/embedding_sharding.py', 'L942-L956', '融合 splits 前的校验读回', 'Validation readbacks before fused splits'),
  'split_validation': ('distributed/dist_data.py', 'L644-L661', '第一次 wait 中的发送端校验读回', 'Sent-split validation readback in the first wait'),
  'host_copy': ('sparse/jagged_tensor.py', 'L68-L140', 'CUDA metadata 的 D2H 与 stream synchronize', 'CUDA metadata D2H and stream synchronization'),
+ 'kjt_split_prepare': ('sparse/jagged_tensor.py', 'L2662-L2676', 'KJT.split 的主机 metadata', 'Host metadata in KJT.split'),
+ 'split_h2d': ('distributed/dist_data.py', 'L938-L947', 'Split lists 与 stride 的 H2D', 'Split-list and stride H2D'),
+ 'split_d2h': ('distributed/dist_data.py', 'L586-L597', '接收 splits 的 D2H', 'Received-split D2H'),
+ 'input_recat': ('distributed/dist_data.py', 'L249-L367', '输入 recat 与可变 batch offsets', 'Input recat and unequal-batch offsets'),
+ 'collective_tag': ('distributed/dist_data.py', 'L463-L489', 'Collective 校验 tag 的 H2D', 'Collective-validation tag H2D'),
  'compute': ('distributed/embedding.py', 'L1627-L1718', 'EC compute 与 output_dist', 'EC compute and output_dist'),
  'lookup': ('distributed/embedding_lookup.py', 'L408-L433', 'GroupedEmbeddingsLookup.forward', 'GroupedEmbeddingsLookup.forward'),
  'tbe': ('distributed/batched_embedding_kernel.py', 'L2530-L2605', 'BatchedFusedEmbedding 的 backend 配置', 'BatchedFusedEmbedding backend configuration'),
@@ -89,8 +94,10 @@ output = module.compute_and_output_dist(ctx, dist_input)
 {figure:03}
 <h3 id="zh-input-sync">等待与主机同步</h3>
 <p>CPU 等待不只发生在接收 splits 之后。发起通信前，<code>KJT.dist_splits()</code> 就需要主机上的 <code>length_per_key</code>。若这个 metadata 尚未缓存，TorchRec 会对 CUDA lengths 求和，再通过 <code>_safe_tolist</code> 取回 Python list。接收 payload 后，固定 stride 分支的 <code>dist_init()</code> 又会对新 KJT 调用 <code>sync()</code>，整理它的 <code>length_per_key</code> 和 offsets metadata。{source:kjt_splits}；{source:kjt_lengths}；{source:kjt_init}</p>
-<p>图 3 用 D1、D2、D3 分别标出发送尺寸准备、接收尺寸读回和 KJT metadata 重建。非空 CUDA tensor 经过 safe-list 路径时，会先做 D2H，再显式同步当前 stream；已缓存的 metadata 可以直接复用。Splits 的 <code>_wait_impl</code> 也说明了转成主机 list 时的 CPU 等待。{source:host_copy}；{source:splits}</p>
+<p>图 3 的 01 对应分桶前的条件读回：输入 KJT 的 <code>length_per_key</code> 未缓存且 CUDA lengths 非空时，<code>permute / split</code> 才触发 D2H；随后 <code>offset_per_key</code> 复用主机计数，不再读回。D1、D2、D3 分别标出分桶后的发送尺寸准备、接收尺寸读回和 KJT metadata 重建。非空 CUDA tensor 经过 safe-list 路径时，会先做 D2H，再显式同步当前 stream。{source:kjt_split_prepare}；{source:kjt_lengths}；{source:host_copy}</p>
+<p>H1-a、H1-b、H1-c 分别上传 lengths splits、values splits 和 stride。在固定 stride、无 weights 的路径上，这是三次独立的 <code>torch.tensor(..., device=cuda)</code>，每次传输 <code>8P</code> 字节；之后才打包并发起 splits AllToAll。{source:split_h2d}</p>
 <p>这个固定版本还在第一次 wait 中读回发送端 <code>_input_tensor</code>，用于检查 split sizes 的整数溢出，图中另标为 V2。这次读回发生在正常执行路径上，并不以发现错误为前提。因此，D1 / D2 / D3 标识三类主要数据依赖，不代表全部同步调用，也不代表每次运行恰好出现三次 stall。{source:split_validation}</p>
+<p>逐项的传输方向、字节数与触发条件见<a href="#zh-host-transfers">主机与设备拷贝表</a>。表中 01 与图中同名标记对应，H1 一行汇总 H1-a/b/c。</p>
 <p>这些校验读回由 <a href="https://github.com/meta-pytorch/torchrec/commit/a950331f5d1778a25a3ff44fe3a255277e1338f2">PR #3978（<code>a950331f5</code>）</a>引入，最早包含它们的周版本是 <a href="https://github.com/meta-pytorch/torchrec/releases/tag/v2026.04.13.00"><code>v2026.04.13.00</code></a>；正式发布的 1.6.0 尚未包含，<a href="https://github.com/meta-pytorch/torchrec/releases/tag/v1.7.0-rc1">1.7.0</a> 已包含。最初使用 CUDA tensor 的 <code>.tolist()</code>，随后 <a href="https://github.com/meta-pytorch/torchrec/commit/ec5baf373ef8ef3ea82c23e4c3086815e7ffcd3f">PR #4131（<code>ec5baf373</code>）</a> 将其替换为 safe-list 路径，保留主机读回，并显式同步当前 stream。本文固定的 <code>1d87b8f79b7bb</code> 已包含这两次改动。</p>
 <p>异步 collective 的 <code>Work.wait()</code> 标出消费通信结果的位置。仅凭这个调用，无法断定 CPU 会等待整张 GPU，也无法推断 NCCL 内部所有 stream 的行为。读图时应把这类通信依赖与必须拿到主机数值的 metadata 同步分开。</p>
 <p>Recat 在本地重排数据，把通信接收时的 rank / feature 布局转成 lookup 所需的布局，这一步不发起跨 rank 通信。完成后，row owner 就有了各请求 rank 发来的 ID，可以开始查表；embedding 向量将在后面的输出分发阶段送回。</p>
@@ -128,6 +135,29 @@ output = module.compute_and_output_dist(ctx, dist_input)
 {figure:12}
 
 <h2 id="zh-sync">6. 通信与同步汇总</h2>
+<h3 id="zh-host-transfers">主机与设备拷贝</h3>
+<p>仅统计每批执行的 TorchRec metadata 拷贝，不含输入 KJT 搬运。基础路径：单个 row-wise group、固定 stride、各 rank 的 batch size 相同，无 weights、去重、codec 或 collective tag。<code>P &gt; 1</code> 为 rank 数，<code>F</code> 为分桶前的 feature 数；下表字节数均按每 rank 计算。</p>
+<div class="table-scroll"><table class="transfer-inventory"><thead><tr><th>序号</th><th>方向</th><th>阶段</th><th>数据（源码）</th><th>字节 / 批</th><th>必要性 / 条件</th></tr></thead><tbody>
+<tr><td>01</td><td><span class="seq-key seq-host">D2H</span></td><td>输入重排 / 拆组</td><td>{source:kjt_split_prepare|分桶前各 feature 的 ID 数}</td><td><code>8F</code></td><td>按需；metadata 已缓存或 lengths 为空时跳过。</td></tr>
+<tr><td>02 · D1</td><td><span class="seq-key seq-host">D2H</span></td><td>Splits 准备</td><td>{source:kjt_splits|各 rank × feature 的 ID 数}</td><td><code>8FP</code></td><td>当前非空路径需要；分桶后的计数重新计算。</td></tr>
+<tr><td>03 · H1</td><td><span class="seq-key seq-h2d">H2D</span></td><td>Splits 发起前</td><td>{source:split_h2d|H1-a/b/c：lengths / values / stride}</td><td><code>24P</code><br>三份，各 <code>8P</code></td><td>当前实现需要；供 NCCL 交换尺寸。</td></tr>
+<tr><td>04 · D2</td><td><span class="seq-key seq-host">D2H</span></td><td>第一次 wait</td><td>{source:split_d2h|接收端 splits + stride}</td><td><code>24P</code></td><td>需要；确定 payload 接收尺寸。</td></tr>
+<tr><td>05 · V2</td><td><span class="seq-key seq-host">D2H</span></td><td>第一次 wait</td><td>{source:split_validation|发送端 splits + stride 校验}</td><td><code>24P</code></td><td>校验额外读回；非算法必需。</td></tr>
+<tr><td>06 · H2</td><td><span class="seq-key seq-h2d">H2D</span></td><td>第一次 wait</td><td>{source:input_recat|输入 recat 索引}</td><td><code>4FP</code></td><td>当前每批上传；固定布局可复用。</td></tr>
+<tr><td>07 · D3</td><td><span class="seq-key seq-host">D2H</span></td><td>第二次 wait</td><td>{source:kjt_init|接收 KJT 各 feature 的总 ID 数}</td><td><code>8F</code></td><td>当前非空路径需要；重建主机 metadata。</td></tr>
+</tbody></table></div>
+<p>D2H 经 safe-list 读回并同步<strong>当前 stream</strong>；H2D 为普通 CUDA tensor 构造的阻塞拷贝。整数 lengths 求和得到 int64，因此计数按 <code>8 B</code> 计算。{source:host_copy|同步实现}；{source:kjt_lengths|计数实现}。</p>
+<div class="note-box"><p><strong>V2 在正常路径上执行。</strong>关闭 overflow debug 不会消除读回。D2 / V2 都复制完整 metadata，而非仅校验所用的最后一行。</p></div>
+<p>例如 <code>P=8, F=1</code>：D1 + D2 + V2 + D3 合计 <strong>456 B D2H</strong>、四处显式同步；H1 + H2 合计 <strong>224 B H2D</strong>。01 若触发，再加 <code>8 B</code> D2H 和一次同步。等待包含 stream 上的前置工作，不能由字节数推算耗时。</p>
+<h3 id="zh-transfer-conditions">条件触发的拷贝</h3>
+<p>满足相应配置或 pipeline 路径时，按每批额外计入以下拷贝。</p>
+<div class="table-scroll"><table class="transfer-inventory"><thead><tr><th>序号</th><th>方向</th><th>阶段</th><th>数据（源码）</th><th>字节</th><th>必要性 / 条件</th></tr></thead><tbody>
+<tr><td>08</td><td><span class="seq-key seq-h2d">H2D</span></td><td>第一次 wait</td><td>{source:input_recat|Recat 的 input / output offsets}</td><td>额外 <code>8(FP+1)</code></td><td>仅各 rank 的 batch size 不同。</td></tr>
+<tr><td>09</td><td><span class="seq-key seq-h2d">H2D</span><br><span class="seq-key seq-host">D2H</span></td><td>Splits 校验</td><td>{source:collective_tag|Collective 一致性 tag}</td><td>H2D +<code>8P</code><br>D2、V2 各 +<code>8P</code></td><td>仅启用 tag 校验；并入 D2/V2，不新增 D2H 同步调用。</td></tr>
+<tr><td>10 · V1</td><td><span class="seq-key seq-host">D2H</span></td><td><a href="torchrec-sparse-dist-pipeline.html#zh-pipeline-distribution">Pipeline 融合前</a></td><td>{source:fused_validation|逐个 split tensor 校验}</td><td>每份 <code>8P</code><br>基础 KJT 合计 <code>24P</code></td><td>每份各同步一次；额外校验，直接 row-wise 不发生。</td></tr>
+</tbody></table></div>
+<p>VBE、不均匀分桶、weights、codec 和 backend 内部拷贝另计；NCCL AllToAll 与本地 D2D 不计入 H2D / D2H。</p>
+<h3 id="zh-rank-communication">跨 rank 通信</h3>
 <div class="table-scroll"><table><thead><tr><th>阶段</th><th>跨 rank 传输</th><th>结果在哪消费</th><th>需要区分的同步</th></tr></thead><tbody>
 <tr><td>发送 metadata 准备</td><td>无</td><td><code>dist_splits → length_per_key</code></td><td>未缓存时，CUDA lengths 汇总后读回主机</td></tr>
 <tr><td>Input splits</td><td>Split sizes</td><td>外层 awaitable 的 wait</td><td>CUDA sizes 转 Python lists，存在明确的 CPU 等待</td></tr>
@@ -282,8 +312,10 @@ output = module.compute_and_output_dist(ctx, dist_input)
 {figure:03}
 <h3 id="en-input-sync">Waits and host synchronization</h3>
 <p>Host waiting is not limited to receiving splits. Before communication starts, <code>KJT.dist_splits()</code> requires host-side <code>length_per_key</code>. If uncached, TorchRec reduces CUDA lengths and obtains a Python list through <code>_safe_tolist</code>. After receiving payload, the fixed-stride branch of <code>dist_init()</code> calls <code>sync()</code> on the new KJT to prepare its length and offset metadata. {source:kjt_splits}; {source:kjt_lengths}; {source:kjt_init}</p>
-<p>Figure 3 labels send-size preparation, receive-size readback, and KJT metadata reconstruction as D1, D2, and D3. For a nonempty CUDA tensor, the safe-list path performs D2H and explicitly synchronizes the current stream. Cached metadata can be reused. The splits <code>_wait_impl</code> also describes CPU waiting during conversion to a host list. {source:host_copy}; {source:splits}</p>
+<p>Marker 01 in Fig. 3 is the conditional read before bucketization: <code>permute / split</code> triggers D2H only when the input KJT's <code>length_per_key</code> is uncached and CUDA lengths are nonempty. The subsequent <code>offset_per_key</code> reuses host counts without another readback. D1, D2, and D3 mark post-bucket send-size preparation, receive-size readback, and KJT metadata reconstruction. For a nonempty CUDA tensor, the safe-list path performs D2H and explicitly synchronizes the current stream. {source:kjt_split_prepare}; {source:kjt_lengths}; {source:host_copy}</p>
+<p>H1-a, H1-b, and H1-c upload lengths splits, values splits, and stride, respectively. On the fixed-stride, unweighted path, these are three separate <code>torch.tensor(..., device=cuda)</code> calls, each transferring <code>8P</code> bytes. Packing and the splits AllToAll follow these uploads. {source:split_h2d}</p>
 <p>The pinned version also reads back the sent <code>_input_tensor</code> during the first wait to check split-size integer overflow, marked V2 in the diagram. This read runs on the normal path, before any error is detected. D1 / D2 / D3 identify three primary data dependencies, not every synchronization call or an exact count of runtime stalls. {source:split_validation}</p>
+<p>The <a href="#en-host-transfers">host/device transfer inventory</a> lists directions, byte counts, and conditions. Row 01 matches the diagram marker; the H1 row combines H1-a/b/c.</p>
 <p>These validation readbacks were introduced by <a href="https://github.com/meta-pytorch/torchrec/commit/a950331f5d1778a25a3ff44fe3a255277e1338f2">PR #3978 (<code>a950331f5</code>)</a>, first included in the weekly tag <a href="https://github.com/meta-pytorch/torchrec/releases/tag/v2026.04.13.00"><code>v2026.04.13.00</code></a>. Release 1.6.0 did not contain them; <a href="https://github.com/meta-pytorch/torchrec/releases/tag/v1.7.0-rc1">1.7.0</a> does. They originally used CUDA tensor <code>.tolist()</code>. <a href="https://github.com/meta-pytorch/torchrec/commit/ec5baf373ef8ef3ea82c23e4c3086815e7ffcd3f">PR #4131 (<code>ec5baf373</code>)</a> later replaced those conversions with safe-list helpers, retaining host readback and explicitly synchronizing the current stream. The pinned <code>1d87b8f79b7bb</code> contains both changes.</p>
 <p>An asynchronous collective's <code>Work.wait()</code> marks where TorchRec consumes communication results. The call alone does not establish that the CPU waits for the entire device, or explain all internal NCCL stream behavior. Keep this communication dependency separate from metadata operations that require values on the host.</p>
 <p>Recat transforms the received rank / feature layout into the layout required by the local lookup. It is a local permutation, not another cross-rank transfer. The row owner now has its requests, but has not yet returned embedding vectors.</p>
@@ -321,6 +353,29 @@ output = module.compute_and_output_dist(ctx, dist_input)
 {figure:12}
 
 <h2 id="en-sync">6. Communication and synchronization</h2>
+<h3 id="en-host-transfers">Host/device transfers</h3>
+<p>Only per-batch TorchRec metadata copies are counted; input KJT upload is excluded. Baseline: one row-wise group, fixed stride, equal per-rank batch sizes, no weights, deduplication, codec, or collective tag. <code>P &gt; 1</code> is the rank count and <code>F</code> the pre-bucket feature count. All byte counts are per rank.</p>
+<div class="table-scroll"><table class="transfer-inventory"><thead><tr><th>No.</th><th>Direction</th><th>Stage</th><th>Data (source)</th><th>Bytes / batch</th><th>Required / condition</th></tr></thead><tbody>
+<tr><td>01</td><td><span class="seq-key seq-host">D2H</span></td><td>Input permute / split</td><td>{source:kjt_split_prepare|Pre-bucket ID counts per feature}</td><td><code>8F</code></td><td>On demand; skipped for cached metadata or empty lengths.</td></tr>
+<tr><td>02 · D1</td><td><span class="seq-key seq-host">D2H</span></td><td>Split preparation</td><td>{source:kjt_splits|ID counts per rank × feature}</td><td><code>8FP</code></td><td>Required on the current nonempty path; bucket counts are recomputed.</td></tr>
+<tr><td>03 · H1</td><td><span class="seq-key seq-h2d">H2D</span></td><td>Before splits launch</td><td>{source:split_h2d|H1-a/b/c: lengths / values / stride}</td><td><code>24P</code><br>Three arrays, <code>8P</code> each</td><td>Required by the current NCCL size exchange.</td></tr>
+<tr><td>04 · D2</td><td><span class="seq-key seq-host">D2H</span></td><td>First wait</td><td>{source:split_d2h|Received splits + stride}</td><td><code>24P</code></td><td>Required to determine payload receive sizes.</td></tr>
+<tr><td>05 · V2</td><td><span class="seq-key seq-host">D2H</span></td><td>First wait</td><td>{source:split_validation|Sent splits + stride for validation}</td><td><code>24P</code></td><td>Extra validation read; not algorithmically required.</td></tr>
+<tr><td>06 · H2</td><td><span class="seq-key seq-h2d">H2D</span></td><td>First wait</td><td>{source:input_recat|Input recat indices}</td><td><code>4FP</code></td><td>Currently uploaded each batch; reusable with a fixed layout.</td></tr>
+<tr><td>07 · D3</td><td><span class="seq-key seq-host">D2H</span></td><td>Second wait</td><td>{source:kjt_init|Received KJT ID totals per feature}</td><td><code>8F</code></td><td>Required on the current nonempty path to rebuild host metadata.</td></tr>
+</tbody></table></div>
+<p>D2H uses safe-list readback and synchronizes the <strong>current stream</strong>; H2D uses blocking CUDA tensor construction. Integer lengths reduce to int64, so each count occupies <code>8 B</code>. {source:host_copy|Synchronization implementation}; {source:kjt_lengths|count computation}.</p>
+<div class="note-box"><p><strong>V2 executes on the normal path.</strong>Disabling overflow debug does not remove the readback. D2 / V2 copy the entire metadata tensor, not just the last row used by validation.</p></div>
+<p>For <code>P=8, F=1</code>, D1 + D2 + V2 + D3 total <strong>456 B D2H</strong> and four explicit synchronizations; H1 + H2 total <strong>224 B H2D</strong>. If 01 is needed, add <code>8 B</code> D2H and one synchronization. Waiting includes upstream stream work, so bytes do not determine latency.</p>
+<h3 id="en-transfer-conditions">Conditional transfers</h3>
+<p>Count these additional per-batch copies when the configuration or pipeline path applies.</p>
+<div class="table-scroll"><table class="transfer-inventory"><thead><tr><th>No.</th><th>Direction</th><th>Stage</th><th>Data (source)</th><th>Bytes</th><th>Required / condition</th></tr></thead><tbody>
+<tr><td>08</td><td><span class="seq-key seq-h2d">H2D</span></td><td>First wait</td><td>{source:input_recat|Recat input / output offsets}</td><td>Extra <code>8(FP+1)</code></td><td>Only for unequal per-rank batch sizes.</td></tr>
+<tr><td>09</td><td><span class="seq-key seq-h2d">H2D</span><br><span class="seq-key seq-host">D2H</span></td><td>Split validation</td><td>{source:collective_tag|Collective-consistency tag}</td><td>H2D +<code>8P</code><br>D2, V2 each +<code>8P</code></td><td>Only when tag validation is enabled; included in D2/V2 without another D2H sync call.</td></tr>
+<tr><td>10 · V1</td><td><span class="seq-key seq-host">D2H</span></td><td><a href="torchrec-sparse-dist-pipeline.html#en-pipeline-distribution">Pipeline, before fusion</a></td><td>{source:fused_validation|Per-split-tensor validation}</td><td><code>8P</code> per tensor<br><code>24P</code> per baseline KJT</td><td>One sync per tensor; extra validation, absent from direct row-wise execution.</td></tr>
+</tbody></table></div>
+<p>VBE, uneven bucketization, weights, codecs, and internal backend copies require separate accounting. NCCL AllToAll and local D2D are not H2D / D2H.</p>
+<h3 id="en-rank-communication">Cross-rank communication</h3>
 <div class="table-scroll"><table><thead><tr><th>Stage</th><th>Cross-rank payload</th><th>Consumption point</th><th>Synchronization distinction</th></tr></thead><tbody>
 <tr><td>Send metadata preparation</td><td>None</td><td><code>dist_splits → length_per_key</code></td><td>Uncached CUDA lengths are reduced and read back to the host</td></tr>
 <tr><td>Input splits</td><td>Split sizes</td><td>Outer awaitable wait</td><td>CUDA sizes become Python lists: explicit host waiting</td></tr>
@@ -443,9 +498,10 @@ PIPELINE_NAV_ZH = [('pipeline', '1. Pipeline 调度机制'), ('sparse', '2. 普�
 NATIVE_NAV_EN = [('layout', '1. Row sharding and KJT'), ('native', '2. Forward data flow'), ('input', '3. Input distribution'), ('lookup', '4. Lookup and output reconstruction'), ('backward', '5. Backward and parameter updates'), ('sync', '6. Communication and synchronization'), ('sources', 'Source and diagram index')]
 PIPELINE_NAV_EN = [('pipeline', '1. Pipeline scheduling'), ('sparse', '2. Standard sparse dist pipeline'), ('prefetch', '3. Prefetch pipeline'), ('compare', '4. Pipeline comparison'), ('sources', 'Source and diagram index')]
 
-def source(key, lang):
+def source(key, lang, label=None):
     path, lines, zh, en = SOURCES[key]
-    return f'<a href="{BASE}{path}#{lines}">{escape(zh if lang == "zh" else en)}</a>'
+    text = label if label is not None else (zh if lang == "zh" else en)
+    return f'<a href="{BASE}{path}#{lines}">{escape(text)}</a>'
 
 def figure(key, lang):
     slug, zh, en, sources = FIGS[key]
@@ -468,7 +524,7 @@ def figure(key, lang):
 <figcaption><strong>{'图' if lang == 'zh' else 'Fig.'} {number} · {title}</strong><span class="figure-sources">{'源码：' if lang == 'zh' else 'Source: '}{' · '.join(source(k, lang) for k in sources)}</span></figcaption></figure>'''
 
 def expand(body, lang, keys):
-    body = re.sub(r'\{source:(\w+)\}', lambda m: source(m[1], lang), body)
+    body = re.sub(r'\{source:(\w+)(?:\|([^{}]+))?\}', lambda m: source(m[1], lang, m[2]), body)
     body = re.sub(r'\{figure:(\d+)\}', lambda m: figure(m[1], lang), body)
     entries = ''.join(f'<li><a href="#{lang}-fig-{i:02}">{i:02} · {FIGS[k][1] if lang == "zh" else FIGS[k][2]}</a></li>' for i, k in enumerate(keys, 1))
     return body.replace('{figure_index}', f'<ol class="figure-index">{entries}</ol>')
@@ -537,6 +593,9 @@ main.content h1, main.content h2, main.content h3 { letter-spacing: 0; }
 .table-scroll table { width: 100%; min-width: 680px; border-collapse: collapse; font-size: 13.5px; }
 .table-scroll th, .table-scroll td { padding: 11px 13px; border: 1px solid var(--border); text-align: left; vertical-align: top; }
 .table-scroll th { background: var(--bg-elevated); }
+.table-scroll table.transfer-inventory { min-width: 880px; }
+.transfer-inventory th:first-child, .transfer-inventory td:first-child { min-width: 65px; white-space: nowrap; }
+.transfer-inventory .seq-key { white-space: nowrap; }
 .sequence { --diagram-paper: #fdfdfe; --diagram-control: #f1f3f6; --diagram-ink: #283344; --diagram-muted: #526071; --diagram-line: #dce1e7; margin: 32px 0 40px; border: 1px solid var(--diagram-line); border-radius: 8px; overflow: hidden; background: var(--diagram-paper); font-family: var(--font-sans); }
 html[data-theme="dark"] .sequence { --diagram-paper: #171b22; --diagram-control: #252e3b; --diagram-ink: #e7ebf1; --diagram-muted: #aeb9c9; --diagram-line: #343d4b; }
 .diagram-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; padding: 12px 18px; background: var(--diagram-paper); border-bottom: 1px solid var(--diagram-line); font-size: 12px; line-height: 1.4; }
