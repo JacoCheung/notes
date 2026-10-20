@@ -187,7 +187,7 @@
       "original": "01_input_prepare_unique.svg",
       "origin": "https://jacocheung.github.io/visualization/recsys-examples/embedding_collection_rowwise/index.html",
       "title": "Index calculation",
-      "subtitle": "GPU activities [1-45].",
+      "subtitle": "Feature reorder, conditional metadata read, group split, and optional local deduplication.",
       "actors": [
         {
           "name": "Application",
@@ -223,6 +223,10 @@
           ]
         },
         {
+          "kind": "phase",
+          "label": "Optional feature reorder: only when input key order must change"
+        },
+        {
           "a": 1,
           "b": 2,
           "kind": "call",
@@ -231,6 +235,22 @@
           "detail": "align input key order with sharding plan",
           "sources": [
             "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding.py#L1566"
+          ]
+        },
+        {
+          "a": 2,
+          "b": 2,
+          "kind": "host",
+          "tag": "01",
+          "tag_heading": "D2H / HOST SYNC · CONDITIONAL",
+          "tag_detail": "Uncached, nonempty CUDA lengths only; int64[F], 8F bytes.",
+          "label": "length_per_key() → D2H → current_stream.synchronize()",
+          "detail": "Cache host counts; split below reuses them. If reorder is skipped, conditional read 01 occurs in split instead.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L2829-L2841",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L1369-L1395",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L68-L98",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L2568-L2587"
           ]
         },
         {
@@ -254,6 +274,26 @@
           "sources": [
             "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L2899"
           ]
+        },
+        {
+          "kind": "phase",
+          "label": "Split features by sharding group"
+        },
+        {
+          "a": 1,
+          "b": 2,
+          "kind": "call",
+          "label": "features.split(_feature_splits)",
+          "detail": "Reads length_per_key, then builds offset_per_key on the CPU. Cached counts: no D2H. If reorder was skipped: read 01 may occur here, not twice.",
+          "sources": [
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding.py#L1580-L1588",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L2662-L2676",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L1412-L1478"
+          ]
+        },
+        {
+          "kind": "phase",
+          "label": "Optional local deduplication: use_index_dedup enabled"
         },
         {
           "a": 1,
@@ -290,6 +330,8 @@
         }
       ],
       "notes": [
+        "01 matches inventory row 01: first uncached access in permute, or in split if permutation is skipped. Count this read at most once.",
+        "F is the pre-bucket feature count. Fixed-stride, nonempty CUDA lengths produce 8F bytes of host counts; cached or empty inputs skip D2H.",
         "reverse_indices is not used yet; it is consumed only after output AllToAll and unbucketization.",
         "Activities [8-10] build input offsets; the sort/scan kernels that follow are implementation children of fbgemm.jagged_unique_indices.",
         "Activity IDs, sizes, kernel names and optimizer details illustrate one execution configuration; they are not fixed for every run."
@@ -299,43 +341,49 @@
         [
           0,
           1,
-          7,
+          9,
           "call"
         ],
         [
           1,
           1,
-          7,
+          9,
           "call"
         ],
         [
           2,
           2,
-          4,
-          "call"
-        ],
-        [
-          3,
-          3,
-          4,
-          "call"
-        ],
-        [
-          3,
           5,
+          "call"
+        ],
+        [
+          2,
+          6,
           6,
           "call"
         ],
         [
+          3,
           4,
-          4,
-          4,
+          5,
+          "call"
+        ],
+        [
+          3,
+          7,
+          8,
           "call"
         ],
         [
           4,
-          6,
-          6,
+          5,
+          5,
+          "call"
+        ],
+        [
+          4,
+          8,
+          8,
           "call"
         ]
       ]
@@ -345,7 +393,7 @@
       "original": "02_input_dist.svg",
       "origin": "https://jacocheung.github.io/visualization/recsys-examples/embedding_collection_rowwise/index.html",
       "title": "Row-wise sparse input distribution",
-      "subtitle": "Fixed stride, unweighted KJT: conditional input metadata read, three split-metadata uploads, and payload exchanges.",
+      "subtitle": "Fixed stride, unweighted KJT: bucketization, split-metadata uploads, host reads, and payload exchanges.",
       "actors": [
         {
           "name": "ShardedEmbeddingCollection",
@@ -373,22 +421,6 @@
         }
       ],
       "rows": [
-        {
-          "a": 0,
-          "b": 0,
-          "kind": "host",
-          "tag": "01",
-          "tag_heading": "D2H / HOST SYNC · CONDITIONAL",
-          "tag_detail": "Only when length_per_key is uncached and CUDA lengths are nonempty; 8F bytes.",
-          "label": "Input KJT permute / split → length_per_key()",
-          "detail": "Caches host ID counts before bucketization. offset_per_key uses a CPU prefix sum; no second D2H.",
-          "sources": [
-            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding.py#L1566-L1580",
-            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L2662-L2676",
-            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L1369-L1395",
-            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L2568-L2587"
-          ]
-        },
         {
           "a": 0,
           "b": 1,
@@ -439,35 +471,12 @@
           "a": 2,
           "b": 2,
           "kind": "h2d",
-          "tag": "H1-a",
-          "label": "torch.tensor(self._input_splits[0], device=cuda)",
-          "detail": "First loop iteration: lengths element counts per peer; int64[P], 8P bytes.",
+          "tag": "H1",
+          "tag_heading": "H2D · 3 COPIES",
+          "label": "torch.tensor(..., device=cuda) × 3",
+          "detail": "H1-a: lengths splits, self._input_splits[0] → int64[P], 8P bytes.\nH1-b: values splits, self._input_splits[1] → int64[P], 8P bytes.\nH1-c: stride, [input.stride()] * P → int64[P], 8P bytes.",
           "sources": [
-            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L941-L943",
-            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L3193-L3210"
-          ]
-        },
-        {
-          "a": 2,
-          "b": 2,
-          "kind": "h2d",
-          "tag": "H1-b",
-          "label": "torch.tensor(self._input_splits[1], device=cuda)",
-          "detail": "Second loop iteration: ID values counts per peer; int64[P], 8P bytes.",
-          "sources": [
-            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L941-L943",
-            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L3193-L3210"
-          ]
-        },
-        {
-          "a": 2,
-          "b": 2,
-          "kind": "h2d",
-          "tag": "H1-c",
-          "label": "torch.tensor([input.stride()] * self._workers, device=cuda)",
-          "detail": "Append one stride per peer on the fixed-stride path; int64[P], 8P bytes.",
-          "sources": [
-            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L944-L947",
+            "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L941-L947",
             "https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L3193-L3210"
           ]
         },
@@ -631,8 +640,8 @@
         }
       ],
       "notes": [
-        "01 matches inventory row 01: a conditional pre-bucket read, first reached by permute or split. Cached counts are reused by split.",
-        "H1-a / H1-b / H1-c expand one list-comprehension loop and the stride append: three separate H2D copies, 8P bytes each.",
+        "The conditional pre-bucket read 01 belongs to Index calculation (Fig. 2); this sequence starts with the row-wise distributor.",
+        "H1 is one diagram message containing three H2D copies, H1-a / H1-b / H1-c; each copies 8P bytes and has its own inventory row.",
         "P is the number of ranks (>1); F is the input feature count before bucketization. Initial buffers and batch KJT uploads are excluded.",
         "D1 / D2 / D3 mark distinct host-read sites, not a fixed count of runtime stalls; cached / empty paths may skip work.",
         "The three input collectives are distinct: one fixed-size metadata exchange, then lengths and values payload exchanges.",
@@ -645,101 +654,101 @@
         [
           0,
           1,
-          10,
+          7,
           "call"
         ],
         [
           0,
-          11,
-          18,
+          8,
+          15,
           "call"
         ],
         [
           0,
+          16,
           19,
-          22,
           "call"
         ],
         [
           1,
-          2,
-          10,
+          1,
+          7,
           "call"
         ],
         [
           2,
-          4,
-          10,
+          3,
+          7,
           "call"
         ],
         [
           3,
-          9,
-          10,
+          6,
+          7,
           "call"
         ],
         [
           3,
-          11,
-          18,
-          "wait"
-        ],
-        [
-          4,
+          8,
           15,
-          18,
+          "wait"
+        ],
+        [
+          4,
+          12,
+          15,
           "call"
         ],
         [
           4,
+          16,
           19,
-          22,
           "wait"
         ],
         [
           5,
-          10,
-          10,
+          7,
+          7,
           "comm"
         ],
         [
           5,
-          12,
-          12,
+          9,
+          9,
           "wait"
         ],
         [
           5,
-          17,
-          18,
+          14,
+          15,
           "comm"
         ],
         [
           5,
-          19,
-          19,
+          16,
+          16,
           "wait"
         ]
       ],
       "pending": [
         [
           5,
-          10,
-          12,
+          7,
+          9,
           0,
           "Split-size request"
         ],
         [
           5,
-          17,
-          19,
+          14,
+          16,
           0,
           "Lengths request"
         ],
         [
           5,
-          18,
-          19,
+          15,
+          16,
           1,
           "ID values request"
         ]

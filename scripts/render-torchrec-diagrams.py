@@ -100,7 +100,8 @@ def annotation_layout(row, width):
                  comm_lines=comm_lines,comm_top=comm_top)
         label_top=tag_bottom+32
     labels=wrap_message(row['label'],width-10)
-    details=wrap_to(row.get('detail',''),width-10,8.0)
+    details=[line for paragraph in row.get('detail','').splitlines()
+             for line in wrap_to(paragraph,width-10,8.0)]
     sources=[];sx=0;sy=0;line_height=0
     for url in dict.fromkeys(row['sources']):
         lines=wrap_to(source_label(url),width-12,8.2)
