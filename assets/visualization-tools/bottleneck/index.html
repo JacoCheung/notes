@@ -1,0 +1,1074 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Bottleneck Visualization · 可视化工具</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<style>
+  /* === Token system: dark-first terminal/profiler aesthetic === */
+  :root {
+    --bg: #0d0f12;
+    --bg-panel: #141720;
+    --bg-row: #1a1f2e;
+    --bg-input: #0d0f12;
+    --fg: #cdd6f4;
+    --fg-dim: #6c7086;
+    --fg-muted: #45475a;
+    --accent: #89b4fa;     /* blue – primary */
+    --accent2: #a6e3a1;    /* green – good */
+    --warn: #fab387;       /* peach – warning */
+    --crit: #f38ba8;       /* red – bottleneck */
+    --water: #74c7ec;      /* sky – throughput */
+    --border: #313244;
+    --border-bright: #45475a;
+    --shadow: rgba(0,0,0,0.5);
+    --grid: rgba(255,255,255,0.03);
+    color-scheme: dark;
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f0f2f5;
+      --bg-panel: #ffffff;
+      --bg-row: #f8f9fb;
+      --bg-input: #f0f2f5;
+      --fg: #1e2030;
+      --fg-dim: #5c6278;
+      --fg-muted: #9ca0b0;
+      --accent: #1e66f5;
+      --accent2: #40a02b;
+      --warn: #fe640b;
+      --crit: #d20f39;
+      --water: #04a5e5;
+      --border: #ccd0da;
+      --border-bright: #9ca0b0;
+      --shadow: rgba(0,0,0,0.08);
+      --grid: rgba(0,0,0,0.04);
+      color-scheme: light;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #f0f2f5;
+    --bg-panel: #ffffff;
+    --bg-row: #f8f9fb;
+    --bg-input: #f0f2f5;
+    --fg: #1e2030;
+    --fg-dim: #5c6278;
+    --fg-muted: #9ca0b0;
+    --accent: #1e66f5;
+    --accent2: #40a02b;
+    --warn: #fe640b;
+    --crit: #d20f39;
+    --water: #04a5e5;
+    --border: #ccd0da;
+    --border-bright: #9ca0b0;
+    --shadow: rgba(0,0,0,0.08);
+    --grid: rgba(0,0,0,0.04);
+    color-scheme: light;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  [hidden] { display: none !important; }
+
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: 'Inter', system-ui, sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  body {
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 20px;
+  }
+
+  .root {
+    max-width: 920px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  /* ── Header ── */
+  .header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .header-left {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+
+  .header h1 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: -0.01em;
+  }
+
+  .header-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    color: var(--fg-dim);
+    padding: 2px 7px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    letter-spacing: 0.05em;
+  }
+
+  .header-sub {
+    font-size: 0.78rem;
+    color: var(--fg-dim);
+  }
+
+  /* ── Viz panel ── */
+  .viz-panel {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .viz-topbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-row);
+  }
+
+  .dot { width: 8px; height: 8px; border-radius: 50%; }
+
+  .viz-topbar-title {
+    margin-left: 6px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    color: var(--fg-dim);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  #barrel-svg {
+    width: 100%;
+    display: block;
+    background: var(--bg-panel);
+  }
+
+  /* ── Metrics strip ── */
+  .metrics {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    border-top: 1px solid var(--border);
+  }
+
+  .metric {
+    padding: 10px 14px;
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .metric:last-child { border-right: none; }
+
+  .metric-key {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.65rem;
+    color: var(--fg-dim);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .metric-val {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1.1rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--fg);
+  }
+
+  .metric-val.blue { color: var(--accent); }
+  .metric-val.green { color: var(--accent2); }
+  .metric-val.red { color: var(--crit); }
+  .metric-val.warn { color: var(--warn); }
+
+  /* ── Bottleneck insight ── */
+  .insight {
+    background: color-mix(in srgb, var(--crit) 8%, var(--bg-panel));
+    border: 1px solid color-mix(in srgb, var(--crit) 35%, var(--border));
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 0.8rem;
+    color: var(--fg);
+    display: none;
+    gap: 8px;
+    align-items: flex-start;
+  }
+  .insight.visible { display: flex; }
+
+  .insight-icon {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: var(--crit);
+    flex-shrink: 0;
+    padding-top: 1px;
+  }
+
+  .insight-text { color: var(--fg-dim); line-height: 1.6; min-width: 0; }
+  .insight-text strong { color: var(--crit); font-weight: 600; }
+
+  /* ── Stage list ── */
+  .stages-panel {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .stages-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-row);
+  }
+
+  .stages-title {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    color: var(--fg-dim);
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+  }
+
+  .btn-add {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 12px;
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .btn-add:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+
+  /* Stage row */
+  .stage-row {
+    display: grid;
+    grid-template-columns: 200px 1fr 60px 30px;
+    align-items: center;
+    gap: 12px;
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--border);
+    transition: background 0.1s;
+  }
+  .stage-row:last-child { border-bottom: none; }
+  .stage-row:hover { background: var(--bg-row); }
+  .stage-row.is-bottleneck { background: color-mix(in srgb, var(--crit) 5%, var(--bg-panel)); }
+  .stage-row.is-bottleneck:hover { background: color-mix(in srgb, var(--crit) 8%, var(--bg-panel)); }
+
+  .stage-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .stage-indicator {
+    width: 3px;
+    height: 18px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
+
+  .stage-name {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .stage-row.is-bottleneck .stage-name { color: var(--crit); }
+
+  .stage-bneck-tag {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.6rem;
+    font-weight: 700;
+    color: var(--crit);
+    background: color-mix(in srgb, var(--crit) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--crit) 40%, transparent);
+    border-radius: 3px;
+    padding: 1px 5px;
+    letter-spacing: 0.05em;
+    flex-shrink: 0;
+    display: none;
+  }
+  .stage-row.is-bottleneck .stage-bneck-tag { display: inline; }
+
+  .stage-slider-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .stage-bar-bg {
+    flex: 1;
+    height: 6px;
+    background: var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+    position: relative;
+    min-width: 0;
+  }
+
+  .stage-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.15s, background 0.15s;
+  }
+
+  .stage-slider {
+    position: absolute;
+    inset: -6px 0;
+    opacity: 0;
+    cursor: pointer;
+    width: 100%;
+    margin: 0;
+  }
+
+  .stage-val {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--fg-dim);
+    min-width: 24px;
+    text-align: right;
+    flex-shrink: 0;
+  }
+  .stage-row.is-bottleneck .stage-val { color: var(--crit); }
+
+  .btn-del {
+    width: 22px;
+    height: 22px;
+    border-radius: 3px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--fg-muted);
+    cursor: pointer;
+    font-size: 0.75rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: border-color 0.1s, color 0.1s;
+    flex-shrink: 0;
+  }
+  .btn-del:hover { border-color: var(--crit); color: var(--crit); }
+
+  /* Add form */
+  .add-form {
+    display: none;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    padding: 10px 14px;
+    background: var(--bg-row);
+    border-top: 1px solid var(--border);
+  }
+  .add-form.open { display: flex; }
+
+  .form-input {
+    padding: 5px 10px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8rem;
+    color: var(--fg);
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .form-input:focus { border-color: var(--accent); }
+  .form-input.name-input { width: 180px; }
+  .form-input.val-input  { width: 70px; }
+
+  .form-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    color: var(--fg-dim);
+    letter-spacing: 0.05em;
+  }
+
+  .btn-confirm {
+    padding: 5px 14px;
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  .btn-confirm:hover { opacity: 0.85; }
+
+  .btn-cancel-form {
+    padding: 5px 10px;
+    background: transparent;
+    color: var(--fg-dim);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .btn-cancel-form:hover { background: var(--border); }
+
+  @media (max-width: 600px) {
+    .metrics { grid-template-columns: repeat(2, 1fr); }
+    .metric:nth-child(2) { border-right: none; }
+    .metric:nth-child(3) { border-top: 1px solid var(--border); }
+    .stage-row { grid-template-columns: 140px 1fr 44px 24px; gap: 8px; }
+  }
+
+  /* ── Toolbar buttons ── */
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .btn-tool {
+    padding: 4px 10px;
+    background: transparent;
+    color: var(--fg-dim);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+    white-space: nowrap;
+  }
+  .btn-tool:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-tool-warn:hover { border-color: var(--crit); color: var(--crit); }
+
+  /* ── Export modal ── */
+  .export-modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.75);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    padding: 20px;
+  }
+
+  .export-modal-inner {
+    background: var(--bg-panel);
+    border: 1px solid var(--border-bright);
+    border-radius: 8px;
+    max-width: 760px;
+    width: 100%;
+    overflow: hidden;
+  }
+
+  .export-modal-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-row);
+  }
+
+  .export-title {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: 0.04em;
+  }
+
+  .export-hint {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    color: var(--fg-dim);
+    flex: 1;
+  }
+
+  .btn-modal-close {
+    width: 22px;
+    height: 22px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--fg-dim);
+    cursor: pointer;
+    font-size: 0.72rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: border-color 0.1s, color 0.1s;
+  }
+  .btn-modal-close:hover { border-color: var(--crit); color: var(--crit); }
+
+  .export-img {
+    display: block;
+    width: 100%;
+    height: auto;
+    cursor: context-menu;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+  }
+
+  /* Notes integration: preserve the model, fit both desktop and touch screens. */
+  .stage-row { grid-template-columns: minmax(170px, 1fr) minmax(140px, 2fr) 24px; }
+  .stage-bar-bg { height: 24px; overflow: visible; background: transparent; }
+  .stage-bar-bg::before {
+    content: ''; position: absolute; inset: 9px 0; border-radius: 3px;
+    background: var(--border);
+  }
+  .stage-bar-fill { position: absolute; top: 9px; height: 6px; }
+  .stage-slider { inset: 0; height: 24px; }
+  .stage-bar-bg:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .metric-val { overflow-wrap: anywhere; }
+  .stages-header, .header { flex-wrap: wrap; gap: 10px; }
+  .stage-slider:focus-visible, button:focus-visible, a:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 3px;
+  }
+  .export-download { color: var(--accent); font: 12px monospace; }
+  .export-modal-header { flex-wrap: wrap; }
+  @media (max-width: 600px) {
+    body { padding: 12px; }
+    .stage-row { grid-template-columns: minmax(0, 1fr) 24px; gap: 8px; }
+    .stage-label { grid-column: 1; }
+    .stage-slider-wrap { grid-row: 2; grid-column: 1 / -1; }
+    .btn-del { grid-row: 1; grid-column: 2; }
+    .stages-header { align-items: flex-start; }
+    .insight { flex-direction: column; }
+    .viz-topbar-title { font-size: .6rem; letter-spacing: 0; }
+    .header h1 { font-size: 1rem; }
+  }
+</style>
+</head><body>
+
+<div class="root">
+  <div class="header">
+    <div class="header-left">
+      <h1>Bottleneck Visualizer</h1>
+      <span class="header-badge">PERF</span>
+    </div>
+    <div class="header-sub">Normalized stage capacity → pipeline throughput ceiling</div>
+  </div>
+
+  <!-- Barrel viz -->
+  <div class="viz-panel">
+    <div class="viz-topbar">
+      <div class="dot" style="background:#f38ba8"></div>
+      <div class="dot" style="background:#f9e2af"></div>
+      <div class="dot" style="background:#a6e3a1"></div>
+      <span class="viz-topbar-title">throughput_model.barrel — pipeline stages</span>
+    </div>
+    <svg id="barrel-svg" viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg"></svg>
+    <div class="metrics">
+      <div class="metric">
+        <div class="metric-key">throughput ceiling</div>
+        <div class="metric-val blue" id="m-util">—</div>
+      </div>
+      <div class="metric">
+        <div class="metric-key">bottleneck</div>
+        <div class="metric-val red" id="m-bottleneck">—</div>
+      </div>
+      <div class="metric">
+        <div class="metric-key">max capacity</div>
+        <div class="metric-val green" id="m-peak">—</div>
+      </div>
+      <div class="metric">
+        <div class="metric-key">gap to max</div>
+        <div class="metric-val warn" id="m-loss">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Insight -->
+  <div class="insight" id="insight">
+    <span class="insight-icon">⚠ BOTTLENECK</span>
+    <div class="insight-text" id="insight-text"></div>
+  </div>
+
+  <!-- Stage list -->
+  <div class="stages-panel">
+    <div class="stages-header">
+      <span class="stages-title">pipeline stages</span>
+      <div class="toolbar">
+        <button class="btn-tool" onclick="exportImage()">↓ export</button>
+        <button class="btn-tool" onclick="resetStages()">↺ reset</button>
+        <button class="btn-tool btn-tool-warn" onclick="clearStages()">⌫ clear all</button>
+        <button class="btn-add" onclick="openForm()">+ add stage</button>
+      </div>
+    </div>
+    <div id="stage-list"></div>
+    <div class="add-form" id="add-form">
+      <span class="form-label">name</span>
+      <input type="text" class="form-input name-input" id="f-name" placeholder="e.g. NCCL AllReduce" maxlength="20">
+      <span class="form-label">capacity %</span>
+      <input type="number" class="form-input val-input" id="f-val" min="1" max="100" value="80">
+      <button class="btn-confirm" onclick="addStage()">add</button>
+      <button class="btn-cancel-form" onclick="closeForm()">cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Export modal -->
+<div id="export-modal" class="export-modal" hidden>
+  <div class="export-modal-inner">
+    <div class="export-modal-header">
+      <span class="export-title">bottleneck.svg</span>
+      <span class="export-hint">Save SVG · right-click or long-press the preview</span>
+      <button class="btn-modal-close" onclick="document.getElementById('export-modal').hidden=true">✕</button>
+    </div>
+    <a id="export-download" class="export-download" download="bottleneck.svg">Download SVG ↓</a>
+    <img id="export-img" class="export-img" alt="Bottleneck visualization">
+  </div>
+</div>
+
+<script>
+  // stage colors cycling through technical palette
+  const COLORS = [
+    '#89b4fa','#a6e3a1','#f9e2af','#cba6f7','#74c7ec',
+    '#fab387','#f38ba8','#94e2d5','#b4befe','#eba0ac'
+  ];
+
+  const DEFAULT_STAGES = [
+    { id: 1, name: 'GPU Compute',    val: 85 },
+    { id: 2, name: 'Data Loading',   val: 42 },
+    { id: 3, name: 'Mem Bandwidth',  val: 78 },
+    { id: 4, name: 'AllReduce/NCCL', val: 68 },
+    { id: 5, name: 'CPU Preprocess', val: 91 },
+    { id: 6, name: 'Checkpoint I/O', val: 55 },
+  ];
+
+  let stages = DEFAULT_STAGES.map(stage => ({...stage}));
+  let nid = 7;
+  function resetStages() { stages = DEFAULT_STAGES.map(stage => ({...stage})); nid = 7; closeForm(); renderSVG(); }
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  function svgEl(tag, attrs) {
+    const e = document.createElementNS(SVG_NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+    return e;
+  }
+
+  function getColor(i) { return COLORS[i % COLORS.length]; }
+
+  function darkenColor(hex) {
+    // returns a slightly muted version for bar fills
+    return hex;
+  }
+
+  function renderSVG() {
+    const svg = document.getElementById('barrel-svg');
+    svg.innerHTML = '';
+    svg.setAttribute('viewBox', '0 0 700 300');
+
+    if (!stages.length) {
+      const t = svgEl('text', {
+        x: 350, y: 150, 'text-anchor': 'middle', 'dominant-baseline': 'middle',
+        fill: 'var(--fg-dim)', 'font-family': 'JetBrains Mono, monospace', 'font-size': '13'
+      });
+      t.textContent = 'no stages — click "+ add stage" to start';
+      svg.appendChild(t);
+      for (const id of ['m-util', 'm-bottleneck', 'm-peak', 'm-loss']) {
+        document.getElementById(id).textContent = '—';
+      }
+      document.getElementById('insight').classList.remove('visible');
+      renderList();
+      return;
+    }
+
+    const n = stages.length;
+    const W = Math.max(700, n * 12 + 84), H = 300;
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    const PAD_L = 40, PAD_R = 40;
+    const BOT = 258, TOP = 40;
+    const BARREL_H = BOT - TOP; // 218
+
+    const minVal = Math.min(...stages.map(s => s.val));
+    const maxVal = Math.max(...stages.map(s => s.val));
+
+    const GAP = 4;
+    const STAVE_W = Math.max(8, (W - PAD_L - PAD_R - GAP * (n + 1)) / n);
+    const totalUsed = (STAVE_W + GAP) * n + GAP;
+    const ox = PAD_L + ((W - PAD_L - PAD_R) - totalUsed) / 2 + GAP;
+
+    // Defs: grid pattern + water clip
+    const defs = svgEl('defs', {});
+
+    const pat = svgEl('pattern', { id: 'grid', width: '20', height: '20', patternUnits: 'userSpaceOnUse' });
+    const pl = svgEl('path', { d: 'M20 0L0 0 0 20', fill: 'none', stroke: 'var(--grid)', 'stroke-width': '0.5' });
+    pat.appendChild(pl);
+    defs.appendChild(pat);
+
+    const waterH = BARREL_H * minVal / 100;
+    const waterY = BOT - waterH;
+    const clipId = 'wclip';
+    const cp = svgEl('clipPath', { id: clipId });
+    const cr = svgEl('rect', { x: ox, y: waterY, width: totalUsed - GAP, height: waterH });
+    cp.appendChild(cr);
+    defs.appendChild(cp);
+    svg.appendChild(defs);
+
+    // Background grid
+    svg.appendChild(svgEl('rect', { width: W, height: H, fill: 'url(#grid)' }));
+
+    // Horizontal reference lines at 25 50 75 100
+    [25, 50, 75, 100].forEach(pct => {
+      const ly = BOT - BARREL_H * pct / 100;
+      const line = svgEl('line', { x1: PAD_L - 8, y1: ly, x2: W - PAD_R + 8, y2: ly,
+        stroke: 'var(--border)', 'stroke-width': '0.5', 'stroke-dasharray': '3 4' });
+      svg.appendChild(line);
+      const lbl = svgEl('text', { x: PAD_L - 12, y: ly + 1,
+        'text-anchor': 'end', 'dominant-baseline': 'middle',
+        fill: 'var(--fg-muted)', 'font-family': 'JetBrains Mono, monospace', 'font-size': '9' });
+      lbl.textContent = pct;
+      svg.appendChild(lbl);
+    });
+
+    // Water fill
+    const wRect = svgEl('rect', {
+      x: ox, y: waterY,
+      width: totalUsed - GAP, height: waterH,
+      fill: 'rgba(116,199,236,0.18)',
+      'clip-path': `url(#${clipId})`
+    });
+    svg.appendChild(wRect);
+
+    // Water surface
+    if (waterH > 0) {
+      const wSurf = svgEl('rect', {
+        x: ox, y: waterY,
+        width: totalUsed - GAP, height: 2,
+        fill: 'var(--water)', opacity: '0.7', rx: '1'
+      });
+      svg.appendChild(wSurf);
+
+      // Water level dashed line across full width
+      const wLine = svgEl('line', {
+        x1: PAD_L - 8, y1: waterY + 1,
+        x2: W - PAD_R + 8, y2: waterY + 1,
+        stroke: 'var(--water)', 'stroke-width': '1',
+        'stroke-dasharray': '6 4', opacity: '0.5'
+      });
+      svg.appendChild(wLine);
+
+      // Water val label on right
+      const wVal = svgEl('text', {
+        x: W - PAD_R + 12, y: waterY + 1,
+        'dominant-baseline': 'middle',
+        fill: 'var(--water)', 'font-family': 'JetBrains Mono, monospace',
+        'font-size': '9', 'font-weight': '700'
+      });
+      wVal.textContent = minVal + '%';
+      svg.appendChild(wVal);
+    }
+
+    // Staves
+    stages.forEach((s, i) => {
+      const isBN = s.val === minVal;
+      const color = getColor(i);
+      const sh = BARREL_H * s.val / 100;
+      const sy = BOT - sh;
+      const x = ox + i * (STAVE_W + GAP);
+
+      // Stave fill
+      const staveColor = isBN ? 'var(--crit)' : color;
+      const stave = svgEl('rect', {
+        x, y: sy, width: STAVE_W, height: sh,
+        fill: staveColor, opacity: isBN ? '0.85' : '0.65', rx: '2'
+      });
+      svg.appendChild(stave);
+
+      // Top bright cap
+      const cap = svgEl('rect', {
+        x, y: sy, width: STAVE_W, height: 2,
+        fill: isBN ? 'var(--crit)' : color, rx: '1'
+      });
+      svg.appendChild(cap);
+
+      // Scan-line texture
+      for (let sl = sy + 8; sl < BOT - 4; sl += 10) {
+        const scanl = svgEl('rect', {
+          x: x + 1, y: sl, width: STAVE_W - 2, height: 1,
+          fill: 'rgba(0,0,0,0.12)'
+        });
+        svg.appendChild(scanl);
+      }
+
+      // Label above stave
+      if (STAVE_W >= 14) {
+        const labelText = s.name.length > Math.floor(STAVE_W / 5) + 1
+          ? s.name.slice(0, Math.max(2, Math.floor(STAVE_W / 5) + 1))
+          : s.name;
+
+        const lbl = svgEl('text', {
+          x: x + STAVE_W / 2,
+          y: sy - 6,
+          'text-anchor': 'middle',
+          fill: isBN ? 'var(--crit)' : 'var(--fg-dim)',
+          'font-family': 'JetBrains Mono, monospace',
+          'font-size': Math.min(9, Math.max(6, STAVE_W * 0.38)),
+          'font-weight': isBN ? '700' : '400'
+        });
+        lbl.textContent = labelText;
+        svg.appendChild(lbl);
+      }
+
+      // Value inside (if tall enough)
+      if (sh > 20 && STAVE_W >= 16) {
+        const vt = svgEl('text', {
+          x: x + STAVE_W / 2,
+          y: sy + Math.min(16, sh * 0.35),
+          'text-anchor': 'middle',
+          'dominant-baseline': 'middle',
+          fill: '#fff',
+          'font-family': 'JetBrains Mono, monospace',
+          'font-size': Math.min(9, Math.max(6, STAVE_W * 0.35)),
+          'font-weight': '600',
+          opacity: '0.75'
+        });
+        vt.textContent = s.val;
+        svg.appendChild(vt);
+      }
+    });
+
+    // Bottom baseline
+    svg.appendChild(svgEl('line', {
+      x1: ox, y1: BOT + 1, x2: ox + totalUsed - GAP, y2: BOT + 1,
+      stroke: 'var(--border-bright)', 'stroke-width': '1.5'
+    }));
+
+    // Update metrics
+    const loss = maxVal > 0 ? Math.round((1 - minVal / maxVal) * 100) : 0;
+    const bn = stages.find(s => s.val === minVal);
+    document.getElementById('m-util').textContent = minVal + '%';
+    const bottlenecks = stages.filter(stage => stage.val === minVal);
+    document.getElementById('m-bottleneck').textContent = bottlenecks.map(stage => stage.name).join(' + ');
+    document.getElementById('m-peak').textContent = maxVal + '%';
+    document.getElementById('m-loss').textContent = '-' + loss + '%';
+
+    // Insight
+    const insight = document.getElementById('insight');
+    const insightText = document.getElementById('insight-text');
+    const names = bottlenecks.map(stage => esc(stage.name)).join(' + ');
+    const next = stages.filter(stage => stage.val > minVal).sort((a, b) => a.val - b.val)[0];
+    const en = document.documentElement.dataset.articleLang === 'en';
+    insight.classList.add('visible');
+    if (bottlenecks.length === stages.length) {
+      insightText.innerHTML = en
+        ? `All stages share the <strong>${minVal}%</strong> ceiling. Raising it requires improving every tied stage.`
+        : `所有阶段的处理能力都为 <strong>${minVal}%</strong>。只有一起提高这些阶段的能力，整体上限才会上升。`;
+    } else if (bottlenecks.length > 1) {
+      insightText.innerHTML = en
+        ? `<strong>${names}</strong> share the ${minVal}% ceiling. Improving only one leaves the water level unchanged; the next limit is ${next.val}%.`
+        : `<strong>${names}</strong> 共同将上限限制在 ${minVal}%。只提高其中一个，水位不会上升；一起提高后，下一个限制是 ${next.val}%。`;
+    } else {
+      const gain = next.val - minVal;
+      insightText.innerHTML = en
+        ? `<strong>${names}</strong> limits the ceiling to ${minVal}%. Raising it to ${next.val}% adds ${gain} percentage points (about ${(gain / minVal * 100).toFixed(0)}% relative gain).`
+        : `<strong>${names}</strong> 将上限限制在 ${minVal}%。提高至 ${next.val}% 可使整体上限增加 ${gain} 个百分点，相对提升约 ${(gain / minVal * 100).toFixed(0)}%。`;
+    }
+
+    renderList();
+  }
+
+  function renderList() {
+    const list = document.getElementById('stage-list');
+    const minVal = stages.length ? Math.min(...stages.map(s => s.val)) : -1;
+    // Reuse range inputs: replacing the focused element interrupts a drag.
+    list.querySelectorAll('.stage-row').forEach(row => {
+      if (!stages.some(stage => String(stage.id) === row.dataset.id)) row.remove();
+    });
+    stages.forEach((s, i) => {
+      let row = list.querySelector(`[data-id="${s.id}"]`);
+      if (!row) {
+        row = document.createElement('div');
+        row.dataset.id = s.id;
+        row.innerHTML = `<div class="stage-label"><div class="stage-indicator"></div>
+          <span class="stage-name"></span><span class="stage-bneck-tag">BOTTLENECK</span></div>
+          <div class="stage-slider-wrap"><div class="stage-bar-bg"><div class="stage-bar-fill"></div>
+          <input type="range" class="stage-slider" min="1" max="100"></div><span class="stage-val"></span></div>
+          <button class="btn-del" title="Remove stage">✕</button>`;
+        row.querySelector('input').addEventListener('input', e => updateStage(s.id, e.target.value));
+        row.querySelector('button').addEventListener('click', () => delStage(s.id));
+        list.appendChild(row);
+      }
+      const color = s.val === minVal ? 'var(--crit)' : getColor(i);
+      row.className = 'stage-row' + (s.val === minVal ? ' is-bottleneck' : '');
+      row.querySelector('.stage-name').textContent = s.name;
+      row.querySelector('.stage-indicator').style.background = color;
+      row.querySelector('.stage-bar-fill').style.cssText = `width:${s.val}%;background:${color}`;
+      row.querySelector('input').value = s.val;
+      row.querySelector('input').setAttribute('aria-label', s.name + ' normalized capacity');
+      row.querySelector('button').setAttribute('aria-label', 'Remove ' + s.name);
+      row.querySelector('.stage-val').textContent = s.val;
+    });
+  }
+
+  function esc(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function updateStage(id, v) {
+    const s = stages.find(x => x.id === id);
+    if (s && Number.isFinite(+v)) { s.val = Math.min(100, Math.max(1, Math.round(+v))); renderSVG(); }
+  }
+
+  function delStage(id) {
+    stages = stages.filter(s => s.id !== id);
+    renderSVG();
+  }
+
+  function openForm() {
+    document.getElementById('add-form').classList.add('open');
+    document.getElementById('f-name').focus();
+  }
+
+  function closeForm() {
+    document.getElementById('add-form').classList.remove('open');
+  }
+
+  function addStage() {
+    const name = document.getElementById('f-name').value.trim();
+    const val = Math.min(100, Math.max(1, parseInt(document.getElementById('f-val').value) || 80));
+    if (!name) { document.getElementById('f-name').focus(); return; }
+    stages.push({ id: nid++, name, val });
+    document.getElementById('f-name').value = '';
+    document.getElementById('f-val').value = '80';
+    closeForm();
+    renderSVG();
+  }
+
+  document.getElementById('f-name').addEventListener('keydown', e => {
+    if (e.key === 'Enter') document.getElementById('f-val').focus();
+  });
+  document.getElementById('f-val').addEventListener('keydown', e => {
+    if (e.key === 'Enter') addStage();
+  });
+
+  // Close modal on backdrop click
+  document.getElementById('export-modal').addEventListener('click', function(e) {
+    if (e.target === this) this.hidden = true;
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') document.getElementById('export-modal').hidden = true;
+  });
+
+  function clearStages() {
+    if (!stages.length) return;
+    stages = [];
+    renderSVG();
+  }
+
+  function getCssVar(name) {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  }
+
+  function exportImage() {
+    // Resolve CSS variable values at this moment
+    const vars = {
+      'var(--bg-panel)':      getCssVar('--bg-panel'),
+      'var(--fg)':            getCssVar('--fg'),
+      'var(--fg-dim)':        getCssVar('--fg-dim'),
+      'var(--fg-muted)':      getCssVar('--fg-muted'),
+      'var(--border)':        getCssVar('--border'),
+      'var(--border-bright)': getCssVar('--border-bright'),
+      'var(--water)':         getCssVar('--water'),
+      'var(--crit)':          getCssVar('--crit'),
+      'var(--grid)':          getCssVar('--grid'),
+      'var(--accent)':        getCssVar('--accent'),
+      'var(--accent2)':       getCssVar('--accent2'),
+    };
+
+    const svgEl = document.getElementById('barrel-svg');
+    const vb = svgEl.getAttribute('viewBox').split(' ').map(Number);
+    const VW = vb[2], VH = vb[3];
+
+    const clone = svgEl.cloneNode(true);
+    // Must set explicit pixel dimensions on the root SVG element so it
+    // renders at the right size when loaded as a standalone image
+    clone.setAttribute('width', VW);
+    clone.setAttribute('height', VH);
+    clone.removeAttribute('style');
+
+    // Solid background rect (insert first)
+    const bgRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    bgRect.setAttribute('width', VW);
+    bgRect.setAttribute('height', VH);
+    bgRect.setAttribute('fill', vars['var(--bg-panel)']);
+    clone.insertBefore(bgRect, clone.firstChild);
+
+    let svgStr = new XMLSerializer().serializeToString(clone);
+
+    // Replace all CSS var() references with computed values
+    for (const [varRef, value] of Object.entries(vars)) {
+      // value may have leading/trailing spaces from getPropertyValue
+      svgStr = svgStr.split(varRef).join(value.trim() || '#888');
+    }
+    // Remove any remaining unresolved var() (safety net)
+    svgStr = svgStr.replace(/var\(--[^)]+\)/g, '#888');
+
+    // Encode as base64 data URI — works under file:// without canvas
+    try {
+      const b64 = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svgStr)));
+      document.getElementById('export-img').src = b64;
+      document.getElementById('export-download').href = b64;
+      document.getElementById('export-modal').hidden = false;
+    } catch(e) {
+      const url = URL.createObjectURL(new Blob([svgStr], { type: 'image/svg+xml' }));
+      document.getElementById('export-img').src = url;
+      document.getElementById('export-download').href = url;
+      document.getElementById('export-modal').hidden = false;
+    }
+  }
+
+  renderSVG();
+</script>
+<script src="../tool-shell.js"></script>
+<script>new MutationObserver(renderSVG).observe(document.documentElement, {attributes:true, attributeFilter:['data-article-lang']});</script>
+</body></html>

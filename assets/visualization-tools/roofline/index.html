@@ -1,0 +1,1215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Roofline Studio — GPU & Workload Arithmetic Intensity</title>
+<link rel="stylesheet" href="../vendor/katex-0.16.11/katex.min.css" crossorigin="anonymous">
+<script defer src="../vendor/katex-0.16.11/katex.min.js" crossorigin="anonymous"></script>
+<script src="../vendor/d3-7.9.0.min.js"></script>
+<style>
+  :root{
+    --bg:#0a0d13;
+    --bg-grad-1:#0d1119;
+    --panel:#11151e;
+    --panel-2:#151a25;
+    --line:rgba(255,255,255,.07);
+    --line-strong:rgba(255,255,255,.12);
+    --txt:#e7eaf0;
+    --txt-2:#99a2b2;
+    --txt-3:#646e80;
+    --accent:#5eead4;
+    --accent-dim:rgba(94,234,212,.14);
+    --danger:#fb7185;
+    --radius:12px;
+    --radius-sm:8px;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    font-family:var(--sans);
+    background:
+      radial-gradient(1200px 700px at 78% -8%, #14202b 0%, transparent 55%),
+      radial-gradient(900px 600px at 8% 108%, #15131f 0%, transparent 55%),
+      var(--bg);
+    color:var(--txt);
+    -webkit-font-smoothing:antialiased;
+    overflow:hidden;
+  }
+  ::selection{background:var(--accent-dim)}
+
+  .app{display:grid;grid-template-columns:380px 1fr;height:100vh;height:100dvh}
+
+  /* ---------- Sidebar ---------- */
+  .side{
+    background:linear-gradient(180deg,var(--bg-grad-1),var(--bg));
+    border-right:1px solid var(--line);
+    overflow-y:auto;
+    overflow-x:hidden;
+    padding:22px 20px 60px;
+    scrollbar-width:thin;
+    scrollbar-color:rgba(255,255,255,.14) transparent;
+  }
+  .side::-webkit-scrollbar{width:8px}
+  .side::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:8px}
+
+  .brand{display:flex;align-items:center;gap:11px;margin-bottom:4px}
+  .brand-mark{
+    width:30px;height:30px;border-radius:9px;flex:none;
+    background:conic-gradient(from 210deg at 50% 50%, #5eead4, #38bdf8, #818cf8, #5eead4);
+    box-shadow:0 0 0 1px rgba(255,255,255,.08), 0 6px 20px rgba(56,189,248,.18);
+    position:relative;
+  }
+  .brand-mark::after{
+    content:"";position:absolute;inset:6px;border-radius:4px;
+    background:var(--bg);
+    -webkit-mask:linear-gradient(45deg,transparent 46%,#000 46%,#000 54%,transparent 54%),
+                 linear-gradient(-45deg,transparent 46%,#000 46%,#000 54%,transparent 54%);
+  }
+  .brand h1{font-size:15.5px;font-weight:650;letter-spacing:-.01em}
+  .brand p{font-size:11px;color:var(--txt-3);margin-top:1px;font-family:var(--mono)}
+
+  .section{margin-top:26px}
+  .section-head{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:11px}
+  .section-head h2{font-size:12px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;color:var(--txt-2)}
+  .section-head .count{font-size:11px;color:var(--txt-3);font-family:var(--mono)}
+
+  .label{font-size:11px;color:var(--txt-2);margin-bottom:6px;display:block;font-weight:500}
+
+  /* preset chips */
+  .preset{
+    background:var(--panel);border:1px solid var(--line);border-radius:var(--radius-sm);
+    padding:10px 11px;margin-bottom:8px;transition:border-color .18s, background .18s;
+  }
+  .preset:hover{border-color:var(--line-strong)}
+  .preset-top{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px}
+  .preset-name{font-size:12.5px;font-weight:600;letter-spacing:-.005em}
+  .preset-meta{font-size:10.5px;color:var(--txt-3);font-family:var(--mono);white-space:nowrap}
+  .dtype-row{display:flex;flex-wrap:wrap;gap:5px}
+  .dtype-chip{
+    font-family:var(--mono);font-size:10.5px;padding:3px 8px;border-radius:6px;cursor:pointer;
+    background:var(--panel-2);border:1px solid var(--line-strong);color:var(--txt-2);
+    transition:all .15s;white-space:nowrap;
+  }
+  .dtype-chip:hover{color:var(--txt);border-color:var(--accent);background:var(--accent-dim)}
+  .dtype-chip b{color:var(--txt-3);font-weight:500;margin-left:3px}
+
+  /* active item rows */
+  .item-wrap{margin-bottom:7px}
+  .item{
+    display:flex;align-items:center;gap:8px;padding:9px 10px;border-radius:var(--radius-sm);
+    background:var(--panel);border:1px solid var(--line);
+    transition:border-color .15s, opacity .2s;
+  }
+  .item.off{opacity:.42}
+  .item.editing{border-color:var(--accent);border-bottom-left-radius:0;border-bottom-right-radius:0}
+  .item-edit{
+    background:var(--panel-2);border:1px solid var(--accent);border-top:none;
+    border-radius:0 0 var(--radius-sm) var(--radius-sm);padding:11px;
+  }
+  .edit-actions{display:flex;gap:7px;margin-top:11px}
+  .edit-actions .btn{margin-top:0;flex:1;padding:7px}
+  .item .swatch{width:13px;height:13px;border-radius:4px;flex:none;cursor:pointer;box-shadow:0 0 0 1px rgba(255,255,255,.12)}
+  .item .swatch.line{height:4px;border-radius:2px;width:15px}
+  .item .body{flex:1;min-width:0}
+  .item .name{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .item .sub{font-size:10.5px;color:var(--txt-3);font-family:var(--mono);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .item .sub .ai{color:var(--accent)}
+  .icon-btn{
+    background:transparent;border:none;cursor:pointer;color:var(--txt-3);
+    width:24px;height:24px;border-radius:6px;display:grid;place-items:center;flex:none;
+    transition:color .15s,background .15s;
+  }
+  .icon-btn:hover{color:var(--txt);background:rgba(255,255,255,.06)}
+  .icon-btn.del:hover{color:var(--danger);background:rgba(251,113,133,.1)}
+  .icon-btn svg{width:14px;height:14px}
+
+  .empty{font-size:11.5px;color:var(--txt-3);padding:10px 2px;line-height:1.5}
+
+  /* forms */
+  .form{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:13px;margin-top:10px}
+  .seg{display:flex;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;padding:3px;margin-bottom:12px;gap:3px}
+  .seg button{
+    flex:1;font-family:var(--sans);font-size:11px;font-weight:550;padding:6px 4px;border:none;border-radius:6px;
+    background:transparent;color:var(--txt-2);cursor:pointer;transition:all .15s;letter-spacing:-.01em;
+  }
+  .seg button.active{background:var(--accent);color:#05201b;font-weight:650}
+  .seg button:not(.active):hover{color:var(--txt)}
+
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+  .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:9px}
+  .field{display:flex;flex-direction:column}
+  .field label{font-size:10px;color:var(--txt-3);margin-bottom:4px;font-weight:550;letter-spacing:.02em;text-transform:uppercase}
+  input,select{
+    font-family:var(--mono);font-size:12px;background:var(--panel-2);border:1px solid var(--line-strong);
+    color:var(--txt);border-radius:7px;padding:7px 9px;width:100%;transition:border-color .15s, box-shadow .15s;
+  }
+  input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}
+  input::placeholder{color:var(--txt-3)}
+  select{cursor:pointer;appearance:none;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23646e80' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat:no-repeat;background-position:right 10px center;padding-right:26px}
+
+  .ai-preview{
+    margin-top:11px;padding:9px 11px;border-radius:8px;background:var(--panel-2);
+    border:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:8px;
+    font-family:var(--mono);font-size:11px;color:var(--txt-2);
+  }
+  .ai-preview .val{color:var(--accent);font-weight:600;font-size:13px}
+
+  .btn{
+    width:100%;margin-top:11px;font-family:var(--sans);font-size:12.5px;font-weight:600;
+    padding:9px;border:none;border-radius:8px;cursor:pointer;letter-spacing:-.01em;
+    background:var(--accent);color:#05201b;transition:transform .12s, filter .15s, box-shadow .15s;
+    box-shadow:0 4px 14px rgba(94,234,212,.16);
+  }
+  .btn:hover{filter:brightness(1.06)}
+  .btn:active{transform:translateY(1px)}
+  .btn.ghost{background:var(--panel-2);color:var(--txt);box-shadow:none;border:1px solid var(--line-strong)}
+  .btn.ghost:hover{border-color:var(--accent);color:var(--accent)}
+
+  .collapse-head{
+    display:flex;align-items:center;justify-content:space-between;cursor:pointer;
+    font-size:11.5px;font-weight:600;color:var(--txt-2);padding:9px 11px;border-radius:8px;
+    background:var(--panel);border:1px dashed var(--line-strong);margin-top:8px;transition:color .15s,border-color .15s;
+  }
+  .collapse-head:hover{color:var(--txt);border-color:var(--accent)}
+  .collapse-head .chev{transition:transform .2s;width:13px;height:13px}
+  .collapse-head.open .chev{transform:rotate(180deg)}
+  .collapse-body{display:none}
+  .collapse-body.open{display:block}
+
+  /* ---------- Chart area ---------- */
+  .main{position:relative;display:flex;flex-direction:column;min-width:0;overflow:hidden}
+  .topbar{
+    display:flex;align-items:flex-start;justify-content:space-between;gap:16px;
+    padding:20px 28px 14px;border-bottom:1px solid var(--line);
+  }
+  .topbar h2{font-size:17px;font-weight:650;letter-spacing:-.015em}
+  .topbar p{font-size:12px;color:var(--txt-3);margin-top:3px;max-width:62ch;line-height:1.5}
+  .toolbar{display:flex;gap:8px;flex:none}
+  .tool{
+    font-family:var(--sans);font-size:11.5px;font-weight:550;color:var(--txt-2);cursor:pointer;
+    background:var(--panel);border:1px solid var(--line-strong);border-radius:7px;padding:7px 11px;
+    display:flex;align-items:center;gap:6px;transition:all .15s;white-space:nowrap;
+  }
+  .tool:hover{color:var(--txt);border-color:var(--accent)}
+  .tool svg{width:13px;height:13px}
+  .tool.toggle{font-family:var(--mono);font-size:11px}
+  .tool.toggle.active{color:#05201b;background:var(--accent);border-color:var(--accent);font-weight:650}
+  .tool.toggle .dotind{width:6px;height:6px;border-radius:50%;background:currentColor;opacity:.45}
+  .tool.toggle.active .dotind{opacity:1}
+  .toolbar .divider{width:1px;align-self:stretch;background:var(--line-strong);margin:2px 2px}
+
+  .chart-wrap{flex:1;position:relative;min-height:0;padding:6px 14px 8px}
+  svg.chart{display:block;width:100%;height:100%;overflow:visible}
+
+  .grid-line{stroke:rgba(255,255,255,.05)}
+  .grid-line.minor{stroke:rgba(255,255,255,.025)}
+  .axis path,.axis line{stroke:var(--line-strong)}
+  .axis text{fill:var(--txt-3);font-size:11px;font-family:var(--mono)}
+  .axis-title{fill:var(--txt-2);font-size:12px;font-weight:600;font-family:var(--sans)}
+  .region-label{fill:var(--txt-3);font-size:10.5px;font-family:var(--mono);letter-spacing:.04em;opacity:.8}
+
+  .roofline path{fill:none;stroke-width:2.25;stroke-linejoin:round;stroke-linecap:round}
+  .roofline path.glow{stroke-width:7;opacity:.16;filter:blur(3px)}
+  .roof-label{font-size:11px;font-weight:600;font-family:var(--sans)}
+  .ridge{cursor:pointer}
+  .ridge-ring{fill:var(--bg);stroke-width:2}
+  .ridge-core{stroke:none}
+  .ridge-lbl{font-size:10px;font-family:var(--mono);font-weight:600;opacity:.9}
+
+  .wl-line{stroke-width:1.4;stroke-dasharray:5 5;opacity:.55}
+  .wl-toplabel{font-size:10.5px;font-weight:600;font-family:var(--mono)}
+  .wl-toplabel rect{rx:5}
+
+  .pt{cursor:pointer;transition:none}
+  .pt-core{stroke-width:2.4}
+  .pt-halo{fill-opacity:0;stroke-opacity:.0}
+
+  .dim{opacity:.12 !important;transition:opacity .15s}
+  .focus{opacity:1 !important}
+
+  /* tooltip */
+  .tip{
+    position:fixed;z-index:50;pointer-events:none;max-width:340px;
+    background:rgba(17,21,30,.97);border:1px solid var(--line-strong);
+    border-radius:12px;padding:13px 14px;
+    box-shadow:0 18px 50px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.03);
+    backdrop-filter:blur(8px);opacity:0;transform:translateY(4px);
+    transition:opacity .14s, transform .14s;
+  }
+  .tip.show{opacity:1;transform:translateY(0)}
+  .tip-head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+  .tip-head .dotpair{display:flex;flex:none}
+  .tip-head .d{width:11px;height:11px;border-radius:50%;box-shadow:0 0 0 2px var(--panel)}
+  .tip-head .d:last-child{margin-left:-4px}
+  .tip-title{font-size:12.5px;font-weight:650;letter-spacing:-.01em;line-height:1.25}
+  .tip-sub{font-size:10.5px;color:var(--txt-3);font-family:var(--mono);margin-top:1px}
+  .tip-stats{display:grid;grid-template-columns:auto 1fr;gap:3px 14px;margin-bottom:11px;font-size:11px}
+  .tip-stats dt{color:var(--txt-3);font-family:var(--mono)}
+  .tip-stats dd{color:var(--txt);font-family:var(--mono);text-align:right;font-weight:550}
+  .tip-stats dd.bound-mem{color:#fbbf24}
+  .tip-stats dd.bound-comp{color:#5eead4}
+  .tip-formula{border-top:1px solid var(--line);padding-top:10px}
+  .tip-formula .cap{font-size:10px;color:var(--txt-3);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;font-weight:600}
+  .tip-formula .katex{font-size:13px;color:var(--txt)}
+  .tip-formula .katex-display{margin:5px 0}
+  .tex-line{margin:3px 0}
+
+  .footnote{
+    position:absolute;bottom:8px;left:28px;right:28px;
+    font-size:10.5px;color:var(--txt-3);font-family:var(--mono);line-height:1.5;
+    display:flex;gap:18px;flex-wrap:wrap;pointer-events:none;
+  }
+  .footnote b{color:var(--txt-2);font-weight:600}
+
+  @media (max-width:980px){
+    body{overflow:auto}
+    .app{grid-template-columns:1fr;height:auto;min-height:100dvh}
+    .side{border-right:none;border-bottom:1px solid var(--line);max-height:none}
+    .main{min-height:80vh}
+    .chart-wrap{min-height:460px}
+    .footnote{position:static;padding:10px 28px 24px}
+  }
+  @media (prefers-reduced-motion:reduce){
+    *{transition:none !important}
+  }
+
+  /* Notes: adaptive embedding and a light palette without changing the chart model. */
+  :root[data-theme="light"] {
+    --bg:#fbfcfe; --bg-grad-1:#f6f8fb; --panel:#fff; --panel-2:#f2f5f9;
+    --line:#dce2ec; --line-strong:#b6c2d3; --txt:#172333; --txt-2:#42536a;
+    --txt-3:#5a6c82; --accent:#087e70; --accent-dim:rgba(8,126,112,.1); --danger:#b62943;
+    color-scheme:light;
+  }
+  :root[data-theme="dark"] { color-scheme:dark; }
+  body { background:var(--bg); }
+  .app { grid-template-columns:320px minmax(0,1fr); }
+  .embedded .app { height:840px; min-height:0; }
+  .topbar { flex-wrap:wrap; padding:18px 20px 12px; }
+  .toolbar { flex-wrap:wrap; }
+  .tip { max-width:calc(100vw - 16px); background:var(--panel); }
+  .tip-formula { overflow-x:auto; }
+  .footnote { position:static; padding:12px 20px; gap:6px 18px; }
+  .side { scrollbar-color:var(--line-strong) transparent; }
+  :root[data-theme="light"] .grid-line { stroke:rgba(40,60,90,.12); }
+  :root[data-theme="light"] .grid-line.minor { stroke:rgba(40,60,90,.06); }
+  :root[data-theme="light"] .btn,
+  :root[data-theme="light"] .seg button.active,
+  :root[data-theme="light"] .tool.toggle.active { color:#fff; }
+  :root[data-theme="light"] .btn.ghost { color:var(--txt-2); }
+  :root[data-theme="light"] .tip-stats dd.bound-mem { color:#956000; }
+  :root[data-theme="light"] .tip-stats dd.bound-comp { color:#087e70; }
+  button:focus-visible, select:focus-visible, .pt:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+  @media (min-width:821px) and (max-width:980px) {
+    body { overflow:hidden; }
+    .app { height:100dvh; }
+    .side { overflow-y:auto; border-right:1px solid var(--line); }
+    .main { min-height:0; }
+    .chart-wrap { min-height:0; }
+  }
+  @media (max-width:820px) {
+    body { overflow:auto; }
+    .app, .embedded .app { display:flex; flex-direction:column; height:auto; min-height:0; }
+    .main { order:-1; min-height:0; }
+    .chart-wrap { flex:none; height:430px; min-height:0; padding:0; }
+    .side { padding:20px 16px 28px; border-right:0; border-top:1px solid var(--line); }
+    .topbar { padding:16px; }
+    .footnote { padding:10px 16px; }
+    .tool { padding:7px 9px; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- ============ SIDEBAR ============ -->
+  <aside class="side">
+    <div class="brand">
+      <div class="brand-mark"></div>
+      <div>
+        <h1>Roofline Studio</h1>
+        <p>arithmetic-intensity analysis</p>
+      </div>
+    </div>
+
+    <!-- Hardware -->
+    <div class="section">
+      <div class="section-head">
+        <h2>Hardware Rooflines</h2>
+        <span class="count" id="hw-count">0</span>
+      </div>
+      <div id="hw-list"></div>
+
+      <label class="label" style="margin-top:14px">Preset library</label>
+      <select id="preset-select">
+        <option value="">Choose a GPU…</option>
+      </select>
+      <div id="preset-detail"></div>
+
+      <div class="collapse-head" id="hw-custom-toggle">
+        <span>＋ Add custom hardware</span>
+        <svg class="chev" viewBox="0 0 14 14" fill="none"><path d="M3 5l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </div>
+      <div class="collapse-body form" id="hw-custom" style="border-top-left-radius:0;border-top-right-radius:0;margin-top:-1px">
+        <div class="field" style="margin-bottom:9px">
+          <label>Name</label>
+          <input id="hw-name" placeholder="My GPU" value="Custom GPU">
+        </div>
+        <div class="grid3">
+          <div class="field"><label>Precision</label><input id="hw-dtype" value="FP16"></div>
+          <div class="field"><label>Peak TFLOP/s</label><input id="hw-peak" type="number" value="990" min="0"></div>
+          <div class="field"><label>BW GB/s</label><input id="hw-bw" type="number" value="3350" min="0"></div>
+        </div>
+        <button class="btn" id="hw-add">Add roofline</button>
+      </div>
+    </div>
+
+    <!-- Workloads -->
+    <div class="section">
+      <div class="section-head">
+        <h2>Workloads</h2>
+        <span class="count" id="wl-count">0</span>
+      </div>
+      <div id="wl-list"></div>
+
+      <div class="form">
+        <div class="seg" id="wl-seg">
+          <button data-type="gemm" class="active">GEMM</button>
+          <button data-type="bgemm">Batched</button>
+          <button data-type="attention">Attention</button>
+        </div>
+        <div class="field" style="margin-bottom:10px">
+          <label>Name (optional)</label>
+          <input id="wl-name" placeholder="auto · e.g. MM-1">
+        </div>
+        <div id="wl-params"></div>
+        <div class="field" style="margin-top:9px">
+          <label>Element precision</label>
+          <select id="wl-dtype">
+            <option value="FP4">FP4 — 0.5 B/elem</option>
+            <option value="FP8">FP8 — 1 B/elem</option>
+            <option value="FP16" selected>FP16 — 2 B/elem</option>
+            <option value="BF16">BF16 — 2 B/elem</option>
+            <option value="FP32">FP32 — 4 B/elem</option>
+          </select>
+        </div>
+        <div class="ai-preview">
+          <span>Arithmetic intensity</span>
+          <span><span class="val" id="wl-ai-prev">—</span> FLOP/B</span>
+        </div>
+        <button class="btn" id="wl-add">Add workload</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ============ CHART ============ -->
+  <main class="main">
+    <div class="topbar">
+      <div>
+        <h2>GPU Roofline</h2>
+        <p>Each GPU is a roofline (memory-bound ramp into a compute-bound ceiling). Each workload drops a vertical line at its arithmetic intensity. Hover an intersection for the attainable-performance breakdown.</p>
+      </div>
+      <div class="toolbar">
+        <button class="tool toggle" id="tg-xlog" title="Toggle X-axis log scale"><span class="dotind"></span>X log</button>
+        <button class="tool toggle" id="tg-ylog" title="Toggle Y-axis log scale"><span class="dotind"></span>Y log</button>
+        <span class="divider"></span>
+        <button class="tool" id="btn-fit" title="Auto-fit axes to data">
+          <svg viewBox="0 0 16 16" fill="none"><path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          Fit
+        </button>
+        <button class="tool" id="btn-reset" title="Reset to defaults">
+          <svg viewBox="0 0 16 16" fill="none"><path d="M13 8a5 5 0 1 1-1.46-3.54M13 2v3h-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Reset
+        </button>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <svg class="chart" id="chart"></svg>
+    </div>
+    <div class="footnote">
+      <span><b>Peak</b> = selected compute path / precision (no sparsity).</span>
+      <span><b>GEMM bytes</b> = read A,B + write C.</span>
+      <span><b>Attention</b> = FlashAttention-style ideal HBM traffic (Q,K,V,O).</span>
+    </div>
+  </main>
+</div>
+<div class="tip" id="tip"></div>
+
+<script>
+// ============================================================
+//  Data & constants
+// ============================================================
+const DTYPE_BYTES = {FP4:0.5, FP8:1, FP16:2, BF16:2, TF32:4, FP32:4, FP64:8};
+
+// Reference compute peaks (no sparsity) in TFLOP/s, HBM bandwidth in GB/s.
+// Compute paths differ by dtype; low-precision tensor and FP32/FP64 peaks must not be conflated.
+// Sources: NVIDIA H100/H200/A100/V100 datasheets, NVIDIA HGX B200 datasheet, AMD MI300X datasheet.
+const PRESETS = [
+  {name:"NVIDIA V100 SXM2", arch:"Volta",     bw:900,  dtypes:{FP64:7.8, FP32:15.7, FP16:125}},
+  {name:"NVIDIA A100 SXM",  arch:"Ampere",    bw:2039, dtypes:{FP64:19.5, TF32:156, BF16:312, FP16:312}},
+  {name:"NVIDIA H100 SXM",  arch:"Hopper",    bw:3350, dtypes:{FP64:67, TF32:495, BF16:990, FP16:990, FP8:1979}},
+  {name:"NVIDIA H200 SXM",  arch:"Hopper",    bw:4800, dtypes:{FP64:67, TF32:495, BF16:990, FP16:990, FP8:1979}},
+  {name:"NVIDIA B200",      arch:"Blackwell", bw:8000, dtypes:{BF16:2250, FP16:2250, FP8:4500, FP4:9000}},
+  {name:"AMD MI300X",       arch:"CDNA 3",    bw:5300, dtypes:{BF16:1307, FP16:1307, FP8:2615}},
+];
+
+const HW_COLORS = ["#38bdf8","#818cf8","#34d399","#22d3ee","#a78bfa","#60a5fa","#2dd4bf","#4ade80","#7dd3fc"];
+const WL_COLORS = ["#fbbf24","#fb7185","#f472b6","#fdba74","#facc15","#f9a8d4","#fca5a5"];
+
+const WL_DEFS = {
+  gemm:      {label:"GEMM",         fields:[["M",4096],["N",4096],["K",4096]]},
+  bgemm:     {label:"Batched GEMM", fields:[["B",16],["M",1024],["N",1024],["K",1024]]},
+  attention: {label:"Attention",    fields:[["B",8],["H",32],["d",128],["s",4096]]},
+};
+
+let hardware = [];
+let workloads = [];
+let hwSeq = 0, wlSeq = 0, hwColorI = 0, wlColorI = 0;
+let editingHwId = null, editingWlId = null;
+let xLog = false, yLog = false; // default: linear axes
+let userDomain = null; // {x:[..], y:[..]} when user has not changed; null => autofit
+
+// ============================================================
+//  Persistence
+// ============================================================
+const STORE = "notes-roofline-studio-v1";
+function save(){
+  try{ localStorage.setItem(STORE, JSON.stringify({hardware, workloads, xLog, yLog})); }catch(e){}
+}
+function load(){
+  try{
+    const s = JSON.parse(localStorage.getItem(STORE));
+    if(s && s.hardware && s.workloads && (s.hardware.length || s.workloads.length)){
+      hardware = s.hardware; workloads = s.workloads;
+      hwSeq = Math.max(0,...hardware.map(h=>+String(h.id).replace(/\D/g,'')||0));
+      wlSeq = Math.max(0,...workloads.map(w=>+String(w.id).replace(/\D/g,'')||0));
+      hwColorI = hardware.length; wlColorI = workloads.length;
+      xLog = !!s.xLog; yLog = !!s.yLog;
+      return true;
+    }
+  }catch(e){}
+  return false;
+}
+
+// ============================================================
+//  Math
+// ============================================================
+function workloadAI(w){
+  const b = DTYPE_BYTES[w.dtype] ?? 2;
+  const p = w.params;
+  let flops, bytes;
+  if(w.type==="gemm"){
+    flops = 2*p.M*p.N*p.K;
+    bytes = (p.M*p.K + p.K*p.N + p.M*p.N)*b;
+  }else if(w.type==="bgemm"){
+    flops = 2*p.B*p.M*p.N*p.K;
+    bytes = p.B*(p.M*p.K + p.K*p.N + p.M*p.N)*b;
+  }else{ // attention (flash, non-causal)
+    flops = 4*p.B*p.H*p.s*p.s*p.d;
+    bytes = 4*p.B*p.H*p.s*p.d*b;
+  }
+  return {flops, bytes, ai: flops/bytes, b};
+}
+const ridgeAI = h => h.peak / (h.bw/1000);          // FLOP/Byte
+const attainable = (h,ai) => Math.min(h.peak, (h.bw/1000)*ai);  // TFLOP/s
+
+// ============================================================
+//  Formatting
+// ============================================================
+const fmtAI = v => v>=100 ? Math.round(v).toLocaleString() : v>=10 ? v.toFixed(1) : v.toFixed(2);
+const fmtPerf = v => v>=1000 ? (v/1000).toFixed(2)+" PFLOP/s" : v.toFixed(0)+" TFLOP/s";
+const fmtBig = v => {
+  if(v===0) return "0";
+  const e = Math.floor(Math.log10(v));
+  if(e<3) return (Math.round(v*100)/100).toLocaleString();
+  const m = v/Math.pow(10,e);
+  return `${(Math.round(m*100)/100)}\\times10^{${e}}`;
+};
+const niceCeil = x => { const e=Math.floor(Math.log10(x)), f=x/10**e; const m=f<=1?1:f<=2?2:f<=5?5:10; return m*10**e; };
+const niceFloor = x => { const e=Math.floor(Math.log10(x)), f=x/10**e; const m=f>=5?5:f>=2?2:1; return m*10**e; };
+
+// ============================================================
+//  Chart setup
+// ============================================================
+const svg = d3.select("#chart");
+const M = {top:26, right:34, bottom:54, left:70};
+let W=0, H=0;
+
+const gGrid   = svg.append("g").attr("class","grid");
+const gRegion = svg.append("g");
+const gRoof   = svg.append("g");
+const gRidge  = svg.append("g");
+const gWL     = svg.append("g");
+const gPts    = svg.append("g");
+const gXAxis  = svg.append("g").attr("class","axis");
+const gYAxis  = svg.append("g").attr("class","axis");
+const gLabels = svg.append("g");
+
+// clip
+const clip = svg.append("defs").append("clipPath").attr("id","plot-clip").append("rect");
+[gGrid,gRegion,gRoof,gRidge,gWL,gPts].forEach(g=>g.attr("clip-path","url(#plot-clip)"));
+
+let x = d3.scaleLinear(), y = d3.scaleLinear();
+const line = d3.line().x(d=>x(d[0])).y(d=>y(d[1]));
+const reduced = window.matchMedia("(prefers-reduced-motion:reduce)").matches;
+const DUR = reduced ? 0 : 480;
+
+function computeDomain(){
+  if(userDomain) return userDomain;
+  const vh = hardware.filter(h=>h.visible), vw = workloads.filter(w=>w.visible);
+  const ridges = vh.map(ridgeAI);
+  const ais = vw.map(w=>workloadAI(w).ai);
+  const peaks = vh.map(h=>h.peak);
+  const xs = [...ridges, ...ais].filter(v=>v>0 && isFinite(v));
+  let xd, yd;
+  if(xs.length){
+    const mn = Math.min(...xs), mx = Math.max(...xs, 10);
+    xd = xLog ? [niceFloor(Math.max(0.5, mn/8)), niceCeil(mx*4)] : [0, mx*1.06];
+  } else xd = xLog ? [1,10000] : [0,10000];
+  if(peaks.length){
+    const mp = Math.max(...peaks);
+    yd = yLog ? [niceFloor(Math.max(mp/3000,1)), niceCeil(mp*1.8)] : [0, mp*1.08];
+  } else yd = yLog ? [1,10000] : [0,10000];
+  return {x:xd, y:yd};
+}
+function gridValues(scale, isLog, dom, count=8){
+  if(isLog) return logGridValues(dom);
+  return scale.ticks(count).map(v=>({v, major:true}));
+}
+
+function logGridValues(d){
+  const out=[]; let e=Math.floor(Math.log10(d[0]));
+  for(; Math.pow(10,e)<=d[1]*1.0001; e++){
+    for(const m of [1,2,3,4,5,6,7,8,9]){
+      const v=m*Math.pow(10,e);
+      if(v>=d[0]*0.999 && v<=d[1]*1.001) out.push({v, major:m===1});
+    }
+  }
+  return out;
+}
+
+function render(){
+  document.getElementById("hw-count").textContent = hardware.length;
+  document.getElementById("wl-count").textContent = workloads.length;
+
+  const wrap = document.querySelector(".chart-wrap");
+  W = wrap.clientWidth; H = wrap.clientHeight;
+  if(W<=0||H<=0) return;
+  svg.attr("viewBox",`0 0 ${W} ${H}`);
+  const iw = W-M.left-M.right, ih = H-M.top-M.bottom;
+  clip.attr("x",M.left).attr("y",M.top).attr("width",iw).attr("height",ih);
+
+  const dom = computeDomain();
+  x = (xLog ? d3.scaleLog() : d3.scaleLinear()).domain(dom.x).range([M.left, M.left+iw]).clamp(false);
+  if(!xLog) x.nice(8);
+  y = (yLog ? d3.scaleLog() : d3.scaleLinear()).domain(dom.y).range([M.top+ih, M.top]).clamp(false);
+  if(!yLog) y.nice(7);
+  const xdom = x.domain(), ydom = y.domain();
+
+  // ---- grid ----
+  const xg = gridValues(x, xLog, xdom, Math.max(3, Math.floor(iw / 65)));
+  const yg = gridValues(y, yLog, ydom);
+  const gx = gGrid.selectAll(".gx").data(xg, d=>"x"+d.v);
+  gx.join(
+    e=>e.append("line").attr("class",d=>"gx grid-line"+(d.major?"":" minor"))
+        .attr("y1",M.top).attr("y2",M.top+ih).attr("x1",d=>x(d.v)).attr("x2",d=>x(d.v)).style("opacity",0)
+        .call(s=>s.transition().duration(DUR).style("opacity",1)),
+    u=>u.call(s=>s.transition().duration(DUR).attr("x1",d=>x(d.v)).attr("x2",d=>x(d.v))),
+    ex=>ex.remove()
+  );
+  const gy = gGrid.selectAll(".gy").data(yg, d=>"y"+d.v);
+  gy.join(
+    e=>e.append("line").attr("class",d=>"gy grid-line"+(d.major?"":" minor"))
+        .attr("x1",M.left).attr("x2",M.left+iw).attr("y1",d=>y(d.v)).attr("y2",d=>y(d.v)).style("opacity",0)
+        .call(s=>s.transition().duration(DUR).style("opacity",1)),
+    u=>u.call(s=>s.transition().duration(DUR).attr("y1",d=>y(d.v)).attr("y2",d=>y(d.v))),
+    ex=>ex.remove()
+  );
+
+  // ---- axes ----
+  const xt = xg.filter(d=>d.major).map(d=>d.v), yt = yg.filter(d=>d.major).map(d=>d.v);
+  gXAxis.attr("transform",`translate(0,${M.top+ih})`).transition().duration(DUR)
+    .call(d3.axisBottom(x).tickValues(xt).tickFormat(d3.format("~s")).tickSize(6));
+  gYAxis.attr("transform",`translate(${M.left},0)`).transition().duration(DUR)
+    .call(d3.axisLeft(y).tickValues(yt).tickFormat(d3.format("~s")).tickSize(6));
+
+  // axis titles
+  gLabels.selectAll(".axis-title").data([0]).join("text")
+    .attr("class","axis-title").attr("text-anchor","middle")
+    .attr("x",M.left+iw/2).attr("y",H-12).text("Arithmetic Intensity  (FLOP / Byte)");
+  gLabels.selectAll(".axis-title-y").data([0]).join("text")
+    .attr("class","axis-title axis-title-y").attr("text-anchor","middle")
+    .attr("transform",`translate(16,${M.top+ih/2}) rotate(-90)`).text("Performance  (TFLOP / s)");
+
+  drawRooflines(iw,ih);
+  drawWorkloads(iw,ih);
+  drawPoints();
+}
+
+function rooflinePts(h, dom){
+  const bw = h.bw/1000, r = ridgeAI(h);
+  const [x0,x1] = dom.x, ymin = dom.y[0];
+  const memEnd = Math.min(r, x1);
+  const pts = [];
+  const clampY = v => Math.max(Math.min(h.peak, v), ymin);
+  if(memEnd > x0){
+    // sample the memory-bound ramp so it renders correctly on linear OR log axes
+    const N = 64, lo = xLog ? Math.max(x0, 1e-9) : x0;
+    for(let i=0;i<=N;i++){
+      const ai = xLog ? lo*Math.pow(memEnd/lo, i/N) : x0 + (memEnd-x0)*i/N;
+      pts.push([ai, clampY(bw*ai)]);
+    }
+  } else {
+    pts.push([x0, clampY(h.peak)]); // ridge is left of view: entirely compute-bound
+  }
+  if(r < x1) pts.push([x1, clampY(h.peak)]); // compute-bound ceiling
+  return pts;
+}
+
+function drawRooflines(iw,ih){
+  const dom = {x:x.domain(), y:y.domain()};
+  const data = hardware.filter(h=>h.visible);
+
+  const sel = gRoof.selectAll(".roofline").data(data, d=>d.id);
+  const ent = sel.enter().append("g").attr("class","roofline")
+      .on("mouseenter",(e,d)=>{ highlight("hw",d.id); showHwTip(e,d); })
+      .on("mousemove",(e)=>moveTip(e))
+      .on("mouseleave",()=>{ clearHighlight(); hideTip(); });
+  ent.append("path").attr("class","glow");
+  ent.append("path").attr("class","core");
+  ent.append("path").attr("class","hit").attr("fill","none").attr("stroke","transparent")
+     .attr("stroke-width",18).style("pointer-events","stroke").style("cursor","pointer");
+  ent.append("text").attr("class","roof-label");
+  const all = ent.merge(sel);
+  all.select(".hit").attr("d",d=>line(rooflinePts(d,dom)));
+  all.select(".glow").attr("stroke",d=>d.color)
+     .transition().duration(DUR).attr("d",d=>line(rooflinePts(d,dom)));
+  all.select(".core").attr("stroke",d=>d.color)
+     .transition().duration(DUR).attr("d",d=>line(rooflinePts(d,dom)));
+  all.select(".roof-label")
+     .attr("fill",d=>d.color)
+     .attr("text-anchor","end")
+     .attr("x",M.left+iw-6)
+     .text(d=>`${d.shortName} · ${d.dtype}`)
+     .transition().duration(DUR)
+     .attr("y",(d,i)=>{ const yy=y(Math.min(d.peak, (d.bw/1000)*dom.x[1])); return yy-7; });
+  sel.exit().each(function(){ d3.select(this).select(".core").transition().duration(DUR/1.5).attr("opacity",0); })
+     .transition().duration(DUR/1.5).style("opacity",0).remove();
+
+  // ridge points (knee of the roofline: x = peak / bandwidth = AI*, y = peak)
+  const rdata = data.filter(h=>{const r=ridgeAI(h);return r>=dom.x[0]&&r<=dom.x[1]&&h.peak>=dom.y[0]&&h.peak<=dom.y[1];});
+  const rsel = gRidge.selectAll(".ridge").data(rdata, d=>d.id);
+  const rent = rsel.enter().append("g").attr("class","ridge")
+      .on("mouseenter",(e,d)=>{ highlight("hw",d.id); showHwTip(e,d); })
+      .on("mousemove",(e)=>moveTip(e))
+      .on("mouseleave",()=>{ clearHighlight(); hideTip(); });
+  rent.append("circle").attr("class","ridge-ring").attr("r",0);
+  rent.append("circle").attr("class","ridge-core").attr("r",0);
+  rent.append("text").attr("class","ridge-lbl");
+  const rall = rent.merge(rsel);
+  rall.select(".ridge-ring").attr("stroke",d=>d.color)
+      .transition().duration(DUR).attr("cx",d=>x(ridgeAI(d))).attr("cy",d=>y(d.peak)).attr("r",6);
+  rall.select(".ridge-core").attr("fill",d=>d.color)
+      .transition().duration(DUR).attr("cx",d=>x(ridgeAI(d))).attr("cy",d=>y(d.peak)).attr("r",2.2);
+  rall.select(".ridge-lbl").attr("fill",d=>d.color).attr("text-anchor","start")
+      .text(d=>`AI*=${fmtAI(ridgeAI(d))}`)
+      .transition().duration(DUR).attr("x",d=>x(ridgeAI(d))+10).attr("y",d=>y(d.peak)-9);
+  rsel.exit().remove();
+}
+
+function drawWorkloads(iw,ih){
+  const dom = {x:x.domain(), y:y.domain()};
+  const data = workloads.filter(w=>w.visible).map(w=>({...w, ai:workloadAI(w).ai}))
+                        .filter(w=>w.ai>=dom.x[0] && w.ai<=dom.x[1]);
+
+  const sel = gWL.selectAll(".wl-grp").data(data, d=>d.id);
+  const ent = sel.enter().append("g").attr("class","wl-grp")
+      .on("mouseenter",(e,d)=>highlight("wl",d.id))
+      .on("mouseleave",clearHighlight);
+  ent.append("line").attr("class","wl-line");
+  const lbl = ent.append("g").attr("class","wl-toplabel");
+  lbl.append("rect"); lbl.append("text");
+  const all = ent.merge(sel);
+
+  all.select(".wl-line").attr("stroke",d=>d.color)
+     .transition().duration(DUR)
+     .attr("x1",d=>x(d.ai)).attr("x2",d=>x(d.ai)).attr("y1",M.top+ih).attr("y2",M.top+14);
+
+  all.select(".wl-toplabel").each(function(d,i){
+    const g=d3.select(this);
+    const t=g.select("text").attr("fill","#06121a").attr("font-weight",650)
+        .attr("text-anchor","middle").attr("dy","0.34em").text(d.shortName);
+    const tn=t.node(); const bb=tn.getBBox();
+    g.select("rect").attr("fill",d.color).attr("x",bb.x-6).attr("y",bb.y-3)
+        .attr("width",bb.width+12).attr("height",bb.height+6).attr("rx",5);
+  });
+  all.select(".wl-toplabel").transition().duration(DUR)
+     .attr("transform",function(d){
+       const half = this.querySelector("rect").getBBox().width / 2;
+       const center = Math.max(M.left + half, Math.min(M.left + iw - half, x(d.ai)));
+       return `translate(${center},${M.top+7})`;
+     });
+
+  sel.exit().transition().duration(DUR/1.5).style("opacity",0).remove();
+}
+
+function drawPoints(){
+  const dom = {x:x.domain(), y:y.domain()};
+  const pairs=[];
+  for(const w of workloads.filter(w=>w.visible)){
+    const m = workloadAI(w);
+    if(m.ai<dom.x[0]||m.ai>dom.x[1]) continue;
+    for(const h of hardware.filter(h=>h.visible)){
+      const perf = attainable(h, m.ai);
+      if(perf<dom.y[0]||perf>dom.y[1]) continue;
+      pairs.push({key:w.id+"~"+h.id, w, h, ai:m.ai, perf});
+    }
+  }
+  const sel = gPts.selectAll(".pt").data(pairs, d=>d.key);
+  const ent = sel.enter().append("g").attr("class","pt")
+      .attr("data-hw",d=>d.h.id).attr("data-wl",d=>d.w.id);
+  ent.append("circle").attr("class","pt-halo").attr("r",12);
+  ent.append("circle").attr("class","pt-core").attr("r",0);
+  const all = ent.merge(sel);
+  all.attr("data-hw",d=>d.h.id).attr("data-wl",d=>d.w.id);
+  all.select(".pt-core")
+     .attr("fill",d=>d.h.color).attr("stroke",d=>d.w.color)
+     .transition().duration(DUR)
+     .attr("cx",d=>x(d.ai)).attr("cy",d=>y(d.perf)).attr("r",6);
+  all.select(".pt-halo")
+     .attr("cx",d=>x(d.ai)).attr("cy",d=>y(d.perf));
+  all.on("mouseenter",function(e,d){ showTip(e,d); d3.select(this).select(".pt-core").attr("r",8); highlightPair(d); })
+     .on("mousemove",moveTip)
+     .on("mouseleave",function(){ hideTip(); d3.select(this).select(".pt-core").attr("r",6); clearHighlight(); });
+  // Keyboard and touch access to the same detail shown on hover.
+  all.attr("tabindex", 0).attr("role", "button")
+     .attr("aria-label", d => `${d.w.shortName} on ${d.h.shortName}: ${fmtPerf(d.perf)}`)
+     .on("focus", function(e,d) { const r=this.getBoundingClientRect(); showTip({clientX:r.x,clientY:r.y},d); })
+     .on("blur", hideTip)
+     .on("click", function(e,d) { showTip(e,d); })
+     .on("keydown", function(e,d) {
+       if(e.key === "Escape") hideTip();
+       if(e.key === "Enter" || e.key === " ") { e.preventDefault(); const r=this.getBoundingClientRect(); showTip({clientX:r.x,clientY:r.y},d); }
+     });
+  sel.exit().transition().duration(DUR/1.5).style("opacity",0).remove();
+}
+
+// ============================================================
+//  Highlight
+// ============================================================
+function highlight(kind,id){
+  gRoof.selectAll(".roofline").classed("dim",d=> kind==="hw" ? d.id!==id : true).classed("focus",d=> kind==="hw" && d.id===id);
+  gRidge.selectAll(".ridge").classed("dim",d=> kind==="hw" ? d.id!==id : true);
+  gWL.selectAll(".wl-grp").classed("dim",d=> kind==="wl" ? d.id!==id : true).classed("focus",d=> kind==="wl" && d.id===id);
+  gPts.selectAll(".pt").classed("dim",function(){
+    const hw=this.getAttribute("data-hw"), wl=this.getAttribute("data-wl");
+    return kind==="hw" ? hw!==id : wl!==id;
+  });
+}
+function highlightPair(d){
+  gPts.selectAll(".pt").classed("dim",p=>p.key!==d.key);
+  gRoof.selectAll(".roofline").classed("dim",h=>h.id!==d.h.id);
+  gRidge.selectAll(".ridge").classed("dim",h=>h.id!==d.h.id);
+  gWL.selectAll(".wl-grp").classed("dim",w=>w.id!==d.w.id);
+}
+function clearHighlight(){
+  gRoof.selectAll(".roofline").classed("dim",false).classed("focus",false);
+  gRidge.selectAll(".ridge").classed("dim",false);
+  gWL.selectAll(".wl-grp").classed("dim",false).classed("focus",false);
+  gPts.selectAll(".pt").classed("dim",false);
+}
+
+// ============================================================
+//  Tooltip (KaTeX)
+// ============================================================
+const tip = document.getElementById("tip");
+function tex(s,display){ try{ return katex.renderToString(s,{throwOnError:false,displayMode:!!display}); }catch(e){ return s; } }
+
+function formulaFor(w){
+  const m = workloadAI(w), p = w.params, b = m.b;
+  const bs = b===0.5?"0.5":String(b);
+  const L=[];
+  if(w.type==="gemm"){
+    L.push(`\\text{FLOPs}=2MNK=${fmtBig(m.flops)}`);
+    L.push(`\\text{Bytes}=(MK{+}KN{+}MN)\\,b=${fmtBig(m.bytes)}`);
+    L.push(`\\text{AI}=\\dfrac{2MNK}{(MK{+}KN{+}MN)\\,b}=${fmtAI(m.ai)}`);
+  }else if(w.type==="bgemm"){
+    L.push(`\\text{FLOPs}=2BMNK=${fmtBig(m.flops)}`);
+    L.push(`\\text{Bytes}=B(MK{+}KN{+}MN)\\,b=${fmtBig(m.bytes)}`);
+    L.push(`\\text{AI}=\\dfrac{2MNK}{(MK{+}KN{+}MN)\\,b}=${fmtAI(m.ai)}`);
+  }else{
+    L.push(`\\text{FLOPs}=4\\,B\\,H\\,s^2 d=${fmtBig(m.flops)}`);
+    L.push(`\\text{Bytes}=4\\,B\\,H\\,s\\,d\\,b=${fmtBig(m.bytes)}`);
+    L.push(`\\text{AI}=\\dfrac{4BHs^2d}{4BHsd\\,b}=\\dfrac{s}{b}=\\dfrac{${p.s}}{${bs}}=${fmtAI(m.ai)}`);
+  }
+  return L.map(s=>`<div class="tex-line">${tex(s,true)}</div>`).join("");
+}
+function paramStr(w){
+  const p=w.params;
+  if(w.type==="gemm") return `M=${p.M}, N=${p.N}, K=${p.K}`;
+  if(w.type==="bgemm") return `B=${p.B}, M=${p.M}, N=${p.N}, K=${p.K}`;
+  return `B=${p.B}, H=${p.H}, d=${p.d}, s=${p.s}`;
+}
+
+function showTip(e,d){
+  const m = workloadAI(d.w);
+  const r = ridgeAI(d.h);
+  const memBound = m.ai < r;
+  const boundTxt = memBound ? "Memory-bound" : "Compute-bound";
+  const boundCls = memBound ? "bound-mem" : "bound-comp";
+  const eff = (d.perf/d.h.peak*100);
+
+  tip.innerHTML = `
+    <div class="tip-head">
+      <div class="dotpair"><span class="d" style="background:${d.h.color}"></span><span class="d" style="background:${d.w.color}"></span></div>
+      <div>
+        <div class="tip-title">${esc(d.w.shortName)} on ${esc(d.h.shortName)}</div>
+        <div class="tip-sub">${WL_DEFS[d.w.type].label} · ${esc(d.w.dtype)} &nbsp;|&nbsp; ${esc(d.h.dtype)} @ ${d.h.bw} GB/s</div>
+      </div>
+    </div>
+    <dl class="tip-stats">
+      <dt>Params</dt><dd>${paramStr(d.w)}</dd>
+      <dt>Intensity</dt><dd>${fmtAI(m.ai)} FLOP/B</dd>
+      <dt>Ridge point</dt><dd>${fmtAI(r)} FLOP/B</dd>
+      <dt>Peak</dt><dd>${fmtPerf(d.h.peak)}</dd>
+      <dt>Attainable</dt><dd>${fmtPerf(d.perf)}</dd>
+      <dt>Regime</dt><dd class="${boundCls}">${boundTxt} · ${eff.toFixed(0)}% peak</dd>
+    </dl>
+    <div class="tip-formula">
+      <div class="cap">Arithmetic intensity</div>
+      ${formulaFor(d.w)}
+      <div class="cap" style="margin-top:8px">Attainable performance</div>
+      <div class="tex-line">${tex(`P=\\min\\!\\left(${Math.round(d.h.peak)},\\; \\tfrac{${d.h.bw}}{1000}\\times ${fmtAI(m.ai)}\\right)=${d.perf>=1000?(d.perf/1000).toFixed(2)+"\\,\\text{PFLOP/s}":Math.round(d.perf)+"\\,\\text{TFLOP/s}"}`,true)}</div>
+    </div>`;
+  tip.classList.add("show");
+  moveTip(e);
+}
+function showHwTip(e,d){
+  const r = ridgeAI(d), tbs = d.bw/1000;
+  tip.innerHTML = `
+    <div class="tip-head">
+      <div class="dotpair"><span class="d" style="background:${d.color}"></span></div>
+      <div>
+        <div class="tip-title">${esc(d.name)}</div>
+        <div class="tip-sub">${esc(d.dtype)} roofline</div>
+      </div>
+    </div>
+    <dl class="tip-stats">
+      <dt>Peak compute</dt><dd>${fmtPerf(d.peak)}</dd>
+      <dt>HBM bandwidth</dt><dd>${d.bw} GB/s · ${tbs.toFixed(2)} TB/s</dd>
+      <dt>Ridge point</dt><dd>${fmtAI(r)} FLOP/B</dd>
+    </dl>
+    <div class="tip-formula">
+      <div class="cap">Ridge point (memory ↔ compute)</div>
+      <div class="tex-line">${tex(`\\text{AI}^{*}=\\dfrac{P_{\\text{peak}}}{\\text{BW}}=\\dfrac{${Math.round(d.peak)}\\,\\text{TFLOP/s}}{${tbs.toFixed(2)}\\,\\text{TB/s}}=${fmtAI(r)}\\,\\text{FLOP/B}`,true)}</div>
+    </div>`;
+  tip.classList.add("show");
+  moveTip(e);
+}
+function moveTip(e){
+  const pad=16, w=tip.offsetWidth, h=tip.offsetHeight;
+  let lx=e.clientX+pad, ly=e.clientY+pad;
+  if(lx+w>window.innerWidth-8) lx=e.clientX-w-pad;
+  lx=Math.max(8, lx);
+  if(ly+h>window.innerHeight-8) ly=window.innerHeight-h-8;
+  if(ly<8) ly=8;
+  tip.style.left=lx+"px"; tip.style.top=ly+"px";
+}
+function hideTip(){ tip.classList.remove("show"); }
+
+// ============================================================
+//  Sidebar rendering
+// ============================================================
+const ICON_EYE = `<svg viewBox="0 0 16 16" fill="none"><path d="M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8Z" stroke="currentColor" stroke-width="1.4"/><circle cx="8" cy="8" r="1.8" stroke="currentColor" stroke-width="1.4"/></svg>`;
+const ICON_EYE_OFF = `<svg viewBox="0 0 16 16" fill="none"><path d="M6.3 6.3a2.4 2.4 0 0 0 3.4 3.4M4 4.6C2.2 5.8 1 8 1 8s2.5 4.5 7 4.5c1.2 0 2.3-.3 3.2-.8M7 3.5q.5-.05 1-.05c4.5 0 7 4.5 7 4.5s-.6 1-1.6 2M2 2l12 12" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>`;
+const ICON_DEL = `<svg viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6 4V2.5h4V4M5 4l.5 9h5L11 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+const ICON_EDIT = `<svg viewBox="0 0 16 16" fill="none"><path d="M10.4 2.6l3 3M2.5 13.5l.9-3.1 7-7 2.2 2.2-7 7-3.1.9Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>`;
+const esc = s => String(s).replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;");
+
+function renderPresets(){
+  const sel = document.getElementById("preset-select");
+  PRESETS.forEach((p,i)=>{
+    const o=document.createElement("option"); o.value=i; o.textContent=`${p.name} · ${p.arch}`;
+    sel.appendChild(o);
+  });
+  sel.addEventListener("change",()=>renderPresetDetail(sel.value));
+}
+function renderPresetDetail(idx){
+  const c = d3.select("#preset-detail");
+  c.selectAll("*").remove();
+  if(idx==="") return;
+  const p = PRESETS[+idx];
+  const el = c.append("div").attr("class","preset").style("margin-top","8px");
+  const top = el.append("div").attr("class","preset-top");
+  top.append("span").attr("class","preset-meta").text(`${p.bw} GB/s · click a precision to plot`);
+  const row = el.append("div").attr("class","dtype-row");
+  Object.entries(p.dtypes).forEach(([dt,peak])=>{
+    row.append("div").attr("class","dtype-chip")
+      .html(`${dt}<b>${peak>=1000?(peak/1000)+"P":peak+"T"}</b>`)
+      .on("click",()=>addHardware(p.name, dt, peak, p.bw));
+  });
+}
+
+function renderHwList(){
+  const c = document.getElementById("hw-list");
+  c.innerHTML = "";
+  if(!hardware.length){
+    c.innerHTML = `<div class="empty">No rooflines yet. Pick a GPU from the preset library below, or add a custom one.</div>`;
+    return;
+  }
+  hardware.forEach(d=>{
+    const editing = editingHwId===d.id;
+    const wrap = document.createElement("div"); wrap.className="item-wrap";
+    const row = document.createElement("div");
+    row.className = "item"+(d.visible?"":" off")+(editing?" editing":"");
+    const peakTxt = d.peak>=1000?(d.peak/1000)+" PFLOP/s":d.peak+" TFLOP/s";
+    row.innerHTML = `
+      <div class="swatch line" style="background:${d.color}"></div>
+      <div class="body">
+        <div class="name">${esc(d.name)}</div>
+        <div class="sub">${esc(d.dtype)} · ${peakTxt} · ${d.bw} GB/s · ridge <span class="ai">${fmtAI(ridgeAI(d))}</span></div>
+      </div>
+      <button class="icon-btn edit" title="Edit">${ICON_EDIT}</button>
+      <button class="icon-btn vis" title="Toggle">${d.visible?ICON_EYE:ICON_EYE_OFF}</button>
+      <button class="icon-btn del" title="Remove">${ICON_DEL}</button>`;
+    row.querySelector(".edit").onclick = ()=>{ editingHwId = editing?null:d.id; editingWlId=null; renderHwList(); };
+    row.querySelector(".vis").onclick  = ()=>{ d.visible=!d.visible; userDomain=null; renderHwList(); render(); save(); };
+    row.querySelector(".del").onclick  = ()=>removeHardware(d.id);
+    wrap.appendChild(row);
+
+    if(editing){
+      const ed = document.createElement("div"); ed.className="item-edit";
+      ed.innerHTML = `
+        <div class="field" style="margin-bottom:9px"><label>Name</label><input id="eh-name" value="${esc(d.name)}"></div>
+        <div class="grid3">
+          <div class="field"><label>Precision</label><input id="eh-dtype" value="${esc(d.dtype)}"></div>
+          <div class="field"><label>Peak TFLOP/s</label><input id="eh-peak" type="number" min="0" value="${d.peak}"></div>
+          <div class="field"><label>BW GB/s</label><input id="eh-bw" type="number" min="0" value="${d.bw}"></div>
+        </div>
+        <div class="edit-actions">
+          <button class="btn ghost" id="eh-cancel">Cancel</button>
+          <button class="btn" id="eh-save">Save</button>
+        </div>`;
+      ed.querySelector("#eh-cancel").onclick = ()=>{ editingHwId=null; renderHwList(); };
+      ed.querySelector("#eh-save").onclick   = ()=>saveHwEdit(d.id);
+      ed.querySelectorAll("input").forEach(el=>el.addEventListener("keydown",e=>{ if(e.key==="Enter") saveHwEdit(d.id); }));
+      wrap.appendChild(ed);
+    }
+    c.appendChild(wrap);
+  });
+}
+function saveHwEdit(id){
+  const h = hardware.find(x=>x.id===id); if(!h) return;
+  const name = document.getElementById("eh-name").value.trim()||h.name;
+  const dtype = document.getElementById("eh-dtype").value.trim()||h.dtype;
+  const peak = +document.getElementById("eh-peak").value, bw = +document.getElementById("eh-bw").value;
+  h.name=name; h.shortName=name; h.dtype=dtype;
+  if(peak>0) h.peak=peak;
+  if(bw>0) h.bw=bw;
+  editingHwId=null; userDomain=null; renderHwList(); render(); save();
+}
+
+const WL_DTYPES = ["FP4","FP8","FP16","BF16","FP32"];
+function renderWlList(){
+  const c = document.getElementById("wl-list");
+  c.innerHTML = "";
+  if(!workloads.length){ c.innerHTML = `<div class="empty">No workloads yet. Configure one below and hit Add.</div>`; return; }
+  workloads.forEach(d=>{
+    const editing = editingWlId===d.id;
+    const ai = workloadAI(d).ai;
+    const wrap = document.createElement("div"); wrap.className="item-wrap";
+    const row = document.createElement("div");
+    row.className = "item"+(d.visible?"":" off")+(editing?" editing":"");
+    row.innerHTML = `
+      <div class="swatch" style="background:${d.color}"></div>
+      <div class="body">
+        <div class="name">${esc(d.shortName)} · ${WL_DEFS[d.type].label}</div>
+        <div class="sub">${paramStr(d)} · ${esc(d.dtype)} · AI <span class="ai">${fmtAI(ai)}</span></div>
+      </div>
+      <button class="icon-btn edit" title="Edit">${ICON_EDIT}</button>
+      <button class="icon-btn vis" title="Toggle">${d.visible?ICON_EYE:ICON_EYE_OFF}</button>
+      <button class="icon-btn del" title="Remove">${ICON_DEL}</button>`;
+    row.querySelector(".edit").onclick = ()=>{ editingWlId = editing?null:d.id; editingHwId=null; renderWlList(); };
+    row.querySelector(".vis").onclick  = ()=>{ d.visible=!d.visible; userDomain=null; renderWlList(); render(); save(); };
+    row.querySelector(".del").onclick  = ()=>removeWorkload(d.id);
+    wrap.appendChild(row);
+    c.appendChild(wrap);
+
+    if(editing){
+      const def = WL_DEFS[d.type];
+      const cls = def.fields.length===4 ? "grid2" : "grid3";
+      const fieldsHtml = def.fields.map(([k])=>
+        `<div class="field"><label>${fieldLabel(k)}</label><input type="number" min="1" id="ew-${k}" value="${d.params[k]}"></div>`).join("");
+      const ed = document.createElement("div"); ed.className="item-edit";
+      ed.innerHTML = `
+        <div class="field" style="margin-bottom:9px"><label>Name</label><input id="ew-name" value="${esc(d.shortName)}"></div>
+        <div class="${cls}">${fieldsHtml}</div>
+        <div class="field" style="margin-top:9px"><label>Element precision</label>
+          <select id="ew-dtype">${WL_DTYPES.map(t=>`<option value="${t}" ${t===d.dtype?"selected":""}>${t} — ${DTYPE_BYTES[t]} B/elem</option>`).join("")}</select>
+        </div>
+        <div class="ai-preview"><span>Arithmetic intensity</span><span><span class="val" id="ew-ai">—</span> FLOP/B</span></div>
+        <div class="edit-actions">
+          <button class="btn ghost" id="ew-cancel">Cancel</button>
+          <button class="btn" id="ew-save">Save</button>
+        </div>`;
+      const recompute = ()=>{
+        const params={}; def.fields.forEach(([k])=>params[k]=Math.max(1,+document.getElementById("ew-"+k).value||1));
+        const dt=document.getElementById("ew-dtype").value;
+        document.getElementById("ew-ai").textContent=fmtAI(workloadAI({type:d.type,params,dtype:dt}).ai);
+      };
+      ed.querySelectorAll("input,select").forEach(el=>{
+        el.addEventListener("input",recompute);
+        el.addEventListener("keydown",e=>{ if(e.key==="Enter") saveWlEdit(d.id); });
+      });
+      ed.querySelector("#ew-cancel").onclick = ()=>{ editingWlId=null; renderWlList(); };
+      ed.querySelector("#ew-save").onclick   = ()=>saveWlEdit(d.id);
+      wrap.appendChild(ed);
+      recompute();
+    }
+  });
+}
+function saveWlEdit(id){
+  const w = workloads.find(x=>x.id===id); if(!w) return;
+  WL_DEFS[w.type].fields.forEach(([k])=>{ w.params[k]=Math.max(1,+document.getElementById("ew-"+k).value||1); });
+  w.dtype = document.getElementById("ew-dtype").value;
+  w.shortName = document.getElementById("ew-name").value.trim() || w.shortName;
+  editingWlId=null; userDomain=null; renderWlList(); render(); save();
+}
+
+// ============================================================
+//  Mutations
+// ============================================================
+function shortHw(name){ return name.replace(/^NVIDIA\s+/,"").replace(/^AMD\s+/,"").replace(/\s+SXM.*$/,"").replace(/\s+\d+GB$/,""); }
+
+function pushHardware(name, dtype, peak, bw, shortName){
+  hardware.push({
+    id:"h"+(++hwSeq), name, shortName:shortName||shortHw(name), dtype,
+    peak:+peak, bw:+bw, color:HW_COLORS[hwColorI++ % HW_COLORS.length], visible:true
+  });
+}
+function addHardware(name, dtype, peak, bw, shortName){
+  pushHardware(name, dtype, peak, bw, shortName);
+  userDomain=null; renderHwList(); render(); save();
+}
+function removeHardware(id){ hardware=hardware.filter(h=>h.id!==id); userDomain=null; renderHwList(); render(); save(); }
+
+let wlNameCounter = {gemm:0,bgemm:0,attention:0};
+function pushWorkload(type, params, dtype, name){
+  const pre = type==="attention"?"ATTN":type==="bgemm"?"BMM":"MM";
+  const auto = `${pre}-${++wlNameCounter[type]}`;
+  workloads.push({
+    id:"w"+(++wlSeq), type, params:{...params}, dtype,
+    shortName:(name && name.trim()) || auto,
+    color:WL_COLORS[wlColorI++ % WL_COLORS.length], visible:true
+  });
+}
+function addWorkload(type, params, dtype, name){
+  pushWorkload(type, params, dtype, name);
+  userDomain=null; renderWlList(); render(); save();
+}
+function removeWorkload(id){ workloads=workloads.filter(w=>w.id!==id); userDomain=null; renderWlList(); render(); save(); }
+
+// ============================================================
+//  Workload form
+// ============================================================
+let curType="gemm";
+function renderWlParams(){
+  const def = WL_DEFS[curType];
+  const wrap = d3.select("#wl-params");
+  wrap.selectAll("*").remove();
+  const cls = def.fields.length===4 ? "grid2" : "grid3";
+  const grid = wrap.append("div").attr("class",cls);
+  def.fields.forEach(([k,v])=>{
+    const f = grid.append("div").attr("class","field");
+    f.append("label").text(fieldLabel(k));
+    f.append("input").attr("type","number").attr("min","1").attr("id","wlf-"+k).attr("value",v)
+      .on("input",updateAIPreview);
+  });
+  updateAIPreview();
+}
+function fieldLabel(k){
+  return ({M:"M",N:"N",K:"K",B:"Batch B",H:"# heads",d:"head dim",s:"seq len"})[k]||k;
+}
+function readWlForm(){
+  const params={};
+  WL_DEFS[curType].fields.forEach(([k])=>{ params[k]=Math.max(1, +document.getElementById("wlf-"+k).value||1); });
+  return {params, dtype:document.getElementById("wl-dtype").value};
+}
+function updateAIPreview(){
+  const {params,dtype}=readWlForm();
+  const ai = workloadAI({type:curType,params,dtype}).ai;
+  document.getElementById("wl-ai-prev").textContent = isFinite(ai)?fmtAI(ai):"—";
+}
+
+document.getElementById("wl-seg").addEventListener("click",e=>{
+  const b=e.target.closest("button"); if(!b) return;
+  document.querySelectorAll("#wl-seg button").forEach(x=>x.classList.remove("active"));
+  b.classList.add("active"); curType=b.dataset.type; renderWlParams();
+});
+document.getElementById("wl-dtype").addEventListener("change",updateAIPreview);
+document.getElementById("wl-add").addEventListener("click",()=>{
+  const {params,dtype}=readWlForm();
+  const nameEl=document.getElementById("wl-name");
+  addWorkload(curType,params,dtype,nameEl.value);
+  nameEl.value="";
+});
+
+// hardware custom collapse
+const hwToggle=document.getElementById("hw-custom-toggle"), hwBody=document.getElementById("hw-custom");
+hwToggle.addEventListener("click",()=>{ hwToggle.classList.toggle("open"); hwBody.classList.toggle("open"); });
+document.getElementById("hw-add").addEventListener("click",()=>{
+  const name=document.getElementById("hw-name").value.trim()||"Custom GPU";
+  const dtype=document.getElementById("hw-dtype").value.trim()||"FP16";
+  const peak=+document.getElementById("hw-peak").value, bw=+document.getElementById("hw-bw").value;
+  if(peak>0&&bw>0) addHardware(name,dtype,peak,bw,name);
+});
+
+// toolbar
+function updateToggleUI(){
+  document.getElementById("tg-xlog").classList.toggle("active", xLog);
+  document.getElementById("tg-ylog").classList.toggle("active", yLog);
+}
+document.getElementById("tg-xlog").addEventListener("click",()=>{ xLog=!xLog; userDomain=null; updateToggleUI(); render(); save(); });
+document.getElementById("tg-ylog").addEventListener("click",()=>{ yLog=!yLog; userDomain=null; updateToggleUI(); render(); save(); });
+document.getElementById("btn-fit").addEventListener("click",()=>{ userDomain=null; render(); });
+document.getElementById("btn-reset").addEventListener("click",()=>{
+  try { localStorage.removeItem(STORE); } catch (_) {}
+  xLog = yLog = false; editingHwId = editingWlId = null;
+  // hard-clear every chart layer (interrupt in-flight transitions + cancel pending removes)
+  // so the re-render is a clean full enter, immune to enter/exit/update races
+  [gGrid,gRegion,gRoof,gRidge,gWL,gPts].forEach(g=>g.selectAll("*").interrupt().remove());
+  seedDefaults(); userDomain=null; renderAll(); save();
+});
+
+// ============================================================
+//  Init
+// ============================================================
+function seedDefaults(){
+  hardware=[]; workloads=[]; hwSeq=wlSeq=hwColorI=wlColorI=0; wlNameCounter={gemm:0,bgemm:0,attention:0};
+  pushHardware("NVIDIA A100 SXM","FP16",312,2039);
+  pushHardware("NVIDIA H100 SXM","FP16",990,3350);
+  pushHardware("NVIDIA B200","FP16",2250,8000);
+  pushWorkload("gemm",{M:4096,N:4096,K:4096},"FP16");
+  pushWorkload("attention",{B:8,H:32,d:128,s:4096},"FP16");
+}
+function renderAll(){ updateToggleUI(); renderHwList(); renderWlList(); renderWlParams(); render(); }
+
+function boot(){
+  if(!load()) seedDefaults();
+  renderPresets();
+  renderAll();
+}
+// wait for fonts/katex
+if(document.readyState!=="loading") boot(); else document.addEventListener("DOMContentLoaded",boot);
+
+// resize
+const ro = new ResizeObserver(()=>render());
+ro.observe(document.querySelector(".chart-wrap"));
+window.addEventListener("resize",render);
+</script>
+<script src="../tool-shell.js"></script>
+</body>
+</html>
