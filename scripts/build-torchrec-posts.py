@@ -33,6 +33,9 @@ SOURCES = {
  'split_sizes_h2d': ('distributed/dist_data.py', 'L941-L943', 'Lengths / values splits 的 H2D', 'Lengths / values split H2D'),
  'split_stride_h2d': ('distributed/dist_data.py', 'L944-L947', 'Stride 的 H2D', 'Stride H2D'),
  'split_d2h': ('distributed/dist_data.py', 'L586-L597', '接收 splits 的 D2H', 'Received-split D2H'),
+ 'split_layout': ('distributed/dist_data.py', 'L529-L542', 'Splits 的打包与 AllToAll', 'Split packing and AllToAll'),
+ 'rw_feature_splits': ('distributed/sharding/rw_sharding.py', 'L478-L481', 'Row-wise 的 feature splits', 'Row-wise feature splits'),
+ 'fused_split_layout': ('distributed/embedding_sharding.py', 'L915-L940', '多个请求的 splits 合并', 'Combining splits from multiple requests'),
  'input_recat': ('distributed/dist_data.py', 'L249-L367', '输入 recat 与可变 batch offsets', 'Input recat and unequal-batch offsets'),
  'collective_tag': ('distributed/dist_data.py', 'L463-L489', 'Collective 校验 tag 的 H2D', 'Collective-validation tag H2D'),
  'compute': ('distributed/embedding.py', 'L1627-L1718', 'EC compute 与 output_dist', 'EC compute and output_dist'),
@@ -60,10 +63,56 @@ SOURCES = {
 }
 FIGS = {'01': ('01-native-forward', 'forward 的模块总览', 'Forward module overview', ['forward', 'input', 'compute']), '02': ('02-input-prepare', '输入重排与可选 unique 的细分调用', 'Input permutation and optional unique', ['prepare', 'input']), '03': ('03-input-distribution', 'Input distribution：H2D、host sync 与三次 AllToAll', 'Input distribution: H2D, host sync, and three AllToAll calls', ['bucket', 'splits', 'tensors', 'host_copy']), '04': ('04-local-lookup', 'Grouped lookup、BatchedFusedEmbedding 与 TBE', 'Grouped lookup, BatchedFusedEmbedding, and TBE', ['lookup', 'tbe', 'tbe_call']), '05': ('05-output-distribution', '输出通信的布局准备、codec 与 AllToAll 发起', 'Output layout preparation, codec, and AllToAll launch', ['output', 'seq']), '06': ('06-output-postprocess', 'Lazy wait、unbucketize 与 reverse_indices 展开', 'Lazy wait, unbucketize, and reverse_indices expansion', ['output', 'jt']), '07': ('07-backward-overview', 'Backward 的完整 autograd 拓扑', 'Complete backward autograd topology', ['jt', 'seq', 'tbe']), '08': ('08-gradient-restore', 'Split、reverse_indices 与 unbucketize 的梯度恢复', 'Gradients through split, reverse_indices, and unbucketize', ['jt', 'output']), '09': ('09-backward-launch', '反向 AllToAll 的 encode、launch 与请求保存', 'Reverse AllToAll encode, launch, and request storage', ['seq']), '10': ('10-backward-finalize', '反向请求的 wait、decode、recat 与梯度缩放', 'Reverse request wait, decode, recat, and gradient scaling', ['seq']), '11': ('11-fused-backward', 'TBE 的本地 backward 与示例中的 fused update', 'Local TBE backward and the sample fused update', ['tbe', 'tbe_call', 'fused']), '12': ('12-gradient-boundary', 'Forward wrapper 与整数输入的梯度边界', 'Gradient boundaries at forward wrappers and integer inputs', ['input', 'tbe', 'fused']), '13': ('13-context-handoff', '两种 pipeline 的 batch context 交接', 'Per-batch state handoff in both pipelines', ['rewrite', 'runtime', 'prefetch_helper', 'preforward']), '14': ('14-sparse-pipeline', '普通 sparse dist pipeline 的稳定态调用序列', 'Steady-state ordinary sparse dist pipeline', ['ordinary', 'runtime', 'wait']), '15': ('15-sparse-pipeline-timeline', '普通 sparse-dist pipeline：三轮交互时间线', 'Ordinary sparse-dist pipeline: interactive three-iteration timeline', ['ordinary', 'wait', 'runtime']), '16': ('16-prefetch-pipeline', '带 prefetch 的 sparse dist pipeline 的稳定态调用序列', 'Steady-state prefetch sparse dist pipeline', ['prefetch', 'prefetch_helper', 'preforward'])}
 
+SPLITS_PRIMER_ZH = r'''
+<aside class="note-box splits-primer" id="zh-splits-primer" role="note" aria-labelledby="zh-splits-primer-title">
+<p id="zh-splits-primer-title"><strong>Splits：每个 rank 的收发计数</strong></p>
+<p>输入通信中的 <code>splits</code> 是各 rank 要收发的 <strong>tensor 元素数量</strong>，不是 ID 本身，也不是字节数。以下用一个独立例子说明：<code>P=2</code> 个 rank、一个 feature、每个 rank 的 batch size 为 <code>B=2</code>，固定 stride、无 weights，关闭去重和 collective tag 校验。分桶后，两端准备的 metadata 如下；每个张量都是 CUDA 上的 <code>int64</code>，shape 为 <code>[P]=[2]</code>，元素按目标 rank 0、1 排列。</p>
+<div class="table-scroll"><table><thead><tr><th scope="col">Metadata tensor</th><th scope="col">rank 0 发送端</th><th scope="col">rank 1 发送端</th><th scope="col">每项的含义</th></tr></thead><tbody>
+<tr><td>lengths splits</td><td><code>[2, 2]</code></td><td><code>[2, 2]</code></td><td>发送多少个 lengths 元素；本例为 feature 数 × B = 2</td></tr>
+<tr><td>values splits</td><td><code>[3, 1]</code></td><td><code>[2, 4]</code></td><td>发送多少个 ID；由本批次 ID 的分桶结果决定</td></tr>
+<tr><td>stride metadata</td><td><code>[2, 2]</code></td><td><code>[2, 2]</code></td><td>把发送端的 batch size B 告知每个接收端</td></tr>
+</tbody></table></div>
+<p>因此 rank 0 向 rank 0、1 分别发送 3、1 个 ID，rank 1 分别发送 2、4 个 ID。源码把这三个 metadata tensor 按 <code>stack(..., dim=1)</code> 排成 <code>[P, 3]</code>，再 flatten 成真正交给 splits AllToAll 的一维 tensor：</p>
+<pre class="code" data-language="text"># 每个三元组：[lengths 元素数, ID 数, stride]
+rank 0 发送：[2, 3, 2,  2, 1, 2]   # shape [6]，按目标 rank 排列
+rank 1 发送：[2, 2, 2,  2, 4, 2]   # shape [6]，按目标 rank 排列
+rank 0 接收：[2, 3, 2,  2, 2, 2]   # shape [6]，按来源 rank 排列</pre>
+<p>rank 0 接收后用 <code>view(P, -1).T</code> 得到 <code>[3, P]</code>，读回的列表是 <code>[[2, 2], [3, 2], [2, 2]]</code>，依次对应 lengths、values 和 stride。其中 values 的接收 splits <code>[3, 2]</code> 表示从 rank 0 收 3 个 ID、从 rank 1 收 2 个 ID，因此后续 values 接收 buffer 有 5 个元素。Splits 通信每个 peer 只交换固定数量的计数；真正的 lengths / ID payload 随后按这些计数传输。{source:kjt_splits}；{source:split_h2d}；{source:split_layout}；{source:split_d2h}</p>
+<p>源码中 <code>KJTAllToAll(splits=[1, 1])</code> 的构造参数另指<strong>每个 rank 分配的 feature 数</strong>；它和上述随 batch 变化的 ID 数不同。一般有 N 个 metadata tensor 时，打包布局为 <code>[P, N]</code>，实际收发 shape 为 <code>[P × N]</code>；weights、variable stride 和可选校验 tag 的字段组成应按实际路径确定。{source:rw_feature_splits}</p>
+{fused_splits_primer}
+</aside>
+'''
+
+SPLITS_PRIMER_EN = r'''
+<aside class="note-box splits-primer" id="en-splits-primer" role="note" aria-labelledby="en-splits-primer-title">
+<p id="en-splits-primer-title"><strong>Splits: per-rank send and receive counts</strong></p>
+<p>In input communication, <code>splits</code> count <strong>tensor elements</strong> sent to or received from each rank, rather than IDs themselves or bytes. This standalone example has <code>P=2</code> ranks, one feature, and local batch size <code>B=2</code> on each rank, with fixed stride, no weights, no deduplication, and no collective validation tag. After bucketization, each sender prepares the metadata below. Each tensor is CUDA <code>int64</code> with shape <code>[P]=[2]</code>; entries follow destination ranks 0 and 1.</p>
+<div class="table-scroll"><table><thead><tr><th scope="col">Metadata tensor</th><th scope="col">Rank 0 sender</th><th scope="col">Rank 1 sender</th><th scope="col">Meaning of each entry</th></tr></thead><tbody>
+<tr><td>Lengths splits</td><td><code>[2, 2]</code></td><td><code>[2, 2]</code></td><td>Number of lengths elements; feature count × B = 2 here</td></tr>
+<tr><td>Values splits</td><td><code>[3, 1]</code></td><td><code>[2, 4]</code></td><td>Number of IDs, determined by this batch's bucketization</td></tr>
+<tr><td>Stride metadata</td><td><code>[2, 2]</code></td><td><code>[2, 2]</code></td><td>Sender batch size B, repeated for every destination</td></tr>
+</tbody></table></div>
+<p>Rank 0 sends 3 and 1 IDs to ranks 0 and 1; rank 1 sends 2 and 4. The implementation packs the three metadata tensors with <code>stack(..., dim=1)</code> into <code>[P, 3]</code>, then flattens them into the actual one-dimensional input to splits AllToAll:</p>
+<pre class="code" data-language="text"># Each triple: [lengths element count, ID count, stride]
+rank 0 sends:    [2, 3, 2,  2, 1, 2]   # shape [6], destination order
+rank 1 sends:    [2, 2, 2,  2, 4, 2]   # shape [6], destination order
+rank 0 receives: [2, 3, 2,  2, 2, 2]   # shape [6], source order</pre>
+<p>Rank 0 applies <code>view(P, -1).T</code> to obtain <code>[3, P]</code> and reads back <code>[[2, 2], [3, 2], [2, 2]]</code> for lengths, values, and stride. The values receive splits <code>[3, 2]</code> mean 3 IDs from rank 0 and 2 from rank 1, so the subsequent values receive buffer has 5 elements. Splits communication exchanges a fixed number of counts per peer; lengths and ID payloads follow using those counts. {source:kjt_splits}; {source:split_h2d}; {source:split_layout}; {source:split_d2h}</p>
+<p>The constructor argument in <code>KJTAllToAll(splits=[1, 1])</code> instead assigns a <strong>feature count to each rank</strong>, distinct from batch-dependent ID counts. With N metadata tensors, the packed layout is <code>[P, N]</code> and the actual send and receive shape is <code>[P × N]</code>. Weights, variable stride, and an optional validation tag affect which fields are present. {source:rw_feature_splits}</p>
+{fused_splits_primer}
+</aside>
+'''
+
+FUSED_SPLITS_PRIMER = {
+    'zh': '<p>Pipeline 的 fused splits 将同一个 process group 中多个请求的 metadata 一起打包。若合并 M 个上述基础 KJT 请求，且不附加 tag，则 <code>N=3M</code>，收发 shape 为 <code>[3MP]</code>；例如 <code>M=2, P=2</code> 时为 <code>[12]</code>。融合的是计数，ID payload 仍单独传输。{source:fused_split_layout}</p>',
+    'en': '<p>Pipeline fused splits pack metadata from multiple requests in the same process group. For M baseline KJT requests as above, without a tag, <code>N=3M</code> and the send and receive shape is <code>[3MP]</code>; for <code>M=2, P=2</code>, it is <code>[12]</code>. Counts are fused; ID payloads still travel separately. {source:fused_split_layout}</p>',
+}
+
 NATIVE_ZH = r'''
 <h1>TorchRec Row-wise Sharding</h1>
 <p class="lead">Row-wise sharding 是 TorchRec 分布式 embedding 的一种分片方式，通过跨 rank 划分表行扩展存储与查表能力。本文以 <code>ShardedEmbeddingCollection</code> 为对象，介绍 KJT 输入组织、ID 分发、本地 lookup、输出顺序恢复与梯度回传，并用源码链接和序列图标明 forward、backward 中的 NCCL 通信、主机同步与数据依赖。</p>
 <div class="note-box"><p>本文分析 TorchRec 提交 <a href="https://github.com/pytorch/torchrec/tree/1d87b8f79b7bb1671cb8be3e646e99e835cce610"><code>1d87b8f79b7bb</code></a> 中的 <code>ShardedEmbeddingCollection</code>，采用多 rank、CUDA/NCCL 和 eager 模式。它返回 unpooled sequence embeddings。基础例子使用固定 batch stride、无权重的 KJT，去重和通信 codec 单独作为可选分支说明。实现机制以这份 TorchRec 源码为依据；Pooled EmbeddingBag 的输出通信走另一条路径。</p></div>
+{splits_primer}
 <p class="reading-note">序列图从上往下阅读。生命线上的 activation bar 表示调用执行或数据访问区间，错开的窄条表示嵌套 self-call；虚线空心条表示尚未消费的异步请求。Stream 泳道中的 bar 对应提交阶段，长度不代表 GPU 耗时。整行色块用 <span class="seq-key seq-h2d">蓝色标 H2D</span>、<span class="seq-key seq-host">红色标 D2H / host sync</span>、<span class="seq-key seq-comm">紫色标 AllToAll</span>，黄色标 request wait，绿色标 GPU stream 依赖。图 3 的 D1 / D2 / D3 对应三处主机读回位置，实际 stall 次数取决于执行路径。点击消息文字或下方的文件行号可打开对应的 TorchRec 源码。图表默认适应宽度，也可放大或单独打开。</p>
 
 <p class="reading-note">图中细分模块调用、异步请求和 backend 计算。消息下方的源码链接定位 TorchRec 调用点；GPU activity 编号、拷贝大小、kernel 名称和 optimizer 配置用于说明具体执行示例，实际运行会随输入、backend 和配置变化。阅读通信与同步时，以函数之间的数据依赖和 wait 位置为准。</p>
@@ -185,6 +234,7 @@ PIPELINE_ZH = r'''<h1>TorchRec Sparse Dist Pipeline</h1>
 <p class="lead">TorchRec 的 sparse dist pipeline 通过跨 batch 调度，将后续输入的准备和分发与当前 batch 的训练重叠。本文比较 <code>TrainPipelineSparseDist</code> 与 <code>PrefetchTrainPipelineSparseDist</code> 的执行流程，重点说明两阶段输入通信、batch context 交接、CUDA stream 依赖和 embedding prefetch 的缓存条件，并用序列图与时间线呈现启动、稳定运行和排空过程。</p>
 <div class="note-box"><p>本文分析 TorchRec 提交 <a href="https://github.com/pytorch/torchrec/tree/1d87b8f79b7bb1671cb8be3e646e99e835cce610"><code>1d87b8f79b7bb</code></a> 中的两种 sparse dist pipeline，以多 rank、eager CUDA/NCCL 下的 <code>ShardedEmbeddingCollection</code> 为例。它返回 unpooled sequence embeddings，基础输入是固定 batch stride、无权重的 KJT。实现机制以这份 TorchRec 源码为依据。</p></div>
 <p>Row-wise sharding 把 embedding 表按行分到多个 rank。每个 rank 的样本可能请求其他 rank 持有的行，所以输入分发要把 ID 送到对应的 row owner。<code>KeyedJaggedTensor</code>（KJT）携带 feature keys、ID values 和 lengths / offsets。Row owner 收到输入后查本地表，再通过输出 AllToAll 把向量发回请求方；backward 则沿相反方向回传向量梯度。Pipeline 主要提前调度输入准备和分发，本地 lookup、输出通信和 backward 仍由当前 batch 的模型执行。{source:rw}；{source:input}；{source:seq}</p>
+{splits_primer}
 <p>输入分发分两次等待。第一次消费 split-size metadata，读回接收尺寸并发起 KJT payload 通信；第二次消费 payload，重建本地 lookup 所需的 KJT。第一次返回时，payload 仍可能在传输。Pipeline 可以把这两个阶段安排在不同位置，提前推进后续 batch 的输入准备。各次 AllToAll 的细分调用也可参阅本系列的<a href="torchrec-row-wise-sharding.html#zh-input">row-wise 输入分发</a>。{source:forward}；{source:splits}；{source:tensors}</p>
 <p>这里的 CPU 同步来自 metadata：发送前需要准备各 rank 的 split sizes，第一次 wait 要把接收尺寸从 CUDA 读成 Python lists，第二次 wait 的固定 stride 分支还会整理新 KJT 的 lengths / offsets。非空 CUDA tensor 走 <code>_safe_tolist</code> 路径时，会做 D2H 并同步当前 stream；已经缓存的 metadata 可以跳过重新计算。单独看到 <code>Work.wait()</code>，则不能据此断定 CPU 会等待整张 GPU。{source:kjt_splits}；{source:kjt_init}；{source:host_copy}</p>
 <p class="reading-note">序列图从上往下表示主机提交顺序和逻辑依赖。Activation bar 表示调用或访问区间，错开的窄条表示嵌套 self-call，虚线空心条表示尚未消费的请求；stream 泳道和 bar 长度不代表实测 GPU 耗时。<span class="seq-key seq-h2d">蓝色标 H2D</span>、<span class="seq-key seq-host">红色标 D2H / host sync</span>、<span class="seq-key seq-comm">紫色标 AllToAll</span>，黄色标 request wait，绿色标 stream 依赖。D1 / D2 / D3 与 row-wise 文章的读回位置一一对应；V1 / V2 标出固定版本中的额外校验读回。实际 stall 次数取决于 metadata 缓存和执行路径。点击消息或文件行号可打开源码，所有图默认适应宽度。</p>
@@ -285,6 +335,7 @@ NATIVE_EN = r'''
 <h1>TorchRec row-wise sharding</h1>
 <p class="lead">Row-wise sharding distributes embedding-table rows across ranks to scale storage and lookup in TorchRec. Using <code>ShardedEmbeddingCollection</code>, this article covers KJT inputs, ID distribution, local lookup, output reconstruction and gradient return. Source-linked sequence diagrams identify NCCL communication, host synchronization and data dependencies in forward and backward execution.</p>
 <div class="note-box"><p>The implementation described here is <code>ShardedEmbeddingCollection</code> at TorchRec commit <a href="https://github.com/pytorch/torchrec/tree/1d87b8f79b7bb1671cb8be3e646e99e835cce610"><code>1d87b8f79b7bb</code></a>, running in eager mode across multiple ranks with CUDA/NCCL. It returns unpooled sequence embeddings. The baseline uses an unweighted KJT with fixed batch stride; deduplication and communication codecs appear as optional branches. All implementation explanations refer to this TorchRec source. Pooled EmbeddingBag output distribution follows a different path.</p></div>
+{splits_primer}
 <p class="reading-note">Read each sequence from top to bottom. Activation bars mark execution or data-access scopes, and offset bars mark nested self-calls. Hollow dashed bars represent unconsumed asynchronous requests. Bars in stream lanes show submission stages; their lengths do not measure GPU time. Full-row bands mark <span class="seq-key seq-h2d">H2D in blue</span>, <span class="seq-key seq-host">D2H / host sync in red</span>, and <span class="seq-key seq-comm">AllToAll in purple</span>. Amber marks request waits, and green marks GPU stream dependencies. D1 / D2 / D3 in Fig. 3 identify three host-read sites; the number of runtime stalls depends on the execution path. Click a message or its file:line label to open the corresponding TorchRec source. Diagrams fit the available width by default and can be enlarged or opened separately.</p>
 
 <p class="reading-note">The diagrams separate module calls, asynchronous requests, and backend computation. Source links below messages locate TorchRec callsites. GPU activity IDs, copy sizes, kernel names, and optimizer settings illustrate specific executions and can vary with inputs, backends, and configuration. Function dependencies and wait locations describe the communication and synchronization mechanism.</p>
@@ -406,6 +457,7 @@ PIPELINE_EN = r'''<h1>TorchRec sparse dist pipeline</h1>
 <p class="lead">TorchRec sparse distribution pipelines overlap preparation and distribution of later inputs with training of the current batch. This article compares <code>TrainPipelineSparseDist</code> and <code>PrefetchTrainPipelineSparseDist</code>, covering two-stage input communication, batch-context handoff, CUDA stream dependencies and embedding-cache requirements. Sequence diagrams and a timeline show startup, steady-state operation and drain.</p>
 <div class="note-box"><p>This article examines the two sparse distribution pipelines at TorchRec commit <a href="https://github.com/pytorch/torchrec/tree/1d87b8f79b7bb1671cb8be3e646e99e835cce610"><code>1d87b8f79b7bb</code></a>, using multi-rank eager CUDA/NCCL <code>ShardedEmbeddingCollection</code>. It returns unpooled sequence embeddings. The baseline input is an unweighted KJT with fixed batch stride. Implementation explanations refer to this TorchRec source.</p></div>
 <p>Row-wise sharding divides embedding-table rows across ranks. A rank's samples can request rows owned by other ranks, so input distribution routes IDs to their row owners. A <code>KeyedJaggedTensor</code> (KJT) carries feature keys, ID values, and lengths / offsets. Each owner looks up its local rows and returns vectors through output AllToAll; backward sends vector gradients in the reverse direction. Pipeline scheduling advances input preparation and distribution. Local lookup, output communication, and backward still execute as part of the current batch's model work. {source:rw}; {source:input}; {source:seq}</p>
+{splits_primer}
 <p>Input distribution has two waits. The first consumes split-size metadata, reads receive sizes onto the host, and launches the KJT payload. The second consumes that payload and reconstructs the KJT for local lookup. Payload may still be in flight when the first wait returns. A pipeline can schedule these stages separately to prepare later batches ahead of use. For individual AllToAll calls, see <a href="torchrec-row-wise-sharding.html#en-input">row-wise input distribution</a> in this series. {source:forward}; {source:splits}; {source:tensors}</p>
 <p>Host synchronization comes from metadata: split sizes must be prepared before sending, the first wait converts received CUDA sizes to Python lists, and the fixed-stride branch of the second wait prepares the new KJT's length and offset metadata. For nonempty CUDA tensors, <code>_safe_tolist</code> performs D2H and synchronizes the current stream. Cached metadata can avoid recomputation. A <code>Work.wait()</code> call alone does not establish that the CPU waits for the entire device. {source:kjt_splits}; {source:kjt_init}; {source:host_copy}</p>
 <p class="reading-note">Read sequences from top to bottom as host submission order and logical dependencies. Activation bars mark calls or access scopes, offset bars mark nested self-calls, and hollow dashed bars mark unconsumed requests. Stream lanes and bar lengths do not measure GPU time. Bands mark <span class="seq-key seq-h2d">H2D in blue</span>, <span class="seq-key seq-host">D2H / host sync in red</span>, and <span class="seq-key seq-comm">AllToAll in purple</span>; amber marks request waits and green marks stream dependencies. D1 / D2 / D3 match the read sites in the row-wise article; V1 / V2 identify additional validation readbacks in the pinned version. Runtime stalls depend on cached metadata and the execution path. Messages and file:line labels link to source. All figures fit the available width by default.</p>
@@ -532,6 +584,9 @@ def figure(key, lang):
 <figcaption><strong>{'图' if lang == 'zh' else 'Fig.'} {number} · {title}</strong><span class="figure-sources">{'源码：' if lang == 'zh' else 'Source: '}{' · '.join(source(k, lang) for k in sources)}</span></figcaption></figure>'''
 
 def expand(body, lang, keys):
+    primer = globals()['SPLITS_PRIMER_' + lang.upper()]
+    fused = FUSED_SPLITS_PRIMER[lang] if keys[0] == '13' else ''
+    body = body.replace('{splits_primer}', primer.replace('{fused_splits_primer}', fused))
     body = re.sub(r'\{source:(\w+)(?:\|([^{}]+))?\}', lambda m: source(m[1], lang, m[2]), body)
     body = re.sub(r'\{figure:(\d+)\}', lambda m: figure(m[1], lang), body)
     entries = ''.join(f'<li><a href="#{lang}-fig-{i:02}">{i:02} · {FIGS[k][1] if lang == "zh" else FIGS[k][2]}</a></li>' for i, k in enumerate(keys, 1))
