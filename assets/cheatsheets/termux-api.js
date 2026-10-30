@@ -20,8 +20,10 @@
         group.hidden = !groupShown;
         shown += groupShown;
       });
-      sheet.querySelector('.termux-results').textContent = en
-        ? `${shown} / ${rows.length} commands` : `显示 ${shown} / ${rows.length} 个命令入口`;
+      const results = sheet.querySelector('.termux-results');
+      results.textContent = `${shown} / ${rows.length}`;
+      results.setAttribute('aria-label', en
+        ? `${shown} of ${rows.length} commands` : `显示 ${shown} / ${rows.length} 个命令入口`);
       sheet.querySelector('.termux-empty').hidden = shown > 0;
     }
     function reset() { input.value = ''; category.value = 'all'; filter(); }
@@ -51,8 +53,8 @@
             finally { area.remove(); button.focus({ preventScroll: true }); }
             if (!copied) throw new Error('Clipboard unavailable');
           }
-          button.textContent = en ? 'Copied' : '已复制';
-          status.textContent = en ? 'Copied as text; nothing was executed.' : '已复制文本，未执行命令。';
+          button.textContent = '✓';
+          status.textContent = en ? 'Copied.' : '已复制。';
           setTimeout(() => { button.textContent = en ? 'Copy' : '复制'; }, 1600);
         } catch {
           status.textContent = en ? 'Copy unavailable. Select and copy the code manually.' : '复制不可用，请手动选中代码复制。';
