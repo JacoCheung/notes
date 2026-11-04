@@ -1,0 +1,1038 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>用 CUPTI 追踪 PyTorch 显存分配</title>
+<meta name="post:title" content="用 CUPTI 追踪 PyTorch 显存分配">
+<meta name="post:title_en" content="Tracing PyTorch memory allocation with CUPTI">
+<meta name="post:slug" content="cupti-pytorch-memory-tracing">
+<meta name="post:date" content="2026-10-29">
+<meta name="post:tags" content="PyTorch, CUDA, CUPTI, 显存, VMM">
+<meta name="post:tags_en" content="PyTorch, CUDA, CUPTI, Memory, VMM">
+<meta name="post:reading" content="25 分钟">
+<meta name="post:reading_en" content="25 min">
+<meta name="post:summary" content="从 CUPTI Callback / Activity 接口到可编译追踪器，用同一段 PyTorch 程序对比 cudaMalloc、缓存复用与 driver VMM 映射。">
+<meta name="post:summary_en" content="Build a CUPTI callback tracer to compare cudaMalloc, cache reuse, and driver VMM mappings in the same PyTorch allocation workload.">
+<meta name="post:series" content="pytorch-internals">
+<meta name="post:series_title" content="PyTorch 内部机制">
+<meta name="post:series_title_en" content="PyTorch Internals">
+<meta name="post:series_order" content="11">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
+<link rel="stylesheet" href="../assets/pytorch-internals/cupti-memory/trace.css">
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
+<script src="../assets/pytorch-internals/cupti-memory/figures.js" defer></script>
+</head><body><div class="layout"><aside class="toc"><div class="toc-title">目录 · TOC</div></aside><main class="content">
+<div class="lang-zh">
+<h1>用 CUPTI 追踪 PyTorch 显存分配</h1>
+<p class="lead">PyTorch 的一次 Tensor 分配，可能复用缓存中的旧地址，也可能触发 CUDA runtime 的 cudaMalloc，或由 driver 的虚拟内存管理接口创建并映射新的物理内存。CUPTI 能记录这些 CUDA 调用的参数、返回值和发生时间，让 Tensor 生命周期、allocator 缓存与底层显存资源之间的关系可以逐项核对。本文以同一段 PyTorch 分配程序，对比普通 native allocator 与 expandable segments 两条路径，并给出可编译的追踪器和运行命令。</p>
+<aside class="trace-note"><p>示例面向 Linux、CUDA Toolkit / CUPTI 12.8 与 PyTorch 2.8.0，PyTorch 源码固定到 <a href="https://github.com/pytorch/pytorch/tree/ba56102387ef21a3b04b357e5b183d48f0afefc7">ba56102387ef</a>。这里的 memory 事务指分配、释放和地址映射；kernel 内的 load/store、cache sector 与 DRAM transaction 属于另一种分析尺度。</p></aside>
+
+<h2 id="zh-cupti">1. CUPTI 与 Nsight Systems</h2>
+<h3 id="zh-role">CUDA 的观测接口</h3>
+<p>CUPTI（CUDA Profiling Tools Interface）是 NVIDIA 提供的 CUDA profiling / tracing 接口。工具通过它订阅 CUDA API 调用，收集 kernel、memcpy 等活动记录，并将 CPU 提交与 GPU 执行关联起来。它随 CUDA Toolkit 提供头文件、动态库和示例，应用可以在进程内加载自己的采集器。<a href="https://docs.nvidia.com/cupti/12.8/index.html">CUPTI 12.8</a></p>
+<p>Nsight Systems 使用 CUPTI 收集 CUDA 相关信息，在此基础上组织时间线、统计与导出文件；它还采集 CPU 调度、OS runtime、NVTX 等其他信息。这些信息各有采集来源，不能把整个 nsys 都视为 CUPTI 的封装。直接使用 CUPTI 的价值在于定义自己的筛选范围和记录字段，例如只关心某几个显存 API 的参数。<a href="https://docs.nvidia.com/nsight-systems/InstallationGuide/">Nsight Systems / CUPTI</a></p>
+<h3 id="zh-scale">显存事件的层次</h3>
+<div class="trace-table"><table><thead><tr><th>观察对象</th><th>典型问题</th><th>对应入口</th></tr></thead><tbody>
+<tr><td>PyTorch Tensor / allocator</td><td>哪次 Tensor 分配使用了缓存块？</td><td>Tensor 指针、memory_allocated / memory_reserved、allocator snapshot</td></tr>
+<tr><td>CUDA 内存管理</td><td>何时调用 cudaMalloc、cuMemCreate、cuMemMap？参数是什么？</td><td>CUPTI Runtime / Driver API callbacks</td></tr>
+<tr><td>GPU 数据搬运</td><td>一次 H2D 实际何时开始、何时结束？</td><td>MEMCPY activity；CPU API 区间不能替代 GPU 执行区间</td></tr>
+<tr><td>Kernel 内存访问</td><td>Load/store 产生多少 cache / DRAM 流量？</td><td>硬件计数器与 Nsight Compute 等 profiling 工具</td></tr>
+</tbody></table></div>
+<p>MEMCPY activity 描述实际搬运的字节数和 GPU 起止时间；cudaMalloc callback 描述内存管理 API 的一次调用。两者可以同时出现在 CUDA 工作负载里，但记录的含义不同。<a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__ActivityMemcpy6.html">CUpti_ActivityMemcpy6</a>。本项目的 <a href="gpu-memory-data-path-nsight-compute.html">GPU 访存路径与 Nsight Compute</a> 讨论 kernel 内的访存层次。</p>
+
+<h2 id="zh-interfaces">2. Callback 与 Activity</h2>
+<h3 id="zh-callback">同步 callback</h3>
+<p>一个 subscriber 将回调函数注册给 CUPTI。Domain 区分 runtime、driver、resource 等事件来源，CBID 标识 domain 内的具体 API。本文只启用两个 runtime CBID 和七个 driver VMM CBID；未订阅的 API 不会出现在这份日志中。<a href="https://docs.nvidia.com/cupti/12.8/api/group__CUPTI__CALLBACK__API.html">Callback API</a></p>
+<div class="trace-table"><table><thead><tr><th>接口 / 字段</th><th>用途</th></tr></thead><tbody>
+<tr><td>cuptiSubscribe</td><td>注册 callback 与用户状态，取得 subscriber handle</td></tr>
+<tr><td>cuptiEnableCallback</td><td>为一个 domain + CBID 启用或禁用通知</td></tr>
+<tr><td>CUPTI_API_ENTER / EXIT</td><td>在 CUDA API 执行前、返回调用者前运行 callback</td></tr>
+<tr><td>functionParams</td><td>按该 CBID 对应的参数结构读取输入和输出参数</td></tr>
+<tr><td>functionReturnValue</td><td>EXIT 时读取 cudaError_t 或 CUresult</td></tr>
+<tr><td>correlationData / correlationId</td><td>前者保存同一次调用 ENTER / EXIT 之间的工具状态；后者关联对应 activity</td></tr>
+<tr><td>cuptiUnsubscribe</td><td>停止订阅；应在回调代码所在动态库卸载前完成</td></tr>
+</tbody></table></div>
+<p>Runtime 和 Driver API callback 在调用线程上同步执行，日志写入会延长应用的执行路径。callback 内不应调用 CUDA runtime / driver API，也不应创建 CUDA Tensor；这可能引发递归或死锁。示例只读取参数、调用 CUPTI 时间戳接口并写入 CSV。<a href="https://docs.nvidia.com/cupti/12.8/main/main.html#callback-api">CUPTI Callback usage</a></p>
+<figure class="trace-figure"><div class="trace-toolbar"><span>图中消息与 API 可点击查看来源</span><span><button type="button" data-trace-fit="fit" aria-pressed="true">适应宽度</button> <button type="button" data-trace-fit="actual" aria-pressed="false">100%</button></span></div><div class="trace-viewport" tabindex="0"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 850" role="img" aria-labelledby="zh-cupti-callback"><title id="zh-cupti-callback">Synchronous ENTER and EXIT callbacks around a CUDA API</title><defs><marker id="zh-cupti-callback-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--trace-rule)"/></marker></defs><path d="M125 100 V820" stroke="var(--trace-rule)" stroke-width="1.7" stroke-dasharray="6 5"/><rect x="7" y="24" width="236" height="72" rx="4" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><text x="125" y="56" text-anchor="middle" font-size="18" font-weight="600">PyTorch allocator</text><text x="125" y="80" text-anchor="middle" font-size="13" font-weight="400">same calling CPU thread</text><path d="M500 100 V820" stroke="var(--trace-rule)" stroke-width="1.7" stroke-dasharray="6 5"/><rect x="382" y="24" width="236" height="72" rx="4" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><text x="500" y="56" text-anchor="middle" font-size="18" font-weight="600">CUDA API</text><text x="500" y="80" text-anchor="middle" font-size="13" font-weight="400">same calling CPU thread</text><path d="M875 100 V820" stroke="var(--trace-rule)" stroke-width="1.7" stroke-dasharray="6 5"/><rect x="757" y="24" width="236" height="72" rx="4" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><text x="875" y="56" text-anchor="middle" font-size="18" font-weight="600">CUPTI subscriber</text><text x="875" y="80" text-anchor="middle" font-size="13" font-weight="400">same calling CPU thread</text><rect x="117" y="140" width="16" height="635" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><rect x="492" y="140" width="16" height="635" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><rect x="867" y="212" width="16" height="63" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><rect x="867" y="492" width="16" height="213" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><a href="https://docs.nvidia.com/cupti/12.8/api/group__CUPTI__CALLBACK__API.html" target="_blank" rel="noopener"><path d="M133 150 H490" fill="none" stroke="var(--trace-rule)" stroke-width="1.8" marker-end="url(#zh-cupti-callback-arrow)"/><rect x="206.10000000000002" y="120" width="212.79999999999998" height="24" fill="var(--trace-bg)"/><text x="312.5" y="133" text-anchor="middle" font-size="16" font-weight="400">cudaMalloc / cuMemCreate</text></a><a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__CallbackData.html" target="_blank" rel="noopener"><path d="M508 220 H865" fill="none" stroke="var(--trace-rule)" stroke-width="1.8" marker-end="url(#zh-cupti-callback-arrow)"/><rect x="593.4" y="190" width="188.2" height="24" fill="var(--trace-bg)"/><text x="687.5" y="203" text-anchor="middle" font-size="16" font-weight="400">ENTER: save timestamp</text></a><a href="https://docs.nvidia.com/cupti/12.8/main/main.html#callback-api" target="_blank" rel="noopener"><path d="M867 270 H510" fill="none" stroke="var(--trace-rule)" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#zh-cupti-callback-arrow)"/><rect x="597.5" y="240" width="180.0" height="24" fill="var(--trace-bg)"/><text x="687.5" y="253" text-anchor="middle" font-size="16" font-weight="400">return from callback</text></a><a href="https://docs.nvidia.com/cuda/archive/12.8.1/cuda-driver-api/group__CUDA__VA.html" target="_blank" rel="noopener"><path d="M508 368 h46 v24 h-46" fill="none" stroke="var(--trace-rule)" stroke-width="1.8" marker-end="url(#zh-cupti-callback-arrow)"/><rect x="585.9" y="350" width="188.2" height="24" fill="var(--trace-bg)"/><text x="680" y="363" text-anchor="middle" font-size="16" font-weight="400">CUDA executes the API</text></a><a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__CallbackData.html" target="_blank" rel="noopener"><path d="M508 500 H865" fill="none" stroke="var(--trace-rule)" stroke-width="1.8" marker-end="url(#zh-cupti-callback-arrow)"/><rect x="577.0" y="470" width="220.99999999999997" height="24" fill="var(--trace-bg)"/><text x="687.5" y="483" text-anchor="middle" font-size="16" font-weight="400">EXIT: result + parameters</text></a><a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__CallbackData.html" target="_blank" rel="noopener"><path d="M867 598 h-46 v24 h46" fill="none" stroke="var(--trace-rule)" stroke-width="1.8" marker-end="url(#zh-cupti-callback-arrow)"/><rect x="588.6" y="580" width="212.79999999999998" height="24" fill="var(--trace-bg)"/><text x="695" y="593" text-anchor="middle" font-size="16" font-weight="400">decode fields; write CSV</text></a><a href="https://docs.nvidia.com/cupti/12.8/main/main.html#callback-api" target="_blank" rel="noopener"><path d="M867 700 H510" fill="none" stroke="var(--trace-rule)" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#zh-cupti-callback-arrow)"/><rect x="597.5" y="670" width="180.0" height="24" fill="var(--trace-bg)"/><text x="687.5" y="683" text-anchor="middle" font-size="16" font-weight="400">return from callback</text></a><a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__CallbackData.html" target="_blank" rel="noopener"><path d="M492 770 H135" fill="none" stroke="var(--trace-rule)" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#zh-cupti-callback-arrow)"/><rect x="210.2" y="740" width="204.6" height="24" fill="var(--trace-bg)"/><text x="312.5" y="753" text-anchor="middle" font-size="16" font-weight="400">return status to caller</text></a></svg></div><figcaption>Runtime / Driver API callback 在调用 CUDA API 的 CPU 线程上同步执行。实心条标明调用范围，长度不代表实测耗时。消息可点击查看接口说明。</figcaption></figure>
+<p>参数结构由 Toolkit 的 <code>generated_cuda_runtime_api_meta.h</code> 和 <code>generated_cuda_meta.h</code> 定义。<code>cudaMalloc_v3020_params</code> 中的 v3020 是该 API 参数版本标识，不要求使用 CUDA 3.2。分配地址位于输出参数 <code>*devPtr</code> 中，必须在 EXIT 且返回成功后读取；失败时仍可以记录请求大小和错误码。<a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__CallbackData.html">CUpti_CallbackData</a></p>
+<pre class="code" data-language="cpp"><code>// At CUPTI_API_EXIT for cudaMalloc:
+const auto* p = static_cast&lt;const cudaMalloc_v3020_params*&gt;(info-&gt;functionParams);
+const auto result = *static_cast&lt;const cudaError_t*&gt;(info-&gt;functionReturnValue);
+const size_t requested_bytes = p-&gt;size;
+if (result == cudaSuccess) {
+    void* allocated_address = *p-&gt;devPtr;
+    // Copy scalar fields into the trace while the callback data is valid.
+}</code></pre>
+<p>functionParams 指向的结构只在 callback 有效期内可用。需要异步写日志时，应在回调内复制所需标量，不能把这些临时指针直接塞进后台队列。示例用 correlationData 保存 ENTER 时间戳，并在 EXIT 输出一条完整记录；start_ns / end_ns 是 host 侧 API 边界，不是 GPU 工作持续时间。</p>
+<h3 id="zh-activity">异步 activity</h3>
+<p>Activity API 让 CUPTI 把记录写入工具提供的 buffer，再异步交付给工具。RUNTIME / DRIVER activity 给出 API 名称对应的 CBID、时间、进程 / 线程与返回值；它们不提供 callback 那样的完整 functionParams。需要提取 VMM 的 handle、地址和映射长度时，callback 更直接。<a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__ActivityAPI.html">CUpti_ActivityAPI</a></p>
+<pre class="code" data-language="text"><code>Register buffers: cuptiActivityRegisterCallbacks(requestBuffer, completeBuffer)
+Enable records:   cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME / DRIVER / ...)
+Run workload:     CUPTI fills buffers, then delivers them asynchronously
+Consume buffer:   cuptiActivityGetNextRecord(...) until MAX_LIMIT_REACHED
+Check losses:     cuptiActivityGetNumDroppedRecords(context, streamId, &amp;dropped)
+Finish workload:  synchronize needed CUDA work outside callbacks
+Drain records:    cuptiActivityFlushAll(0); release buffers after parsing</code></pre>
+<p>Buffer 解析需要处理结束状态、记录版本和丢失计数。<code>cuptiActivityFlushAll</code> 本身不隐式同步 CUDA 工作；希望得到完整 GPU 起止时间时，应用必须先完成所需同步。本文的可运行追踪器只使用 Callback API，因此不注册 activity buffer，也不需要 activity flush。<a href="https://docs.nvidia.com/cupti/12.8/api/group__CUPTI__ACTIVITY__API.html">Activity API</a></p>
+<p><code>CUPTI_ACTIVITY_KIND_MEMORY2</code> 的 CUpti_ActivityMemory4 将分配与释放表示为独立记录，包含地址、字节数、memory kind 等信息。它适合补充内存生命周期视图；逐项重建 VMM 的 reserve、create、map、set-access 过程，仍应检查对应 Driver callback，不能用一条 MEMORY2 记录代替全部步骤。<a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__ActivityMemory4.html">CUpti_ActivityMemory4</a></p>
+<p>Callback 的 correlationId 对应同一 domain 的 API activity。关联记录时需要保留进程与 domain，不能假设相邻 runtime 和 driver 记录共享同一个 ID；例如 CUpti_ActivityMemcpy6 分别提供 driver 的 correlationId 与 runtimeCorrelationId。callback、API activity 和内存 activity 也可能是同一操作的不同视角，不能重复计数。<a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__CallbackData.html">CUpti_CallbackData</a>；<a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__ActivityMemcpy6.html">CUpti_ActivityMemcpy6</a></p>
+
+<h2 id="zh-allocator">3. PyTorch 显存路径</h2>
+<h3 id="zh-native">缓存与 cudaMalloc</h3>
+<p>Native caching allocator 优先从池中寻找可复用块。缓存不足时，普通路径通过 cudaMalloc 获得更大的分配，再将块交给 Tensor。Tensor 销毁后，allocator 通常保留空闲块供后续使用；只有向 CUDA 归还资源时，才会出现 cudaFree。因此一次 <code>torch.empty</code> 不必对应一次 cudaMalloc，<code>del tensor</code> 也不必对应 cudaFree。<a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L985-L1009">cudaMalloc path</a>；<a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L3054-L3097">Release cached allocation</a></p>
+<p><code>memory_allocated()</code> 统计 allocator 当前归于 Tensor 等活跃分配的大小，<code>memory_reserved()</code> 统计 allocator 管理的显存。两者都不是进程全部 CUDA 资源的总计；CUDA context、库内部或其他 allocator 的内存可能不包含在内。<code>empty_cache()</code> 释放可归还的空闲缓存，不能释放仍被活跃 Tensor 占用的内存。<a href="https://docs.pytorch.org/docs/2.8/notes/cuda.html#memory-management">PyTorch memory management</a></p>
+<h3 id="zh-vmm">Expandable segments 与 VMM</h3>
+<p><code>backend:native,expandable_segments:True</code> 仍使用 PyTorch 的 native allocator，但改变其向 CUDA 获得内存的方式：先预留连续虚拟地址，再按需创建物理分配并映射。可扩展的是已映射的覆盖范围，缓存复用仍然存在。<a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L375-L392">ExpandableSegment: reserve</a>；<a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L399-L484">ExpandableSegment: create</a></p>
+<div class="trace-table"><table><thead><tr><th>Driver API</th><th>管理的资源</th><th>追踪字段</th></tr></thead><tbody>
+<tr><td>cuMemAddressReserve</td><td>预留虚拟地址范围；此时不等于获得同样多的物理显存</td><td>成功后的 ptr、size</td></tr>
+<tr><td>cuMemCreate</td><td>创建物理内存分配并返回 handle；尚未映射到可访问地址</td><td>成功后的 handle、size</td></tr>
+<tr><td>cuMemMap</td><td>将物理分配关联到虚拟地址区间</td><td>ptr、size、handle、offset</td></tr>
+<tr><td>cuMemSetAccess</td><td>设置指定设备对该范围的访问权限</td><td>ptr、size；需要分析多 GPU 权限时再扩展 desc 数组</td></tr>
+<tr><td>cuMemUnmap</td><td>解除指定地址区间的映射</td><td>ptr、size</td></tr>
+<tr><td>cuMemRelease</td><td>释放一个 allocation handle 引用；物理资源回收还取决于剩余引用 / 映射</td><td>handle；从对应成功 create 记录查找大小</td></tr>
+<tr><td>cuMemAddressFree</td><td>归还已解除映射的虚拟地址预留</td><td>ptr、size</td></tr>
+</tbody></table></div>
+<p>这组 API 把地址空间、物理分配、映射和权限拆开管理。cuMemMap 后仍需设置访问权限，才可供相应设备使用。PyTorch 的释放路径先等待相关工作完成，再 unmap、release；整个 expandable segment 销毁时才 address-free。<a href="https://docs.nvidia.com/cuda/archive/12.8.1/cuda-driver-api/group__CUDA__VA.html">CUDA VMM API</a>；<a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L646-L669">Map and access</a>；<a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L672-L699">Unmap and release</a>；<a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L638-L643">Release VA range</a></p>
+<figure class="trace-figure"><div class="trace-toolbar"><span>图中消息与 API 可点击查看来源</span><span><button type="button" data-trace-fit="fit" aria-pressed="true">适应宽度</button> <button type="button" data-trace-fit="actual" aria-pressed="false">100%</button></span></div><div class="trace-viewport" tabindex="0"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 440" role="img" aria-labelledby="zh-cupti-vmm"><title id="zh-cupti-vmm">Virtual reservation, physical handles, and mapping are separate resources</title><rect x="25" y="25" width="590" height="365" rx="4" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><text x="320.0" y="60" text-anchor="middle" font-size="20" font-weight="600">Virtual address range</text><rect x="665" y="25" width="310" height="365" rx="4" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><text x="820.0" y="60" text-anchor="middle" font-size="20" font-weight="600">Physical allocations</text><a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L375-L392" target="_blank" rel="noopener"><text x="320" y="98" text-anchor="middle" font-size="17" font-weight="400">cuMemAddressReserve: address space only</text><rect x="45" y="125" width="550" height="70" fill="var(--trace-bg)" stroke="var(--trace-rule)" stroke-dasharray="5 4"/><text x="320" y="167" text-anchor="middle" font-size="17" font-weight="400">unmapped VA has no physical backing</text></a><a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L399-L484" target="_blank" rel="noopener"><text x="820" y="98" text-anchor="middle" font-size="17" font-weight="400">cuMemCreate → handles</text><rect x="685" y="125" width="57" height="70" fill="var(--trace-physical)" stroke="var(--trace-rule)"/><text x="713" y="155" text-anchor="middle" font-size="17" font-weight="400">H0</text><text x="713" y="178" text-anchor="middle" font-size="12" font-weight="400">20 MiB</text><rect x="752" y="125" width="57" height="70" fill="var(--trace-physical)" stroke="var(--trace-rule)"/><text x="780" y="155" text-anchor="middle" font-size="17" font-weight="400">H1</text><text x="780" y="178" text-anchor="middle" font-size="12" font-weight="400">20 MiB</text><rect x="819" y="125" width="57" height="70" fill="var(--trace-physical)" stroke="var(--trace-rule)"/><text x="847" y="155" text-anchor="middle" font-size="17" font-weight="400">H2</text><text x="847" y="178" text-anchor="middle" font-size="12" font-weight="400">20 MiB</text><rect x="886" y="125" width="57" height="70" fill="var(--trace-physical)" stroke="var(--trace-rule)"/><text x="914" y="155" text-anchor="middle" font-size="17" font-weight="400">H3</text><text x="914" y="178" text-anchor="middle" font-size="12" font-weight="400">20 MiB</text></a><a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L646-L669" target="_blank" rel="noopener"><text x="320" y="225" text-anchor="middle" font-size="17" font-weight="400">cuMemMap: VA interval → physical handle</text><text x="320" y="247" text-anchor="middle" font-size="17" font-weight="400">cuMemSetAccess: allow device access</text><rect x="45" y="267" width="89" height="72" fill="var(--trace-physical)" stroke="var(--trace-rule)"/><text x="89" y="296" text-anchor="middle" font-size="15" font-weight="400">VA → H0</text><text x="89" y="320" text-anchor="middle" font-size="13" font-weight="400">20 MiB</text><rect x="134" y="267" width="89" height="72" fill="var(--trace-physical)" stroke="var(--trace-rule)"/><text x="178" y="296" text-anchor="middle" font-size="15" font-weight="400">VA → H1</text><text x="178" y="320" text-anchor="middle" font-size="13" font-weight="400">20 MiB</text><rect x="223" y="267" width="89" height="72" fill="var(--trace-physical)" stroke="var(--trace-rule)"/><text x="267" y="296" text-anchor="middle" font-size="15" font-weight="400">VA → H2</text><text x="267" y="320" text-anchor="middle" font-size="13" font-weight="400">20 MiB</text><rect x="312" y="267" width="89" height="72" fill="var(--trace-physical)" stroke="var(--trace-rule)"/><text x="356" y="296" text-anchor="middle" font-size="15" font-weight="400">VA → H3</text><text x="356" y="320" text-anchor="middle" font-size="13" font-weight="400">20 MiB</text><rect x="401" y="267" width="194" height="72" fill="var(--trace-bg)" stroke="var(--trace-rule)" stroke-dasharray="5 4"/><text x="498" y="308" text-anchor="middle" font-size="15" font-weight="400">unmapped remainder</text><text x="820" y="285" text-anchor="middle" font-size="17" font-weight="400">64 MiB tensor request</text><text x="820" y="316" text-anchor="middle" font-size="17" font-weight="600">80 MiB mapped backing</text></a><text x="500" y="420" text-anchor="middle" font-size="15" font-weight="400">Illustrative PyTorch 2.8 large-pool case: four 20 MiB allocator chunks, not a GPU page-size claim.</text></svg></div><figcaption>地址预留、物理分配与映射分别记账。此处 80 MiB 来自 PyTorch 大池的 20 MiB 分配粒度；图形不按地址空间大小等比例绘制。</figcaption></figure>
+<aside class="trace-note"><p>三个容易混淆的量：cuMemAddressReserve 的 size 是虚拟地址范围；cuMemCreate 的 size 是物理分配大小；PyTorch memory_reserved 是 allocator 的显存统计，不等于预留的整个虚拟地址范围。<code>CU_MEM_ALLOCATION_TYPE_PINNED</code> 配合 DEVICE location 创建的是这里的设备物理内存，也不是 <a href="pytorch-dataloader.html#zh-device">DataLoader pin_memory</a> 使用的页锁定 CPU batch。</p></aside>
+<p>本文固定版本的大池使用 20 MiB 分配块，小池使用 2 MiB。这是 allocator 的粒度，不代表 GPU 硬件页大小。一个全新的大池承接 64 MiB 请求，可能需要四个 20 MiB handle，映射总量为 80 MiB。地址预留范围则可能远大于这些实际物理分配。<a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L2426-L2440">Allocator segment size</a>；<a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L375-L392">ExpandableSegment: reserve</a></p>
+
+<h2 id="zh-example">4. 端到端示例</h2>
+<h3 id="zh-build">环境与编译</h3>
+<p>示例需要 NVIDIA GPU、兼容 CUDA 12.8 的驱动、CUDA Toolkit 12.8 开发文件，以及带 CUDA 的 PyTorch 2.8。C++ 追踪器使用普通 g++ 编译，不含 device kernel。安装了 PyTorch wheel 不等于系统已经有完整 CUDA 开发头文件；编译时的 CUPTI headers 和动态库应来自同一版本。</p>
+<p>将 <a href="../assets/pytorch-internals/cupti-memory/memory_trace.cpp" download>memory_trace.cpp</a>、<a href="../assets/pytorch-internals/cupti-memory/build.sh" download>build.sh</a>、<a href="../assets/pytorch-internals/cupti-memory/allocator_demo.py" download>allocator_demo.py</a> 和 <a href="../assets/pytorch-internals/cupti-memory/summarize.py" download>summarize.py</a> 保存到同一目录。已有匹配环境时可跳过创建 venv 和安装 PyTorch：</p>
+<pre class="code" data-language="bash"><code># Linux, NVIDIA GPU + compatible driver, CUDA Toolkit 12.8 development files
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+nvidia-smi
+
+# Save memory_trace.cpp, build.sh, allocator_demo.py, summarize.py here.
+export CUDA_ROOT=/usr/local/cuda-12.8
+export TRACE_BUILD=&quot;$PWD/build&quot;
+bash build.sh</code></pre>
+<p>build.sh 默认使用 <code>$CUDA_ROOT/include</code>、<code>$CUDA_ROOT/extras/CUPTI/include</code> 和 <code>$CUDA_ROOT/extras/CUPTI/lib64</code>。发行版安装到其他位置时，可覆盖 CUDA_INCLUDE、CUPTI_INCLUDE 和 CUPTI_LIB。构建产物只链接 libcupti，使用 rpath 指向所选 CUPTI 库目录，无需为截获 cudaMalloc 另写 LD_PRELOAD wrapper。</p>
+<details><summary>查看完整编译脚本</summary><pre class="code" data-language="bash"><code>#!/usr/bin/env bash
+set -euo pipefail
+
+# Override CUDA_INCLUDE, CUPTI_INCLUDE, and CUPTI_LIB for nonstandard installs.
+CUDA_ROOT=${CUDA_ROOT:-/usr/local/cuda-12.8}
+CUDA_INCLUDE=${CUDA_INCLUDE:-$CUDA_ROOT/include}
+CUPTI_INCLUDE=${CUPTI_INCLUDE:-$CUDA_ROOT/extras/CUPTI/include}
+CUPTI_LIB=${CUPTI_LIB:-$CUDA_ROOT/extras/CUPTI/lib64}
+TRACE_BUILD=${TRACE_BUILD:-./build}
+SOURCE_DIR=$(cd -- &quot;$(dirname -- &quot;${BASH_SOURCE[0]}&quot;)&quot; &amp;&amp; pwd)
+test -f &quot;$CUDA_INCLUDE/cuda.h&quot;
+test -f &quot;$CUPTI_INCLUDE/cupti.h&quot;
+if [[ -f &quot;$CUPTI_LIB/libcupti.so&quot; ]]; then
+    CUPTI_LINK=-lcupti
+else
+    test -f &quot;$CUPTI_LIB/libcupti.so.12&quot;
+    CUPTI_LINK=-l:libcupti.so.12
+fi
+mkdir -p &quot;$TRACE_BUILD&quot;
+&quot;${CXX:-g++}&quot; -std=c++17 -O2 -Wall -Wextra -Werror -fPIC -shared -pthread \
+    -I&quot;$CUDA_INCLUDE&quot; -I&quot;$CUPTI_INCLUDE&quot; &quot;$SOURCE_DIR/memory_trace.cpp&quot; \
+    -L&quot;$CUPTI_LIB&quot; &quot;$CUPTI_LINK&quot; -Wl,-rpath,&quot;$CUPTI_LIB&quot; \
+    -o &quot;$TRACE_BUILD/libmemory_trace.so&quot;
+printf &#x27;Built %s/libmemory_trace.so\n&#x27; &quot;$TRACE_BUILD&quot;
+</code></pre></details>
+<h3 id="zh-tracer">追踪器</h3>
+<p>Python 用 ctypes 显式加载追踪器，在首次 CUDA 初始化前执行 trace_start，阶段切换时执行 trace_mark，结束时执行 trace_stop。CUPTI 的 domain / CBID 订阅拦截对应调用，所以即使 PyTorch 通过 driver 函数指针调用 VMM，也不依赖同名函数的 ELF 符号替换。</p>
+<p>追踪器为每次完成的 API 调用记录 phase、PID / TID、domain、CBID、correlation ID、context UID、函数名、起止时间、返回值与内存字段。失败记录保留请求字节数，但不读取未定义的输出地址或 handle。cudaFree 和 cuMemRelease 本身没有 size 参数，因此其 bytes 留空。</p>
+<details><summary>查看完整 C++ 追踪器</summary><pre class="code" data-language="cpp"><code>// Linux teaching tracer: CUDA Toolkit / CUPTI 12.8, one controlled process.
+// Callback logging is synchronous; do not use these timings as a benchmark.
+#include &lt;cupti.h&gt;
+#include &lt;cupti_driver_cbid.h&gt;
+#include &lt;cupti_runtime_cbid.h&gt;
+// cupti.h already includes generated_cuda{,_runtime_api}_meta.h in 12.8.
+// These generated parameter headers do not have independent include guards.
+
+#include &lt;cinttypes&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstring&gt;
+#include &lt;mutex&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;unistd.h&gt;
+
+namespace {
+CUpti_SubscriberHandle subscriber{};
+FILE* output = nullptr;
+std::mutex output_mutex;
+char phase[64] = &quot;INIT&quot;;
+bool active = false;
+bool io_failed = false;
+
+struct Fields {
+    uint64_t bytes = 0, address = 0, handle = 0, offset = 0;
+    bool has_bytes = false, has_address = false, has_handle = false;
+    bool has_offset = false;
+};
+
+// Decode inputs at EXIT. Read output pointers ONLY after successful return.
+Fields decode(CUpti_CallbackDomain domain, CUpti_CallbackId id,
+              const void* params, bool success) {
+    Fields f;
+    if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {
+        if (id == CUPTI_RUNTIME_TRACE_CBID_cudaMalloc_v3020) {
+            const auto* p = static_cast&lt;const cudaMalloc_v3020_params*&gt;(params);
+            f.bytes = p-&gt;size; f.has_bytes = true;
+            if (success &amp;&amp; p-&gt;devPtr) {
+                f.address = reinterpret_cast&lt;uintptr_t&gt;(*p-&gt;devPtr);
+                f.has_address = true;
+            }
+        } else if (id == CUPTI_RUNTIME_TRACE_CBID_cudaFree_v3020) {
+            const auto* p = static_cast&lt;const cudaFree_v3020_params*&gt;(params);
+            f.address = reinterpret_cast&lt;uintptr_t&gt;(p-&gt;devPtr);
+            f.has_address = true;
+        }
+        return f;
+    }
+    switch (id) {
+    case CUPTI_DRIVER_TRACE_CBID_cuMemAddressReserve: {
+        const auto* p = static_cast&lt;const cuMemAddressReserve_params*&gt;(params);
+        f.bytes = p-&gt;size; f.has_bytes = true;
+        if (success &amp;&amp; p-&gt;ptr) { f.address = *p-&gt;ptr; f.has_address = true; }
+        break;
+    }
+    case CUPTI_DRIVER_TRACE_CBID_cuMemAddressFree: {
+        const auto* p = static_cast&lt;const cuMemAddressFree_params*&gt;(params);
+        f.bytes = p-&gt;size; f.address = p-&gt;ptr;
+        f.has_bytes = f.has_address = true;
+        break;
+    }
+    case CUPTI_DRIVER_TRACE_CBID_cuMemCreate: {
+        const auto* p = static_cast&lt;const cuMemCreate_params*&gt;(params);
+        f.bytes = p-&gt;size; f.has_bytes = true;
+        if (success &amp;&amp; p-&gt;handle) { f.handle = *p-&gt;handle; f.has_handle = true; }
+        break;
+    }
+    case CUPTI_DRIVER_TRACE_CBID_cuMemRelease: {
+        const auto* p = static_cast&lt;const cuMemRelease_params*&gt;(params);
+        f.handle = p-&gt;handle; f.has_handle = true;
+        break;
+    }
+    case CUPTI_DRIVER_TRACE_CBID_cuMemMap: {
+        const auto* p = static_cast&lt;const cuMemMap_params*&gt;(params);
+        f.address = p-&gt;ptr; f.bytes = p-&gt;size; f.handle = p-&gt;handle;
+        f.offset = p-&gt;offset;
+        f.has_address = f.has_bytes = f.has_handle = f.has_offset = true;
+        break;
+    }
+    case CUPTI_DRIVER_TRACE_CBID_cuMemUnmap: {
+        const auto* p = static_cast&lt;const cuMemUnmap_params*&gt;(params);
+        f.address = p-&gt;ptr; f.bytes = p-&gt;size;
+        f.has_address = f.has_bytes = true;
+        break;
+    }
+    case CUPTI_DRIVER_TRACE_CBID_cuMemSetAccess: {
+        const auto* p = static_cast&lt;const cuMemSetAccess_params*&gt;(params);
+        f.address = p-&gt;ptr; f.bytes = p-&gt;size;
+        f.has_address = f.has_bytes = true;
+        break;
+    }
+    default: break;
+    }
+    return f;
+}
+
+uint64_t timestamp() {
+    uint64_t value = 0;
+    // A zero timestamp is retained as missing data, never a valid duration.
+    if (cuptiGetTimestamp(&amp;value) != CUPTI_SUCCESS) return 0;
+    return value;
+}
+
+void CUPTIAPI callback(void*, CUpti_CallbackDomain domain,
+                       CUpti_CallbackId id, const void* data) {
+    if (domain != CUPTI_CB_DOMAIN_RUNTIME_API &amp;&amp;
+        domain != CUPTI_CB_DOMAIN_DRIVER_API) return;
+    const auto* info = static_cast&lt;const CUpti_CallbackData*&gt;(data);
+    if (info-&gt;callbackSite == CUPTI_API_ENTER) {
+        *info-&gt;correlationData = timestamp();
+        return;
+    }
+    if (info-&gt;callbackSite != CUPTI_API_EXIT) return;
+    const uint64_t end = timestamp();
+    const uint64_t start = *info-&gt;correlationData;
+    const int result = domain == CUPTI_CB_DOMAIN_RUNTIME_API
+        ? static_cast&lt;int&gt;(*static_cast&lt;const cudaError_t*&gt;(info-&gt;functionReturnValue))
+        : static_cast&lt;int&gt;(*static_cast&lt;const CUresult*&gt;(info-&gt;functionReturnValue));
+    const Fields f = decode(domain, id, info-&gt;functionParams, result == 0);
+    char bytes[32] = &quot;&quot;, address[32] = &quot;&quot;, handle[32] = &quot;&quot;, offset[32] = &quot;&quot;;
+    if (f.has_bytes) std::snprintf(bytes, sizeof(bytes), &quot;%&quot; PRIu64, f.bytes);
+    if (f.has_address) std::snprintf(address, sizeof(address), &quot;0x%&quot; PRIx64, f.address);
+    if (f.has_handle) std::snprintf(handle, sizeof(handle), &quot;0x%&quot; PRIx64, f.handle);
+    if (f.has_offset) std::snprintf(offset, sizeof(offset), &quot;%&quot; PRIu64, f.offset);
+    std::lock_guard&lt;std::mutex&gt; lock(output_mutex);
+    if (!output) return;
+    const int written = std::fprintf(output,
+        &quot;api,%s,%ld,%ld,%s,%u,%u,%u,%s,%&quot; PRIu64 &quot;,%&quot; PRIu64 &quot;,%d,%s,%s,%s,%s\n&quot;,
+        phase, static_cast&lt;long&gt;(getpid()), static_cast&lt;long&gt;(syscall(SYS_gettid)),
+        domain == CUPTI_CB_DOMAIN_RUNTIME_API ? &quot;runtime&quot; : &quot;driver&quot;,
+        static_cast&lt;unsigned&gt;(id), info-&gt;correlationId, info-&gt;contextUid,
+        info-&gt;functionName, start, end, result, bytes, address, handle, offset);
+    if (written &lt; 0) io_failed = true;
+}
+
+bool check(CUptiResult result, const char* operation) {
+    if (result == CUPTI_SUCCESS) return true;
+    const char* message = &quot;unknown CUPTI error&quot;;
+    cuptiGetResultString(result, &amp;message);
+    std::fprintf(stderr, &quot;%s: %s (%d)\n&quot;, operation, message, static_cast&lt;int&gt;(result));
+    return false;
+}
+}  // namespace
+
+// Call start/mark/stop serially from the controlling Python thread.
+// Before stop, all application threads must have left traced CUDA API calls.
+extern &quot;C&quot; int trace_start(const char* path) {
+    if (active || output || !path) return -1;
+    output = std::fopen(path, &quot;w&quot;);
+    if (!output) { std::perror(&quot;open trace&quot;); return -1; }
+    io_failed = false;
+    std::snprintf(phase, sizeof(phase), &quot;INIT&quot;);
+    std::fprintf(output, &quot;kind,phase,pid,tid,domain,cbid,correlation_id,context_uid,api,start_ns,end_ns,result,bytes,address,handle,offset\n&quot;);
+    if (!check(cuptiSubscribe(&amp;subscriber, callback, nullptr), &quot;cuptiSubscribe&quot;)) {
+        std::fclose(output); output = nullptr; return -1;
+    }
+    active = true;
+    struct Selection { CUpti_CallbackDomain domain; CUpti_CallbackId id; };
+    const Selection selection[] = {
+        {CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_cudaMalloc_v3020},
+        {CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_cudaFree_v3020},
+        {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemAddressReserve},
+        {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemAddressFree},
+        {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemCreate},
+        {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemRelease},
+        {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemMap},
+        {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemUnmap},
+        {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemSetAccess},
+    };
+    for (const auto&amp; item : selection) {
+        if (!check(cuptiEnableCallback(1, subscriber, item.domain, item.id), &quot;cuptiEnableCallback&quot;)) {
+            if (check(cuptiUnsubscribe(subscriber), &quot;cuptiUnsubscribe&quot;)) {
+                active = false; std::fclose(output); output = nullptr;
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+extern &quot;C&quot; int trace_mark(const char* name) {
+    if (!active || !name || std::strlen(name) &gt;= sizeof(phase)) return -1;
+    // Keep CSV fields unquoted by restricting phase labels to safe characters.
+    for (const char* p = name; *p; ++p) {
+        if (!((*p &gt;= &#x27;A&#x27; &amp;&amp; *p &lt;= &#x27;Z&#x27;) || (*p &gt;= &#x27;0&#x27; &amp;&amp; *p &lt;= &#x27;9&#x27;) || *p == &#x27;_&#x27;)) return -1;
+    }
+    const uint64_t now = timestamp();
+    std::lock_guard&lt;std::mutex&gt; lock(output_mutex);
+    std::snprintf(phase, sizeof(phase), &quot;%s&quot;, name);
+    if (std::fprintf(output, &quot;phase,%s,%ld,%ld,host,,,,mark,%&quot; PRIu64 &quot;,%&quot; PRIu64 &quot;,0,,,,\n&quot;,
+        phase, static_cast&lt;long&gt;(getpid()), static_cast&lt;long&gt;(syscall(SYS_gettid)), now, now) &lt; 0) io_failed = true;
+    return io_failed ? -1 : 0;
+}
+
+extern &quot;C&quot; int trace_stop() {
+    if (!active) return -1;
+    if (!check(cuptiUnsubscribe(subscriber), &quot;cuptiUnsubscribe&quot;)) return -1;
+    active = false;
+    std::lock_guard&lt;std::mutex&gt; lock(output_mutex);
+    const bool failed = io_failed || std::ferror(output);
+    const int closed = std::fclose(output); output = nullptr;
+    return failed || closed != 0 ? -1 : 0;
+}
+</code></pre></details>
+<p>这是便于阅读的同步 CSV 采集器：一个 mutex 保证每行完整，写入和 callback 都有开销。生产级工具通常在 callback 中复制标量到预分配队列，再由后台线程处理。示例的全局 phase 只适用于这段受控程序；多线程服务需要按线程或显式操作 ID 关联，不能据此把所有 CUDA 调用归因到某个 Python 算子。</p>
+<h3 id="zh-workload">分配、复用与释放</h3>
+<p>程序先分配 64 MiB 的 A，删除后用同样大小的 B 检查缓存复用；B 保持存活时，再分配 96 MiB 的 C，使池需要增长。最后删除 B、C 并 empty_cache。所有 Tensor 都使用 torch.empty，不填值、不做 H2D，这样观察的是 allocator 行为。每个阶段同时输出 PyTorch 内存统计与需要核对的地址。</p>
+<pre class="code" data-language="python"><code>&quot;&quot;&quot;Controlled PyTorch allocation phases. Run each allocator mode in a fresh process.&quot;&quot;&quot;
+import argparse
+import ctypes
+import gc
+import json
+import os
+from pathlib import Path
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(&quot;--library&quot;, required=True, type=Path)
+    parser.add_argument(&quot;--trace&quot;, required=True, type=Path)
+    args = parser.parse_args()
+    # Importing torch does not intentionally create CUDA tensors in this script.
+    # Set PYTORCH_CUDA_ALLOC_CONF in the launch command, before this import.
+    import torch
+
+    if torch.version.cuda is None:
+        raise SystemExit(&quot;Install a CUDA-enabled PyTorch build; this is a CPU-only build.&quot;)
+    tracer = ctypes.CDLL(str(args.library.resolve()))
+    tracer.trace_start.argtypes = [ctypes.c_char_p]
+    tracer.trace_mark.argtypes = [ctypes.c_char_p]
+    tracer.trace_stop.argtypes = []
+    for name in (&quot;trace_start&quot;, &quot;trace_mark&quot;, &quot;trace_stop&quot;):
+        getattr(tracer, name).restype = ctypes.c_int
+
+    def mark(name):
+        if tracer.trace_mark(name.encode()) != 0:
+            raise RuntimeError(&quot;Could not write trace phase &quot; + name)
+
+    def snapshot(name, **pointers):
+        print(json.dumps({&quot;phase&quot;: name,
+            &quot;allocated&quot;: torch.cuda.memory_allocated(),
+            &quot;reserved&quot;: torch.cuda.memory_reserved(), **pointers}), flush=True)
+
+    args.trace.parent.mkdir(parents=True, exist_ok=True)
+    if tracer.trace_start(os.fsencode(args.trace)) != 0:
+        raise SystemExit(&quot;CUPTI subscription failed; inspect the error above.&quot;)
+    try:
+        mark(&quot;INIT&quot;)
+        torch.cuda.init()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        print(json.dumps({&quot;torch&quot;: torch.__version__, &quot;cuda_build&quot;: torch.version.cuda,
+            &quot;allocator_config&quot;: os.environ.get(&quot;PYTORCH_CUDA_ALLOC_CONF&quot;, &quot;&quot;),
+            &quot;backend&quot;: torch.cuda.memory.get_allocator_backend()}), flush=True)
+        snapshot(&quot;INIT&quot;)
+
+        mark(&quot;ALLOC_A&quot;)
+        a = torch.empty(16 * 1024 * 1024, dtype=torch.float32, device=&quot;cuda&quot;)  # 64 MiB
+        original = a.data_ptr()
+        snapshot(&quot;ALLOC_A&quot;, a=hex(original))
+
+        mark(&quot;DROP_A&quot;)
+        del a
+        gc.collect()
+        snapshot(&quot;DROP_A&quot;)
+
+        mark(&quot;REUSE_B&quot;)
+        b = torch.empty(16 * 1024 * 1024, dtype=torch.float32, device=&quot;cuda&quot;)
+        snapshot(&quot;REUSE_B&quot;, b=hex(b.data_ptr()), reused=(b.data_ptr() == original))
+
+        mark(&quot;GROW_C&quot;)
+        c = torch.empty(24 * 1024 * 1024, dtype=torch.float32, device=&quot;cuda&quot;)  # 96 MiB
+        snapshot(&quot;GROW_C&quot;, c=hex(c.data_ptr()))
+
+        mark(&quot;DROP_ALL&quot;)
+        del b, c
+        gc.collect()
+        torch.cuda.synchronize()
+        snapshot(&quot;DROP_ALL&quot;)
+
+        mark(&quot;EMPTY_CACHE&quot;)
+        torch.cuda.empty_cache()
+        snapshot(&quot;EMPTY_CACHE&quot;)
+        torch.cuda.synchronize()
+    finally:
+        # No application worker threads issue CUDA calls in this example.
+        # Unsubscribe before ctypes can unload the library at process exit.
+        if tracer.trace_stop() != 0:
+            raise RuntimeError(&quot;Trace shutdown or file write failed&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre>
+<p>两种 allocator 配置必须在独立 Python 进程中运行，环境变量在导入 PyTorch 前生效。不要设置 PYTORCH_NO_CUDA_MEMORY_CACHING=1，否则会破坏这里要观察的缓存路径。下面显式选择 native backend，避免把 cudaMallocAsync backend 混入比较。</p>
+<pre class="code" data-language="bash"><code>mkdir -p traces
+
+# Each command starts a fresh process. Keep the native cache enabled.
+env -u PYTORCH_NO_CUDA_MEMORY_CACHING -u PYTORCH_ALLOC_CONF \
+  PYTORCH_CUDA_ALLOC_CONF=backend:native,expandable_segments:False \
+  python allocator_demo.py --library &quot;$TRACE_BUILD/libmemory_trace.so&quot; \
+  --trace traces/native.csv &gt; traces/native-states.jsonl
+
+env -u PYTORCH_NO_CUDA_MEMORY_CACHING -u PYTORCH_ALLOC_CONF \
+  PYTORCH_CUDA_ALLOC_CONF=backend:native,expandable_segments:True \
+  python allocator_demo.py --library &quot;$TRACE_BUILD/libmemory_trace.so&quot; \
+  --trace traces/vmm.csv &gt; traces/vmm-states.jsonl
+
+python summarize.py traces/native.csv
+python summarize.py traces/vmm.csv
+cat traces/native-states.jsonl
+cat traces/vmm-states.jsonl</code></pre>
+<p>CSV 保存 CUDA API 事件，JSONL 保存每个阶段结束时的 PyTorch 统计。阶段标签不是 CUPTI 或 NVTX 的标准事件；它只是本例写入日志的标记，让没有 CUDA API 调用的 DROP_A、REUSE_B 等阶段也能被保留下来。</p>
+
+<h2 id="zh-reading">5. 日志解读</h2>
+<h3 id="zh-expected">两条路径的预期差异</h3>
+<p>下表是根据固定版本 allocator 源码推导的预期行为，不是实机采集结果。具体调用次数取决于初始池状态、分配粒度、失败重试和平台支持；应以 CSV 中 result=0 的记录和 JSONL 统计核对。</p>
+<div class="trace-table"><table><thead><tr><th>阶段</th><th>普通 native</th><th>Expandable segments</th><th>PyTorch 侧观察</th></tr></thead><tbody>
+<tr><td>ALLOC_A：64 MiB</td><td>缓存不足时 cudaMalloc</td><td>Reserve VA；Create → Map → SetAccess</td><td>allocated 上升；reserved 可能超过请求大小</td></tr>
+<tr><td>DROP_A</td><td>通常不调用 cudaFree</td><td>通常不调用 Unmap / Release</td><td>allocated 下降，缓存仍保留</td></tr>
+<tr><td>REUSE_B：64 MiB</td><td>复用缓存时没有新 cudaMalloc</td><td>复用已有映射时没有新 Create / Map</td><td>比较 B 与 A 的地址，并查看 reserved 是否变化</td></tr>
+<tr><td>GROW_C：96 MiB</td><td>缓存不足，再次 cudaMalloc</td><td>已有 VA 有空间时增加 Create / Map，不一定再次 Reserve</td><td>活跃分配达到 160 MiB；reserved 受粒度影响</td></tr>
+<tr><td>DROP_ALL</td><td>回到空闲缓存</td><td>回到已映射的空闲缓存</td><td>本例活跃 Tensor 已全部删除</td></tr>
+<tr><td>EMPTY_CACHE</td><td>cudaFree 可释放的缓存块</td><td>Unmap / Release；整个 segment 释放时 AddressFree</td><td>reserved 下降；不代表 CUDA context 等资源全部释放</td></tr>
+</tbody></table></div>
+<p>PyTorch 2.8 的 expandable 路径可能先尝试一种 handle 类型，再在不支持时回退。一个失败的 cuMemCreate 后跟着成功重试，并不表示分配了两份内存。错误码是判断资源是否建立的前提，而不是可以省略的诊断字段。<a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L399-L484">ExpandableSegment: create</a></p>
+<h3 id="zh-accounting">地址、handle 与计数</h3>
+<p>Native 路径可用成功 cudaMalloc 的 address → size 配对 cudaFree；VMM 路径则要分别维护 VA 范围、handle → size，以及 (VA interval, handle, offset) 映射。地址与 handle 都可能被再次使用，需要按发生顺序维护生命周期；不要把某个十六进制值当作全程唯一对象 ID。</p>
+<p>例如同一份 80 MiB backing 既产生 80 MiB 的 create 记录，也产生 80 MiB 的 map 记录。二者相加得到的 160 MiB 没有“物理占用”的含义。Reserve 的巨大 size 更不能加入显存总量。通用 VMM 程序还允许多映射、共享 handle 与跨进程引用，cuMemRelease 的一次调用也不足以独立证明物理内存已回收。</p>
+<p>配套汇总脚本只按 phase / domain / API 统计成功次数、失败次数及该 API 自身的 bytes 总和，刻意不输出跨 API 的“总显存”。Free / Release 缺少的 size 也不会被当作 0 字节释放。需要绘制占用曲线时，应补上生命周期配对与映射状态分析，并说明统计的是活跃 Tensor、allocator backing 还是保留的 VA。</p>
+<details><summary>查看日志汇总脚本</summary><pre class="code" data-language="python"><code>&quot;&quot;&quot;Summarize API events without adding VA reservation bytes to allocation bytes.&quot;&quot;&quot;
+import argparse
+import csv
+from collections import Counter
+
+
+def summarize(path):
+    with open(path, newline=&quot;&quot;) as stream:
+        rows = list(csv.DictReader(stream))
+    if not rows:
+        raise ValueError(&quot;Empty trace: check subscription, workload, and output path&quot;)
+    phases = list(dict.fromkeys(row[&quot;phase&quot;] for row in rows))
+    counts = Counter()
+    failed = Counter()
+    byte_totals = Counter()
+    for row in rows:
+        if row[&quot;kind&quot;] != &quot;api&quot;:
+            continue
+        key = (row[&quot;phase&quot;], row[&quot;domain&quot;], row[&quot;api&quot;])
+        if int(row[&quot;result&quot;]) != 0:
+            failed[key] += 1
+            continue
+        counts[key] += 1
+        if row[&quot;bytes&quot;]:
+            byte_totals[key] += int(row[&quot;bytes&quot;])
+    print(f&quot;{&#x27;phase&#x27;:&lt;14} {&#x27;domain&#x27;:&lt;8} {&#x27;API&#x27;:&lt;24} {&#x27;ok&#x27;:&gt;4} {&#x27;failed&#x27;:&gt;6} {&#x27;sum(bytes), MiB&#x27;:&gt;16}&quot;)
+    for phase in phases:
+        keys = sorted(key for key in counts.keys() | failed.keys() if key[0] == phase)
+        if not keys:
+            print(f&quot;{phase:&lt;14} (no selected API calls)&quot;)
+        for key in keys:
+            total = f&quot;{byte_totals[key] / 2**20:.2f}&quot; if key in byte_totals else &quot;-&quot;
+            print(f&quot;{key[0]:&lt;14} {key[1]:&lt;8} {key[2]:&lt;24} {counts[key]:&gt;4} {failed[key]:&gt;6} {total:&gt;16}&quot;)
+    print(&quot;\nBytes are summed separately per API, not live memory or a cross-API total.&quot;)
+    print(&quot;Reserve = VA range; Create = physical allocation; Map = mapping extent.&quot;)
+    print(&quot;Release/Free can omit a size; recover it from the successful creation record.&quot;)
+    if not counts:
+        raise ValueError(&quot;No successful selected API calls: this is not evidence of zero allocation&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(&quot;trace&quot;)
+    summarize(parser.parse_args().trace)
+</code></pre></details>
+<h3 id="zh-limits">观测范围与排查</h3>
+<div class="trace-table"><table><thead><tr><th>现象</th><th>检查方向</th></tr></thead><tbody>
+<tr><td>没有任何成功事件</td><td>检查 cuptiSubscribe 的错误、库版本、CUDA 可用性和启动时机。空日志不证明程序没有分配。</td></tr>
+<tr><td>REUSE_B 没有 CUDA 分配调用</td><td>同时查看 data_ptr 与 reserved；缓存命中本来就可能没有底层 API。</td></tr>
+<tr><td>打开 expandable_segments 后没有 VMM</td><td>确认在新进程中设置配置、使用 native backend，并检查平台不支持的 warning；不要把回退路径当成 VMM 结果。</td></tr>
+<tr><td>与 nsys / torch.profiler 同用时报订阅失败</td><td>CUPTI 12.8 的 callback subscriber 限制为一个；采集器与这些 CUDA profiler 分开运行。</td></tr>
+<tr><td>出现 cudaMallocAsync 或其他分配器</td><td>超出本例九个 CBID 的范围；需为实际 API 增加订阅、参数解码和相应生命周期语义。</td></tr>
+<tr><td>耗时比无采集时长</td><td>同步 callback 和文件写入会扰动时序。本例用于解释调用与资源，不用于给 allocator 做性能排名。</td></tr>
+</tbody></table></div>
+<p>自动阶段标记不包含 Python 调用栈，CSV 不含 kernel、memcpy、隐式 driver 内部事件或其他进程的分配。本例主动取消订阅后发生的进程退出清理也不在观测范围内。若要联看完整时间线，可在另一次运行中使用 Nsight Systems；其 SQLite 表可参考本项目的 <a href="cheatsheet-cupti.html">CUPTI 表速查</a>。其中的表名属于 nsys 导出 schema，并不是本文自定义 CSV 的字段。<a href="https://docs.nvidia.com/cupti/12.8/main/main.html#callback-api">CUPTI Callback usage</a></p>
+
+<h2 id="zh-validation">6. 验证与源码</h2>
+<p>本文追踪器在无 GPU 的 Linux 环境中，以 NVIDIA CUDA / CUPTI 12.8 开发文件编译并检查 host 端参数解码与日志汇总。当前环境无法执行真实 CUDA 分配；两种 allocator 的端到端命令和预期行为仍需在支持的 GPU 上验证。文中的 64 / 80 MiB 等推导不作为实测数据。</p>
+<p>接口语义来自 <a href="https://docs.nvidia.com/cupti/12.8/api/group__CUPTI__CALLBACK__API.html">Callback API</a>、<a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__CallbackData.html">CUpti_CallbackData</a>、<a href="https://docs.nvidia.com/cupti/12.8/api/group__CUPTI__ACTIVITY__API.html">Activity API</a> 和 <a href="https://docs.nvidia.com/cuda/archive/12.8.1/cuda-driver-api/group__CUDA__VA.html">CUDA VMM API</a>。Allocator 的关键实现为 <a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L985-L1009">cudaMalloc path</a>、<a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L375-L392">ExpandableSegment: reserve</a>、<a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L399-L484">ExpandableSegment: create</a>、<a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L646-L669">Map and access</a>、<a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L672-L699">Unmap and release</a>。更换 Toolkit 或 PyTorch 版本时，应核对参数结构、CBID、allocator 配置及平台能力，再复用这套采集方法。</p>
+</div><div class="lang-en">
+<h1>Tracing PyTorch memory allocation with CUPTI</h1>
+<p class="lead">A PyTorch Tensor allocation may reuse a cached address, call the CUDA runtime’s cudaMalloc, or create and map physical memory through driver virtual memory management APIs. CUPTI exposes the arguments, results, and timing of these CUDA calls, connecting Tensor lifetimes to allocator caches and underlying resources. A single allocation workload compares the ordinary native allocator with expandable segments, using a compilable tracer and explicit launch commands.</p>
+<aside class="trace-note"><p>The example targets Linux, CUDA Toolkit / CUPTI 12.8, and PyTorch 2.8.0, with PyTorch source pinned to <a href="https://github.com/pytorch/pytorch/tree/ba56102387ef21a3b04b357e5b183d48f0afefc7">ba56102387ef</a>. Memory operations here mean allocation, release, and address mapping. Kernel load/store instructions, cache sectors, and DRAM transactions are a different observation level.</p></aside>
+
+<h2 id="en-cupti">1. CUPTI and Nsight Systems</h2>
+<h3 id="en-role">Observing CUDA</h3>
+<p>CUPTI, the CUDA Profiling Tools Interface, provides NVIDIA’s interfaces for CUDA profiling and tracing. Tools subscribe to API calls, collect kernel and memcpy activities, and correlate CPU submissions with GPU execution. The Toolkit supplies headers, libraries, and samples for building a collector loaded into the application process. <a href="https://docs.nvidia.com/cupti/12.8/index.html">CUPTI 12.8</a></p>
+<p>Nsight Systems uses CUPTI for CUDA information and adds timeline presentation, statistics, and export. Its CPU scheduling, OS runtime, and NVTX views involve other collection mechanisms too. A custom CUPTI tool gives control over selection and fields, such as the arguments of a small set of allocation APIs. <a href="https://docs.nvidia.com/nsight-systems/InstallationGuide/">Nsight Systems / CUPTI</a></p>
+<h3 id="en-scale">Memory observation levels</h3>
+<div class="trace-table"><table><thead><tr><th>Object</th><th>Question</th><th>Observation</th></tr></thead><tbody>
+<tr><td>PyTorch Tensor / allocator</td><td>Did this allocation reuse a cached block?</td><td>Tensor pointers, allocated / reserved statistics, allocator snapshots</td></tr>
+<tr><td>CUDA memory management</td><td>When were cudaMalloc, cuMemCreate, and cuMemMap called, with which arguments?</td><td>CUPTI Runtime / Driver API callbacks</td></tr>
+<tr><td>GPU transfers</td><td>When did an H2D copy actually execute?</td><td>MEMCPY activity; CPU API intervals do not substitute for GPU intervals</td></tr>
+<tr><td>Kernel memory accesses</td><td>How much cache / DRAM traffic did load/store instructions cause?</td><td>Hardware metrics and tools such as Nsight Compute</td></tr>
+</tbody></table></div>
+<p>A MEMCPY activity describes transfer bytes and device timestamps. A cudaMalloc callback describes a memory-management API invocation. Both may occur in a workload but carry different meanings. <a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__ActivityMemcpy6.html">CUpti_ActivityMemcpy6</a>. The <a href="gpu-memory-data-path-nsight-compute.html">GPU memory-path article</a> covers memory accesses inside kernels.</p>
+
+<h2 id="en-interfaces">2. Callback and Activity</h2>
+<h3 id="en-callback">Synchronous callbacks</h3>
+<p>A subscriber registers a callback with CUPTI. A domain identifies runtime, driver, resource, or another event category; a CBID identifies a particular API within that domain. This tracer enables two runtime CBIDs and seven driver VMM CBIDs. Calls outside that selection are absent from its log. <a href="https://docs.nvidia.com/cupti/12.8/api/group__CUPTI__CALLBACK__API.html">Callback API</a></p>
+<div class="trace-table"><table><thead><tr><th>Interface / field</th><th>Purpose</th></tr></thead><tbody>
+<tr><td>cuptiSubscribe</td><td>Register a callback and user state; obtain a subscriber handle</td></tr>
+<tr><td>cuptiEnableCallback</td><td>Enable or disable notifications for one domain + CBID</td></tr>
+<tr><td>CUPTI_API_ENTER / EXIT</td><td>Run before the API executes and before it returns to its caller</td></tr>
+<tr><td>functionParams</td><td>Decode inputs and outputs using the structure matching that CBID</td></tr>
+<tr><td>functionReturnValue</td><td>Read cudaError_t or CUresult at EXIT</td></tr>
+<tr><td>correlationData / correlationId</td><td>Per-call ENTER / EXIT tool state versus correlation to activity records</td></tr>
+<tr><td>cuptiUnsubscribe</td><td>Stop notifications before unloading the library containing the callback</td></tr>
+</tbody></table></div>
+<p>Runtime and Driver API callbacks execute synchronously on the calling thread. Logging therefore adds work to the application’s execution path. Do not call CUDA runtime / driver APIs or create CUDA tensors inside these callbacks: recursion or deadlock may result. This example reads parameters, obtains CUPTI timestamps, and writes CSV. <a href="https://docs.nvidia.com/cupti/12.8/main/main.html#callback-api">CUPTI Callback usage</a></p>
+<figure class="trace-figure"><div class="trace-toolbar"><span>Source-linked diagram</span><span><button type="button" data-trace-fit="fit" aria-pressed="true">Fit width</button> <button type="button" data-trace-fit="actual" aria-pressed="false">100%</button></span></div><div class="trace-viewport" tabindex="0"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 850" role="img" aria-labelledby="en-cupti-callback"><title id="en-cupti-callback">Synchronous ENTER and EXIT callbacks around a CUDA API</title><defs><marker id="en-cupti-callback-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="var(--trace-rule)"/></marker></defs><path d="M125 100 V820" stroke="var(--trace-rule)" stroke-width="1.7" stroke-dasharray="6 5"/><rect x="7" y="24" width="236" height="72" rx="4" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><text x="125" y="56" text-anchor="middle" font-size="18" font-weight="600">PyTorch allocator</text><text x="125" y="80" text-anchor="middle" font-size="13" font-weight="400">same calling CPU thread</text><path d="M500 100 V820" stroke="var(--trace-rule)" stroke-width="1.7" stroke-dasharray="6 5"/><rect x="382" y="24" width="236" height="72" rx="4" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><text x="500" y="56" text-anchor="middle" font-size="18" font-weight="600">CUDA API</text><text x="500" y="80" text-anchor="middle" font-size="13" font-weight="400">same calling CPU thread</text><path d="M875 100 V820" stroke="var(--trace-rule)" stroke-width="1.7" stroke-dasharray="6 5"/><rect x="757" y="24" width="236" height="72" rx="4" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><text x="875" y="56" text-anchor="middle" font-size="18" font-weight="600">CUPTI subscriber</text><text x="875" y="80" text-anchor="middle" font-size="13" font-weight="400">same calling CPU thread</text><rect x="117" y="140" width="16" height="635" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><rect x="492" y="140" width="16" height="635" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><rect x="867" y="212" width="16" height="63" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><rect x="867" y="492" width="16" height="213" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><a href="https://docs.nvidia.com/cupti/12.8/api/group__CUPTI__CALLBACK__API.html" target="_blank" rel="noopener"><path d="M133 150 H490" fill="none" stroke="var(--trace-rule)" stroke-width="1.8" marker-end="url(#en-cupti-callback-arrow)"/><rect x="206.10000000000002" y="120" width="212.79999999999998" height="24" fill="var(--trace-bg)"/><text x="312.5" y="133" text-anchor="middle" font-size="16" font-weight="400">cudaMalloc / cuMemCreate</text></a><a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__CallbackData.html" target="_blank" rel="noopener"><path d="M508 220 H865" fill="none" stroke="var(--trace-rule)" stroke-width="1.8" marker-end="url(#en-cupti-callback-arrow)"/><rect x="593.4" y="190" width="188.2" height="24" fill="var(--trace-bg)"/><text x="687.5" y="203" text-anchor="middle" font-size="16" font-weight="400">ENTER: save timestamp</text></a><a href="https://docs.nvidia.com/cupti/12.8/main/main.html#callback-api" target="_blank" rel="noopener"><path d="M867 270 H510" fill="none" stroke="var(--trace-rule)" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#en-cupti-callback-arrow)"/><rect x="597.5" y="240" width="180.0" height="24" fill="var(--trace-bg)"/><text x="687.5" y="253" text-anchor="middle" font-size="16" font-weight="400">return from callback</text></a><a href="https://docs.nvidia.com/cuda/archive/12.8.1/cuda-driver-api/group__CUDA__VA.html" target="_blank" rel="noopener"><path d="M508 368 h46 v24 h-46" fill="none" stroke="var(--trace-rule)" stroke-width="1.8" marker-end="url(#en-cupti-callback-arrow)"/><rect x="585.9" y="350" width="188.2" height="24" fill="var(--trace-bg)"/><text x="680" y="363" text-anchor="middle" font-size="16" font-weight="400">CUDA executes the API</text></a><a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__CallbackData.html" target="_blank" rel="noopener"><path d="M508 500 H865" fill="none" stroke="var(--trace-rule)" stroke-width="1.8" marker-end="url(#en-cupti-callback-arrow)"/><rect x="577.0" y="470" width="220.99999999999997" height="24" fill="var(--trace-bg)"/><text x="687.5" y="483" text-anchor="middle" font-size="16" font-weight="400">EXIT: result + parameters</text></a><a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__CallbackData.html" target="_blank" rel="noopener"><path d="M867 598 h-46 v24 h46" fill="none" stroke="var(--trace-rule)" stroke-width="1.8" marker-end="url(#en-cupti-callback-arrow)"/><rect x="588.6" y="580" width="212.79999999999998" height="24" fill="var(--trace-bg)"/><text x="695" y="593" text-anchor="middle" font-size="16" font-weight="400">decode fields; write CSV</text></a><a href="https://docs.nvidia.com/cupti/12.8/main/main.html#callback-api" target="_blank" rel="noopener"><path d="M867 700 H510" fill="none" stroke="var(--trace-rule)" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#en-cupti-callback-arrow)"/><rect x="597.5" y="670" width="180.0" height="24" fill="var(--trace-bg)"/><text x="687.5" y="683" text-anchor="middle" font-size="16" font-weight="400">return from callback</text></a><a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__CallbackData.html" target="_blank" rel="noopener"><path d="M492 770 H135" fill="none" stroke="var(--trace-rule)" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#en-cupti-callback-arrow)"/><rect x="210.2" y="740" width="204.6" height="24" fill="var(--trace-bg)"/><text x="312.5" y="753" text-anchor="middle" font-size="16" font-weight="400">return status to caller</text></a></svg></div><figcaption>Runtime and Driver API callbacks execute synchronously on the calling CPU thread. Bars show call scopes, not measured durations. Messages link to API documentation.</figcaption></figure>
+<p>The Toolkit’s generated_cuda_runtime_api_meta.h and generated_cuda_meta.h define parameter structures. The v3020 suffix in cudaMalloc_v3020_params identifies an API parameter version, not a requirement to install CUDA 3.2. The allocated address is an output, <code>*devPtr</code>, and must only be read at a successful EXIT. A failed call still has a request size and an error worth recording. <a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__CallbackData.html">CUpti_CallbackData</a></p>
+<pre class="code" data-language="cpp"><code>// At CUPTI_API_EXIT for cudaMalloc:
+const auto* p = static_cast&lt;const cudaMalloc_v3020_params*&gt;(info-&gt;functionParams);
+const auto result = *static_cast&lt;const cudaError_t*&gt;(info-&gt;functionReturnValue);
+const size_t requested_bytes = p-&gt;size;
+if (result == cudaSuccess) {
+    void* allocated_address = *p-&gt;devPtr;
+    // Copy scalar fields into the trace while the callback data is valid.
+}</code></pre>
+<p>functionParams is valid only during the callback. An asynchronous logger must copy needed scalar values before returning, rather than retain these temporary pointers. The example stores the ENTER timestamp in correlationData and writes one record at EXIT. Its start_ns / end_ns delimit host API execution, not GPU work.</p>
+<h3 id="en-activity">Asynchronous activities</h3>
+<p>The Activity API fills tool-provided buffers and delivers records asynchronously. RUNTIME / DRIVER activities contain CBID, timing, process / thread IDs, and return values. They do not expose the full functionParams available to callbacks. Callbacks are the direct route to VMM handles, addresses, and mapping lengths. <a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__ActivityAPI.html">CUpti_ActivityAPI</a></p>
+<pre class="code" data-language="text"><code>Register buffers: cuptiActivityRegisterCallbacks(requestBuffer, completeBuffer)
+Enable records:   cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME / DRIVER / ...)
+Run workload:     CUPTI fills buffers, then delivers them asynchronously
+Consume buffer:   cuptiActivityGetNextRecord(...) until MAX_LIMIT_REACHED
+Check losses:     cuptiActivityGetNumDroppedRecords(context, streamId, &amp;dropped)
+Finish workload:  synchronize needed CUDA work outside callbacks
+Drain records:    cuptiActivityFlushAll(0); release buffers after parsing</code></pre>
+<p>Buffer handling must account for end-of-buffer status, record versions, and dropped records. cuptiActivityFlushAll does not implicitly synchronize CUDA work; the application must complete the necessary work first when complete GPU timestamps are required. The runnable tracer below uses only callbacks, so it neither registers activity buffers nor performs an activity flush. <a href="https://docs.nvidia.com/cupti/12.8/api/group__CUPTI__ACTIVITY__API.html">Activity API</a></p>
+<p>CUpti_ActivityMemory4, enabled with CUPTI_ACTIVITY_KIND_MEMORY2, gives separate allocation and release records with addresses, byte counts, and memory kinds. It can complement a lifetime view. Reconstructing VMM reservation, creation, mapping, and access operations still requires inspecting the corresponding driver callbacks; one MEMORY2 record is not a replacement for the entire sequence. <a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__ActivityMemory4.html">CUpti_ActivityMemory4</a></p>
+<p>A callback’s correlationId matches its API activity within the corresponding domain. Preserve process and domain when joining records, and do not assume adjacent runtime and driver calls share an ID. CUpti_ActivityMemcpy6, for example, distinguishes the driver correlationId from runtimeCorrelationId. Callbacks, API activities, and memory activities can also describe the same underlying operation and must not be counted as independent allocations. <a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__CallbackData.html">CUpti_CallbackData</a>; <a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__ActivityMemcpy6.html">CUpti_ActivityMemcpy6</a></p>
+
+<h2 id="en-allocator">3. PyTorch allocation paths</h2>
+<h3 id="en-native">Caching and cudaMalloc</h3>
+<p>The native caching allocator first searches for reusable blocks. When the ordinary path needs more memory, it obtains an allocation through cudaMalloc and assigns a block to the Tensor. Deleting a Tensor typically leaves an idle block in the pool; cudaFree appears when resources are returned to CUDA. Consequently, neither torch.empty nor del tensor implies a one-to-one CUDA allocation or free. <a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L985-L1009">cudaMalloc path</a>; <a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L3054-L3097">Release cached allocation</a></p>
+<p>memory_allocated() measures allocator-accounted live allocations such as Tensor storage, while memory_reserved() measures memory managed by the allocator. Neither is a complete inventory of all CUDA resources in the process: context memory, library allocations, and other allocators may be outside that accounting. empty_cache() returns eligible idle cached memory; it cannot free storage still owned by live Tensors. <a href="https://docs.pytorch.org/docs/2.8/notes/cuda.html#memory-management">PyTorch memory management</a></p>
+<h3 id="en-vmm">Expandable segments and VMM</h3>
+<p>backend:native,expandable_segments:True retains the native allocator and changes how it obtains memory from CUDA. It reserves a contiguous virtual range, then creates physical allocations and maps them as needed. The mapped coverage can grow, while cache reuse remains part of the path. <a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L375-L392">ExpandableSegment: reserve</a>; <a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L399-L484">ExpandableSegment: create</a></p>
+<div class="trace-table"><table><thead><tr><th>Driver API</th><th>Resource effect</th><th>Recorded fields</th></tr></thead><tbody>
+<tr><td>cuMemAddressReserve</td><td>Reserve virtual addresses, without allocating that many physical bytes</td><td>Successful output ptr; size</td></tr>
+<tr><td>cuMemCreate</td><td>Create a physical allocation and return a handle, not yet an accessible mapping</td><td>Successful output handle; size</td></tr>
+<tr><td>cuMemMap</td><td>Associate physical backing with a virtual interval</td><td>ptr, size, handle, offset</td></tr>
+<tr><td>cuMemSetAccess</td><td>Set device access permissions</td><td>ptr, size; extend decoding to desc entries for multi-GPU permissions</td></tr>
+<tr><td>cuMemUnmap</td><td>Remove a mapping</td><td>ptr, size</td></tr>
+<tr><td>cuMemRelease</td><td>Release a handle reference; physical lifetime also depends on remaining references / mappings</td><td>handle; recover size from its successful creation</td></tr>
+<tr><td>cuMemAddressFree</td><td>Return an unmapped virtual reservation</td><td>ptr, size</td></tr>
+</tbody></table></div>
+<p>These calls separate addresses, physical backing, mappings, and permissions. Mapping alone does not grant device access. PyTorch waits for relevant work before unmapping and releasing backing; destruction of the whole expandable segment releases its VA reservation. <a href="https://docs.nvidia.com/cuda/archive/12.8.1/cuda-driver-api/group__CUDA__VA.html">CUDA VMM API</a>; <a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L646-L669">Map and access</a>; <a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L672-L699">Unmap and release</a>; <a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L638-L643">Release VA range</a></p>
+<figure class="trace-figure"><div class="trace-toolbar"><span>Source-linked diagram</span><span><button type="button" data-trace-fit="fit" aria-pressed="true">Fit width</button> <button type="button" data-trace-fit="actual" aria-pressed="false">100%</button></span></div><div class="trace-viewport" tabindex="0"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 440" role="img" aria-labelledby="en-cupti-vmm"><title id="en-cupti-vmm">Virtual reservation, physical handles, and mapping are separate resources</title><rect x="25" y="25" width="590" height="365" rx="4" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><text x="320.0" y="60" text-anchor="middle" font-size="20" font-weight="600">Virtual address range</text><rect x="665" y="25" width="310" height="365" rx="4" fill="var(--trace-fill)" stroke="var(--trace-rule)" stroke-width="2"/><text x="820.0" y="60" text-anchor="middle" font-size="20" font-weight="600">Physical allocations</text><a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L375-L392" target="_blank" rel="noopener"><text x="320" y="98" text-anchor="middle" font-size="17" font-weight="400">cuMemAddressReserve: address space only</text><rect x="45" y="125" width="550" height="70" fill="var(--trace-bg)" stroke="var(--trace-rule)" stroke-dasharray="5 4"/><text x="320" y="167" text-anchor="middle" font-size="17" font-weight="400">unmapped VA has no physical backing</text></a><a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L399-L484" target="_blank" rel="noopener"><text x="820" y="98" text-anchor="middle" font-size="17" font-weight="400">cuMemCreate → handles</text><rect x="685" y="125" width="57" height="70" fill="var(--trace-physical)" stroke="var(--trace-rule)"/><text x="713" y="155" text-anchor="middle" font-size="17" font-weight="400">H0</text><text x="713" y="178" text-anchor="middle" font-size="12" font-weight="400">20 MiB</text><rect x="752" y="125" width="57" height="70" fill="var(--trace-physical)" stroke="var(--trace-rule)"/><text x="780" y="155" text-anchor="middle" font-size="17" font-weight="400">H1</text><text x="780" y="178" text-anchor="middle" font-size="12" font-weight="400">20 MiB</text><rect x="819" y="125" width="57" height="70" fill="var(--trace-physical)" stroke="var(--trace-rule)"/><text x="847" y="155" text-anchor="middle" font-size="17" font-weight="400">H2</text><text x="847" y="178" text-anchor="middle" font-size="12" font-weight="400">20 MiB</text><rect x="886" y="125" width="57" height="70" fill="var(--trace-physical)" stroke="var(--trace-rule)"/><text x="914" y="155" text-anchor="middle" font-size="17" font-weight="400">H3</text><text x="914" y="178" text-anchor="middle" font-size="12" font-weight="400">20 MiB</text></a><a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L646-L669" target="_blank" rel="noopener"><text x="320" y="225" text-anchor="middle" font-size="17" font-weight="400">cuMemMap: VA interval → physical handle</text><text x="320" y="247" text-anchor="middle" font-size="17" font-weight="400">cuMemSetAccess: allow device access</text><rect x="45" y="267" width="89" height="72" fill="var(--trace-physical)" stroke="var(--trace-rule)"/><text x="89" y="296" text-anchor="middle" font-size="15" font-weight="400">VA → H0</text><text x="89" y="320" text-anchor="middle" font-size="13" font-weight="400">20 MiB</text><rect x="134" y="267" width="89" height="72" fill="var(--trace-physical)" stroke="var(--trace-rule)"/><text x="178" y="296" text-anchor="middle" font-size="15" font-weight="400">VA → H1</text><text x="178" y="320" text-anchor="middle" font-size="13" font-weight="400">20 MiB</text><rect x="223" y="267" width="89" height="72" fill="var(--trace-physical)" stroke="var(--trace-rule)"/><text x="267" y="296" text-anchor="middle" font-size="15" font-weight="400">VA → H2</text><text x="267" y="320" text-anchor="middle" font-size="13" font-weight="400">20 MiB</text><rect x="312" y="267" width="89" height="72" fill="var(--trace-physical)" stroke="var(--trace-rule)"/><text x="356" y="296" text-anchor="middle" font-size="15" font-weight="400">VA → H3</text><text x="356" y="320" text-anchor="middle" font-size="13" font-weight="400">20 MiB</text><rect x="401" y="267" width="194" height="72" fill="var(--trace-bg)" stroke="var(--trace-rule)" stroke-dasharray="5 4"/><text x="498" y="308" text-anchor="middle" font-size="15" font-weight="400">unmapped remainder</text><text x="820" y="285" text-anchor="middle" font-size="17" font-weight="400">64 MiB tensor request</text><text x="820" y="316" text-anchor="middle" font-size="17" font-weight="600">80 MiB mapped backing</text></a><text x="500" y="420" text-anchor="middle" font-size="15" font-weight="400">Illustrative PyTorch 2.8 large-pool case: four 20 MiB allocator chunks, not a GPU page-size claim.</text></svg></div><figcaption>Track reserved addresses, physical allocations, and mappings separately. The 80 MiB example follows PyTorch’s 20 MiB large-pool chunks; VA ranges are not drawn to scale.</figcaption></figure>
+<aside class="trace-note"><p>Keep three quantities separate: cuMemAddressReserve size is virtual address space; cuMemCreate size is physical allocation; PyTorch memory_reserved is allocator memory accounting, not the entire reserved VA range. CU_MEM_ALLOCATION_TYPE_PINNED with a DEVICE location describes device physical memory here, not the page-locked CPU batches in <a href="pytorch-dataloader.html#en-device">DataLoader pin_memory</a>.</p></aside>
+<p>The pinned PyTorch version uses 20 MiB chunks for its large pool and 2 MiB chunks for its small pool. These are allocator granularities, not GPU hardware page sizes. A fresh large pool serving a 64 MiB request can create four 20 MiB handles, giving 80 MiB of mapped backing. Its VA reservation can be much larger. <a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L2426-L2440">Allocator segment size</a>; <a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L375-L392">ExpandableSegment: reserve</a></p>
+
+<h2 id="en-example">4. End-to-end example</h2>
+<h3 id="en-build">Environment and build</h3>
+<p>The example requires an NVIDIA GPU, a driver compatible with CUDA 12.8, CUDA Toolkit 12.8 development files, and CUDA-enabled PyTorch 2.8. The tracer is ordinary C++ compiled with g++; it contains no device kernel. A PyTorch wheel does not by itself supply a complete system Toolkit installation. Match CUPTI headers to the library used at build and runtime.</p>
+<p>Save <a href="../assets/pytorch-internals/cupti-memory/memory_trace.cpp" download>memory_trace.cpp</a>, <a href="../assets/pytorch-internals/cupti-memory/build.sh" download>build.sh</a>, <a href="../assets/pytorch-internals/cupti-memory/allocator_demo.py" download>allocator_demo.py</a>, and <a href="../assets/pytorch-internals/cupti-memory/summarize.py" download>summarize.py</a> in one directory. Skip environment creation and installation if a matching environment already exists:</p>
+<pre class="code" data-language="bash"><code># Linux, NVIDIA GPU + compatible driver, CUDA Toolkit 12.8 development files
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+nvidia-smi
+
+# Save memory_trace.cpp, build.sh, allocator_demo.py, summarize.py here.
+export CUDA_ROOT=/usr/local/cuda-12.8
+export TRACE_BUILD=&quot;$PWD/build&quot;
+bash build.sh</code></pre>
+<p>build.sh defaults to $CUDA_ROOT/include, $CUDA_ROOT/extras/CUPTI/include, and $CUDA_ROOT/extras/CUPTI/lib64. Override CUDA_INCLUDE, CUPTI_INCLUDE, and CUPTI_LIB for other layouts. The shared library links only libcupti and records its directory in rpath. Capturing cudaMalloc does not require a separate LD_PRELOAD symbol wrapper.</p>
+<details><summary>Complete build script</summary><pre class="code" data-language="bash"><code>#!/usr/bin/env bash
+set -euo pipefail
+
+# Override CUDA_INCLUDE, CUPTI_INCLUDE, and CUPTI_LIB for nonstandard installs.
+CUDA_ROOT=${CUDA_ROOT:-/usr/local/cuda-12.8}
+CUDA_INCLUDE=${CUDA_INCLUDE:-$CUDA_ROOT/include}
+CUPTI_INCLUDE=${CUPTI_INCLUDE:-$CUDA_ROOT/extras/CUPTI/include}
+CUPTI_LIB=${CUPTI_LIB:-$CUDA_ROOT/extras/CUPTI/lib64}
+TRACE_BUILD=${TRACE_BUILD:-./build}
+SOURCE_DIR=$(cd -- &quot;$(dirname -- &quot;${BASH_SOURCE[0]}&quot;)&quot; &amp;&amp; pwd)
+test -f &quot;$CUDA_INCLUDE/cuda.h&quot;
+test -f &quot;$CUPTI_INCLUDE/cupti.h&quot;
+if [[ -f &quot;$CUPTI_LIB/libcupti.so&quot; ]]; then
+    CUPTI_LINK=-lcupti
+else
+    test -f &quot;$CUPTI_LIB/libcupti.so.12&quot;
+    CUPTI_LINK=-l:libcupti.so.12
+fi
+mkdir -p &quot;$TRACE_BUILD&quot;
+&quot;${CXX:-g++}&quot; -std=c++17 -O2 -Wall -Wextra -Werror -fPIC -shared -pthread \
+    -I&quot;$CUDA_INCLUDE&quot; -I&quot;$CUPTI_INCLUDE&quot; &quot;$SOURCE_DIR/memory_trace.cpp&quot; \
+    -L&quot;$CUPTI_LIB&quot; &quot;$CUPTI_LINK&quot; -Wl,-rpath,&quot;$CUPTI_LIB&quot; \
+    -o &quot;$TRACE_BUILD/libmemory_trace.so&quot;
+printf &#x27;Built %s/libmemory_trace.so\n&#x27; &quot;$TRACE_BUILD&quot;
+</code></pre></details>
+<h3 id="en-tracer">The tracer</h3>
+<p>Python explicitly loads the library through ctypes, starts tracing before its first CUDA initialization, marks each phase, and stops tracing at the end. CUPTI subscribes to domains and CBIDs, so PyTorch’s calls through driver function pointers do not depend on ELF symbol interposition.</p>
+<p>Each completed API record contains a phase, PID / TID, domain, CBID, correlation ID, context UID, name, timestamps, result, and memory fields. Failed calls retain request bytes but never dereference undefined output addresses or handles. cudaFree and cuMemRelease have no size argument, so their bytes field is empty.</p>
+<details><summary>Complete C++ tracer</summary><pre class="code" data-language="cpp"><code>// Linux teaching tracer: CUDA Toolkit / CUPTI 12.8, one controlled process.
+// Callback logging is synchronous; do not use these timings as a benchmark.
+#include &lt;cupti.h&gt;
+#include &lt;cupti_driver_cbid.h&gt;
+#include &lt;cupti_runtime_cbid.h&gt;
+// cupti.h already includes generated_cuda{,_runtime_api}_meta.h in 12.8.
+// These generated parameter headers do not have independent include guards.
+
+#include &lt;cinttypes&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstring&gt;
+#include &lt;mutex&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;unistd.h&gt;
+
+namespace {
+CUpti_SubscriberHandle subscriber{};
+FILE* output = nullptr;
+std::mutex output_mutex;
+char phase[64] = &quot;INIT&quot;;
+bool active = false;
+bool io_failed = false;
+
+struct Fields {
+    uint64_t bytes = 0, address = 0, handle = 0, offset = 0;
+    bool has_bytes = false, has_address = false, has_handle = false;
+    bool has_offset = false;
+};
+
+// Decode inputs at EXIT. Read output pointers ONLY after successful return.
+Fields decode(CUpti_CallbackDomain domain, CUpti_CallbackId id,
+              const void* params, bool success) {
+    Fields f;
+    if (domain == CUPTI_CB_DOMAIN_RUNTIME_API) {
+        if (id == CUPTI_RUNTIME_TRACE_CBID_cudaMalloc_v3020) {
+            const auto* p = static_cast&lt;const cudaMalloc_v3020_params*&gt;(params);
+            f.bytes = p-&gt;size; f.has_bytes = true;
+            if (success &amp;&amp; p-&gt;devPtr) {
+                f.address = reinterpret_cast&lt;uintptr_t&gt;(*p-&gt;devPtr);
+                f.has_address = true;
+            }
+        } else if (id == CUPTI_RUNTIME_TRACE_CBID_cudaFree_v3020) {
+            const auto* p = static_cast&lt;const cudaFree_v3020_params*&gt;(params);
+            f.address = reinterpret_cast&lt;uintptr_t&gt;(p-&gt;devPtr);
+            f.has_address = true;
+        }
+        return f;
+    }
+    switch (id) {
+    case CUPTI_DRIVER_TRACE_CBID_cuMemAddressReserve: {
+        const auto* p = static_cast&lt;const cuMemAddressReserve_params*&gt;(params);
+        f.bytes = p-&gt;size; f.has_bytes = true;
+        if (success &amp;&amp; p-&gt;ptr) { f.address = *p-&gt;ptr; f.has_address = true; }
+        break;
+    }
+    case CUPTI_DRIVER_TRACE_CBID_cuMemAddressFree: {
+        const auto* p = static_cast&lt;const cuMemAddressFree_params*&gt;(params);
+        f.bytes = p-&gt;size; f.address = p-&gt;ptr;
+        f.has_bytes = f.has_address = true;
+        break;
+    }
+    case CUPTI_DRIVER_TRACE_CBID_cuMemCreate: {
+        const auto* p = static_cast&lt;const cuMemCreate_params*&gt;(params);
+        f.bytes = p-&gt;size; f.has_bytes = true;
+        if (success &amp;&amp; p-&gt;handle) { f.handle = *p-&gt;handle; f.has_handle = true; }
+        break;
+    }
+    case CUPTI_DRIVER_TRACE_CBID_cuMemRelease: {
+        const auto* p = static_cast&lt;const cuMemRelease_params*&gt;(params);
+        f.handle = p-&gt;handle; f.has_handle = true;
+        break;
+    }
+    case CUPTI_DRIVER_TRACE_CBID_cuMemMap: {
+        const auto* p = static_cast&lt;const cuMemMap_params*&gt;(params);
+        f.address = p-&gt;ptr; f.bytes = p-&gt;size; f.handle = p-&gt;handle;
+        f.offset = p-&gt;offset;
+        f.has_address = f.has_bytes = f.has_handle = f.has_offset = true;
+        break;
+    }
+    case CUPTI_DRIVER_TRACE_CBID_cuMemUnmap: {
+        const auto* p = static_cast&lt;const cuMemUnmap_params*&gt;(params);
+        f.address = p-&gt;ptr; f.bytes = p-&gt;size;
+        f.has_address = f.has_bytes = true;
+        break;
+    }
+    case CUPTI_DRIVER_TRACE_CBID_cuMemSetAccess: {
+        const auto* p = static_cast&lt;const cuMemSetAccess_params*&gt;(params);
+        f.address = p-&gt;ptr; f.bytes = p-&gt;size;
+        f.has_address = f.has_bytes = true;
+        break;
+    }
+    default: break;
+    }
+    return f;
+}
+
+uint64_t timestamp() {
+    uint64_t value = 0;
+    // A zero timestamp is retained as missing data, never a valid duration.
+    if (cuptiGetTimestamp(&amp;value) != CUPTI_SUCCESS) return 0;
+    return value;
+}
+
+void CUPTIAPI callback(void*, CUpti_CallbackDomain domain,
+                       CUpti_CallbackId id, const void* data) {
+    if (domain != CUPTI_CB_DOMAIN_RUNTIME_API &amp;&amp;
+        domain != CUPTI_CB_DOMAIN_DRIVER_API) return;
+    const auto* info = static_cast&lt;const CUpti_CallbackData*&gt;(data);
+    if (info-&gt;callbackSite == CUPTI_API_ENTER) {
+        *info-&gt;correlationData = timestamp();
+        return;
+    }
+    if (info-&gt;callbackSite != CUPTI_API_EXIT) return;
+    const uint64_t end = timestamp();
+    const uint64_t start = *info-&gt;correlationData;
+    const int result = domain == CUPTI_CB_DOMAIN_RUNTIME_API
+        ? static_cast&lt;int&gt;(*static_cast&lt;const cudaError_t*&gt;(info-&gt;functionReturnValue))
+        : static_cast&lt;int&gt;(*static_cast&lt;const CUresult*&gt;(info-&gt;functionReturnValue));
+    const Fields f = decode(domain, id, info-&gt;functionParams, result == 0);
+    char bytes[32] = &quot;&quot;, address[32] = &quot;&quot;, handle[32] = &quot;&quot;, offset[32] = &quot;&quot;;
+    if (f.has_bytes) std::snprintf(bytes, sizeof(bytes), &quot;%&quot; PRIu64, f.bytes);
+    if (f.has_address) std::snprintf(address, sizeof(address), &quot;0x%&quot; PRIx64, f.address);
+    if (f.has_handle) std::snprintf(handle, sizeof(handle), &quot;0x%&quot; PRIx64, f.handle);
+    if (f.has_offset) std::snprintf(offset, sizeof(offset), &quot;%&quot; PRIu64, f.offset);
+    std::lock_guard&lt;std::mutex&gt; lock(output_mutex);
+    if (!output) return;
+    const int written = std::fprintf(output,
+        &quot;api,%s,%ld,%ld,%s,%u,%u,%u,%s,%&quot; PRIu64 &quot;,%&quot; PRIu64 &quot;,%d,%s,%s,%s,%s\n&quot;,
+        phase, static_cast&lt;long&gt;(getpid()), static_cast&lt;long&gt;(syscall(SYS_gettid)),
+        domain == CUPTI_CB_DOMAIN_RUNTIME_API ? &quot;runtime&quot; : &quot;driver&quot;,
+        static_cast&lt;unsigned&gt;(id), info-&gt;correlationId, info-&gt;contextUid,
+        info-&gt;functionName, start, end, result, bytes, address, handle, offset);
+    if (written &lt; 0) io_failed = true;
+}
+
+bool check(CUptiResult result, const char* operation) {
+    if (result == CUPTI_SUCCESS) return true;
+    const char* message = &quot;unknown CUPTI error&quot;;
+    cuptiGetResultString(result, &amp;message);
+    std::fprintf(stderr, &quot;%s: %s (%d)\n&quot;, operation, message, static_cast&lt;int&gt;(result));
+    return false;
+}
+}  // namespace
+
+// Call start/mark/stop serially from the controlling Python thread.
+// Before stop, all application threads must have left traced CUDA API calls.
+extern &quot;C&quot; int trace_start(const char* path) {
+    if (active || output || !path) return -1;
+    output = std::fopen(path, &quot;w&quot;);
+    if (!output) { std::perror(&quot;open trace&quot;); return -1; }
+    io_failed = false;
+    std::snprintf(phase, sizeof(phase), &quot;INIT&quot;);
+    std::fprintf(output, &quot;kind,phase,pid,tid,domain,cbid,correlation_id,context_uid,api,start_ns,end_ns,result,bytes,address,handle,offset\n&quot;);
+    if (!check(cuptiSubscribe(&amp;subscriber, callback, nullptr), &quot;cuptiSubscribe&quot;)) {
+        std::fclose(output); output = nullptr; return -1;
+    }
+    active = true;
+    struct Selection { CUpti_CallbackDomain domain; CUpti_CallbackId id; };
+    const Selection selection[] = {
+        {CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_cudaMalloc_v3020},
+        {CUPTI_CB_DOMAIN_RUNTIME_API, CUPTI_RUNTIME_TRACE_CBID_cudaFree_v3020},
+        {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemAddressReserve},
+        {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemAddressFree},
+        {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemCreate},
+        {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemRelease},
+        {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemMap},
+        {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemUnmap},
+        {CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuMemSetAccess},
+    };
+    for (const auto&amp; item : selection) {
+        if (!check(cuptiEnableCallback(1, subscriber, item.domain, item.id), &quot;cuptiEnableCallback&quot;)) {
+            if (check(cuptiUnsubscribe(subscriber), &quot;cuptiUnsubscribe&quot;)) {
+                active = false; std::fclose(output); output = nullptr;
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+extern &quot;C&quot; int trace_mark(const char* name) {
+    if (!active || !name || std::strlen(name) &gt;= sizeof(phase)) return -1;
+    // Keep CSV fields unquoted by restricting phase labels to safe characters.
+    for (const char* p = name; *p; ++p) {
+        if (!((*p &gt;= &#x27;A&#x27; &amp;&amp; *p &lt;= &#x27;Z&#x27;) || (*p &gt;= &#x27;0&#x27; &amp;&amp; *p &lt;= &#x27;9&#x27;) || *p == &#x27;_&#x27;)) return -1;
+    }
+    const uint64_t now = timestamp();
+    std::lock_guard&lt;std::mutex&gt; lock(output_mutex);
+    std::snprintf(phase, sizeof(phase), &quot;%s&quot;, name);
+    if (std::fprintf(output, &quot;phase,%s,%ld,%ld,host,,,,mark,%&quot; PRIu64 &quot;,%&quot; PRIu64 &quot;,0,,,,\n&quot;,
+        phase, static_cast&lt;long&gt;(getpid()), static_cast&lt;long&gt;(syscall(SYS_gettid)), now, now) &lt; 0) io_failed = true;
+    return io_failed ? -1 : 0;
+}
+
+extern &quot;C&quot; int trace_stop() {
+    if (!active) return -1;
+    if (!check(cuptiUnsubscribe(subscriber), &quot;cuptiUnsubscribe&quot;)) return -1;
+    active = false;
+    std::lock_guard&lt;std::mutex&gt; lock(output_mutex);
+    const bool failed = io_failed || std::ferror(output);
+    const int closed = std::fclose(output); output = nullptr;
+    return failed || closed != 0 ? -1 : 0;
+}
+</code></pre></details>
+<p>This is a synchronous teaching logger. A mutex keeps CSV rows intact; both callbacks and writes add overhead. A production collector would typically copy scalar fields into preallocated queues for a background writer. The global phase is appropriate only for this controlled program. Multithreaded services need per-thread or explicit operation IDs, rather than treating the phase as attribution to a Python operator.</p>
+<h3 id="en-workload">Allocation, reuse, and release</h3>
+<p>The workload allocates a 64 MiB A, deletes it, then requests an equally sized B to inspect reuse. While B remains live, it allocates a 96 MiB C to grow the pool. It deletes B and C before empty_cache. All tensors use torch.empty, with no initialization or H2D, isolating allocator behavior. Each phase reports PyTorch memory statistics and the relevant addresses.</p>
+<pre class="code" data-language="python"><code>&quot;&quot;&quot;Controlled PyTorch allocation phases. Run each allocator mode in a fresh process.&quot;&quot;&quot;
+import argparse
+import ctypes
+import gc
+import json
+import os
+from pathlib import Path
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(&quot;--library&quot;, required=True, type=Path)
+    parser.add_argument(&quot;--trace&quot;, required=True, type=Path)
+    args = parser.parse_args()
+    # Importing torch does not intentionally create CUDA tensors in this script.
+    # Set PYTORCH_CUDA_ALLOC_CONF in the launch command, before this import.
+    import torch
+
+    if torch.version.cuda is None:
+        raise SystemExit(&quot;Install a CUDA-enabled PyTorch build; this is a CPU-only build.&quot;)
+    tracer = ctypes.CDLL(str(args.library.resolve()))
+    tracer.trace_start.argtypes = [ctypes.c_char_p]
+    tracer.trace_mark.argtypes = [ctypes.c_char_p]
+    tracer.trace_stop.argtypes = []
+    for name in (&quot;trace_start&quot;, &quot;trace_mark&quot;, &quot;trace_stop&quot;):
+        getattr(tracer, name).restype = ctypes.c_int
+
+    def mark(name):
+        if tracer.trace_mark(name.encode()) != 0:
+            raise RuntimeError(&quot;Could not write trace phase &quot; + name)
+
+    def snapshot(name, **pointers):
+        print(json.dumps({&quot;phase&quot;: name,
+            &quot;allocated&quot;: torch.cuda.memory_allocated(),
+            &quot;reserved&quot;: torch.cuda.memory_reserved(), **pointers}), flush=True)
+
+    args.trace.parent.mkdir(parents=True, exist_ok=True)
+    if tracer.trace_start(os.fsencode(args.trace)) != 0:
+        raise SystemExit(&quot;CUPTI subscription failed; inspect the error above.&quot;)
+    try:
+        mark(&quot;INIT&quot;)
+        torch.cuda.init()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        print(json.dumps({&quot;torch&quot;: torch.__version__, &quot;cuda_build&quot;: torch.version.cuda,
+            &quot;allocator_config&quot;: os.environ.get(&quot;PYTORCH_CUDA_ALLOC_CONF&quot;, &quot;&quot;),
+            &quot;backend&quot;: torch.cuda.memory.get_allocator_backend()}), flush=True)
+        snapshot(&quot;INIT&quot;)
+
+        mark(&quot;ALLOC_A&quot;)
+        a = torch.empty(16 * 1024 * 1024, dtype=torch.float32, device=&quot;cuda&quot;)  # 64 MiB
+        original = a.data_ptr()
+        snapshot(&quot;ALLOC_A&quot;, a=hex(original))
+
+        mark(&quot;DROP_A&quot;)
+        del a
+        gc.collect()
+        snapshot(&quot;DROP_A&quot;)
+
+        mark(&quot;REUSE_B&quot;)
+        b = torch.empty(16 * 1024 * 1024, dtype=torch.float32, device=&quot;cuda&quot;)
+        snapshot(&quot;REUSE_B&quot;, b=hex(b.data_ptr()), reused=(b.data_ptr() == original))
+
+        mark(&quot;GROW_C&quot;)
+        c = torch.empty(24 * 1024 * 1024, dtype=torch.float32, device=&quot;cuda&quot;)  # 96 MiB
+        snapshot(&quot;GROW_C&quot;, c=hex(c.data_ptr()))
+
+        mark(&quot;DROP_ALL&quot;)
+        del b, c
+        gc.collect()
+        torch.cuda.synchronize()
+        snapshot(&quot;DROP_ALL&quot;)
+
+        mark(&quot;EMPTY_CACHE&quot;)
+        torch.cuda.empty_cache()
+        snapshot(&quot;EMPTY_CACHE&quot;)
+        torch.cuda.synchronize()
+    finally:
+        # No application worker threads issue CUDA calls in this example.
+        # Unsubscribe before ctypes can unload the library at process exit.
+        if tracer.trace_stop() != 0:
+            raise RuntimeError(&quot;Trace shutdown or file write failed&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre>
+<p>Run the two configurations in separate Python processes, with allocator settings in place before importing torch. PYTORCH_NO_CUDA_MEMORY_CACHING=1 would disable the cache behavior being studied. The commands explicitly select the native backend to keep cudaMallocAsync outside this comparison.</p>
+<pre class="code" data-language="bash"><code>mkdir -p traces
+
+# Each command starts a fresh process. Keep the native cache enabled.
+env -u PYTORCH_NO_CUDA_MEMORY_CACHING -u PYTORCH_ALLOC_CONF \
+  PYTORCH_CUDA_ALLOC_CONF=backend:native,expandable_segments:False \
+  python allocator_demo.py --library &quot;$TRACE_BUILD/libmemory_trace.so&quot; \
+  --trace traces/native.csv &gt; traces/native-states.jsonl
+
+env -u PYTORCH_NO_CUDA_MEMORY_CACHING -u PYTORCH_ALLOC_CONF \
+  PYTORCH_CUDA_ALLOC_CONF=backend:native,expandable_segments:True \
+  python allocator_demo.py --library &quot;$TRACE_BUILD/libmemory_trace.so&quot; \
+  --trace traces/vmm.csv &gt; traces/vmm-states.jsonl
+
+python summarize.py traces/native.csv
+python summarize.py traces/vmm.csv
+cat traces/native-states.jsonl
+cat traces/vmm-states.jsonl</code></pre>
+<p>CSV holds CUDA API events; JSONL holds PyTorch statistics after each phase. Phase markers are local log records, not standard CUPTI or NVTX events. They preserve phases such as DROP_A and REUSE_B even when those phases produce no selected CUDA calls.</p>
+
+<h2 id="en-reading">5. Reading the trace</h2>
+<h3 id="en-expected">Expected path differences</h3>
+<p>The table is a source-derived expectation, not a measured GPU trace. Call counts depend on initial pool state, allocation granularity, retries, and platform support. Check successful CSV records, result=0, alongside JSONL statistics.</p>
+<div class="trace-table"><table><thead><tr><th>Phase</th><th>Ordinary native</th><th>Expandable segments</th><th>PyTorch observation</th></tr></thead><tbody>
+<tr><td>ALLOC_A: 64 MiB</td><td>cudaMalloc on a cache miss</td><td>Reserve VA; Create → Map → SetAccess</td><td>allocated rises; reserved can exceed request size</td></tr>
+<tr><td>DROP_A</td><td>Typically no cudaFree</td><td>Typically no Unmap / Release</td><td>allocated falls while cache remains</td></tr>
+<tr><td>REUSE_B: 64 MiB</td><td>No new cudaMalloc on a cache hit</td><td>No new Create / Map when reusing mapped backing</td><td>Compare B / A pointers and changes to reserved</td></tr>
+<tr><td>GROW_C: 96 MiB</td><td>Another cudaMalloc if the cache is insufficient</td><td>More Create / Map; no new Reserve needed when the existing range has room</td><td>160 MiB of live Tensor storage; reserved follows granularity</td></tr>
+<tr><td>DROP_ALL</td><td>Return blocks to idle cache</td><td>Return blocks to mapped idle cache</td><td>All workload Tensors have been deleted</td></tr>
+<tr><td>EMPTY_CACHE</td><td>cudaFree eligible cached blocks</td><td>Unmap / Release; AddressFree on whole-segment destruction</td><td>reserved falls; context resources can remain</td></tr>
+</tbody></table></div>
+<p>The PyTorch 2.8 expandable path may try one handle type, then fall back if unsupported. A failed cuMemCreate followed by a successful retry is not two allocations. Return status determines whether a resource was established. <a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L399-L484">ExpandableSegment: create</a></p>
+<h3 id="en-accounting">Addresses, handles, and counts</h3>
+<p>For the ordinary path, match successful cudaMalloc address → size records to cudaFree. For VMM, separately track VA ranges, handle → size, and (VA interval, handle, offset) mappings. Both addresses and handles can be reused, so maintain lifetimes in event order rather than treating a hexadecimal value as a permanent object ID.</p>
+<p>The same 80 MiB backing can generate 80 MiB of create records and 80 MiB of map records. Adding them into a 160 MiB physical total is incorrect. Large reservation sizes must also stay out of physical accounting. General VMM applications may share handles, create multiple mappings, or retain cross-process references; one cuMemRelease does not independently prove physical reclamation.</p>
+<p>The summarizer groups by phase / domain / API, reporting successful calls, failures, and that API’s own byte sum. It does not output a cross-API memory total or treat the missing Free / Release size as zero-byte release. A memory-usage curve needs additional lifetime matching and mapping state, plus a definition of whether it measures live Tensors, allocator backing, or VA reservations.</p>
+<details><summary>Complete summarizer</summary><pre class="code" data-language="python"><code>&quot;&quot;&quot;Summarize API events without adding VA reservation bytes to allocation bytes.&quot;&quot;&quot;
+import argparse
+import csv
+from collections import Counter
+
+
+def summarize(path):
+    with open(path, newline=&quot;&quot;) as stream:
+        rows = list(csv.DictReader(stream))
+    if not rows:
+        raise ValueError(&quot;Empty trace: check subscription, workload, and output path&quot;)
+    phases = list(dict.fromkeys(row[&quot;phase&quot;] for row in rows))
+    counts = Counter()
+    failed = Counter()
+    byte_totals = Counter()
+    for row in rows:
+        if row[&quot;kind&quot;] != &quot;api&quot;:
+            continue
+        key = (row[&quot;phase&quot;], row[&quot;domain&quot;], row[&quot;api&quot;])
+        if int(row[&quot;result&quot;]) != 0:
+            failed[key] += 1
+            continue
+        counts[key] += 1
+        if row[&quot;bytes&quot;]:
+            byte_totals[key] += int(row[&quot;bytes&quot;])
+    print(f&quot;{&#x27;phase&#x27;:&lt;14} {&#x27;domain&#x27;:&lt;8} {&#x27;API&#x27;:&lt;24} {&#x27;ok&#x27;:&gt;4} {&#x27;failed&#x27;:&gt;6} {&#x27;sum(bytes), MiB&#x27;:&gt;16}&quot;)
+    for phase in phases:
+        keys = sorted(key for key in counts.keys() | failed.keys() if key[0] == phase)
+        if not keys:
+            print(f&quot;{phase:&lt;14} (no selected API calls)&quot;)
+        for key in keys:
+            total = f&quot;{byte_totals[key] / 2**20:.2f}&quot; if key in byte_totals else &quot;-&quot;
+            print(f&quot;{key[0]:&lt;14} {key[1]:&lt;8} {key[2]:&lt;24} {counts[key]:&gt;4} {failed[key]:&gt;6} {total:&gt;16}&quot;)
+    print(&quot;\nBytes are summed separately per API, not live memory or a cross-API total.&quot;)
+    print(&quot;Reserve = VA range; Create = physical allocation; Map = mapping extent.&quot;)
+    print(&quot;Release/Free can omit a size; recover it from the successful creation record.&quot;)
+    if not counts:
+        raise ValueError(&quot;No successful selected API calls: this is not evidence of zero allocation&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(&quot;trace&quot;)
+    summarize(parser.parse_args().trace)
+</code></pre></details>
+<h3 id="en-limits">Coverage and troubleshooting</h3>
+<div class="trace-table"><table><thead><tr><th>Observation</th><th>What to check</th></tr></thead><tbody>
+<tr><td>No successful events</td><td>Inspect subscription errors, library versions, CUDA availability, and start timing. An empty trace is not evidence of zero allocation.</td></tr>
+<tr><td>No allocation calls in REUSE_B</td><td>Check data_ptr and reserved; a cache hit can legitimately produce no lower-level allocation API.</td></tr>
+<tr><td>No VMM after enabling expandable segments</td><td>Use a fresh process and native backend; inspect unsupported-platform warnings. Do not label a fallback as VMM execution.</td></tr>
+<tr><td>Subscription fails alongside nsys / torch.profiler</td><td>CUPTI 12.8 allows one callback subscriber; run the collector separately from those CUDA profilers.</td></tr>
+<tr><td>cudaMallocAsync or another allocator is active</td><td>Outside these nine CBIDs; add the actual APIs, parameter structures, and lifetime semantics.</td></tr>
+<tr><td>Execution is slower with tracing</td><td>Synchronous callbacks and file writes perturb timing. Use this collector to understand calls and resources, not rank allocator performance.</td></tr>
+</tbody></table></div>
+<p>Phase labels contain no Python stack. The CSV omits kernels, copies, implicit driver internals, other processes, and process-exit cleanup after unsubscription. Collect a separate Nsight Systems run for a full timeline. The project’s <a href="cheatsheet-cupti.html">CUPTI table cheatsheet</a> describes nsys SQLite export tables, not this custom CSV format. <a href="https://docs.nvidia.com/cupti/12.8/main/main.html#callback-api">CUPTI Callback usage</a></p>
+
+<h2 id="en-validation">6. Validation and source</h2>
+<p>The tracer was compiled on Linux without a GPU using NVIDIA CUDA / CUPTI 12.8 development files, with host-side parameter decoding and log summarization checks. This environment cannot perform real CUDA allocations. The two end-to-end allocator runs remain to be verified on a supported GPU. Figures such as 64 / 80 MiB are derived examples, not measured results.</p>
+<p>Interface references: <a href="https://docs.nvidia.com/cupti/12.8/api/group__CUPTI__CALLBACK__API.html">Callback API</a>, <a href="https://docs.nvidia.com/cupti/12.8/api/structCUpti__CallbackData.html">CUpti_CallbackData</a>, <a href="https://docs.nvidia.com/cupti/12.8/api/group__CUPTI__ACTIVITY__API.html">Activity API</a>, and <a href="https://docs.nvidia.com/cuda/archive/12.8.1/cuda-driver-api/group__CUDA__VA.html">CUDA VMM API</a>. Allocator implementation: <a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L985-L1009">cudaMalloc path</a>, <a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L375-L392">ExpandableSegment: reserve</a>, <a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L399-L484">ExpandableSegment: create</a>, <a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L646-L669">Map and access</a>, and <a href="https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/c10/cuda/CUDACachingAllocator.cpp#L672-L699">Unmap and release</a>. When changing Toolkit or PyTorch versions, recheck structures, CBIDs, allocator configuration, and platform capabilities before reusing the collector.</p>
+</div>
+</main></div></body></html>
