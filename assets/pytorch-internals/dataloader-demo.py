@@ -5,6 +5,8 @@ python dataloader-demo.py --workers 1
 python dataloader-demo.py --workers 2 --slow
 python dataloader-demo.py --workers 2 --ragged
 python dataloader-demo.py --workers 2 --bulk
+python dataloader-demo.py --workers 2 --manual-batch
+python dataloader-demo.py --workers 2 --prebuilt-batch
 torchrun --standalone --nproc-per-node=2 dataloader-demo.py --ddp --workers 1
 """
 
@@ -79,6 +81,35 @@ class BulkSamples(FiveSamples):
         return [self[index] for index in indices]
 
 
+def build_batch(indices):
+    index = torch.as_tensor(indices, dtype=torch.long)
+    worker = get_worker_info()
+    return {
+        "index": index,
+        "x": torch.stack((index, 10 * index), dim=1).to(torch.float32),
+        "y": index % 2,
+        "worker": torch.full_like(index, -1 if worker is None else worker.id),
+    }
+
+
+class ManualBatches(Dataset):
+    def __len__(self):
+        return len(ORDER)
+
+    def __getitem__(self, indices):
+        return build_batch(indices)
+
+
+def passthrough(batch):
+    return batch
+
+
+class PrebuiltBatches(FiveSamples):
+    # Custom contract with passthrough, beyond the documented list-of-samples API.
+    def __getitems__(self, indices):
+        return build_batch(indices)
+
+
 def trace_collate(samples):
     batch = default_collate(samples)
     worker = get_worker_info()
@@ -93,13 +124,23 @@ def worker_options(workers):
 
 
 def run_local(args):
-    dataset_type = (RaggedSamples if args.ragged else BulkSamples if args.bulk
-                    else SlowSamples if args.slow else FiveSamples)
+    if args.manual_batch:
+        dataset_type = ManualBatches
+    elif args.prebuilt_batch:
+        dataset_type = PrebuiltBatches
+    else:
+        dataset_type = (RaggedSamples if args.ragged else BulkSamples if args.bulk
+                        else SlowSamples if args.slow else FiveSamples)
+    index_batches = BatchSampler(FixedOrder(), batch_size=2, drop_last=args.drop_batch)
+    batching = ({"sampler": index_batches, "batch_size": None} if args.manual_batch
+                else {"batch_sampler": index_batches})
+    collate = (passthrough if args.manual_batch or args.prebuilt_batch
+               else pad_collate if args.ragged else trace_collate)
     loader = DataLoader(
         dataset_type(),
-        batch_sampler=BatchSampler(FixedOrder(), batch_size=2, drop_last=args.drop_batch),
+        **batching,
         num_workers=args.workers,
-        collate_fn=pad_collate if args.ragged else trace_collate,
+        collate_fn=collate,
         in_order=not args.unordered,
         **worker_options(args.workers),
     )
@@ -169,6 +210,11 @@ def main():
     parser.add_argument("--unordered", action="store_true")
     parser.add_argument("--ragged", action="store_true")
     parser.add_argument("--bulk", action="store_true")
+    prebuilt = parser.add_mutually_exclusive_group()
+    prebuilt.add_argument("--manual-batch", action="store_true",
+                         help="Pass index lists through sampler to __getitem__")
+    prebuilt.add_argument("--prebuilt-batch", action="store_true",
+                         help="Return prebuilt batches from __getitems__ with passthrough")
     parser.add_argument("--drop-sampler", action="store_true")
     parser.add_argument("--drop-batch", action="store_true")
     args = parser.parse_args()
@@ -176,7 +222,10 @@ def main():
         parser.error("--workers must be nonnegative")
     if args.epochs < 1:
         parser.error("--epochs must be positive")
-    if args.ddp and (args.ragged or args.bulk or args.slow or args.unordered):
+    if (args.manual_batch or args.prebuilt_batch) and (args.ragged or args.bulk or args.slow):
+        parser.error("prebuilt batch modes cannot be combined with --ragged, --bulk, or --slow")
+    if args.ddp and (args.ragged or args.bulk or args.slow or args.unordered
+                     or args.manual_batch or args.prebuilt_batch):
         parser.error("--ddp uses the fixed-size dataset and ordered delivery")
     torch.set_num_threads(1)
     run_ddp(args) if args.ddp else run_local(args)

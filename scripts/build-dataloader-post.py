@@ -12,6 +12,7 @@ BASE = f'https://github.com/pytorch/pytorch/blob/{REV}/torch/utils/data/'
 SOURCES = {
     'dataset': ('dataset.py', 'L39-L62', 'Dataset'),
     'construct': ('dataloader.py', 'L355-L408', 'Sampler / BatchSampler / collate_fn'),
+    'auto': ('dataloader.py', 'L496-L510', '_auto_collation / _index_sampler'),
     'iterator': ('dataloader.py', 'L481-L495', 'DataLoader.__iter__'),
     'batch': ('sampler.py', 'L285-L348', 'BatchSampler'),
     'random': ('sampler.py', 'L104-L195', 'SequentialSampler / RandomSampler'),
@@ -19,6 +20,8 @@ SOURCES = {
     'fetch': ('_utils/fetch.py', 'L46-L55', '_MapDatasetFetcher.fetch'),
     'collate': ('_utils/collate.py', 'L118-L272', 'collate / torch.stack'),
     'default': ('_utils/collate.py', 'L337-L398', 'default_collate'),
+    'convert': ('_utils/collate.py', 'L23-L109', 'default_convert'),
+    'stack_dataset': ('dataset.py', 'L259-L294', 'StackDataset.__getitems__'),
     'spawn': ('dataloader.py', 'L1130-L1212', 'Workers / pin-memory thread'),
     'prefetch': ('dataloader.py', 'L1230-L1270', 'Prefetch initialization'),
     'dispatch': ('dataloader.py', 'L1518-L1556', 'Task dispatch / replenishment'),
@@ -68,6 +71,43 @@ if __name__ == "__main__":
         print(batch["index"].tolist(), batch["worker"].tolist())''',
     'ragged': 'from torch.nn.utils.rnn import pad_sequence\nfrom torch.utils.data import default_collate\n\n' + NODES['RaggedSamples'] + '\n\n' + NODES['pad_collate'],
     'bulk': NODES['BulkSamples'],
+    'fetch_paths': '''# Simplified map-style fetch path; key comes from loader._index_sampler.
+def fetch(dataset, key, auto_collation, collate_fn):
+    if auto_collation:
+        getitems = getattr(dataset, "__getitems__", None)
+        data = getitems(key) if getitems else [dataset[i] for i in key]
+    else:
+        data = dataset[key]
+    return collate_fn(data)''',
+    'manual': '# Reuse torch, Dataset, DataLoader, BatchSampler, get_worker_info,\n# ORDER and FixedOrder from the five-sample example.\n\n' +
+        NODES['build_batch'] + '\n\n\n' + NODES['ManualBatches'] + '\n\n\n' + NODES['passthrough'] + '''
+
+
+if __name__ == "__main__":
+    index_batches = BatchSampler(FixedOrder(), batch_size=2, drop_last=False)
+    loader = DataLoader(
+        ManualBatches(),
+        sampler=index_batches,    # One sampler item is an entire index list.
+        batch_size=None,          # Do not group those lists again.
+        collate_fn=passthrough,
+        num_workers=2,
+        multiprocessing_context="spawn",
+    )
+    for batch in loader:
+        print(batch["index"].tolist(), tuple(batch["x"].shape))''',
+    'prebuilt': '# Reuse FiveSamples, build_batch, passthrough and FixedOrder.\n' + NODES['PrebuiltBatches'] + '''
+
+
+if __name__ == "__main__":
+    loader = DataLoader(
+        PrebuiltBatches(),
+        batch_sampler=BatchSampler(FixedOrder(), batch_size=2, drop_last=False),
+        collate_fn=passthrough,
+        num_workers=2,
+        multiprocessing_context="spawn",
+    )
+    for batch in loader:
+        print(batch["index"].tolist(), tuple(batch["x"].shape))''',
     'ddp': NODES['run_ddp'],
     'cuda': '''# The training/rank process performs H2D, not a DataLoader worker.
 for batch in loader:  # loader has pin_memory=True on a CUDA system
@@ -182,7 +222,7 @@ ZH = r'''
 <tr><td>collate_fn</td><td>将样本列表合成 batch</td><td>两个 x 堆成 shape 为 <code>[2,2]</code> 的 tensor</td></tr>
 <tr><td>DataLoader / iterator</td><td>协调采样、读取、预取与交付</td><td>每次 <code>next(iterator)</code> 返回一批</td></tr>
 </tbody></table></div>
-<p>BatchSampler 处理的是<strong>索引列表</strong>，collate_fn 接收的是<strong>已经读出的样本列表</strong>。两者之间发生实际的数据访问。默认配置下，<code>shuffle=False</code> 对应 SequentialSampler，<code>shuffle=True</code> 对应 RandomSampler；提供 batch_size 时，DataLoader 通常再包一层 BatchSampler。{source:construct}；{source:random}</p>
+<p>上表采用默认的自动 batching 路径：BatchSampler 处理<strong>索引列表</strong>，collate_fn 接收<strong>已经读出的样本列表</strong>，两者之间发生实际的数据访问。手动 batching 可以改变 Dataset 与 collate_fn 之间的数据约定，见<a href="#zh-batching">第 4 章</a>。默认配置下，<code>shuffle=False</code> 对应 SequentialSampler，<code>shuffle=True</code> 对应 RandomSampler；提供 batch_size 时，DataLoader 通常再包一层 BatchSampler。{source:construct}；{source:random}</p>
 <h3 id="zh-fixed-example">五个样本</h3>
 <p>样本 i 的特征为 <code>[i, 10i]</code>，标签为 <code>i % 2</code>。这个 Dataset 返回确定性的内存数据，便于检查索引流向。附带的 worker 字段只用于观察执行位置：-1 表示训练进程，0、1 表示该 DataLoader 的子进程。</p>
 {code:base}
@@ -218,15 +258,49 @@ ZH = r'''
 <p>默认每次创建新迭代器都会启动 worker，遍历结束后关闭。persistent_workers=True 则跨轮保留 worker 及其 Dataset 实例，减少重启开销；主进程里修改 <code>dataset.epoch</code> 并不会自动更新这些副本，worker_init_fn 也不会每轮重新执行。需要随 epoch 改变的状态必须显式传递。{source:iterator}；{source:worker}</p>
 <p>采样随机性与 worker 内的数据增强随机性是两层状态。此版本在 worker 启动时初始化 PyTorch、Python random，以及可用时的 NumPy RNG；自行创建的随机生成器或其他库仍需明确管理。<code>get_worker_info()</code> 提供 worker ID、seed 和本进程 Dataset。固定采样顺序并不自动保证随机增强在不同 worker 数下完全一致。{source:seed}；{source:info}</p>
 
-<h2 id="zh-batch">4. Batch 的组织与搬运</h2>
+<h2 id="zh-batching">4. Collate 与 batching</h2>
+<p>一批索引、一次批量读取和一个可供模型使用的 batch，分别对应分组、访问和组装。数据库一次返回多条记录后，仍可能需要把各字段堆成 tensor 或为序列补齐；若 Dataset 已经完成这些操作，collate_fn 可以直接返回它收到的 batch。DataLoader 的配置决定如何传递索引，Dataset 与 collate_fn 则需要约定返回值的结构。</p>
+<h3 id="zh-collate-contract">Collate 接口</h3>
+<p><code>collate_fn(data)</code> 接收一个位置参数，返回交付给后续阶段的数据。常规自动 batching 的类型关系是 <code>list[Sample] → Batch</code>；Sample 和 Batch 在这里代表应用自己的数据结构，可以是 tensor、字典或元组。DataLoader 不会额外传入 indices、batch_size 或 worker_id；需要保留样本索引时，应像本例一样将它放入 Dataset 的返回值。{source:fetch}</p>
+<div class="loader-table"><table><thead><tr><th>模式</th><th>collate_fn 的入参</th><th>未指定 collate_fn 时</th></tr></thead><tbody>
+<tr><td>自动 batching，标准接口</td><td>一批样本的列表，如 <code>[sample_3, sample_0]</code></td><td><code>default_collate</code>：递归组装，堆叠 tensor</td></tr>
+<tr><td>关闭自动 batching</td><td>一次 <code>dataset[key]</code> 的返回值，可以已经是完整 batch</td><td><code>default_convert</code>：转换 NumPy 等数据，不自动增加 batch 维度</td></tr>
+</tbody></table></div>
+<p><strong><code>collate_fn=None</code> 表示选择默认函数，并不是跳过这个阶段。</strong>完全保留 Dataset 的返回对象时，可显式传入 <code>def passthrough(batch): return batch</code>。它省去了额外组装，worker 结果传输和可选的 pinning 仍按各自配置执行。{source:construct}；{source:convert}</p>
+<h3 id="zh-auto-batching">自动 batching</h3>
+<p>对 map-style Dataset，内部开关是 <code>loader._auto_collation == (loader.batch_sampler is not None)</code>。构造 DataLoader 时确定这个模式，创建迭代器和 fetcher 时传入相应状态。普通 <code>sampler=</code> 即使接收一个 BatchSampler 对象，也不会因为对象的类型而自动开启 batching。{source:auto}；{source:construct}</p>
+<div class="loader-table"><table><thead><tr><th>配置</th><th>内部模式</th><th>任务索引来自</th></tr></thead><tbody>
+<tr><td><code>batch_size=2</code>，不传 batch_sampler</td><td>开启：内部创建 BatchSampler</td><td>内部 BatchSampler，每次一组索引</td></tr>
+<tr><td><code>batch_sampler=index_batches</code></td><td>开启：使用给定的 batch_sampler</td><td>index_batches，每次一组索引</td></tr>
+<tr><td><code>sampler=index_batches, batch_size=None</code>，不传 batch_sampler</td><td>关闭：每个 sampler 输出作为一个 key</td><td>index_batches；这个 key 本身可以是索引列表</td></tr>
+</tbody></table></div>
+<p>显式传入 batch_sampler 时，不再同时指定 batch_size、sampler、shuffle 或 drop_last。构造器会将实例上的 <code>batch_size</code> 归一化为 None，但仍保留 batch_sampler，所以此时自动 batching 仍然开启。判断模式应检查 batch_sampler，而不能只看实例上的 batch_size。{source:construct}</p>
+<p>每次 <code>_MapDatasetFetcher.fetch()</code> 执行时，先检查该模式，再决定是否使用 <code>__getitems__</code>。下面保留了源码的分支关系；单进程和多 worker 使用同一套规则。{source:fetch}</p>
+{code:fetch_paths}
+<p>开启自动 batching 且实现了 __getitems__ 时，整批索引只调用一次该方法；没有该方法时，fetcher 才逐个调用 __getitem__。关闭自动 batching 后，key 被整体交给 __getitem__，即使它是 <code>[3,0]</code>，也不会切换到 __getitems__。collate_fn 总是在读取之后执行，不参与接口选择。</p>
+<h3 id="zh-bulk">批量读取接口</h3>
+<p><code>Dataset.__getitems__(indices)</code> 的文档约定是接收一批索引，返回按请求顺序排列的<strong>样本列表</strong>。例如输入 <code>[3,0]</code>，返回 <code>[sample_3, sample_0]</code>，随后 default_collate 将各字段组装成 batch。数据库批查询、合并文件读取可以利用这个入口；下面只是接口示意，列表循环本身没有带来 I/O 加速。{source:dataset}；{source:fetch}</p>
+{code:bulk}
+<h3 id="zh-manual-batching">手动 batching</h3>
+<p>存储层若能直接返回 <code>x: [B,D]</code>、<code>y: [B]</code>，Dataset 可以直接提供这些批量 tensor。配置 <code>batch_size=None</code>、不传 batch_sampler，让 <code>__getitem__(key)</code> 的返回值作为一个完整数据单元交付。key 可以是单个样本 ID、预分批的 batch ID，也可以是由 Sampler 产生的索引列表。<a href="https://docs.pytorch.org/docs/2.8/data.html#disable-automatic-batching">关闭自动 batching</a>；{source:fetch}</p>
+<p>沿用五个样本和 <code>[3,0,4,1,2]</code> 的采样顺序，将 BatchSampler 对象放入 <strong><code>sampler=</code></strong> 参数。每次产生的 <code>[3,0]</code>、<code>[4,1]</code>、<code>[2]</code> 都作为一个 key 传给 __getitem__。例子直接构造整批字段，passthrough 保留已经构建好的字典：</p>
+{code:manual}
+<pre class="code">[3, 0] (2, 2)
+[4, 1] (2, 2)
+[2] (1, 2)</pre>
+<p>打印结果依次为索引和 x 的 shape。这里 <code>len(dataset)</code> 仍表示五个底层样本，而 <code>len(loader)</code> 来自产生任务的 sampler，共三批。尾批是否丢弃由 index_batches 的 drop_last 决定；不要再向关闭自动 batching 的 DataLoader 传入 <code>drop_last=True</code>。若漏写 <code>batch_size=None</code>，默认 batch_size=1 会再包一层 BatchSampler，将第一个 key 变为 <code>[[3,0]]</code>，产生不符合本例约定的嵌套索引。{source:construct}；{source:auto}</p>
+<h3 id="zh-prebuilt-batching">预组装 batch</h3>
+<p>已有代码也可能选择让 <code>__getitems__</code> 直接返回完整 batch。本文固定的 PyTorch 2.8 fetcher 会把返回值原样传给 collate_fn，因此它可以与 passthrough 配对使用。这个分支仍开启自动 batching，索引分组与派发继续由 <code>batch_sampler=</code> 控制。{source:fetch}</p>
+{code:prebuilt}
+<aside class="loader-note"><p>这是 Dataset 与自定义 collate_fn 之间的配套约定，超出了 __getitems__ 返回样本列表的文档约定。default_collate 仍按样本序列解释输入，直接传入本例的批量字典会报错。依赖样本列表的封装也未必兼容，例如 StackDataset 会检查返回长度并逐样本遍历。需要组合这些封装时，应保留标准的样本列表接口。{source:dataset}；{source:stack_dataset}</p></aside>
+<p>两种预组装配置都能把整批索引交给 Dataset：<code>sampler=index_batches, batch_size=None</code> 调用 __getitem__；<code>batch_sampler=index_batches</code> 在实现了 __getitems__ 时调用后者。两种配置都使用 passthrough，无需把已有的批量 tensor 拆成样本再堆回去。</p>
+<p>完整的<a href="../assets/pytorch-internals/dataloader-demo.py" download>示例脚本</a>提供 <code>--bulk</code>、<code>--manual-batch</code> 和 <code>--prebuilt-batch</code> 三种模式。将 <code>--workers</code> 设为 0 或 2，可以比较执行位置；索引顺序以及 x、y 的 shape 保持一致，worker 字段反映实际的执行进程。</p>
 <h3 id="zh-collate">默认堆叠与变长补齐</h3>
 <p>default_collate 会递归处理字典等结构，将同一字段的 tensor 堆叠，给结果增加 batch 维度；本例第一批的 x 为 <code>[2,2]</code>，y 为 <code>[2]</code>。它不会自动为变长 tensor 补齐。若样本 i 改为长度 i+1 的序列，第一批两条序列的长度就是 4 和 1，需要自定义 collate_fn。{source:default}；{source:collate}</p>
 {code:ragged}
 <p>第一批得到 <code>x=[[1,2,3,4],[1,0,0,0]]</code>、<code>lengths=[4,1]</code>。Mask 区分有效位置与 padding，避免把补入的 0 当作真实输入。使用 <code>DataLoader(RaggedSamples(), …, collate_fn=pad_collate)</code> 时，num_workers=0 在主进程执行补齐；num_workers&gt;0 在收到该批任务的 worker 内执行。</p>
-<h3 id="zh-bulk">批量读取接口</h3>
-<p>实现可选的 <code>Dataset.__getitems__(indices)</code> 后，fetcher 会把整批索引交给它，而不是逐次调用 __getitem__。数据库批查询、连续文件读取可以利用这个接口；返回结果仍应是按请求顺序排列的<strong>样本列表</strong>，之后依然调用 collate_fn。下面只是接口示意，列表循环本身没有带来 I/O 加速。{source:fetch}</p>
-{code:bulk}
-<p>若显式设置 batch_size=None 且没有 batch_sampler，则关闭自动 batching：Sampler 每次给一个 key，fetcher 取一个样本，默认使用 default_convert。此时用户提供的 collate_fn 接收单个样本，而非样本列表，不能套用本文的整批任务示意。{source:construct}；{source:fetch}</p>
+
+<h2 id="zh-batch">5. Batch 搬运</h2>
 <h3 id="zh-device">Pin memory 与 H2D</h3>
 <p>通常让 Dataset 和 collate_fn 返回 CPU tensor。CUDA 可用且启用 <code>pin_memory=True</code> 时，DataLoader 将 batch 中的 CPU tensor 放入页锁定（page-locked）主机内存，便于高效地传到 GPU。自动 pinning 位于 <strong>collate_fn 之后、batch 返回给训练循环之前</strong>；具体执行位置取决于 num_workers。{source:single}；{source:spawn}；{source:pin}</p>
 <div class="loader-table"><table><thead><tr><th>配置</th><th>读取数据、执行 collate_fn</th><th>执行自动 pin_memory</th></tr></thead><tbody>
@@ -245,7 +319,7 @@ worker：读取 → collate_fn → result queue
 {code:cuda}
 <p><code>non_blocking=True</code> 允许异步提交搬运；H2D 与计算是否实际重叠还取决于 stream、数据依赖和硬件。同一 CUDA stream 上紧接着使用 x 的计算仍要等搬运完成。自定义 batch 类型需要实现相应的 pin_memory 支持；普通 tensor 字典可由默认逻辑递归处理。</p>
 
-<h2 id="zh-ddp">5. DDP 中的数据读取</h2>
+<h2 id="zh-ddp">6. DDP 中的数据读取</h2>
 <h3 id="zh-ranks">Rank 与 worker</h3>
 <p>DDP 通常由每张 GPU 对应一个训练进程，每个 rank 都有自己的 Dataset、DataLoader 和 worker 池。DDP 负责模型副本之间的梯度同步，<strong>不会自动切分 DataLoader 的输入</strong>；map-style 数据通常用 DistributedSampler 进行分片。<a href="https://docs.pytorch.org/docs/2.8/generated/torch.nn.parallel.DistributedDataParallel.html">DDP 官方说明</a>。</p>
 <p>分片先于本地分批：各 rank 用相同 seed 和 epoch 产生同一份全局索引排列，再按 <code>indices[rank:total_size:world_size]</code> 取属于自己的位置，最后由各自的 BatchSampler 分批。DistributedSampler 在各 rank 本地计算这些索引，通常不需要每轮做一次索引广播。{source:dist}</p>
@@ -278,6 +352,8 @@ python dataloader-demo.py --workers 1
 python dataloader-demo.py --workers 2 --slow
 python dataloader-demo.py --workers 2 --ragged
 python dataloader-demo.py --workers 2 --bulk
+python dataloader-demo.py --workers 2 --manual-batch
+python dataloader-demo.py --workers 2 --prebuilt-batch
 
 # 两个 CPU rank，每个 rank 一个读取 worker
 torchrun --standalone --nproc-per-node=2 dataloader-demo.py --ddp --workers 1
@@ -286,7 +362,7 @@ torchrun --standalone --nproc-per-node=2 dataloader-demo.py --ddp --workers 1
 torchrun --standalone --nproc-per-node=2 dataloader-demo.py --ddp --device cuda --workers 2</pre>
 <p>Epoch 0 在 rank 0 输出 <code>[3,4]</code>、<code>[2]</code>，rank 1 输出 <code>[0,1]</code>、<code>[3]</code>；不同进程的打印行可能交错。Epoch 1 会换一份排列。使用 <code>--drop-sampler</code> 和 <code>--drop-batch</code> 可以分别观察上面两种丢弃策略。</p>
 
-<h2 id="zh-reading">6. 源码与排查</h2>
+<h2 id="zh-reading">7. 源码与排查</h2>
 <div class="loader-table"><table><thead><tr><th>现象</th><th>优先检查</th></tr></thead><tbody>
 <tr><td>样本错误、异常难定位</td><td>先用 num_workers=0 查看 Dataset / collate 的直接调用栈，再恢复多进程。</td></tr>
 <tr><td>Worker 已完成一批，训练仍等待</td><td>检查是否被更早的慢任务阻塞；区分完成顺序和 in_order 交付顺序。</td></tr>
@@ -312,7 +388,7 @@ EN = r'''
 <tr><td>collate_fn</td><td>Assemble samples into a batch</td><td>Stack two x tensors into shape <code>[2,2]</code></td></tr>
 <tr><td>DataLoader / iterator</td><td>Coordinate sampling, fetching, prefetching, and delivery</td><td>One batch per <code>next(iterator)</code></td></tr>
 </tbody></table></div>
-<p>BatchSampler handles <strong>indices</strong>; collate_fn receives <strong>samples already fetched</strong>. Actual data access happens between them. Without a custom sampler, shuffle=False selects SequentialSampler and shuffle=True selects RandomSampler. With batch_size enabled, DataLoader normally wraps the sampler in BatchSampler. {source:construct}; {source:random}</p>
+<p>The table describes standard automatic batching: BatchSampler handles <strong>indices</strong>, and collate_fn receives <strong>samples already fetched</strong>. Actual data access happens between them. Manual batching can change the contract between Dataset and collate_fn; see <a href="#en-batching">section 4</a>. Without a custom sampler, shuffle=False selects SequentialSampler and shuffle=True selects RandomSampler. With batch_size enabled, DataLoader normally wraps the sampler in BatchSampler. {source:construct}; {source:random}</p>
 <h3 id="en-fixed-example">Five samples</h3>
 <p>Sample i has features <code>[i, 10i]</code> and label <code>i % 2</code>. Removing I/O and random augmentation makes index flow easy to inspect. The worker field records where retrieval runs: -1 for the training process, or a worker ID local to this loader.</p>
 {code:base}
@@ -348,15 +424,49 @@ EN = r'''
 <p>Normally a new iterator starts workers and exhaustion shuts them down. persistent_workers=True retains processes and their Dataset instances across epochs. Mutating dataset.epoch in the parent does not automatically update those replicas, and worker_init_fn does not rerun every epoch. Epoch-dependent state needs explicit communication. {source:iterator}; {source:worker}</p>
 <p>Sampling randomness and augmentation randomness are separate. This version seeds PyTorch, Python random, and, when available, NumPy as workers start. Custom generators and other libraries still need explicit management. get_worker_info exposes the local worker ID, seed, and Dataset. A fixed sampling order alone does not guarantee identical augmentation when the worker count changes. {source:seed}; {source:info}</p>
 
-<h2 id="en-batch">4. Batch structure and transfer</h2>
+<h2 id="en-batching">4. Collation and batching</h2>
+<p>Grouping indices, fetching several records at once, and assembling model inputs are separate operations. A database query may return a list of records that still need field-wise stacking or sequence padding. If the Dataset already performs that assembly, collate_fn can return the completed batch unchanged. DataLoader configuration controls how indices are passed; Dataset and collate_fn must agree on the structure returned.</p>
+<h3 id="en-collate-contract">The collate interface</h3>
+<p><code>collate_fn(data)</code> takes one positional argument and returns the data for subsequent stages. Standard automatic batching follows <code>list[Sample] → Batch</code>; Sample and Batch stand for application-defined structures, including tensors, dictionaries, and tuples. DataLoader does not pass indices, batch_size, or worker_id as additional arguments. Preserve sample indices in the Dataset's return value when needed, as this example does. {source:fetch}</p>
+<div class="loader-table"><table><thead><tr><th>Mode</th><th>Input to collate_fn</th><th>Default when omitted</th></tr></thead><tbody>
+<tr><td>Automatic batching, standard interface</td><td>A sample list, such as <code>[sample_3, sample_0]</code></td><td><code>default_collate</code>: recursively assemble fields and stack tensors</td></tr>
+<tr><td>Automatic batching disabled</td><td>One return value from <code>dataset[key]</code>, potentially a complete batch</td><td><code>default_convert</code>: convert data such as NumPy arrays without adding a batch dimension</td></tr>
+</tbody></table></div>
+<p><strong><code>collate_fn=None</code> selects a default function; it does not skip the stage.</strong> To preserve the Dataset's returned object, explicitly pass <code>def passthrough(batch): return batch</code>. This avoids further assembly; worker result transport and optional pinning still follow their own configuration. {source:construct}; {source:convert}</p>
+<h3 id="en-auto-batching">Automatic batching</h3>
+<p>For map-style datasets, the internal switch is <code>loader._auto_collation == (loader.batch_sampler is not None)</code>. Construction establishes this mode, and iterator and fetcher creation propagate it. Passing a BatchSampler object through the ordinary <code>sampler=</code> parameter does not enable automatic batching based on that object's type. {source:auto}; {source:construct}</p>
+<div class="loader-table"><table><thead><tr><th>Configuration</th><th>Internal mode</th><th>Task indices come from</th></tr></thead><tbody>
+<tr><td><code>batch_size=2</code>, no batch_sampler</td><td>Enabled: construct an internal BatchSampler</td><td>The internal BatchSampler, one index group at a time</td></tr>
+<tr><td><code>batch_sampler=index_batches</code></td><td>Enabled: use the provided batch_sampler</td><td>index_batches, one index group at a time</td></tr>
+<tr><td><code>sampler=index_batches, batch_size=None</code>, no batch_sampler</td><td>Disabled: treat each sampler output as one key</td><td>index_batches; a key can itself be an index list</td></tr>
+</tbody></table></div>
+<p>With an explicit batch_sampler, omit batch_size, sampler, shuffle, and drop_last. Construction normalizes the instance's <code>batch_size</code> to None while retaining batch_sampler, so automatic batching remains enabled. Inspect batch_sampler to determine the mode, rather than the instance's batch_size alone. {source:construct}</p>
+<p>Each <code>_MapDatasetFetcher.fetch()</code> call checks the mode before deciding whether to use <code>__getitems__</code>. This simplified version preserves the source branches. Single-process and multi-worker loading use the same rules. {source:fetch}</p>
+{code:fetch_paths}
+<p>With automatic batching and an implemented __getitems__, the complete index group goes to that method once. Without it, the fetcher calls __getitem__ for each index. With automatic batching disabled, __getitem__ receives the whole key, even if it is <code>[3,0]</code>; an index list does not trigger __getitems__. Collate runs after fetching and does not choose the interface.</p>
+<h3 id="en-bulk">Batched fetching</h3>
+<p>The documented contract of <code>Dataset.__getitems__(indices)</code> takes a group of indices and returns a <strong>list of samples in requested order</strong>. Input <code>[3,0]</code> produces <code>[sample_3, sample_0]</code>, whose fields default_collate then assembles. A backend can use this entry point for one database query or combined file reads. The following loop demonstrates the interface only; it does not itself accelerate I/O. {source:dataset}; {source:fetch}</p>
+{code:bulk}
+<h3 id="en-manual-batching">Manual batching</h3>
+<p>When storage can supply <code>x: [B,D]</code> and <code>y: [B]</code> directly, Dataset can return these batch tensors. Set <code>batch_size=None</code> and omit batch_sampler so that one return value from <code>__getitem__(key)</code> is delivered as a complete data unit. A key can be a sample ID, a preassigned batch ID, or an index list produced by a sampler. <a href="https://docs.pytorch.org/docs/2.8/data.html#disable-automatic-batching">Disable automatic batching</a>; {source:fetch}</p>
+<p>Keep the five samples and order <code>[3,0,4,1,2]</code>, but pass the BatchSampler object through <strong><code>sampler=</code></strong>. Its outputs <code>[3,0]</code>, <code>[4,1]</code>, and <code>[2]</code> each become one key for __getitem__. This example constructs whole-batch fields directly; passthrough preserves the assembled dictionary:</p>
+{code:manual}
+<pre class="code">[3, 0] (2, 2)
+[4, 1] (2, 2)
+[2] (1, 2)</pre>
+<p>The output shows indices followed by x shape. Here <code>len(dataset)</code> still counts five underlying samples; <code>len(loader)</code> comes from the task-producing sampler and counts three batches. The index_batches drop_last option controls the tail. Do not pass <code>drop_last=True</code> to a DataLoader with automatic batching disabled. Omitting <code>batch_size=None</code> leaves the default of 1, which adds another BatchSampler and changes the first key to <code>[[3,0]]</code>, violating this example's index contract. {source:construct}; {source:auto}</p>
+<h3 id="en-prebuilt-batching">Prebuilt batches</h3>
+<p>Existing code may instead return a complete batch from <code>__getitems__</code>. The pinned PyTorch 2.8 fetcher passes that return value directly to collate_fn, allowing a paired passthrough function. Automatic batching remains enabled on this path; <code>batch_sampler=</code> still controls index grouping and dispatch. {source:fetch}</p>
+{code:prebuilt}
+<aside class="loader-note"><p>This is a custom contract between Dataset and collate_fn, beyond the documented list-of-samples return type for __getitems__. default_collate still interprets its input as a sample sequence and fails on this example's batch dictionary. Wrappers expecting a sample list may also be incompatible: StackDataset checks the returned length and iterates over samples. Preserve the standard sample-list interface when composing those wrappers. {source:dataset}; {source:stack_dataset}</p></aside>
+<p>Both configurations deliver whole index groups to Dataset: <code>sampler=index_batches, batch_size=None</code> calls __getitem__; <code>batch_sampler=index_batches</code> calls __getitems__ when implemented. Both use passthrough, avoiding the need to split batch tensors into samples and stack them again.</p>
+<p>The <a href="../assets/pytorch-internals/dataloader-demo.py" download>complete example script</a> provides <code>--bulk</code>, <code>--manual-batch</code>, and <code>--prebuilt-batch</code>. Set <code>--workers</code> to 0 or 2 to compare execution locations. Index order and x/y shapes remain the same; worker fields report the executing process.</p>
 <h3 id="en-collate">Stacking and padding</h3>
 <p>default_collate recursively handles structures such as dictionaries and stacks matching tensor fields, adding a batch dimension. The first batch has x shape <code>[2,2]</code> and y shape <code>[2]</code>. It does not automatically pad unequal tensor lengths. If sample i instead contains a sequence of length i+1, the first batch contains lengths four and one and needs custom collation. {source:default}; {source:collate}</p>
 {code:ragged}
 <p>The first batch becomes <code>x=[[1,2,3,4],[1,0,0,0]]</code>, with <code>lengths=[4,1]</code>. A mask distinguishes valid positions from padding. Pass pad_collate to DataLoader with RaggedSamples: padding runs in the main process for num_workers=0, or inside the worker assigned that batch for num_workers&gt;0.</p>
-<h3 id="en-bulk">Batched fetching</h3>
-<p>The optional Dataset.__getitems__(indices) receives an entire index list instead of repeated __getitem__ calls. A backend could use one database query or combine file reads. It should return a <strong>list of samples in requested order</strong>; collate_fn still runs afterward. This example demonstrates the interface only: its Python loop does not itself accelerate I/O. {source:fetch}</p>
-{code:bulk}
-<p>Setting batch_size=None without batch_sampler disables automatic batching. The sampler supplies one key, the fetcher obtains one sample, and default_convert is the default conversion. A custom collate_fn then receives a single sample, not a sample list; the whole-batch task diagrams do not apply to that mode. {source:construct}; {source:fetch}</p>
+
+<h2 id="en-batch">5. Batch transfer</h2>
 <h3 id="en-device">Pin memory and H2D</h3>
 <p>Dataset and collate_fn normally return CPU tensors. With CUDA available and <code>pin_memory=True</code>, DataLoader places the batch's CPU tensors in page-locked host memory for efficient GPU transfer. Automatic pinning runs <strong>after collate_fn and before the batch reaches the training loop</strong>. Its execution location depends on num_workers. {source:single}; {source:spawn}; {source:pin}</p>
 <div class="loader-table"><table><thead><tr><th>Configuration</th><th>Fetching and collate_fn</th><th>Automatic pin_memory</th></tr></thead><tbody>
@@ -375,7 +485,7 @@ Training process / training thread: data queue → return batch in delivery orde
 {code:cuda}
 <p>non_blocking=True permits asynchronous transfer submission. Actual overlap with computation also depends on streams, dependencies, and hardware; a consumer on the same CUDA stream still waits for its copy. Custom batch classes need pin_memory support, whereas ordinary tensor dictionaries are traversed by the default implementation.</p>
 
-<h2 id="en-ddp">5. Reading data under DDP</h2>
+<h2 id="en-ddp">6. Reading data under DDP</h2>
 <h3 id="en-ranks">Ranks and workers</h3>
 <p>A typical DDP setup assigns one training process to each GPU, with a Dataset, DataLoader, and worker pool per rank. DDP synchronizes model gradients; <strong>it does not shard DataLoader inputs automatically</strong>. Map-style training commonly uses DistributedSampler for that job. <a href="https://docs.pytorch.org/docs/2.8/generated/torch.nn.parallel.DistributedDataParallel.html">DDP documentation</a>.</p>
 <p>Rank sharding precedes local batching. Each rank computes the same global permutation using the same seed and epoch, selects <code>indices[rank:total_size:world_size]</code>, and passes its indices to its local BatchSampler. These computations are rank-local and normally need no epoch-by-epoch index broadcast. {source:dist}</p>
@@ -408,6 +518,8 @@ python dataloader-demo.py --workers 1
 python dataloader-demo.py --workers 2 --slow
 python dataloader-demo.py --workers 2 --ragged
 python dataloader-demo.py --workers 2 --bulk
+python dataloader-demo.py --workers 2 --manual-batch
+python dataloader-demo.py --workers 2 --prebuilt-batch
 
 # Two CPU ranks, one data worker per rank.
 torchrun --standalone --nproc-per-node=2 dataloader-demo.py --ddp --workers 1
@@ -416,7 +528,7 @@ torchrun --standalone --nproc-per-node=2 dataloader-demo.py --ddp --workers 1
 torchrun --standalone --nproc-per-node=2 dataloader-demo.py --ddp --device cuda --workers 2</pre>
 <p>At epoch 0, rank 0 outputs <code>[3,4]</code> and <code>[2]</code>; rank 1 outputs <code>[0,1]</code> and <code>[3]</code>. Printed lines can interleave across processes. Epoch 1 uses another permutation. --drop-sampler and --drop-batch independently enable the two drop policies.</p>
 
-<h2 id="en-reading">6. Source and diagnosis</h2>
+<h2 id="en-reading">7. Source and diagnosis</h2>
 <div class="loader-table"><table><thead><tr><th>Symptom</th><th>First check</th></tr></thead><tbody>
 <tr><td>Bad samples or opaque exceptions</td><td>Use num_workers=0 for a direct Dataset / collate traceback, then restore multiprocessing.</td></tr>
 <tr><td>A worker completed a batch but training waits</td><td>Check whether an earlier slow task blocks in_order delivery.</td></tr>
@@ -438,7 +550,7 @@ def main():
         'title':'PyTorch DataLoader 工作原理','title_en':'PyTorch DataLoader internals',
         'slug':'pytorch-dataloader','date':'2026-10-26',
         'tags':'PyTorch, 深度学习, DataLoader, DDP','tags_en':'PyTorch, Deep Learning, DataLoader, DDP',
-        'reading':'20 分钟','reading_en':'20 min',
+        'reading':'25 分钟','reading_en':'25 min',
         'summary':'围绕五个样本解释 map-style DataLoader 的采样、分批、读取与组装，从单进程、单 worker 扩展到多 worker 预取和 DDP 分片。',
         'summary_en':'Follow five samples through map-style sampling, batching, fetching, collation, worker prefetch, and distributed rank sharding.',
         'series':'pytorch-internals','series_title':'PyTorch 内部机制','series_title_en':'PyTorch Internals','series_order':'10',
