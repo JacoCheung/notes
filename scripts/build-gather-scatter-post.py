@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""Build the bilingual gather/scatter article from runnable examples."""
+
+import ast
+from html import escape
+from pathlib import Path
+import re
+import textwrap
+
+ROOT = Path(__file__).resolve().parents[1]
+REV = 'a1cb3cc05d46d198467bebbb6e8fba50a325d4e7'
+BASE = f'https://github.com/pytorch/pytorch/blob/{REV}/'
+SOURCES = {
+    'gather': ('tools/autograd/derivatives.yaml', 'L730-L733', 'gather derivative'),
+    'gather_backward': ('aten/src/ATen/native/TensorAdvancedIndexing.cpp', 'L2092-L2109', 'gather_backward'),
+    'scatter': ('tools/autograd/derivatives.yaml', 'L1488-L1503', 'scatter / scatter_add derivatives'),
+    'shape': ('aten/src/ATen/native/ScatterGatherChecks.h', 'L37-L124', 'shape checks'),
+    'kernel': ('aten/src/ATen/native/cuda/ScatterGatherKernel.cu', 'L519-L546', 'CUDA gather / scatter kernels'),
+    'atomic': ('aten/src/ATen/native/cuda/ScatterGatherKernel.cu', 'L31-L42', 'ReduceAdd / fastAtomicAdd'),
+}
+DEMO = (ROOT / 'assets/pytorch-internals/gather-scatter/demo.py').read_text()
+SNIPPETS = {}
+for node in ast.parse(DEMO).body:
+    if isinstance(node, ast.FunctionDef) and node.name != 'verify':
+        lines = DEMO.splitlines()[node.body[0].lineno - 1:node.body[-1].lineno - 1]
+        SNIPPETS[node.name] = textwrap.dedent('\n'.join(lines))
+
+
+def source(key):
+    path, lines, title = SOURCES[key]
+    return f'<a href="{BASE}{path}#{lines}">{escape(title)}</a>'
+
+
+def flow(lang, backward=False):
+    name = f'{lang}-flow-' + ('backward' if backward else 'forward')
+    title = ('Gather：梯度沿索引返回并累加' if backward else 'Gather：同一元素可以被读取多次') if lang == 'zh' else ('Gather: return and add gradients' if backward else 'Gather: repeated reads of one element')
+    top = [160, 390, 620] if backward else [80, 270, 460, 650]
+    bottom = [80, 270, 460, 650] if backward else [160, 390, 620]
+    a = ['1', '2', '3'] if backward else ['10', '20', '30', '40']
+    b = ['2', '0', '1 + 3 = 4', '0'] if backward else ['30', '10', '30']
+    edges = [(0, 2), (1, 0), (2, 2)] if backward else [(2, 0), (0, 1), (2, 2)]
+    top_label = 'g[0, :]' if backward else 'x[0, :]'
+    bottom_label = 'dx[0, :]' if backward else 'out[0, :]'
+    parts = [f'<figure class="gs-figure"><svg viewBox="0 0 800 304" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="{name}-title"><title id="{name}-title">{escape(title)}</title>',
+             f'<defs><marker id="{name}-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0 L7 3.5 L0 7 Z" fill="currentColor"/></marker></defs>',
+             '<text x="26" y="25" font-size="17">index[0, :] = [2, 0, 2]</text>',
+             f'<text x="26" y="56" font-size="15">{top_label}</text>',
+             f'<text x="26" y="293" font-size="15">{bottom_label}</text>']
+    for row, values, y in [(top, a, 70), (bottom, b, 216)]:
+        for x, value in zip(row, values):
+            parts.append(f'<rect x="{x-55}" y="{y}" width="110" height="46" rx="3" fill="var(--bg-subtle)" stroke="currentColor" stroke-width="1.4"/><text x="{x}" y="{y+29}" text-anchor="middle" font-size="17">{value}</text>')
+    for i, (start, end) in enumerate(edges):
+        sx = top[start] + ((i - 1) * 12 if not backward and start == 2 else 0)
+        ex = bottom[end] + ((i - 1) * 12 if backward and end == 2 else 0)
+        parts.append(f'<path d="M{sx} 118 C{sx} 157 {ex} 173 {ex} 211" fill="none" stroke="currentColor" stroke-width="1.8" marker-end="url(#{name}-arrow)"/>')
+    caption = ('第 0 行的上游梯度为 [1, 2, 3]；第 0、2 项都返回 x[0,2]，累加为 4。' if backward else '第 0 行沿 dim=1 读取列 2、0、2；输出的第 0、2 项都来自 x[0,2]。') if lang == 'zh' else ('Upstream row [1, 2, 3]: entries 0 and 2 both return to x[0,2], adding to 4.' if backward else 'Row 0 reads columns 2, 0, 2 along dim=1. Output entries 0 and 2 share x[0,2].')
+    return ''.join(parts) + f'</svg><figcaption>{caption}</figcaption></figure>'
+
+
+def lab(lang):
+    zh = lang == 'zh'
+    labels = ['操作', '阶段', '坐标轴', '索引'] if zh else ['Operation', 'Pass', 'Axis', 'Indices']
+    choices = [
+        ('op', [('gather', 'gather'), ('scatter', 'scatter'), ('scatter_add', 'scatter_add')]),
+        ('pass', [('forward', '前向' if zh else 'Forward'), ('backward', '反向' if zh else 'Backward')]),
+        ('dim', [('1', 'dim=1'), ('0', 'dim=0')]),
+        ('indices', [('repeated', '重复索引' if zh else 'Repeated'), ('unique', '唯一目标' if zh else 'Unique targets')]),
+    ]
+    controls = ''.join(f'<label>{label}<select data-{key}>' + ''.join(f'<option value="{value}">{text}</option>' for value, text in options) + '</select></label>' for label, (key, options) in zip(labels, choices))
+    intro = '切换操作、前后向和坐标轴。dim=0 使用所有示例张量的转置，便于比较同一组对应关系。粗边框标记重复索引指向的目标。' if zh else 'Switch the operator, pass, and axis. dim=0 transposes every example tensor to preserve the same mapping. Heavy borders mark targets referenced more than once.'
+    return f'<div class="gs-lab" data-lang="{lang}"><p>{intro}</p><div class="gs-controls">{controls}</div><code data-equation></code><div class="gs-matrices"></div><div aria-live="polite"><p data-explanation></p><p data-warning hidden></p></div><noscript><p>' + ('交互演示需要 JavaScript；正文中的公式、数值和图示可直接阅读。' if zh else 'Enable JavaScript for the interactive example. The article’s formulas, values, and figures are available without it.') + '</p></noscript></div>'
+
+
+ZH = r'''
+<h1>PyTorch Gather 与 Scatter 的前向和反向</h1>
+<p>Gather 和 Scatter 用索引张量描述元素之间的对应关系：Gather 为输出的每个位置选择一个输入元素，Scatter 为源张量的每个元素指定一个写入位置。这种对应关系也决定了梯度的流向。以二维 Tensor 为例，沿行或列替换一个坐标，就能推导出前向赋值、重复索引的处理，以及反向传播中的梯度累加。</p>
+
+<h2 id="zh-coordinates">1. 坐标与赋值</h2>
+<h3 id="zh-formulas">二维赋值公式</h3>
+<p>设 <code>index[i,j]</code> 存放待替换的坐标。<code>dim=0</code> 替换行坐标，<code>dim=1</code> 替换列坐标，其余坐标保持原值。对 index 中的每个位置，核心赋值如下：</p>
+<div class="gs-table"><table><thead><tr><th>操作</th><th>dim=0：替换行坐标</th><th>dim=1：替换列坐标</th></tr></thead><tbody>
+<tr><td>gather</td><td><code>out[i,j] = x[index[i,j], j]</code></td><td><code>out[i,j] = x[i, index[i,j]]</code></td></tr>
+<tr><td>scatter</td><td><code>out[index[i,j], j] = src[i,j]</code></td><td><code>out[i, index[i,j]] = src[i,j]</code></td></tr>
+</tbody></table></div>
+<p>Gather 的索引用在等号右边，决定<strong>从哪里读</strong>；Scatter 的索引用在等号左边，决定<strong>写到哪里</strong>。表中的 i、j 遍历 index 的 shape；它们在 Gather 中也是输出坐标，在 Scatter 中也是参与写入的源坐标。<a href="https://docs.pytorch.org/docs/2.8/generated/torch.gather.html">Gather API</a> · <a href="https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.scatter_.html">Scatter API</a></p>
+<p><code>base.scatter(dim, index, src)</code> 先以 base 的值作为输出的初始内容，再覆盖被索引命中的位置。未命中的位置保留 base，输出 shape 也与 base 相同。Gather 的输出 shape 则等于 index.shape。</p>
+<h3 id="zh-notation">参数与范围</h3>
+<p>下面的数值示例使用浮点数据和 <code>torch.long</code> 索引，默认 <code>import torch</code>。Scatter 指不带 reduce 的 Tensor 源覆盖操作；累加使用独立的 <code>scatter_add</code>。示例采用返回新 Tensor 的版本，带下划线的 <code>scatter_</code>、<code>scatter_add_</code> 会原地修改接收者。API 与源码固定到 PyTorch 2.8.0，验证环境为 2.8.0+cpu。</p>
+
+<h2 id="zh-forward">2. 前向数据流</h2>
+<h3 id="zh-gather-forward">Gather：索引读取</h3>
+{code:gather_columns}
+<p><code>out[0,0] = x[0,2] = 30</code>，<code>out[0,1] = x[0,0] = 10</code>。第二行有自己的索引 [1,3,0]，因此同一输出列可以从不同行的不同输入列读取。第一行重复读取列 2，两份输出都等于 30。</p>
+{figure:forward}
+<p>把 dim 改为 0 后，index 中的数值解释为行号。下面输入为 [2,4]，索引和输出为 [3,4]；可以多次读取同一行，因此索引在被选轴上的长度可以大于输入：</p>
+{code:gather_rows}
+<p>例如 <code>out[0,2] = x[index[0,2],2] = x[1,2] = 70</code>。沿 dim=0 的 Gather 仍是逐元素选取，各列可以选择不同的行。</p>
+<h3 id="zh-scatter-forward">Scatter：索引覆盖</h3>
+{code:scatter_columns}
+<p>源张量第一行的 10、20、30 分别写到输出列 2、0、3。列 1 没有被写入，保留 base[0,1]=2；第二行同理保留 base[1,2]=7。<code>src.shape</code> 是 [2,3]，输出的 [2,4] 由 base 提供。</p>
+<p>沿 dim=0 写入时，每列独立指定目标行：</p>
+{code:scatter_rows}
+<p>这里 <code>src[0,2]=30</code> 写到 <code>out[1,2]</code>，<code>src[1,2]=70</code> 写到 <code>out[0,2]</code>。索引数值在不同列重复不会产生冲突；只有两个源元素映射到<strong>同一个完整目标坐标</strong>时才会竞争覆盖。</p>
+<h3 id="zh-add-forward">Scatter add：索引累加</h3>
+<p><code>scatter_add</code> 沿用 Scatter 的坐标映射，把赋值改为加法，并包含 base 的初始值：</p>
+<pre class="code">out = base.clone()
+# dim=0: out[index[i,j], j] += src[i,j]
+# dim=1: out[i, index[i,j]] += src[i,j]</pre>
+<p>若把列索引改为 [2,0,2]，第一行的 src[0,0]=10 和 src[0,2]=30 都累加到列 2。该位置结果为 <code>base[0,2] + 10 + 30 = 43</code>。初始化为零时，它就是按索引分组求和。<a href="https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.scatter_add_.html">Scatter add API</a></p>
+{lab}
+
+<h2 id="zh-gather-backward">3. Gather 的反向</h2>
+<h3 id="zh-gradient-sum">沿读取路径累加</h3>
+<p>记上游梯度 <code>g = ∂L/∂out</code>。一次读取 <code>out[i,j] = x[i,index[i,j]]</code> 对被读取元素的局部导数为 1。某个输入若被多个输出使用，链式法则要求把这些输出传来的梯度相加。二维 Gather 的反向为：</p>
+<div class="gs-table"><table><thead><tr><th>轴</th><th>输入梯度</th></tr></thead><tbody>
+<tr><td>dim=0</td><td><code>dx[k,j] = Σ_{i: index[i,j]=k} g[i,j]</code></td></tr>
+<tr><td>dim=1</td><td><code>dx[i,k] = Σ_{j: index[i,j]=k} g[i,j]</code></td></tr>
+</tbody></table></div>
+<p>没有被读取的输入元素得到 0。用 PyTorch 表达这条规则，就是从与 x 同 shape 的零张量开始做 Scatter add：</p>
+<pre class="code">dx = torch.zeros_like(x).scatter_add(dim, index, g)</pre>
+{code:gather_backward}
+<p>这里通过 <code>L=(out*g).sum()</code> 指定不同的上游梯度，以便区分每条路径。第一行的第 0、2 项都来自 x[0,2]，因此该元素的梯度是 <code>1+3=4</code>。源码的稠密梯度分支也采用“分配零张量，再 scatter_add”的实现。{source:gather_backward}</p>
+{figure:backward}
+<h3 id="zh-transpose">选择矩阵的转置</h3>
+<p>只看第一行，将列索引 [2,0,2] 写成选择矩阵 P，每个输出对应一行：</p>
+<pre class="code">    [0 0 1 0]       x = [10, 20, 30, 40]ᵀ
+P = [1 0 0 0]       y = P x = [30, 10, 30]ᵀ
+    [0 0 1 0]
+
+g  = [1, 2, 3]ᵀ
+dx = Pᵀ g = [2, 0, 4, 0]ᵀ</pre>
+<p>P 的两行指向同一输入，Pᵀ 就把这两份贡献相加。这说明反向采用的是<strong>线性映射的转置</strong>。只有索引构成完整排列、每个元素恰好使用一次时，这个转置才同时等于逆映射；一般 Gather 会重复或遗漏元素，无法恢复全部原始数据。</p>
+<p><code>sparse_grad=True</code> 改变输入梯度的存储形式，仍遵循同一求和规则。重复坐标在稀疏表示中可能尚未合并，<code>coalesce()</code> 会合并它们；完整示例检查其转为稠密后的数值与上式一致。{source:gather} · {source:gather_backward}</p>
+
+<h2 id="zh-scatter-backward">4. Scatter 的反向</h2>
+<h3 id="zh-overwrite-grad">覆盖与保留</h3>
+<p>对目标坐标互不冲突、<code>src.shape == index.shape</code> 的 <code>out=base.scatter(dim,index,src)</code>，存在两条求导路径。被写入的位置依赖 src，未写入的位置继续依赖 base。对 dim=1：</p>
+<pre class="code">dsrc[i,j] = g[i, index[i,j]]
+dbase[i,k] = 0       if any j has index[i,j] == k
+            g[i,k]  otherwise</pre>
+<p>因此源梯度通过 Gather 取得，base 梯度在覆盖位置清零。对 dim=0，同样有 <code>dsrc[i,j]=g[index[i,j],j]</code>。这两条规则可直接对应到 Autograd 的导数定义。{source:scatter}</p>
+{code:scatter_backward}
+<p>第一行的源元素 10 被写到输出列 2，取得该位置的上游梯度 3。base 第一行仅列 1 被保留，所以只有 dbase[0,1]=2。将 base 初始化为零并不会改变这条导数规则；它是否需要梯度由 requires_grad 和计算图决定。</p>
+<h3 id="zh-collisions">重复覆盖</h3>
+<p>对于同一行的 <code>index=[2,0,2]</code> 和 <code>src=[10,20,30]</code>，10 与 30 争用输出列 2。覆盖操作的接口没有承诺谁胜出，不能把某次 CPU 执行中观察到的结果当作“最后一个源元素必胜”的规则。</p>
+<p>这也影响反向：实现中的 <code>g.gather(dim,index)</code> 会给两个源位置都传回 g[0,2]，即使前向输出只保留了其中一个值。它没有记录一个可供反向使用的胜出者，因此不能据此获得正确的覆盖梯度。需要重复项求和时，应使用 scatter_add；若业务要求明确的覆盖优先级，应先确定唯一写入者，再构造无冲突的索引。<a href="https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.scatter_.html">官方对重复索引和梯度的说明</a></p>
+<h3 id="zh-add-grad">累加的两条梯度</h3>
+<p>Scatter add 的每个目标值都包含 base 的原值，因此 base 的梯度完整保留。所有参与加法的源元素对目标的导数均为 1；即使目标重复，各源元素也都应收到该目标的上游梯度：</p>
+<pre class="code">dbase = g
+dsrc = g.gather(dim, index)</pre>
+{code:scatter_add_backward}
+<p>第一行的目标列 2 等于 <code>3+10+30=43</code>，对这三项的导数都是 1。若该输出的梯度为 3，base[0,2]、src[0,0]、src[0,2] 都获得梯度 3。{source:scatter}</p>
+<div class="gs-table"><table><thead><tr><th>前向操作</th><th>数据输入的梯度</th><th>base 的梯度</th></tr></thead><tbody>
+<tr><td><code>x.gather(dim,index)</code></td><td><code>zeros_like(x).scatter_add(dim,index,g)</code></td><td>无 base 参数</td></tr>
+<tr><td><code>base.scatter(dim,index,src)</code></td><td><code>g.gather(dim,index)</code>，目标必须无冲突</td><td><code>g.scatter(dim,index,0)</code></td></tr>
+<tr><td><code>base.scatter_add(dim,index,src)</code></td><td><code>g.gather(dim,index)</code>，支持重复目标</td><td><code>g</code></td></tr>
+</tbody></table></div>
+<p>表中使用默认稠密 Gather 梯度，以及 src、index 同 shape 的 Scatter。index 是固定的整数寻址信息，Autograd 不对它求导；通过 argmax 等操作产生索引，也不能沿这个整数索引获得选择决策的梯度。</p>
+
+<h2 id="zh-shapes">5. Shape 与使用场景</h2>
+<h3 id="zh-shape-rules">Shape 约束</h3>
+<p>对于非空的常规张量，Gather 要求 x、index 的维数相同，且每个 <code>d != dim</code> 都满足 <code>index.size(d) ≤ x.size(d)</code>。Scatter 要求 base、index、src 的维数相同；index 在所有轴上不大于 src，在非 dim 轴上不大于 base。各项索引必须在目标轴的有效范围内。{source:shape}</p>
+<p>这些接口不会自动广播 index。Scatter 前向可以读取较大 src 中由 index.shape 覆盖的部分，但文档支持的 Tensor 源反向要求 <code>src.shape == index.shape</code>。用于训练时，让两者 shape 一致可以避免“前向成功，反向 shape 不匹配”。</p>
+<h3 id="zh-batched-lookup">批量选择与聚合</h3>
+<p>对 <code>features:[B,N,D]</code>，如果每个 batch 有一组不同的 <code>ids:[B,K]</code>，可以把每个节点编号沿 D 维展开，再一次性取出对应特征向量：</p>
+{code:batch_lookup}
+<p><code>expand</code> 显式构造 [B,K,D] 的索引视图，让每个特征分量使用同一节点编号。Gather 的各 batch 可以采用不同索引；若整批共享同一条一维索引，<code>index_select</code> 通常更容易表达。图网络按目标节点汇总消息、按分组 ID 累加统计量，则可以用零初始化的目标张量配合 scatter_add。</p>
+<h3 id="zh-inplace">原地操作与计算图</h3>
+<p>训练代码中，<code>base.scatter(...)</code> 保留原 base，便于跟踪两条梯度路径。<code>base.scatter_(...)</code> 会修改同一 Tensor；对 requires_grad=True 的叶子 Tensor 直接这样修改会报错，修改其他反向步骤保存的张量也可能触发版本检查。原地版本的使用需要结合完整计算图判断。计算图中的节点与梯度汇合可继续参阅<a href="pytorch-autograd-grad-fn-next-functions.html">PyTorch Autograd 反向图</a>。</p>
+
+<h2 id="zh-implementation">6. 实现与验证</h2>
+<h3 id="zh-cuda">CUDA 中的累加</h3>
+<p>固定版本的 CUDA Gather kernel 按 index 读取输入，再写到各自独立的输出位置。重复读取本身不产生写入冲突；Gather 反向使用的 Scatter add 则可能让多个线程更新同一梯度位置。该版本的通用 CUDA Scatter add 路径通过原子加法完成这些更新。{source:kernel} · {source:atomic}</p>
+<p>浮点加法的舍入结果依赖累加顺序，因此 CUDA scatter_add 即使符合求和语义，也可能出现末位数值差异。这与覆盖式 scatter 的多个值竞争同一目标是两种情况。本文的 CPU 测试验证数值与求导规则；CUDA 的具体 kernel 和确定性路径来自源码阅读，没有在此给出 GPU 性能测量。</p>
+<h3 id="zh-verification">可运行验证</h3>
+<p><a href="../assets/pytorch-internals/gather-scatter/demo.py" download>下载完整 Python 示例</a>后运行：</p>
+<pre class="code" data-language="bash">python demo.py</pre>
+<p>脚本检查本文的前向结果、两个轴上的梯度公式、重复读取和累加、稀疏梯度，以及六组双精度 gradcheck。Gradcheck 用数值扰动独立核对 Gather、无冲突 Scatter、Scatter add 的导数；重复覆盖仅检查实现行为，不作为正确梯度的示例。</p>
+<h3 id="zh-sources">源码入口</h3>
+<ul><li>{source:gather}：index 不参与求导，输入梯度调用 gather_backward。</li><li>{source:gather_backward}：稠密梯度初始化与 Scatter add，稀疏分支入口。</li><li>{source:scatter}：覆盖式和累加式 Scatter 对 base、src 的导数。</li><li>{source:shape}：输入维数与索引 shape 检查。</li><li>{source:kernel}：GPU 上的读取、覆盖与累加入口。</li></ul>
+'''
+
+EN = r'''
+<h1>PyTorch Gather and Scatter: forward and backward</h1>
+<p>Gather and Scatter use an index tensor to map elements between tensors. Gather chooses an input element for each output position; Scatter chooses a destination for each source element. The same mapping determines gradient flow. Two-dimensional examples make both axes explicit and expose the difference between repeated reads, overlapping writes, and gradient accumulation.</p>
+
+<h2 id="en-coordinates">1. Coordinates and assignment</h2>
+<h3 id="en-formulas">Two-dimensional formulas</h3>
+<p>The value index[i,j] replaces one coordinate: the row for dim=0, or the column for dim=1. The other coordinate stays unchanged. For each position in index:</p>
+<div class="gs-table"><table><thead><tr><th>Operation</th><th>dim=0: replace the row</th><th>dim=1: replace the column</th></tr></thead><tbody>
+<tr><td>gather</td><td><code>out[i,j] = x[index[i,j], j]</code></td><td><code>out[i,j] = x[i, index[i,j]]</code></td></tr>
+<tr><td>scatter</td><td><code>out[index[i,j], j] = src[i,j]</code></td><td><code>out[i, index[i,j]] = src[i,j]</code></td></tr>
+</tbody></table></div>
+<p>Gather applies the index on the right-hand side to choose <strong>where to read</strong>. Scatter applies it on the left-hand side to choose <strong>where to write</strong>. The coordinates i,j range over index.shape: they are output coordinates for Gather and participating source coordinates for Scatter. <a href="https://docs.pytorch.org/docs/2.8/generated/torch.gather.html">Gather API</a> · <a href="https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.scatter_.html">Scatter API</a></p>
+<p><code>base.scatter(dim,index,src)</code> starts with base's values and overwrites the addressed positions. Unwritten positions keep their original values, and the output has base.shape. Gather returns index.shape.</p>
+<h3 id="en-notation">Parameters and scope</h3>
+<p>Examples use floating-point data and torch.long indices, with <code>import torch</code> assumed. Scatter means the Tensor-source overwrite overload without reduce; addition uses scatter_add. Examples return new tensors. The underscore variants scatter_ and scatter_add_ modify the receiver in place. APIs and source are pinned to PyTorch 2.8.0; examples were checked with 2.8.0+cpu.</p>
+
+<h2 id="en-forward">2. Forward data flow</h2>
+<h3 id="en-gather-forward">Gather: indexed reads</h3>
+{code:gather_columns}
+<p><code>out[0,0]=x[0,2]=30</code> and <code>out[0,1]=x[0,0]=10</code>. The second row uses its own indices [1,3,0], allowing different input columns for the same output column. Row 0 reads column 2 twice, producing two copies of 30.</p>
+{figure:forward}
+<p>With dim=0, index values identify rows. An input of shape [2,4] can produce an output of shape [3,4], because a row may be read more than once:</p>
+{code:gather_rows}
+<p>For example, <code>out[0,2]=x[index[0,2],2]=x[1,2]=70</code>. Each column can select different rows; Gather addresses individual elements along the chosen axis.</p>
+<h3 id="en-scatter-forward">Scatter: indexed overwrite</h3>
+{code:scatter_columns}
+<p>The first source row writes 10, 20, 30 into columns 2, 0, 3. Column 1 retains base[0,1]=2. The second row retains base[1,2]=7. The source has shape [2,3]; base supplies the output shape [2,4].</p>
+<p>Along dim=0, each column independently specifies destination rows:</p>
+{code:scatter_rows}
+<p>Here src[0,2]=30 writes to out[1,2], while src[1,2]=70 writes to out[0,2]. Repeating an index value in different columns causes no collision. Competing writes occur when source elements target the <strong>same complete destination coordinate</strong>.</p>
+<h3 id="en-add-forward">Scatter add: indexed sums</h3>
+<p>Scatter add uses the same coordinates, adds each source contribution, and includes the initial base value:</p>
+<pre class="code">out = base.clone()
+# dim=0: out[index[i,j], j] += src[i,j]
+# dim=1: out[i, index[i,j]] += src[i,j]</pre>
+<p>With column indices [2,0,2], src[0,0]=10 and src[0,2]=30 both contribute to column 2. The result there is <code>base[0,2]+10+30=43</code>. A zero base gives a grouped sum. <a href="https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.scatter_add_.html">Scatter add API</a></p>
+{lab}
+
+<h2 id="en-gather-backward">3. Gather backward</h2>
+<h3 id="en-gradient-sum">Accumulating along read paths</h3>
+<p>Let <code>g=∂L/∂out</code> be the upstream gradient. A read out[i,j]=x[i,index[i,j]] has local derivative 1 with respect to the selected element. When several outputs depend on one input, the chain rule sums their contributions:</p>
+<div class="gs-table"><table><thead><tr><th>Axis</th><th>Input gradient</th></tr></thead><tbody>
+<tr><td>dim=0</td><td><code>dx[k,j] = Σ_{i: index[i,j]=k} g[i,j]</code></td></tr>
+<tr><td>dim=1</td><td><code>dx[i,k] = Σ_{j: index[i,j]=k} g[i,j]</code></td></tr>
+</tbody></table></div>
+<p>Unread elements receive zero. This is a Scatter add into an input-shaped zero tensor:</p>
+<pre class="code">dx = torch.zeros_like(x).scatter_add(dim, index, g)</pre>
+{code:gather_backward}
+<p>The loss <code>L=(out*g).sum()</code> assigns distinct upstream gradients to reveal each path. Entries 0 and 2 of the first output row both read x[0,2], giving that input gradient <code>1+3=4</code>. The dense source implementation also allocates zeros and applies Scatter add. {source:gather_backward}</p>
+{figure:backward}
+<h3 id="en-transpose">The transposed selection matrix</h3>
+<p>For the first row, indices [2,0,2] define a selection matrix P with one row per output:</p>
+<pre class="code">    [0 0 1 0]       x = [10, 20, 30, 40]ᵀ
+P = [1 0 0 0]       y = P x = [30, 10, 30]ᵀ
+    [0 0 1 0]
+
+g  = [1, 2, 3]ᵀ
+dx = Pᵀ g = [2, 0, 4, 0]ᵀ</pre>
+<p>Two rows of P select one input; Pᵀ adds their contributions. Backward therefore applies the <strong>transpose of the linear map</strong>. This transpose also equals the inverse when the indices form a complete permutation. General Gather can repeat or omit inputs and cannot recover all original values.</p>
+<p><code>sparse_grad=True</code> changes gradient storage while preserving the same sum. Repeated coordinates may remain separate in a sparse tensor until coalesce() combines them. The runnable example checks that its dense equivalent matches the formula. {source:gather} · {source:gather_backward}</p>
+
+<h2 id="en-scatter-backward">4. Scatter backward</h2>
+<h3 id="en-overwrite-grad">Overwritten and retained values</h3>
+<p>For <code>out=base.scatter(dim,index,src)</code> with distinct destinations and src.shape==index.shape, two derivative paths matter. Written positions depend on src; retained positions depend on base. Along dim=1:</p>
+<pre class="code">dsrc[i,j] = g[i, index[i,j]]
+dbase[i,k] = 0       if any j has index[i,j] == k
+            g[i,k]  otherwise</pre>
+<p>Gather retrieves the source gradient; setting addressed positions to zero produces the base gradient. Along dim=0, <code>dsrc[i,j]=g[index[i,j],j]</code>. Both rules appear directly in Autograd's derivative definitions. {source:scatter}</p>
+{code:scatter_backward}
+<p>The source value 10 writes to output column 2 and receives upstream gradient 3. Only column 1 of the first base row survives, giving dbase[0,1]=2. Initializing base with zeros leaves this derivative unchanged; requires_grad and the graph determine whether a gradient is requested.</p>
+<h3 id="en-collisions">Repeated overwrites</h3>
+<p>For one row with index=[2,0,2] and src=[10,20,30], values 10 and 30 compete for column 2. The interface does not promise a winner. A particular CPU execution cannot establish a portable last-source-wins rule.</p>
+<p>The implementation's <code>g.gather(dim,index)</code> sends g[0,2] to both source positions even though forward retained only one source value. Without a recorded winner, this does not give the correct overwrite gradient. Use scatter_add for repeated sums. If the application requires overwrite priority, resolve the winner first and construct unique destination indices. <a href="https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.scatter_.html">Official duplicate-index and gradient warning</a></p>
+<h3 id="en-add-grad">Both gradients of a sum</h3>
+<p>Every Scatter add output includes its base value, so the entire upstream gradient passes to base. Each contributing source has derivative 1 with respect to its target. All sources sharing a destination should receive that destination's gradient:</p>
+<pre class="code">dbase = g
+dsrc = g.gather(dim, index)</pre>
+{code:scatter_add_backward}
+<p>Column 2 of row 0 equals <code>3+10+30=43</code>, with derivative 1 for each term. An upstream gradient of 3 therefore gives gradient 3 to base[0,2], src[0,0], and src[0,2]. {source:scatter}</p>
+<div class="gs-table"><table><thead><tr><th>Forward</th><th>Data input gradient</th><th>Base gradient</th></tr></thead><tbody>
+<tr><td><code>x.gather(dim,index)</code></td><td><code>zeros_like(x).scatter_add(dim,index,g)</code></td><td>No base argument</td></tr>
+<tr><td><code>base.scatter(dim,index,src)</code></td><td><code>g.gather(dim,index)</code>, distinct destinations</td><td><code>g.scatter(dim,index,0)</code></td></tr>
+<tr><td><code>base.scatter_add(dim,index,src)</code></td><td><code>g.gather(dim,index)</code>, repeated destinations allowed</td><td><code>g</code></td></tr>
+</tbody></table></div>
+<p>The table assumes the default dense Gather gradient and matching src/index shapes for Scatter. Integer indices specify fixed addresses and receive no gradient. Producing indices with argmax does not provide a gradient through the discrete selection decision.</p>
+
+<h2 id="en-shapes">5. Shapes and applications</h2>
+<h3 id="en-shape-rules">Shape constraints</h3>
+<p>For ordinary nonempty tensors, Gather requires equal ranks for x and index, with <code>index.size(d) ≤ x.size(d)</code> for every d!=dim. Scatter requires equal ranks for base, index, and src. Index extents must not exceed src on any axis, or base on axes other than dim. Index values must fall within the addressed axis. {source:shape}</p>
+<p>These APIs do not broadcast index automatically. Scatter forward can use the region of a larger src covered by index.shape, but its documented Tensor-source backward requires <code>src.shape == index.shape</code>. Match them in training code to avoid a successful forward followed by a backward shape error.</p>
+<h3 id="en-batched-lookup">Batched selection and aggregation</h3>
+<p>Given features:[B,N,D] and per-batch ids:[B,K], expand each node ID over D to gather the complete feature vector:</p>
+{code:batch_lookup}
+<p>Expand explicitly creates an index view of shape [B,K,D], using the same node ID for all feature components. Gather permits different selections in each batch. If every batch shares one one-dimensional index, index_select is often a simpler expression. Scatter add into a zero base can aggregate graph messages by destination node or compute statistics by group ID.</p>
+<h3 id="en-inplace">In-place operations and Autograd</h3>
+<p><code>base.scatter(...)</code> preserves base, making both gradient paths easy to follow. The in-place variant modifies the same tensor. Directly modifying a leaf with requires_grad=True raises an error; changing a tensor saved by another backward operation may also fail version checks. In-place use must account for the complete graph. See <a href="pytorch-autograd-grad-fn-next-functions.html">PyTorch Autograd reverse graph</a> for nodes and converging gradient paths.</p>
+
+<h2 id="en-implementation">6. Implementation and verification</h2>
+<h3 id="en-cuda">CUDA accumulation</h3>
+<p>The pinned CUDA Gather kernel reads through index and writes separate output locations. Repeated reads introduce no write conflict. Its Scatter add backward can have several threads update the same input gradient. This version's general CUDA Scatter add path performs those updates with atomic addition. {source:kernel} · {source:atomic}</p>
+<p>Floating-point rounding depends on addition order, so CUDA scatter_add can exhibit differences in the last bits while implementing a sum. Overwrite Scatter has a separate issue: competing values for one destination. CPU tests here verify values and derivative rules; CUDA kernel and determinism details come from source inspection, without GPU performance measurements.</p>
+<h3 id="en-verification">Runnable checks</h3>
+<p><a href="../assets/pytorch-internals/gather-scatter/demo.py" download>Download the complete Python example</a> and run:</p>
+<pre class="code" data-language="bash">python demo.py</pre>
+<p>The script checks forward values, gradient formulas on both axes, repeated reads and sums, sparse gradients, and six double-precision gradchecks. Numerical perturbations independently verify Gather, conflict-free Scatter, and Scatter add. The repeated-overwrite case checks implementation behavior only and is excluded from correct-gradient examples.</p>
+<h3 id="en-sources">Source entry points</h3>
+<ul><li>{source:gather}: nondifferentiable indices and the gather_backward call.</li><li>{source:gather_backward}: dense gradient initialization, Scatter add, and the sparse branch.</li><li>{source:scatter}: base and source derivatives for overwrite and addition.</li><li>{source:shape}: tensor rank and index shape checks.</li><li>{source:kernel}: GPU entry points for reading, overwriting, and adding.</li></ul>
+'''
+
+
+def expand(body, lang):
+    body = re.sub(r'\{code:(\w+)\}', lambda m: '<pre class="code" data-language="python"><code>' + escape(SNIPPETS[m[1]]) + '</code></pre>', body)
+    body = re.sub(r'\{source:(\w+)\}', lambda m: source(m[1]), body)
+    body = re.sub(r'\{figure:(\w+)\}', lambda m: flow(lang, m[1] == 'backward'), body)
+    return body.replace('{lab}', lab(lang))
+
+
+def main():
+    metadata = {
+        'title': 'PyTorch Gather 与 Scatter 的前向和反向',
+        'title_en': 'PyTorch Gather and Scatter: forward and backward',
+        'slug': 'pytorch-gather-scatter', 'date': '2026-11-09',
+        'tags': 'PyTorch, Autograd, Tensor, 索引', 'tags_en': 'PyTorch, Autograd, Tensor, Indexing',
+        'reading': '15 分钟', 'reading_en': '15 min',
+        'summary': '从二维坐标赋值推导 gather、scatter 和 scatter_add 的数据流与梯度，解释重复索引、覆盖位置和梯度累加，附交互演示与可运行验证。',
+        'summary_en': 'Derive gather, scatter, and scatter_add from two-dimensional coordinate assignments, including repeated indices, overwritten values, and gradient accumulation, with an interactive example and runnable checks.',
+        'series': 'pytorch-internals', 'series_title': 'PyTorch 内部机制',
+        'series_title_en': 'PyTorch Internals', 'series_order': '12',
+    }
+    meta = '\n'.join(f'<meta name="post:{k}" content="{escape(v, quote=True)}">' for k, v in metadata.items())
+    html = f'''<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{metadata['title']}</title>
+{meta}
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
+<link rel="stylesheet" href="../assets/pytorch-internals/gather-scatter/style.css">
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
+<script src="../assets/pytorch-internals/gather-scatter/lab.js" defer></script>
+</head><body><div class="layout"><aside class="toc"><div class="toc-title">目录 · TOC</div></aside><main class="content">
+<div class="lang-zh">{expand(ZH, 'zh')}</div><div class="lang-en">{expand(EN, 'en')}</div>
+</main></div></body></html>
+'''
+    target = ROOT / 'posts/pytorch-gather-scatter.html'
+    target.write_text(html)
+    print('Wrote', target)
+
+
+if __name__ == '__main__':
+    main()
