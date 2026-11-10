@@ -1,6 +1,8 @@
 // Shared post-page shell: navigation, language/theme controls, metadata,
 // heading anchors, table layouts, table-of-contents state, and back-to-top behavior.
 (function () {
+  const drawerScriptURL = new URL('assets/navigation-drawer.js', document.currentScript.src);
+  let mobileNavigation = null;
   document.documentElement.classList.add('post-document');
 
   try {
@@ -76,6 +78,7 @@
 
   function updateLanguage(nav) {
     document.documentElement.lang = lang === 'en' ? 'en' : 'zh-CN';
+    mobileNavigation?.setLanguage(lang);
     const notes = nav.querySelector('[data-nav="notes"]');
     const github = nav.querySelector('[data-nav="github"]');
     const language = nav.querySelector('#post-lang-toggle');
@@ -200,7 +203,7 @@
   }
 
   function positionToc() {
-    if (!postToc) return;
+    if (!postToc || postToc.closest('.mobile-nav-dialog[open]')) return;
     const header = Array.from(document.querySelectorAll('main.content .post-header'))
       .find(element => element.getClientRects().length > 0);
     if (header) header.insertAdjacentElement('afterend', postToc);
@@ -302,6 +305,15 @@
     });
     updateTocLanguage();
     positionToc();
+    const drawerScript = document.createElement('script');
+    drawerScript.src = drawerScriptURL;
+    drawerScript.onload = () => {
+      mobileNavigation = window.NotesNavigationDrawer({
+        content: postToc, kind: 'article', onClose: positionToc,
+      });
+      mobileNavigation?.setLanguage(lang);
+    };
+    document.head.appendChild(drawerScript);
   }
 
   let seriesNavigation = null;

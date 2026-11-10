@@ -61,6 +61,7 @@ let searchQuery = '';
 let composingSearch = false;
 const expandedSeries = new Set();
 const collapsedSearchSeries = new Set();
+let mobileNavigation = null;
 
 try {
   const savedLanguage = localStorage.getItem('lang');
@@ -119,6 +120,7 @@ function cycleTheme() {
 
 function applyLanguage() {
   document.documentElement.lang = text().html_lang;
+  mobileNavigation?.setLanguage(language);
   document.getElementById('nav-notes').textContent = text().nav_notes;
   document.getElementById('tagline').textContent = text().tagline;
   document.getElementById('series-nav-title').textContent = text().series;
@@ -365,5 +367,14 @@ searchInput.addEventListener('keydown', event => {
 });
 
 document.querySelectorAll('.reveal').forEach(element => element.classList.add('shown'));
+mobileNavigation = window.NotesNavigationDrawer?.({
+  content: document.getElementById('series-nav'),
+  kind: 'series',
+  onSelect() {
+    const list = document.getElementById('post-list');
+    document.getElementById('active-filter').scrollIntoView({ block: 'start', behavior: 'instant' });
+    list.querySelector('button, a')?.focus({ preventScroll: true });
+  },
+});
 applyLanguage();
 loadPosts();
