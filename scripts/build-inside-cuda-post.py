@@ -715,8 +715,8 @@ def main():
         'slug':'cuda-linux-driver-stack', 'date':'2026-11-09',
         'tags':'CUDA, Linux, GPU, 驱动, 系统调用', 'tags_en':'CUDA, Linux, GPU, Driver, Syscalls',
         'reading':'20 分钟', 'reading_en':'20 min',
-        'summary':'CUDA 用户态驱动经 Linux 设备接口建立 GPU 资源、映射和提交通道，GPU 执行计算与搬运。H100 实测日志展示了 API 调用与设备文件、驱动入口的对应关系。',
-        'summary_en':'CUDA user-space drivers establish GPU resources, mappings, and submission channels through Linux device interfaces, while the GPU executes computation and transfers. H100 strace/ltrace captures connect API calls with device files and driver entry points.',
+        'summary':'调用一次 CUDA API，底下发生了哪些 ioctl？文章用 H100 上的 strace/ltrace 实测日志，把 API 调用对到设备文件和驱动入口。',
+        'summary_en':'Which ioctls run beneath a single CUDA API call? Measured strace and ltrace logs from an H100 map API calls to device files and driver entry points.',
         'series':'inside-cuda', 'series_title':'Inside CUDA', 'series_title_en':'Inside CUDA', 'series_order':'1',
     }
     metadata = '\n'.join(f'<meta name="post:{k}" content="{escape(v,quote=True)}">' for k,v in meta.items())

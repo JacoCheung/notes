@@ -451,7 +451,7 @@ def expand(lang):
 
 
 def main():
-    meta=dict(title='GPU 互联的软件与驱动',title_en='GPU interconnect software and drivers',slug='gpu-interconnect-software-stack',date='2026-11-09',tags='CUDA, NCCL, NVSHMEM, RDMA, NVLink',tags_en='CUDA, NCCL, NVSHMEM, RDMA, NVLink',reading='25 分钟',reading_en='25 min',summary='GPUDirect RDMA 允许网卡直接搬运已注册的 GPU 显存。CPU proxy 与 GPU 直接提交请求的路径可以使用相同的数据通路，区别在于谁构造并提交网卡请求，以及谁推进完成状态。',summary_en='GPUDirect RDMA lets a NIC transfer data directly to and from registered GPU memory. CPU proxies and GPU submission paths can use the same data path; they differ in who constructs and submits NIC requests and handles completion.',series='inside-cuda',series_title='Inside CUDA',series_title_en='Inside CUDA',series_order='2')
+    meta=dict(title='GPU 互联的软件与驱动',title_en='GPU interconnect software and drivers',slug='gpu-interconnect-software-stack',date='2026-11-09',tags='CUDA, NCCL, NVSHMEM, RDMA, NVLink',tags_en='CUDA, NCCL, NVSHMEM, RDMA, NVLink',reading='25 分钟',reading_en='25 min',summary='由 CPU proxy 提交网卡请求时，数据仍可直接在显存和网卡之间传输。各条路径的区别主要在于谁构造、提交网卡请求，谁处理完成。',summary_en='When a CPU proxy posts network requests, data can still move directly between GPU memory and the network adapter. The paths differ mainly in who posts requests and handles completion.',series='inside-cuda',series_title='Inside CUDA',series_title_en='Inside CUDA',series_order='2')
     metadata='\n'.join(f'<meta name="post:{key}" content="{escape(value,quote=True)}">' for key,value in meta.items())
     html=f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{meta['title']}</title>

@@ -343,8 +343,8 @@ def main():
         'slug': 'pytorch-gather-scatter', 'date': '2026-11-09',
         'tags': 'PyTorch, Autograd, Tensor, 索引', 'tags_en': 'PyTorch, Autograd, Tensor, Indexing',
         'reading': '15 分钟', 'reading_en': '15 min',
-        'summary': 'Gather 按索引选取输入，反向将多条读取路径的梯度累加回源位置。Scatter 按索引写入目标；重复目标在覆盖时产生竞争，在 scatter_add 中按加法合并。',
-        'summary_en': 'Gather selects inputs by index, then accumulates gradients back along the read paths. Scatter uses indices to select write destinations: repeated destinations create competing overwrites, while scatter_add combines their contributions by addition.',
+        'summary': '索引重复时，覆盖式 scatter 前向只留下一个值，反向却给两个源位置都传了梯度。梯度沿索引的对应关系流动，配有逐步动画和可运行脚本。',
+        'summary_en': 'With duplicate indices, an overwriting scatter keeps one value forward, yet backward sends gradient to both sources. Gradients follow the index mapping, shown in a step-by-step animation and runnable script.',
         'series': 'pytorch-internals', 'series_title': 'PyTorch 内部机制',
         'series_title_en': 'PyTorch Internals', 'series_order': '12',
     }

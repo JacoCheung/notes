@@ -320,7 +320,7 @@ def expand(lang):
 
 
 def main():
-    meta=dict(title='UVM managed memory 访存路径',title_en='UVM managed memory access paths',slug='cuda-uvm-managed-memory',date='2026-11-10',tags='CUDA, UVM, Unified Memory, MMU, Linux',tags_en='CUDA, UVM, Unified Memory, MMU, Linux',reading='15 分钟',reading_en='15 min',summary='UVM 为同一 managed 指针维护 CPU 和 GPU 的映射。页面驻留位置可随访问需求变化；缺页时，驱动选择补建映射、调整权限或迁移页面，再恢复访问。',summary_en='UVM maintains CPU and GPU mappings for the same managed pointer. When an access faults, the driver can add a mapping, adjust permissions, or migrate the page before resuming execution.',series='inside-cuda',series_title='Inside CUDA',series_title_en='Inside CUDA',series_order='3')
+    meta=dict(title='UVM managed memory 访存路径',title_en='UVM managed memory access paths',slug='cuda-uvm-managed-memory',date='2026-11-10',tags='CUDA, UVM, Unified Memory, MMU, Linux',tags_en='CUDA, UVM, Unified Memory, MMU, Linux',reading='15 分钟',reading_en='15 min',summary='缺页不一定要搬页面：驱动可能只给 managed 内存补映射或改权限，迁移也可能在不缺页时发生。文中对照开源驱动源码，跟踪 CPU 和 GPU 两条缺页处理路径。',summary_en='A fault on managed memory may need only a mapping or permission update; migration can happen without one. The article follows CPU and GPU fault paths through open-source driver code.',series='inside-cuda',series_title='Inside CUDA',series_title_en='Inside CUDA',series_order='3')
     metadata='\n'.join(f'<meta name="post:{k}" content="{escape(v,quote=True)}">' for k,v in meta.items())
     html=f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{meta['title']}</title>

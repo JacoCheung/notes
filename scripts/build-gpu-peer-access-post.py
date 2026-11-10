@@ -737,8 +737,8 @@ def main():
         'tags':'CUDA, GPU, P2P, NCCL, NVLink, 页表',
         'tags_en':'CUDA, GPU, P2P, NCCL, NVLink, Page Tables',
         'reading':'25 分钟', 'reading_en':'25 min',
-        'summary':'映射建立后，kernel 用普通 load/store 指令访问另一张 GPU 的显存。地址翻译与硬件路由将请求送往对端，数据经 NVLink 或 PCIe 传输，省去 CPU 内存中转。',
-        'summary_en':'GPU P2P lets kernels access remote GPU memory with ordinary loads and stores through driver-established mappings and permissions. Address translation and hardware routing direct traffic over NVLink or PCIe without staging the payload in CPU memory.',
+        'summary':'读另一张 GPU 的显存，kernel 照样写 src[i]，指令里不带设备编号。驱动建好映射后，地址翻译找到对端，硬件路由再经 NVLink 或 PCIe 送达请求。',
+        'summary_en':'Kernels read peer GPU memory with plain src[i]; the instruction names no device. Driver mappings let address translation find the peer; routing then carries the request over NVLink or PCIe.',
         'series':'inside-cuda', 'series_title':'Inside CUDA',
         'series_title_en':'Inside CUDA', 'series_order':'4',
     }
