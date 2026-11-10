@@ -48,6 +48,8 @@ LINKS = {
     'gsp': SOURCE + 'src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c',
     'modeset': SOURCE + 'kernel-open/nvidia-modeset/nvidia-modeset-linux.c',
     'drm': SOURCE + 'kernel-open/nvidia-drm/nvidia-drm-drv.c',
+    'drm-nodes': 'https://docs.kernel.org/gpu/drm-uapi.html#primary-nodes-drm-master-and-authentication',
+    'modeset-fops': SOURCE + 'kernel-open/nvidia-modeset/nvidia-modeset-linux.c#L2090-L2116',
     'vfs': 'https://docs.kernel.org/filesystems/vfs.html',
     'open-man': 'https://man7.org/linux/man-pages/man2/open.2.html',
     'ioctl-man': 'https://man7.org/linux/man-pages/man2/ioctl.2.html',
@@ -119,6 +121,22 @@ COMPONENTS = {
         zh='参与 peer 访问的其他 GPU，可通过直连链路或 NVSwitch 连接。能否访问以及采用哪条路径，由设备能力、映射权限和实际拓扑共同决定。',
         en='Other GPUs participating in peer access, connected directly or through NVSwitch. Device capabilities, mapping permissions and topology determine which accesses and paths are available.',
         links=[('peer-post','GPU P2P')]),
+    'dev-uvm': dict(section='device-files', layer='interface',
+        zh='/dev/nvidia-uvm 是 UVM 的字符设备入口。libcuda 打开它取得 fd，再通过 ioctl 配置地址空间，通过 mmap 建立相应映射。Linux 将这些操作分派到 nvidia-uvm.ko 的 uvm_fops。',
+        en='/dev/nvidia-uvm is the UVM character-device interface. libcuda opens it to obtain an fd, then uses ioctl to configure address spaces and mmap to establish mappings. Linux dispatches these operations through uvm_fops in nvidia-uvm.ko.',
+        links=[('uvm-fops','uvm_fops'),('uvm-chrdev','UVM character-device registration')]),
+    'dev-core': dict(section='device-files', layer='interface',
+        zh='/dev/nvidiactl 提供核心控制接口，/dev/nvidiaN 提供各 GPU 的设备接口，N 代表设备节点编号。libcuda 和 NVML 打开节点取得 fd；后续 ioctl、mmap 等操作由 nvidia.ko 的 nvidia_fops 处理。节点编号与应用中的 CUDA ordinal 可以不同。',
+        en='/dev/nvidiactl provides core control operations; /dev/nvidiaN provides per-GPU interfaces, where N is the device-node number. libcuda and NVML open these nodes to obtain fds. nvidia_fops in nvidia.ko handles subsequent operations such as ioctl and mmap. Device-node numbers can differ from CUDA ordinals.',
+        links=[('fops','nvidia_fops'),('chrdev-init','Core character-device registration')]),
+    'dev-modeset': dict(section='device-files', layer='interface',
+        zh='/dev/nvidia-modeset 是 NVIDIA 图形用户态组件访问显示模式管理功能的字符设备。请求经 nvkms_fops 分派到 nvidia-modeset.ko；DRM/KMS 路径则通过 nvidia-drm.ko 在内核中调用 modeset 服务。',
+        en='/dev/nvidia-modeset is the character device used by NVIDIA graphics components for display-mode management. nvkms_fops dispatches requests to nvidia-modeset.ko. The DRM/KMS path calls modeset services from nvidia-drm.ko within the kernel.',
+        links=[('modeset-fops','nvkms_fops'),('components','NVIDIA display components')]),
+    'dev-drm': dict(section='device-files', layer='interface',
+        zh='/dev/dri/cardN 是 DRM primary node，显示程序通过它提交 KMS 等 ioctl，请求进入 nvidia-drm.ko。可用的 /dev/dri/renderD* 节点用于渲染接口；KMS 显示控制使用 cardN。',
+        en='/dev/dri/cardN is a DRM primary node. Display software submits KMS and other ioctls through it to nvidia-drm.ko. Available /dev/dri/renderD* nodes expose rendering interfaces; KMS display control uses cardN.',
+        links=[('drm-nodes','DRM device nodes'),('drm','nvidia-drm-drv.c')]),
 }
 
 
@@ -144,17 +162,17 @@ def start_svg(name, height, title, description, interactive=False, width=1440):
 
 
 def node(x, y, w, h, title, subtitle, paths, key=None, core=False, component=None, panel=None):
-    attrs = f'class="node{" core" if core else ""}" data-paths="{paths}"'
+    attrs = f'class="node{" core" if core else ""}{" device-node" if component and component.startswith("dev-") else ""}" data-paths="{paths}"'
     tag = 'a' if key else 'g'
     href = f' href="{LINKS[key]}" target="_blank" rel="noopener"' if key else ''
     if component:
         tag, href = 'g', ''
         attrs += f' role="button" tabindex="0" data-component="{component}" data-component-title="{escape(title, quote=True)}" aria-label="{escape(title, quote=True)}" aria-haspopup="dialog" aria-expanded="false" aria-controls="{panel}"'
     out = f'<{tag} {attrs}{href}><rect x="{x}" y="{y}" width="{w}" height="{h}" rx="5"/>'
-    size = 16 if w < 230 and len(title) > 15 else 17
+    size = 14 if h <= 44 else (16 if w < 230 and len(title) > 15 else 17)
     compact = h <= 54
-    out += text(x + w / 2, y + (26 if compact else 28), title, size, weight=600)
-    out += text(x + w / 2, y + (45 if compact else 52), subtitle, 13 if compact else 14, cls='muted')
+    out += text(x + w / 2, y + (17 if h <= 44 else 26 if compact else 28), title, size, weight=600)
+    out += text(x + w / 2, y + (34 if h <= 44 else 45 if compact else 52), subtitle, 11 if h <= 44 else 13 if compact else 14, cls='muted')
     return out + f'</{tag}>'
 
 
@@ -175,14 +193,16 @@ def architecture(lang):
     zh = lang == 'zh'
     name = f'cuda-stack-{lang}'
     out = start_svg(name, 850, 'CUDA / Linux / GPU',
-        '用户态库、Linux 模块和 GPU 硬件。实线表示调用或管理依赖，绿色虚线表示 GPU P2P 数据路径。' if zh else
-        'User libraries, Linux modules and GPU hardware. Solid lines show calls or management dependencies; teal dashed lines show GPU P2P data paths.', interactive=True, width=1180)
+        '用户态库经字符设备文件访问 Linux 驱动，驱动建立 GPU 资源。绿色虚线表示 GPU P2P 数据路径。' if zh else
+        'User libraries access Linux drivers through character-device files; drivers establish GPU resources. Teal dashed lines show GPU P2P data paths.', interactive=True, width=1180)
     for y, h, title in [(16, 262, 'CPU 用户态 · 每个应用进程' if zh else 'CPU USER SPACE · application processes'),
-                         (310, 254, 'CPU 内核态 · Linux' if zh else 'CPU KERNEL · Linux')]:
+                         (386, 214, 'CPU 内核态 · Linux' if zh else 'CPU KERNEL · Linux')]:
         out += f'<rect class="band" x="16" y="{y}" width="1148" height="{h}" rx="6"/>'
-        out += text(50, y+28, title, 17, 'start', weight=600)
-    out += '<rect class="board" x="16" y="610" width="910" height="202" rx="6"/>'
-    out += text(50, 638, 'GPU 板卡' if zh else 'GPU BOARD', 17, 'start', weight=600)
+        out += text(300 if y == 386 else 50, y+28, title, 17, 'start', weight=600)
+    out += '<rect class="device-band" x="16" y="290" width="1148" height="82" rx="6"/>'
+    out += text(40, 307, '设备文件' if zh else 'Device files', 13, 'start', weight=600)
+    out += '<rect class="board" x="16" y="640" width="910" height="172" rx="6"/>'
+    out += text(50, 662, 'GPU 板卡' if zh else 'GPU BOARD', 17, 'start', weight=600)
     # Route edges first so node borders remain continuous and legible.
     for d, paths, both, data, label, key in [
         ('M190 116V138', 'cuda', False, False, None, None),
@@ -191,19 +211,24 @@ def architecture(lang):
         ('M190 192V218', 'cuda', False, False, None, None),
         ('M460 192V218', 'cuda', False, False, None, 'runtime'),
         ('M740 116V218', 'monitor', False, False, None, None),
-        ('M325 272V358', 'cuda', False, False, (408, 300, 'UVM ioctl / mmap', 145), 'uvm'),
-        ('M70 245H30V480H70', 'cuda', False, False, None, 'fops'),
-        ('M740 272V430H550V450', 'monitor', False, False, (740, 300, 'query / control', 125), None),
-        ('M1010 192V358', 'graphics', False, False, (1010, 300, 'DRM / KMS', 105), None),
-        ('M325 412V450', 'cuda', True, False, (400, 435, 'RM services', 105), None),
-        ('M1010 412V450', 'graphics', False, False, None, None),
-        ('M900 480H580', 'graphics', False, False, (740, 470, 'display services', 130), None),
-        ('M195 510V650', 'cuda monitor graphics', True, False, (195, 594, 'GSP-RM RPC', 120), 'gsp'),
-        ('M500 510V650', 'cuda monitor graphics', False, False, (500, 594, 'host MMIO', 105), None),
-        ('M580 385H610V632H655V650', 'cuda', False, False, (743, 594, 'UVM GPU work: copy / page tables', 270), 'uvm-push'),
-        ('M320 677H390', 'cuda monitor graphics', False, False, None, None),
-        ('M480 704V746', 'cuda', True, False, None, None),
-        ('M750 704V746', 'cuda', True, False, None, None),
+        ('M202 272V318', 'cuda', False, False, None, 'uvm'),
+        ('M510 272V318', 'cuda', False, False, None, 'fops'),
+        ('M740 272V284H650V318', 'monitor', False, False, None, 'fops'),
+        ('M990 192V284H850V318', 'graphics', False, False, None, 'modeset-fops'),
+        ('M1055 192V318', 'graphics', False, False, None, 'drm-nodes'),
+        ('M202 360V422', 'cuda', False, False, None, 'uvm-fops'),
+        ('M545 360V380H600V520H580', 'cuda monitor', False, False, None, 'fops'),
+        ('M850 360V494H930V510', 'graphics', False, False, None, 'modeset-fops'),
+        ('M1055 360V422', 'graphics', False, False, None, 'drm'),
+        ('M325 476V510', 'cuda', True, False, (400, 499, 'RM services', 105), None),
+        ('M1010 476V510', 'graphics', False, False, None, None),
+        ('M900 537H580', 'graphics', False, False, (740, 527, 'display services', 130), None),
+        ('M195 564V670', 'cuda monitor graphics', True, False, (195, 626, 'GSP-RM RPC', 120), 'gsp'),
+        ('M500 564V670', 'cuda monitor graphics', False, False, (500, 626, 'host MMIO', 105), None),
+        ('M580 449H620V652H655V670', 'cuda', False, False, (758, 626, 'UVM GPU work: copy / page tables', 270), 'uvm-push'),
+        ('M320 697H390', 'cuda monitor graphics', False, False, None, None),
+        ('M480 724V746', 'cuda', True, False, None, None),
+        ('M750 724V746', 'cuda', True, False, None, None),
         ('M890 773H955', 'cuda', True, True, (923, 763, 'P2P', 38), None),
     ]:
         # References live in the component descriptions; the overview itself
@@ -217,15 +242,19 @@ def architecture(lang):
         (640,62,200,54,'nvidia-smi', '监控与管理' if zh else 'Monitoring / control','monitor','nvml',False),
         (640,218,200,54,'libnvidia-ml.so', 'NVML','monitor','nvml',False),
         (900,138,220,54,'Compositor / Xorg', '图形用户态组件' if zh else 'Graphics user space','graphics','drm',False),
-        (70,358,510,54,'nvidia-uvm.ko', 'UVM · VA spaces / faults / migration','cuda','uvm',True),
-        (70,450,510,60,'nvidia.ko', 'Kernel RM · GPU resources / memory / mappings','cuda monitor graphics','fops',True),
-        (900,358,220,54,'nvidia-drm.ko', 'Linux DRM / KMS','graphics','drm',False),
-        (900,450,220,60,'nvidia-modeset.ko', '显示模式与引擎' if zh else 'Display modes / engines','graphics','modeset',False),
-        (70,650,250,54,'GSP processor', 'GSP-RM firmware','cuda monitor graphics','gsp-doc',False),
-        (390,650,500,54,'GPU engines / MMU', 'SM · Copy Engine · memory / display engines','cuda monitor graphics','cuda',False),
+        (70,422,510,54,'nvidia-uvm.ko', 'UVM · VA spaces / faults / migration','cuda','uvm',True),
+        (70,510,510,54,'nvidia.ko', 'Kernel RM · GPU resources / memory / mappings','cuda monitor graphics','fops',True),
+        (900,422,220,54,'nvidia-drm.ko', 'Linux DRM / KMS','graphics','drm',False),
+        (900,510,220,54,'nvidia-modeset.ko', '显示模式与引擎' if zh else 'Display modes / engines','graphics','modeset',False),
+        (70,670,250,54,'GSP processor', 'GSP-RM firmware','cuda monitor graphics','gsp-doc',False),
+        (390,670,500,54,'GPU engines / MMU', 'SM · Copy Engine · memory / display engines','cuda monitor graphics','cuda',False),
         (390,746,180,54,'VRAM', 'HBM / GDDR','cuda',None,False),
         (610,746,280,54,'NVLink / PCIe interfaces', 'GPU P2P 数据通路' if zh else 'GPU P2P data paths','cuda','peer-post',False),
         (955,746,200,54,'Other GPUs', 'direct / NVSwitch','cuda',None,False),
+        (70,318,265,42,'/dev/nvidia-uvm', 'open · ioctl · mmap','cuda',None,False),
+        (355,318,380,42,'/dev/nvidiactl · /dev/nvidiaN', 'open · ioctl · mmap','cuda monitor',None,False),
+        (755,318,190,42,'/dev/nvidia-modeset', 'open · ioctl · mmap','graphics',None,False),
+        (965,318,180,42,'/dev/dri/cardN', 'open · DRM / KMS ioctl','graphics',None,False),
     ]
     assert len(nodes) == len(COMPONENTS)
     for component, args in zip(COMPONENTS, nodes):
@@ -285,10 +314,12 @@ def component_panel(lang):
         'user-libraries': '1.2 用户态库' if zh else '1.2 User-space libraries',
         'kernel-modules': '1.3 Linux 模块' if zh else '1.3 Linux modules',
         'hardware-firmware': '1.4 固件与硬件' if zh else '1.4 Firmware and hardware',
+        'device-files': '2.1 设备文件' if zh else '2.1 Device files',
     }
     layers = dict(user='CPU 用户态' if zh else 'CPU user space',
                   kernel='CPU 内核态' if zh else 'CPU kernel space',
-                  gpu='GPU 板卡' if zh else 'GPU board', device='互联设备' if zh else 'Peer device')
+                  gpu='GPU 板卡' if zh else 'GPU board', device='互联设备' if zh else 'Peer device',
+                  interface='Linux 字符设备接口' if zh else 'Linux character-device interface')
     catalog = {}
     for component, data in COMPONENTS.items():
         catalog[component] = {
@@ -325,8 +356,8 @@ def figure(lang, kind):
     width = 1180 if kind == 'architecture' else 1440
     ratio = width / (850 if kind == 'architecture' else 670)
     caption = {
-        ('zh','architecture'): '图展示主要依赖，并非每次 CUDA 调用都会走完所有箭头。绿色虚线表示 GPU 之间的 P2P 数据流，不经过 GSP 或 CPU 软件栈逐字节转发。',
-        ('en','architecture'): 'These are principal dependencies, not a mandatory path for every CUDA call. Teal lines show GPU P2P data paths, which do not pass byte by byte through GSP or CPU software.',
+        ('zh','architecture'): '设备文件一行标出用户态访问驱动的入口；打开后，进程通过 fd 发出 ioctl 等请求。N 表示设备节点编号。绿色虚线表示 GPU 间的 P2P 数据通路。',
+        ('en','architecture'): 'The device-file row identifies user-space entry points into the drivers. After opening a node, the process issues requests such as ioctl through its fd. N denotes a device-node number. Teal dashed lines show GPU P2P data paths.',
         ('zh','sequence'): '上半部分对应公开源码中的 Linux 回调；最后一组说明已建立映射后的提交路径。实测日志在下文单独给出。',
         ('en','sequence'): 'The first three groups map to Linux callbacks in public source. The last group illustrates submission after resource setup. Measured logs appear separately below.',
     }[lang,kind]
@@ -725,7 +756,7 @@ def main():
 <title>{meta['title']}</title>
 {metadata}
 <link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
-<link rel="stylesheet" href="{BASE}style.css?v=gpu-stack-5">
+<link rel="stylesheet" href="{BASE}style.css?v=gpu-stack-6">
 <script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <script src="{BASE}page.js?v=component-info-4" defer></script>
 </head><body><div class="layout"><aside class="toc"><div class="toc-title">目录 · TOC</div>{render_series_nav(meta, ROOT / 'posts')}</aside><main class="content cuda-article">

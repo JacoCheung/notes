@@ -1,5 +1,5 @@
 // Shared post-page shell: navigation, language/theme controls, metadata,
-// heading anchors, table-of-contents state, and back-to-top behavior.
+// heading anchors, table layouts, table-of-contents state, and back-to-top behavior.
 (function () {
   document.documentElement.classList.add('post-document');
 
@@ -483,6 +483,55 @@
     document.body.appendChild(button);
   }
 
+  function prepareTables(main) {
+    const frames = [];
+    const containers = '.table-scroll, .loader-table, .gs-table, .trace-table, .p2p-table, .sheet-table-scroll';
+    main.querySelectorAll('table').forEach(table => {
+      if (table.closest('.post-table-frame')) return;
+      const parent = table.parentElement;
+      let frame;
+      if (parent.matches(containers) && parent.children.length === 1) {
+        frame = parent;
+      } else {
+        frame = document.createElement('div');
+        table.before(frame);
+        frame.appendChild(table);
+      }
+      frame.classList.add('post-table-frame');
+      // Reference sheets already define their own grids and mobile row layouts.
+      if (table.closest('.cheatsheet-sheet, .termux-sheet, .man-sheet')) {
+        frame.classList.add('post-table-reference');
+      } else {
+        const columns = Math.max(0, ...Array.from(table.rows, row =>
+          Array.from(row.cells).reduce((count, cell) => count + cell.colSpan, 0)));
+        table.style.setProperty('--post-table-min', columns <= 2 ? '0px' : `${Math.min(60, 28 + (columns - 3) * 8)}rem`);
+      }
+      const label = table.caption?.textContent.trim() ||
+        Array.from(table.tHead?.rows[0]?.cells || table.rows[0]?.cells || [], cell => cell.textContent.trim()).join(' · ');
+      frames.push({ frame, table, label });
+    });
+
+    const updateScrollAccess = () => frames.forEach(({ frame, label }) => {
+      const scrollable = frame.clientWidth > 0 && frame.scrollWidth > frame.clientWidth + 1;
+      if (scrollable) {
+        frame.tabIndex = 0;
+        frame.setAttribute('role', 'region');
+        if (label) frame.setAttribute('aria-label', label);
+      } else {
+        frame.removeAttribute('tabindex');
+        frame.removeAttribute('role');
+        frame.removeAttribute('aria-label');
+      }
+    });
+    if ('ResizeObserver' in window) {
+      const observer = new ResizeObserver(updateScrollAccess);
+      frames.forEach(({ frame, table }) => { observer.observe(frame); observer.observe(table); });
+    } else {
+      window.addEventListener('resize', updateScrollAccess, { passive: true });
+    }
+    updateScrollAccess();
+  }
+
   function attach() {
     document.body.classList.add('post-page');
     createNavigation();
@@ -493,6 +542,7 @@
       createTableOfContents(main);
       addHeadingAnchors(main);
       sizeStaticFigures(main);
+      prepareTables(main);
     }
     createSeriesNavigation();
     attachTocTracking();

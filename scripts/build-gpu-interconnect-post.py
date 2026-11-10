@@ -30,6 +30,55 @@ def code(value):
 
 
 CODE = {
+    'uar-map': '''
+        #include <cuda_runtime.h>
+        #include <cstdint>
+
+        // cpu_reg = uar->reg_addr; bytes = this UAR's register span.
+        cudaError_t map_uar_to_gpu(void* cpu_reg, size_t bytes,
+                                  uint64_t** gpu_doorbell_ptr) {
+            *gpu_doorbell_ptr = nullptr;
+            unsigned flags = cudaHostRegisterPortable
+                           | cudaHostRegisterMapped
+                           | cudaHostRegisterIoMemory;
+            cudaError_t rc = cudaHostRegister(cpu_reg, bytes, flags);
+            if (rc != cudaSuccess) return rc;
+
+            void* device_alias = nullptr;
+            rc = cudaHostGetDevicePointer(&device_alias, cpu_reg, 0);
+            if (rc != cudaSuccess) {
+                cudaHostUnregister(cpu_reg);
+                return rc;
+            }
+            *gpu_doorbell_ptr = static_cast<uint64_t*>(device_alias);
+            return cudaSuccess;
+        }
+    ''',
+    'uar-pte': '''
+        // VER3 encoding example, following Hopper's UVM PTE builder.
+        // Input: GPU-visible NIC page address, 4 KiB aligned, below 2^52.
+        uint64_t encode_uar_pte(uint64_t nic_page_addr) {
+            constexpr uint64_t address_mask = ((1ULL << 52) - 1) & ~0xfffULL;
+            constexpr uint64_t pcf = 0x19;  // REGULAR_RW_NO_ATOMIC_UNCACHED_ACD
+            constexpr uint64_t kind = 0x6;  // GENERIC_MEMORY
+            return (nic_page_addr & address_mask)  // ADDRESS [51:12]
+                 | (kind << 8)                   // KIND [11:8]
+                 | (pcf << 3)                    // PCF [7:3]
+                 | (3ULL << 1)                   // SYSTEM_NON_COHERENT [2:1]
+                 | 1ULL;                         // VALID [0]
+        }
+    ''',
+    'uar-store': '''
+        // Called by the submitting thread after preparing WQEs and the DBR.
+        // mlx5_db_be: the correctly encoded 64-bit mlx5 doorbell value.
+        __device__ __forceinline__
+        void ring_uar(uint64_t* gpu_doorbell_ptr, uint64_t mlx5_db_be) {
+            asm volatile("fence.acq_rel.sys;" ::: "memory");
+            asm volatile("st.mmio.relaxed.sys.global.b64 [%0], %1;"
+                         : : "l"(gpu_doorbell_ptr), "l"(mlx5_db_be)
+                         : "memory");
+        }
+    ''',
     'nv-kernel': '''
         #include <nvshmem.h>
         #include <nvshmemx.h>
@@ -68,7 +117,16 @@ CODE = {
         ncclCommWindowRegister(comm, dst, bytes, &dstWin, NCCL_WIN_COLL_SYMMETRIC);
 
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-        reqs.ginType = NCCL_GIN_TYPE_GDAKI;   // explicitly request this backend
+        reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
+        reqs.ginContextCount = 1;
+        reqs.ginSignalCount = 1;
+        ncclDevComm devComm;
+        ncclDevCommCreate(comm, &reqs, &devComm);
+    ''',
+    'gin-gdaki-setup': '''
+        // Replace the requirements/create block in the common setup.
+        ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+        reqs.ginType = NCCL_GIN_TYPE_GDAKI;
         reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
         reqs.ginContextCount = 1;
         reqs.ginSignalCount = 1;
@@ -124,13 +182,18 @@ COMPONENTS = {
     'mlx5kernel': ('modules', 'user-verbs', NETWORK_PATHS),
     'gpu': ('modules', 'peer-post', ALL_PATHS),
     'nic': ('modules', 'gpureadme', NETWORK_PATHS),
+    'dev-uverbs': ('device-files', 'uverbs-fops', NETWORK_PATHS),
+    'dev-core': ('device-files', 'gpu-fops', ALL_PATHS),
+    'dev-uvm': ('device-files', 'uvm-fops', ALL_PATHS),
 }
 
 
 def box(x, y, w, title, subtitle, component, lang, h=54, paths=None, node_id=None):
     paths = COMPONENTS[component][2] if paths is None else paths
-    size = 13 if w < 200 else 15
-    return f'<g class="node" data-node-id="{node_id or component}" data-paths="{paths}" data-component="{component}" data-component-title="{escape(title, quote=True)}" tabindex="0" role="button" aria-label="{escape(title, quote=True)}" aria-haspopup="dialog" aria-expanded="false" aria-controls="interconnect-info-{lang}"><rect x="{x}" y="{y}" width="{w}" height="{h}" rx="4"/>' + txt(x+w/2,y+23,title,size,weight=650) + txt(x+w/2,y+43,subtitle,11 if w < 200 else 12,cls='muted') + '</g>'
+    compact = h <= 44
+    size = 13 if compact or w < 200 else 14 if len(title) > 22 else 15
+    css = 'node device-node' if component.startswith('dev-') else 'node'
+    return f'<g class="{css}" data-node-id="{node_id or component}" data-paths="{paths}" data-component="{component}" data-component-title="{escape(title, quote=True)}" tabindex="0" role="button" aria-label="{escape(title, quote=True)}" aria-haspopup="dialog" aria-expanded="false" aria-controls="interconnect-info-{lang}"><rect x="{x}" y="{y}" width="{w}" height="{h}" rx="4"/>' + txt(x+w/2,y+(17 if compact else 23),title,size,weight=650) + txt(x+w/2,y+(34 if compact else 43),subtitle,11 if compact or w < 200 else 12,cls='muted') + '</g>'
 
 
 def relationship(name, source, target, points, kind, paths, ref, description, label=None, both=False):
@@ -150,7 +213,7 @@ def relationship(name, source, target, points, kind, paths, ref, description, la
 def architecture(lang):
     zh = lang == 'zh'
     name = 'interconnect-stack-'+lang
-    out = svg_start(name, 792, 'GPU interconnect: calls, setup, submission and payload', True)
+    out = svg_start(name, 856, 'GPU interconnect: libraries, device files, drivers and payload', True)
     legend = [('control','CPU 调用 / 提交' if zh else 'CPU call / submission'),
               ('setup','初始化 / 注册 / 映射' if zh else 'Setup / registration / mapping'),
               ('gpu','GPU 调用 / 请求' if zh else 'GPU call / request'),
@@ -159,12 +222,14 @@ def architecture(lang):
         x=30+i*290
         out += f'<path class="seq-edge {kind}" d="M{x} 24h34" marker-end="url(#{name}-{kind})"/>'
         out += txt(x+44,28,title,12,'start')
-    for x,y,w,h,title in [(16,48,710,330,'CPU 用户态 · host libraries / proxy' if zh else 'CPU USER SPACE · host libraries / proxy'),
-                          (746,48,398,330,'GPU kernel · device API' if zh else 'GPU KERNEL · device API'),
-                          (16,394,1128,210,'Linux 内核 · 资源与权限' if zh else 'LINUX · resources / access'),
-                          (16,642,1128,134,'硬件 · 直接数据通路' if zh else 'HARDWARE · direct payload paths')]:
-        heading_x = 276 if y == 394 else x+16
+    for x,y,w,h,title in [(16,48,710,294,'CPU 用户态 · host libraries / proxy' if zh else 'CPU USER SPACE · host libraries / proxy'),
+                          (746,48,398,294,'GPU kernel · device API' if zh else 'GPU KERNEL · device API'),
+                          (16,458,1128,210,'Linux 内核 · 资源与权限' if zh else 'LINUX · resources / access'),
+                          (16,706,1128,134,'硬件 · 直接数据通路' if zh else 'HARDWARE · direct payload paths')]:
+        heading_x = 276 if y == 458 else x+16
         out += f'<rect class="band" x="{x}" y="{y}" width="{w}" height="{h}" rx="5"/>' + txt(heading_x,y+23,title,14,'start',weight=600)
+    out += '<rect class="device-band" x="16" y="350" width="1128" height="96" rx="5"/>'
+    out += txt(32,372,'设备文件' if zh else 'Device files',13,'start',weight=600)
     # Routed in the gaps between nodes; edges are painted before the cards.
     edges = [
         ('nccl','verbs',[(100,154),(100,280)],'control','cpu','nccl-proxy','NCCL NET/IB CPU proxy calls the verbs network backend',(76,253,'NET/IB')),
@@ -184,22 +249,25 @@ def architecture(lang):
         ('nvdevice','nvhost',[(958,117),(946,117),(946,82),(391,82),(391,100)],'gpu','proxy','nv-dispatch','NVSHMEM device proxy publishes requests consumed by its host proxy',(627,95,'NVSHMEM proxy request')),
         ('gin','nccl',[(768,132),(738,132),(738,170),(141,170),(141,154)],'gpu','ginproxy','gin-proxy','GIN CPU proxy backend publishes requests for the NCCL host proxy',(395,163,'GIN proxy request')),
         ('gpuhost','gpudevice',[(706,144),(728,144),(728,218),(884,218),(884,280)],'setup','gdaki nvgda','gpu-export','GPUNetIO host setup exports QP / CQ descriptors for device code',(782,211,'export QP / CQ')),
-        ('verbs','rdma',[(100,334),(100,435)],'setup',NETWORK_PATHS,'user-verbs','Verbs establishes RDMA resources through uverbs',(166,407,'uverbs')),
-        ('mlx5','rdma',[(350,334),(350,358),(210,358),(210,435)],'setup',NETWORK_PATHS,'user-verbs','mlx5 setup uses uverbs ioctl / mmap interfaces',(273,351,'ioctl / mmap')),
-        ('cuda','nvidia',[(621,334),(621,370),(957,370),(957,435)],'setup',ALL_PATHS,'gpu-core','libcuda uses NVIDIA core device interfaces',(1026,414,'GPU ioctl')),
-        ('cuda','uvm',[(684,334),(684,385),(780,385),(780,557),(802,557)],'setup',ALL_PATHS,'uvm','libcuda uses UVM device interfaces and mappings',None),
-        ('rdma','mlx5kernel',[(246,462),(276,462)],'setup',NETWORK_PATHS,'user-verbs','RDMA core dispatches device resource operations to mlx5 drivers',None),
-        ('mlx5kernel','peermem',[(506,462),(536,462)],'setup',NETWORK_PATHS,'gdr-doc','RDMA driver obtains GPU memory mappings via peer memory or DMA-BUF',None),
-        ('peermem','nvidia',[(756,462),(802,462)],'setup',NETWORK_PATHS,'peermem','GPU memory registration cooperates with the NVIDIA GPU driver',None),
-        ('uvm','nvidia',[(957,530),(957,489)],'setup',ALL_PATHS,'uvm','UVM cooperates with Kernel RM',(1024,515,'RM services'),True),
-        ('mlx5kernel','nic',[(391,489),(391,598),(1075,598),(1075,690)],'setup',NETWORK_PATHS,'user-verbs','mlx5 drivers configure NIC hardware resources',(432,589,'NIC setup')),
-        ('nvidia','gpu',[(957,489),(957,512),(646,512),(646,690)],'setup',ALL_PATHS,'gpu-core','GPU driver establishes GPU resources and mappings',(598,548,'GPU setup')),
-        ('uvm','gpu',[(802,557),(710,557),(710,690)],'setup',ALL_PATHS,'uvm','UVM manages GPU virtual address mappings',None),
-        ('mlx5','nic',[(506,307),(520,307),(520,625),(990,625),(990,690)],'control','cpu proxy ginproxy','mlx5-send','CPU fast path writes WQEs / rings doorbells after resource setup',(812,619,'CPU WQE / doorbell')),
-        ('gpudevice','nic',[(850,334),(850,386),(1140,386),(1140,717),(1112,717)],'gpu','gdaki nvgda','gpu-submit','GPUNetIO device verbs submit WQEs and ring a direct GPU doorbell',(1015,367,'GPU WQE / doorbell')),
-        ('ibgda','nic',[(1128,307),(1140,307),(1140,717),(1112,717)],'gpu','ibgda','ibgda-db','IBGDA device code submits WQEs and rings a direct GPU doorbell',None),
-        ('gpu','nic',[(756,717),(866,717)],'payload',NETWORK_PATHS,'gdr-doc','GPUDirect RDMA payload moves directly between GPU memory and NIC',(811,705,'GDR / DMA'),True),
-        ('gpu','peer',[(536,717),(276,717)],'payload','peer','peer-post','GPU peer memory traffic uses NVLink / PCIe, directly or through NVSwitch',(406,705,'NVLink / PCIe'),True),
+        ('verbs','dev-uverbs',[(100,334),(100,350),(150,350),(150,388)],'setup',NETWORK_PATHS,'verbs-open','libibverbs opens the uverbs character device to obtain its command fd',None),
+        ('mlx5','dev-uverbs',[(350,334),(350,388)],'setup',NETWORK_PATHS,'uverbs-fops','The mlx5 provider uses the uverbs fd for ioctl / write / mmap',None),
+        ('dev-uverbs','rdma',[(150,430),(150,499)],'setup',NETWORK_PATHS,'uverbs-fops','The uverbs character device dispatches file operations to ib_uverbs',None),
+        ('cuda','dev-core',[(621,334),(621,388)],'setup',ALL_PATHS,'gpu-fops','libcuda opens /dev/nvidiactl and per-GPU /dev/nvidiaN nodes',None),
+        ('cuda','dev-uvm',[(684,334),(684,360),(977,360),(977,388)],'setup',ALL_PATHS,'uvm-fops','libcuda opens /dev/nvidia-uvm for UVM requests and mappings',None),
+        ('dev-core','nvidia',[(650,430),(650,466),(957,466),(957,499)],'setup',ALL_PATHS,'gpu-fops','nvidia_fops dispatches core device requests to nvidia.ko',None),
+        ('dev-uvm','uvm',[(977,430),(977,478),(1126,478),(1126,621),(1112,621)],'setup',ALL_PATHS,'uvm-fops','uvm_fops dispatches UVM device requests to nvidia-uvm.ko',None),
+        ('rdma','mlx5kernel',[(246,526),(276,526)],'setup',NETWORK_PATHS,'user-verbs','RDMA core dispatches device resource operations to mlx5 drivers',None),
+        ('mlx5kernel','peermem',[(506,526),(536,526)],'setup',NETWORK_PATHS,'gdr-doc','RDMA driver obtains GPU memory mappings via peer memory or DMA-BUF',None),
+        ('peermem','nvidia',[(756,526),(802,526)],'setup',NETWORK_PATHS,'peermem','GPU memory registration cooperates with the NVIDIA GPU driver',None),
+        ('uvm','nvidia',[(957,594),(957,553)],'setup',ALL_PATHS,'uvm','UVM cooperates with Kernel RM',(1024,579,'RM services'),True),
+        ('mlx5kernel','nic',[(391,553),(391,662),(1075,662),(1075,754)],'setup',NETWORK_PATHS,'user-verbs','mlx5 drivers configure NIC hardware resources',(432,653,'NIC setup')),
+        ('nvidia','gpu',[(957,553),(957,576),(646,576),(646,754)],'setup',ALL_PATHS,'gpu-core','GPU driver establishes GPU resources and mappings',(598,612,'GPU setup')),
+        ('uvm','gpu',[(802,621),(710,621),(710,754)],'setup',ALL_PATHS,'uvm','UVM manages GPU virtual address mappings',None),
+        ('mlx5','nic',[(506,307),(520,307),(520,689),(990,689),(990,754)],'control','cpu proxy ginproxy','mlx5-send','CPU fast path writes WQEs / rings doorbells after resource setup',(812,683,'CPU WQE / doorbell')),
+        ('gpudevice','nic',[(850,334),(850,346),(1140,346),(1140,781),(1112,781)],'gpu','gdaki nvgda','gpu-submit','GPUNetIO device verbs submit WQEs and ring a direct GPU doorbell',(1050,451,'GPU WQE / doorbell')),
+        ('ibgda','nic',[(1128,307),(1140,307),(1140,781),(1112,781)],'gpu','ibgda','ibgda-db','IBGDA device code submits WQEs and rings a direct GPU doorbell',None),
+        ('gpu','nic',[(756,781),(866,781)],'payload',NETWORK_PATHS,'gdr-doc','GPUDirect RDMA payload moves directly between GPU memory and NIC',(811,769,'GDR / DMA'),True),
+        ('gpu','peer',[(536,781),(276,781)],'payload','peer','peer-post','GPU peer memory traffic uses NVLink / PCIe, directly or through NVSwitch',(406,769,'NVLink / PCIe'),True),
     ]
     for edge in edges: out += relationship(name,*edge)
     nodes = [
@@ -213,23 +281,50 @@ def architecture(lang):
         ('nvdevice',958,100,170,'libnvshmem_device.a','put / get / signal','nvdevice'),
         ('gpudevice',768,280,170,'GPUNetIO device','WQE · doorbell · CQE','gpunetio'),
         ('ibgda',958,280,170,'IBGDA device','mlx5 queue operations','ibgda'),
-        ('rdma',36,435,210,'ib_uverbs · ib_core','Linux RDMA interface','rdma'),
-        ('mlx5kernel',276,435,230,'mlx5_ib · mlx5_core','NIC resources / registration','mlx5kernel'),
-        ('peermem',536,435,220,'nvidia-peermem / DMA-BUF','registration alternatives','peermem'),
-        ('nvidia',802,435,310,'nvidia.ko','Kernel RM · GPU resources','nvidia'),
-        ('uvm',802,530,310,'nvidia-uvm.ko','GPU virtual address mappings','uvm'),
-        ('peer',36,690,240,'Peer GPU / VRAM','direct or NVSwitch','gpu'),
-        ('gpu',536,690,220,'GPU / VRAM','SM · MMU · payload / queues','gpu'),
-        ('nic',866,690,246,'NIC','IB / RoCE → remote NIC','nic'),
+        ('rdma',36,499,210,'ib_uverbs · ib_core','Linux RDMA interface','rdma'),
+        ('mlx5kernel',276,499,230,'mlx5_ib · mlx5_core','NIC resources / registration','mlx5kernel'),
+        ('peermem',536,499,220,'nvidia-peermem / DMA-BUF','registration alternatives','peermem'),
+        ('nvidia',802,499,310,'nvidia.ko','Kernel RM · GPU resources','nvidia'),
+        ('uvm',802,594,310,'nvidia-uvm.ko','GPU virtual address mappings','uvm'),
+        ('peer',36,754,240,'Peer GPU / VRAM','direct or NVSwitch','gpu'),
+        ('gpu',536,754,220,'GPU / VRAM','SM · MMU · payload / queues','gpu'),
+        ('nic',866,754,246,'NIC','IB / RoCE → remote NIC','nic'),
     ]
     for node_id,*node in nodes:
         out += box(*node,lang,node_id=node_id,paths='peer' if node_id=='peer' else None)
-    return out+'</svg>',792
+    for args in [
+        (36,388,410,'/dev/infiniband/uverbsN','open · ioctl / write · mmap','dev-uverbs'),
+        (536,388,280,'/dev/nvidiactl · /dev/nvidiaN','open · ioctl · mmap','dev-core'),
+        (842,388,270,'/dev/nvidia-uvm','open · ioctl · mmap','dev-uvm'),
+    ]:
+        out += box(*args,lang,h=42)
+    return out+'</svg>',856
 
 
 # Message labels describe logical work; each arrow links to its implementation
 # or, for hardware data movement, the public mechanism documentation.
 SEQUENCES = {
+    'rdma-read': {
+        'actors': [('GPU A memory','local destination'),('NIC A','RDMA requester'),('NIC B','RDMA responder'),('GPU B memory','remote source')],
+        'actors_zh': [('A 显存','本地目标 buffer'),('A 网卡','RDMA 请求方'),('B 网卡','RDMA 响应方'),('B 显存','远端源 buffer')],
+        'rows': [
+            (1,2,'① RDMA Read request: B address + rkey; 4096 B','control','rdma-guide'),
+            (2,2,'② Validate MR range, rkey and remote-read permission','control','verbs-mr'),
+            (3,2,'③ NIC B DMA-reads 4096 B from GPU B','payload','gdr-doc'),
+            (2,1,'④ RDMA Read response: 4096 B','payload','rdma-guide'),
+            (1,0,'⑤ NIC A DMA-writes 4096 B into GPU A','payload','gdr-doc'),
+            (1,1,'Requested completion: CQE on A','control','verbs-post-send'),
+        ],
+        'labels_zh': [
+            '① RDMA Read 请求：B 的地址 + rkey；4096 B',
+            '② 校验 MR 范围、rkey 与远端读权限',
+            '③ B 网卡 DMA 读取 B 显存的 4096 B',
+            '④ RDMA Read 响应：返回 4096 B',
+            '⑤ A 网卡 DMA 写入 A 显存的 4096 B',
+            '按请求产生完成通知：A 侧 CQE',
+        ],
+        'bars': [(0,4,4),(1,0,5),(2,0,3),(3,2,2)],
+    },
     'setup': {
         'actors':[('CPU library','host setup'),('verbs / mlx5','userspace provider'),('Linux drivers','RDMA + GPU'),('NIC','QP / MR'),('GPU memory','registered payload')],
         'rows':[
@@ -343,9 +438,11 @@ def sequence(kind,lang):
     spec = SEQUENCES[kind]
     name = f'interconnect-{kind}-{lang}'
     height = 104 + len(spec['rows'])*62 + 26
-    xs = [120,350,580,810,1040]
-    out = svg_start(name,height,kind+' communication sequence')
-    for i,(title,sub) in enumerate(spec['actors']):
+    actors = spec.get('actors_zh', spec['actors']) if lang == 'zh' else spec['actors']
+    xs = [145,435,725,1015] if len(actors) == 4 else [120,350,580,810,1040]
+    title = TITLES[kind][0 if lang == 'zh' else 1] if kind == 'rdma-read' else kind+' communication sequence'
+    out = svg_start(name,height,title)
+    for i,(title,sub) in enumerate(actors):
         x=xs[i]
         out+=f'<g class="node"><rect x="{x-104}" y="16" width="208" height="54" rx="4"/>'
         out+=txt(x,39,title,15,weight=650)+txt(x,59,sub,12,cls='muted')+'</g>'
@@ -354,10 +451,13 @@ def sequence(kind,lang):
         y=102+begin*62
         out+=f'<rect class="activation" x="{xs[actor]-6}" y="{y-5}" width="12" height="{(end-begin)*62+27}" rx="1"/>'
     for i,(a,b,label,kind_,ref) in enumerate(spec['rows']):
+        if lang == 'zh' and 'labels_zh' in spec:
+            label = spec['labels_zh'][i]
         y=112+i*62
         x1,x2=xs[a],xs[b]
         # Keep labels inside the viewBox even for self-calls in the last lane.
-        w=min(1100,max(len(label)*7.25, len(REFS[ref]['label'])*6.1)+14)
+        label_width = sum(14 if ord(char) > 255 else 8.5 for char in label) if kind == 'rdma-read' else len(label)*7.25
+        w=min(1100,max(label_width, len(REFS[ref]['label'])*6.1)+14)
         lx=max(26,min(min(x1,x2)+18,1138-w))
         path=f'M{x1+6} {y}H{x1+30}V{y+16}H{x1+6}' if a==b else f'M{x1+(6 if b>a else -6)} {y}H{x2+(-7 if b>a else 7)}'
         url=escape(REFS[ref]['url'],quote=True)
@@ -374,6 +474,7 @@ def sequence(kind,lang):
 
 
 TITLES = {
+    'rdma-read':('GPU RDMA Read · 从 B 显存读入 A 显存','GPU RDMA Read · GPU B memory to GPU A memory'),
     'architecture':('GPU 互联：依赖与调用关系','GPU interconnect: dependencies and calls'),
     'setup':('资源建立 · CPU 控制路径','Resource setup · CPU control path'),
     'cpu':('NCCL NET/IB · 一个发送 chunk','NCCL NET/IB · one outgoing chunk'),
@@ -385,6 +486,7 @@ TITLES = {
     'fabric':('跨 OS 的 NVLink 内存共享','NVLink memory sharing across operating systems'),
 }
 CAPTIONS = {
+    'rdma-read':('两端已建立连接并注册显存。蓝色表示请求、校验与完成，紫色箭头沿数据流向绘制；③、⑤是各端 NIC 执行的本地 DMA。', 'Connections and GPU memory registration are already established. Blue marks requests, validation and completion; purple arrows follow data. Steps ③ and ⑤ are local DMA by each NIC.'),
     'architecture':('箭头表示主要调用、资源依赖或数据流，分支按所选 backend 执行。选择路径可同时高亮节点与连线；点击节点查看说明，点击连线查看源码。GPU → NIC 展示直接 doorbell 模式；CPU 辅助模式见各路径的 doorbell 说明。','Arrows show principal calls, resource dependencies or data flow; branches depend on the backend. Select a path to highlight its nodes and edges. Nodes open explanations; edges link to source. GPU → NIC shows direct doorbells; CPU assistance is described with each path.'),
     'setup':('两端都要建立资源；图示 CPU verbs 路径一侧的准备与首次提交。后续 chunk 复用连接和注册信息。','Both endpoints establish resources. Shows setup and the first CPU verbs submission; later chunks reuse connections and registrations.'),
     'cpu':('假设 GDR 已启用。紫色表示 payload；蓝色表示 CPU 控制；绿色表示 GPU 工作。接收端的 proxy 与可见性处理合并展示。','Assumes GDR. Purple: payload. Blue: CPU control. Teal: GPU work. Receiver-side proxy and visibility handling are summarized.'),
@@ -413,10 +515,13 @@ def figure(kind,lang):
     drawing,height=architecture(lang) if kind=='architecture' else sequence(kind,lang)
     focus=''
     if kind=='architecture':
-        labels=[('all','全部' if idx==0 else 'All'),('cpu','NCCL NET/IB'),('proxy','NVSHMEM + proxy'),('ibgda','NVSHMEM IBGDA'),('nvgda','NVSHMEM / GPUNetIO'),('gdaki','NCCL GIN / GDAKI'),('ginproxy','NCCL GIN / CPU proxy'),('peer','CUDA peer')]
-        destinations={'all':'#submission','cpu':'#nccl-cpu','proxy':'#nvshmem','ibgda':'#ibgda','nvgda':'#gpunetio','gdaki':'#gin','ginproxy':'#gin-proxy','peer':'gpu-peer-to-peer-memory.html'}
+        groups=[('普通 NCCL' if idx==0 else 'Ordinary NCCL',[('cpu','NET/IB · CPU proxy')]),('NVSHMEM',[('proxy','CPU proxy / IBRC'),('ibgda','IBGDA'),('nvgda','GPUNetIO')]),('NCCL GIN',[('ginproxy','CPU proxy'),('gdaki','GDAKI / GPUNetIO')]),('互联机制' if idx==0 else 'Interconnect mechanism',[('peer','CUDA peer / NVLink')])]
+        destinations={'all':'#submission','cpu':'#nccl-cpu','proxy':'#nv-proxy-submit','ibgda':'#ibgda','nvgda':'#gpunetio','gdaki':'#gin-gdaki','ginproxy':'#gin-proxy','peer':'gpu-peer-to-peer-memory.html'}
         destinations={key:href+('-en' if lang=='en' and href.startswith('#') else '') for key,href in destinations.items()}
-        focus='<label>'+('路径 ' if idx==0 else 'Path ')+'<select data-path-focus>'+''.join(f'<option value="{key}" data-path-href="{destinations[key]}">{value}</option>' for key,value in labels)+'</select></label>'
+        options=f'<option value="all" data-path-href="{destinations["all"]}">{"全部" if idx==0 else "All"}</option>'
+        for group,items in groups:
+            options+=f'<optgroup label="{group}">'+''.join(f'<option value="{key}" data-path-href="{destinations[key]}">{value}</option>' for key,value in items)+'</optgroup>'
+        focus='<label>'+('路径 ' if idx==0 else 'Path ')+'<select data-path-focus>'+options+'</select></label>'
         focus+=f'<a class="path-reading-link" data-path-reading href="{destinations["all"]}">{"阅读路径说明" if idx==0 else "Read about this path"} →</a>'
     fit,actual=('适应窗口','原始尺寸') if idx==0 else ('Fit window','Actual size')
     return f'''<figure class="cuda-figure" data-size="fit" data-layout="{kind}" style="--diagram-ratio:{1160/height:.10f};--diagram-width:1160px"><div class="diagram-toolbar"><strong>{title}</strong>{focus}<button type="button" data-size-toggle aria-pressed="false" data-fit-label="{fit}" data-actual-label="{actual}">{actual}</button></div><div class="diagram-viewport" tabindex="0" role="region" aria-label="{title}">{drawing}</div><figcaption>{CAPTIONS[kind][idx]}</figcaption>{panel(lang) if kind=='architecture' else ''}</figure>'''
@@ -456,7 +561,7 @@ def main():
     html=f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{meta['title']}</title>
 {metadata}
-<link rel="stylesheet" href="../assets/site.css?v=post-toc-3"><link rel="stylesheet" href="{SHARED}style.css?v=gpu-stack-5"><link rel="stylesheet" href="{BASE}style.css?v=3">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3"><link rel="stylesheet" href="{SHARED}style.css?v=gpu-stack-6"><link rel="stylesheet" href="{BASE}style.css?v=4">
 <script src="../lang-toggle.js?v=post-toc-3" defer></script><script src="{SHARED}page.js?v=component-info-4" defer></script><script src="{BASE}page.js?v=1" defer></script>
 </head><body><div class="layout"><aside class="toc"><div class="toc-title">目录 · TOC</div>{render_series_nav(meta, ROOT / 'posts')}</aside><main class="content cuda-article interconnect-article"><div class="lang-zh">{expand('zh')}</div><div class="lang-en">{expand('en')}</div></main></div></body></html>'''
     target=ROOT/'posts/gpu-interconnect-software-stack.html'

@@ -1,24 +1,60 @@
 <h1>GPU interconnect software and drivers</h1>
-<p class="article-lead">GPU communication commonly takes one of two data paths: peer-memory access over NVLink / PCIe, or RDMA through a network adapter. CUDA drivers establish GPU mappings, Linux RDMA drivers establish NIC resources, and NCCL or NVSHMEM organize transfers over them. The same GPU-memory-to-NIC data path can be driven by a CPU proxy or by requests submitted from a GPU kernel.</p>
+<p class="article-lead">Ordinary NCCL, NVSHMEM and NCCL GIN organize GPU communication through host-called collectives, one-sided operations on symmetric memory, and networking inside user kernels. NVSHMEM and GIN offer backend choices that determine whether CPU proxies or GPU code progress requests. Drivers establish their NIC queues, GPU memory registration and address mappings. Even with CPU-proxy submission, GPUDirect RDMA can carry payload directly between GPU memory and the NIC.</p>
 <p class="source-scope">Source baseline: NCCL 2.32.3, NVSHMEM 3.8.0 and rdma-core 61.0, checked on 2026-11-09. Source links are pinned to commits. Sequence diagrams show source-level call order; activation bars mark each participant's logical activity scope.</p>
 
-<h2 id="paths-en">1. Path overview</h2>
+<h2 id="paths-en">1. Communication approaches and foundations</h2>
 
-<h3 id="submission-en">1.1 API, submission and payload</h3>
-<p>A transfer from GPU 0 to GPU 1 can separate <strong>API invocation, hardware-request submission and payload movement</strong>. For example, a CPU calls <code>ncclAllReduce()</code> and a CPU proxy submits network requests, while payload moves directly between GPU memory and the NIC.</p>
-<table><thead><tr><th>Path</th><th>Application API</th><th>Request submission</th><th>Main payload path</th></tr></thead><tbody>
-<tr><td><a href="gpu-peer-to-peer-memory.html">CUDA peer access</a></td><td>CPU establishes mappings; GPU kernel loads/stores</td><td>GPU executes memory instructions</td><td>GPU ↔ NVLink / PCIe ↔ GPU</td></tr>
-<tr><td><a href="#nccl-cpu-en">Ordinary NCCL NET/IB</a></td><td>CPU calls a collective API</td><td>CPU proxy submits NIC WRs</td><td>With GDR: GPU ↔ NIC ↔ network ↔ NIC ↔ GPU</td></tr>
-<tr><td><a href="#nvshmem-en">NVSHMEM device API + proxy</a></td><td>GPU kernel calls put/get</td><td>GPU writes a request queue; CPU proxy submits WRs</td><td>Can use the same GPUDirect RDMA path</td></tr>
-<tr><td><a href="#ibgda-en">NVSHMEM IBGDA</a></td><td>GPU kernel calls put/get</td><td>GPU constructs WQEs; GPU or an assisting CPU rings the doorbell</td><td>GPU ↔ NIC ↔ network ↔ NIC ↔ GPU</td></tr>
-<tr><td><a href="#gpunetio-en">NVSHMEM GPUNetIO</a></td><td>GPU kernel calls put/get</td><td>GPU constructs WQEs; GPU or an assisting CPU rings the doorbell</td><td>GPU ↔ NIC ↔ network ↔ NIC ↔ GPU</td></tr>
-<tr><td><a href="#gin-en">NCCL GIN + GDAKI</a></td><td>GPU kernel calls <code>ncclGin</code></td><td>GPU constructs WQEs through GPUNetIO; doorbell mode depends on configuration</td><td>GPU ↔ NIC ↔ network ↔ NIC ↔ GPU</td></tr>
-<tr><td><a href="#gin-proxy-en">NCCL GIN + CPU proxy</a></td><td>GPU kernel calls <code>ncclGin</code></td><td>GPU publishes descriptors; CPU proxy submits network requests</td><td>Depends on the selected network backend</td></tr>
+<h3 id="submission-en">1.1 Three communication approaches</h3>
+<p>The three approaches are grouped by application entry point and programming model. GIN belongs to the NCCL Device API; its calls inside user kernels are covered separately from ordinary collective calls. The backend column lists the implementations developed in each chapter.</p>
+<table class="communication-summary" role="table"><thead><tr role="row"><th scope="col">Approach</th><th scope="col">Application entry point</th><th scope="col">Backends covered here</th><th scope="col">Request progress</th></tr></thead><tbody>
+<tr role="row"><td role="cell" data-label="Approach"><a href="#nccl-cpu-en">Ordinary NCCL</a></td><td role="cell" data-label="Application entry point">CPU calls collective APIs such as <code>ncclAllReduce()</code>.</td><td role="cell" data-label="Backends covered here">The conventional NET/IB transport.</td><td role="cell" data-label="Request progress">NCCL schedules collective kernels; a CPU proxy posts NIC requests as chunks become ready.</td></tr>
+<tr role="row"><td role="cell" data-label="Approach"><a href="#nvshmem-en">NVSHMEM</a></td><td role="cell" data-label="Application entry point">PEs and symmetric memory; the examples use kernel-side put/get, signal and quiet.</td><td role="cell" data-label="Backends covered here"><a href="#nv-proxy-submit-en">CPU proxy / IBRC</a><br><a href="#ibgda-en">IBGDA</a><br><a href="#gpunetio-en">GPUNetIO</a></td><td role="cell" data-label="Request progress">The proxy builds and submits network requests on the CPU. IBGDA / GPUNetIO build WQEs on the GPU, with GPU or CPU-assisted doorbells.</td></tr>
+<tr role="row"><td role="cell" data-label="Approach"><a href="#gin-en">NCCL GIN</a></td><td role="cell" data-label="Application entry point">User CUDA kernels call <code>ncclGin</code> with ranks, windows and signals.</td><td role="cell" data-label="Backends covered here"><a href="#gin-proxy-en">CPU proxy</a><br><a href="#gin-gdaki-en">GDAKI / GPUNetIO</a></td><td role="cell" data-label="Request progress">The CPU proxy consumes GPU-published GIN requests. GDAKI delegates network operations to GPUNetIO's GPU queue implementation.</td></tr>
 </tbody></table>
-<p>GPU-initiated networking uses the CPU for initialization, connection exchange, memory registration and kernel launch. GDAKI (GPUDirect Async Kernel-Initiated) moves supported request-submission work into the GPU; GPUDirect RDMA supplies the GPU-memory-to-NIC data path. These capabilities concern request submission and payload transfer, respectively. [[gpureadme|GPUNetIO CPU / GPU roles]] · [[nccl-proxy|NCCL proxy]] · [[nv-dispatch|NVSHMEM transport dispatch]]</p>
+<p>API invocation, NIC-request submission and payload movement can occur in different places. A CPU proxy can submit requests while a GPUDirect RDMA-capable NIC accesses GPU memory directly. GDAKI (GPUDirect Async Kernel-Initiated) describes kernel-initiated NIC operations; GPUDirect RDMA supplies the direct GPU-memory-to-NIC data path. [[nccl-proxy|NCCL proxy]] · [[nv-dispatch|NVSHMEM dispatch]] · [[gin-select|GIN backend selection]] · [[gpureadme|GPUNetIO CPU / GPU roles]]</p>
+<p><strong>CUDA peer / NVLink is an interconnect mechanism.</strong> GPU loads and stores reach another GPU's memory through peer mappings; NCCL and NVSHMEM can use this path. Within the NCCL Device API, LSA addresses load/store-accessible peers, while GIN addresses network operations. Connectivity, driver support and mapping capabilities determine peer-access scope, as covered under <a href="#fabric-boundaries-en">CUDA peer and NVLink</a>. [[device-doc|LSA and GIN]]</p>
+<p><strong>Libraries and kernel modules are dependencies within a complete path.</strong> <code>libibverbs</code> supplies interfaces, <code>libmlx5</code> implements mlx5 userspace queue operations, <code>mlx5_ib</code> manages kernel RDMA resources, and <code>nvidia-peermem</code> participates in GPU memory registration. DMA-BUF can replace that registration mechanism in supported configurations; NCCL / NVSHMEM still provide communication semantics and progress. The <a href="#stack-en">software and drivers</a> section maps these dependencies. [[user-verbs|Verbs and driver roles]] · [[peermem|Peer memory]] · [[dmabuf|DMA-BUF]]</p>
 
-<h3 id="stack-en">1.2 Software and drivers</h3>
+<h3 id="dma-rdma-en">1.2 DMA and RDMA</h3>
+<p>An ordinary Ethernet NIC can receive a packet and DMA-write its data into a receive buffer in local host memory. DMA (Direct Memory Access) lets a device read and write memory through mappings prepared by its driver. The device moves the data; the CPU prepares buffers, descriptors and mappings, and handles submission and completion. [[dma-api|Linux DMA addresses and mappings]]</p>
+<table><thead><tr><th>Mechanism</th><th>Purpose</th><th>Typical data path</th></tr></thead><tbody>
+<tr><td>DMA</td><td>A device directly reads or writes locally accessible memory.</td><td>Local NIC ↔ host memory</td></tr>
+<tr><td>RDMA<br>Remote Direct Memory Access</td><td>A NIC executes remote-memory operations. RDMA Read/Write requests specify a remote address, length and access key; the NIC checks the registered range and permissions, then transfers data.</td><td>Host A memory ↔ NIC A ↔ network ↔ NIC B ↔ host B memory</td></tr>
+<tr><td>GPUDirect RDMA</td><td>GPU memory becomes accessible through a third-party device's direct DMA path. In RDMA networking, a NIC can directly access registered GPU buffers.</td><td>GPU A memory ↔ NIC A ↔ network ↔ NIC B ↔ GPU B memory</td></tr>
+</tbody></table>
+<p><strong>Passing through a NIC does not make a transfer RDMA.</strong> Ordinary TCP/IP traffic also uses local DMA. RDMA adds remote-memory operations, access protection and completion mechanisms understood by the NIC; the endpoints register memory and exchange the addresses and keys needed for remote access in advance. GPUDirect RDMA extends the accessible memory to GPU buffers. [[rdma-guide|RDMA operations]] · [[gdr-doc|GPUDirect RDMA]]</p>
+
+<h4 id="rdma-objects-en">Memory and queue objects</h4>
+<p>An RDMA Read needs authorized memory access, a submitted request and a completion result. These steps use the following objects.</p>
+<table><thead><tr><th>Term</th><th>Meaning and role</th></tr></thead><tbody>
+<tr><td>MR · Memory Region</td><td>A memory range registered with an RDMA device, with address bounds, access permissions and mappings. It can cover host memory or supported GPU memory.</td></tr>
+<tr><td><code>lkey</code> / <code>rkey</code><br>Local / remote access key</td><td>Access identifiers obtained during MR registration. The local buffer uses <code>lkey</code>; a peer receives <code>rkey</code> for remote-memory access checks.</td></tr>
+<tr><td>PD · Protection Domain</td><td>Associates local resources such as QPs and MRs, restricting which queues can use which registered memory.</td></tr>
+<tr><td>QP · Queue Pair</td><td>Contains a send queue (SQ) and a receive queue (RQ). An initiator posts RDMA Read/Write operations to its SQ; the RQ holds receive requests that supply buffers for operations such as Send.</td></tr>
+<tr><td>WR · Work Request</td><td>A software operation description, such as “read 4096 bytes from B into A.” It specifies the operation, local buffer, length, remote address and <code>rkey</code>.</td></tr>
+<tr><td>WQE · Work Queue Element</td><td>A descriptor in the work queue, encoded in a format the NIC understands. A CPU verbs provider converts WRs into WQEs; a GPU submission path can construct them in device code.</td></tr>
+<tr><td>Doorbell</td><td>A mechanism that notifies the NIC of new work. The mlx5 path updates a DBR (Doorbell Record) in memory with queue progress, then writes a mapped MMIO doorbell to prompt WQE processing.</td></tr>
+<tr><td>CQ / CQE<br>Completion Queue / Entry</td><td>A CQ holds completion records called CQEs, including success or error status. The sender can select which successful requests produce CQEs and retrieve their results from the CQ.</td></tr>
+</tbody></table>
+<p>For a CPU verbs request with completion reporting enabled, the path is: <strong>build WR → provider writes WQE → ring doorbell → NIC executes → read CQE from CQ</strong>. The MR supplies the mappings and permissions for memory access. [[rdma-guide|RDMA objects]] · [[verbs-mr|Memory registration]] · [[verbs-post-send|Request and completion options]] · [[mlx5-doorbell|mlx5 doorbell implementation]]</p>
+
+<h4 id="rdma-read-en">Reading a GPU buffer with RDMA</h4>
+<p>A reads <strong>4 KiB</strong> from B's GPU memory into its own GPU memory. Both endpoints have established a reliable-connected (RC) queue pair, or QP, and registered their buffers as memory regions, or MRs. B grants remote-read access to its source MR and gives A the remote address and <code>rkey</code>. A's destination MR allows local writes. A submits a request containing B's address and <code>rkey</code>, plus its own destination address and <code>lkey</code>. These keys identify the remote and local memory-access resources. [[verbs-mr|MR permissions]] · [[verbs-post-send|RDMA Read request fields]]</p>
+{{rdma-read}}
+<p>A issues the request; data flows from B to A. Steps ③ and ⑤ are local DMA operations by the two NICs; steps ① and ④ carry the RDMA request and response across the network. B's NIC validates and reads through the registered MR. This example requests a completion notification: A receives a CQE in its completion queue, or CQ, when the read completes. Before GPU code consumes the destination, the communication library or CUDA interface must also establish memory visibility. [[rdma-guide|RDMA Read]] · [[verbs-post-send|Completion notification]] · [[gdr-ordering|GPU memory visibility]]</p>
+
+<h3 id="stack-en">1.3 Software and drivers</h3>
 {{architecture}}
+<h4 id="dma-software-en">DMA software paths</h4>
+<p>With a ConnectX NIC, Ethernet and RDMA share the NIC and the device infrastructure in <code>mlx5_core</code>. Ordinary networking uses TCP/IP and the Ethernet driver; RDMA uses verbs and the RDMA driver. Drivers configure DMA through the Linux DMA API. [[mlx5-ethernet|mlx5e and mlx5_core]] · [[mlx5-dma|DMA mappings in Ethernet transmit]]</p>
+<table><thead><tr><th>Case</th><th>User-space libraries and interfaces</th><th>Linux modules and device entry points</th><th>Connection to the diagram</th></tr></thead><tbody>
+<tr><td>Ordinary NIC DMA<br>TCP/IP example</td><td>libc <code>socket</code>, <code>send</code> and <code>recv</code>, using a socket fd.</td><td>TCP/IP stack → mlx5e Ethernet driver, built into <code>mlx5_core.ko</code>. The driver prepares host-memory mappings with interfaces such as <code>dma_map_*</code>.</td><td>Uses the Ethernet functionality of the diagram's NIC and <code>mlx5_core</code>. Local DMA moves data to or from host memory. [[mlx5-build|Module build]]</td></tr>
+<tr><td>Host-memory RDMA</td><td><code>libibverbs</code> → <code>libmlx5</code>; register MRs and submit WRs such as Read/Write.</td><td><code>/dev/infiniband/uverbsN</code> → <code>ib_uverbs</code> / <code>ib_core</code> → <code>mlx5_ib</code> / <code>mlx5_core</code>.</td><td>Uses the verbs, uverbs, mlx5 and NIC nodes. Registration and DMA mappings target host memory. [[user-verbs|Userspace verbs]]</td></tr>
+<tr><td>GPU-memory RDMA</td><td>Reuses verbs and the provider; <code>libcuda</code> allocates, identifies or exports GPU buffers. NCCL / NVSHMEM wrap these operations.</td><td>Adds NVIDIA resource management through <code>/dev/nvidiactl</code>, <code>/dev/nvidiaN</code> and the GPU driver. GPU registration uses <code>nvidia-peermem</code> or supported DMA-BUF export/import.</td><td>Uses the CUDA, GPU-driver and registration nodes, plus the purple GPU ↔ NIC data path. UVM manages GPU virtual address spaces; the NIC uses DMA mappings established by registration. [[gdr-doc|GPU memory access]] · [[gdaki-reg|Registration implementation]]</td></tr>
+</tbody></table>
+<p>The GPU adaptation <strong>maps GPU memory for NIC access and manages the lifetime of those mappings</strong>. For conventional pinned registrations, Linux drivers obtain and pin host-memory pages. GPU memory uses NVIDIA driver support for export, mapping and release coordination; the RDMA driver builds MRs and access keys from those resources. Verbs retain their RDMA Read/Write semantics. Constructing WQEs and ringing doorbells in GPU kernels is a further submission extension, covered in the IBGDA / GDAKI chapters. [[peermem|Peer-memory cooperation]] · [[gdaki-reg|DMA-BUF registration]] · [[gpureadme|GPU submission interfaces]]</p>
+
+
 <h4 id="libraries-en">Host and device code</h4>
 <p>A communication library can provide both CPU and GPU code. Host libraries load into CPU processes; device APIs execute on the GPU.</p>
 <table><thead><tr><th>Component</th><th>Execution and responsibility</th><th>Source / interface</th></tr></thead><tbody>
@@ -34,6 +70,15 @@
 </tbody></table>
 <p><code>libmlx5</code> is a userspace provider; <code>mlx5_ib.ko</code> is a kernel module. CPU code submits requests through verbs interfaces such as <code>ibv_post_send()</code>, while GPUNetIO device functions implement GPU queue operations. Both use resources established during setup.</p>
 
+<h4 id="device-files-en">Device files</h4>
+<p>User-space libraries open character devices to obtain fds, then use those fds to request resources, memory registration or mappings from the kernel. The device-node row connects user libraries to Linux drivers; <code>N</code> denotes the node number. [[verbs-open|Opening a verbs device]] · [[gpu-fops|NVIDIA file operations]]</p>
+<table><thead><tr><th>Device file</th><th>Requests and dispatch</th><th>Kernel entry point</th></tr></thead><tbody>
+<tr data-component-row="dev-uverbs"><td><code>/dev/infiniband/uverbsN</code></td><td><code>libibverbs</code> opens the RDMA device to obtain a command fd. Providers such as <code>libmlx5</code> use it for resource-related <code>ioctl</code> / <code>write</code> and <code>mmap</code> operations. <code>ib_uverbs</code> receives the requests and calls the device driver.</td><td>[[uverbs-fops|uverbs_fops / uverbs_mmap_fops]] → <code>ib_uverbs</code> → <code>mlx5_ib</code></td></tr>
+<tr data-component-row="dev-core"><td><code>/dev/nvidiactl</code>, <code>/dev/nvidiaN</code></td><td><code>libcuda</code> uses the core control and per-GPU nodes to establish GPU resources, memory and mappings. Once a node is open, the core driver's file-operations table dispatches operations such as <code>ioctl</code> and <code>mmap</code>.</td><td>[[gpu-fops|nvidia_fops]] → <code>nvidia.ko</code></td></tr>
+<tr data-component-row="dev-uvm"><td><code>/dev/nvidia-uvm</code></td><td><code>libcuda</code> uses UVM-device <code>ioctl</code> requests to configure address spaces and <code>mmap</code> to establish mappings.</td><td>[[uvm-fops|uvm_fops]] → <code>nvidia-uvm.ko</code></td></tr>
+</tbody></table>
+<p>Once resources and mappings are established, a CPU provider or GPU kernel can operate on work queues and doorbells directly; the diagram keeps these as separate arrows to the NIC. <code>nvidia-peermem.ko</code> participates in registration through kernel peer-memory callbacks. The DMA-BUF path uses an exported buffer fd. [[user-verbs|Resource management and the fast path]] · [[peermem|Peer-memory callbacks]] · [[gdaki-reg|DMA-BUF registration]]</p>
+
 <h4 id="modules-en">Linux and hardware</h4>
 <table><thead><tr><th>Component</th><th>Responsibility</th><th>Related interface</th></tr></thead><tbody>
 <tr data-component-row="nvidia"><td><code>nvidia.ko</code></td><td>Core GPU driver / Kernel RM: GPU resources, memory, mappings and interconnect resources.</td><td>[[gpu-core|Source]]; <code>/dev/nvidiactl</code>, <code>/dev/nvidiaN</code></td></tr>
@@ -46,8 +91,8 @@
 </tbody></table>
 <p>These Linux modules primarily handle resource setup, mappings and lifetime. Once queues and doorbells are mapped, CPU verbs fast paths can access them without a syscall for each send. GPU submission moves some of this work into device code. [[user-verbs|Userspace verbs fast path]]</p>
 
-<h3 id="fabric-boundaries-en">1.3 CUDA peer</h3>
-<p>CUDA peer access uses GPU-visible mappings: CPU drivers establish permissions and page tables, then GPU loads/stores reach peer memory over NVLink / PCIe. RDMA uses NIC queues, MRs and access keys, with different address interpretation and submission mechanisms. [[user-verbs|Linux userspace verbs]]</p>
+<h3 id="fabric-boundaries-en">1.4 CUDA peer and NVLink</h3>
+<p>CUDA peer access uses GPU-visible mappings: CPU drivers establish permissions and page tables, then GPU loads/stores reach peer memory directly over NVLink / PCIe. These memory accesses do not pass through NIC RDMA submission queues. Connectivity, drivers and mapping capabilities determine which GPUs are accessible. NIC RDMA establishes remote memory operations through QPs, MRs and access keys. [[device-doc|CUDA P2P, LSA and GIN]] · [[user-verbs|RDMA resource interfaces]]</p>
 <p>[[peer-post|GPU P2P access]] covers peer loads/stores, same-process and cross-process mappings, P100 PTEs, NCCL LSA and NVLink / PCIe routing. Its <a href="gpu-peer-to-peer-memory.html#en-fabric-mapping">cross-node mapping</a> section describes FABRIC handles and IMEX. The component table and sharing sequence here compare NVLink management with networking.</p>
 <div id="nvlink-en"><details class="path-reference"><summary>NVLink management and sharing sequence</summary>
 <h4 id="services-en">Management components</h4>
@@ -62,7 +107,7 @@
 <p id="cross-os-en">IMEX management connections coordinate shared-memory lifetime; payload uses the NVLink fabric after mapping. Ordinary CUDA IPC handles remain node-local. Cross-OS sharing requires compatible FABRIC handles, drivers and permissions. [[vmm-doc|Fabric memory handles]]</p>
 </details></div>
 
-<h3 id="inspection-en">1.4 Observation and source</h3>
+<h3 id="inspection-en">1.5 Observation and source</h3>
 <details class="path-reference"><summary>Topology, loaded libraries and command output</summary>
 <h4 id="commands-en">Inspection commands</h4>
 <p>The inspection commands are read-only. Outputs show <strong>illustrative formats</strong>; device numbers, library paths and service placement depend on the target host.</p>
@@ -83,20 +128,13 @@
 
 </details>
 
-<h2 id="nccl-cpu-en">2. NCCL CPU proxy</h2>
+<h2 id="nccl-cpu-en">2. Ordinary NCCL</h2>
 <p>In the ordinary NCCL NET/IB path, a CPU proxy progresses network requests. <code>libnccl.so</code> organizes the collective; the proxy submits WRs through <code>libibverbs</code> and <code>libmlx5</code>. With GPUDirect RDMA enabled, the NIC transfers GPU buffers directly. Connection and memory setup precede the chunks that reuse those resources.</p>
 
 <div id="resources-en"></div>
 <h3 id="queues-en">2.1 Connections and queues</h3>
 <p>Before a cross-host transfer, the CPU prepares queues, memory addresses and access permissions for both endpoints. CPU or GPU submission code then uses this information.</p>
-<table><thead><tr><th>Object</th><th>Meaning</th><th>Role in a write</th></tr></thead><tbody>
-<tr><td>PD</td><td>Protection Domain</td><td>Associates QPs and registered memory within an access-protection domain.</td></tr>
-<tr><td>MR / lkey / rkey</td><td>Memory Region and local / remote access keys</td><td>Identify NIC-accessible memory, bounds and permissions. Peers exchange remote addresses and rkeys.</td></tr>
-<tr><td>QP</td><td>Queue Pair</td><td>Holds hardware work queues. Which queue is used depends on the operation.</td></tr>
-<tr><td>WR / WQE</td><td>Work Request / Work Queue Element</td><td>Describe source, size, destination and key. A WR is a software request; a WQE is its hardware queue representation.</td></tr>
-<tr><td>Doorbell</td><td>Notification of queue progress</td><td>Lets the NIC discover work. Memory records such as DBRs have distinct roles from MMIO doorbells.</td></tr>
-<tr><td>CQ / CQE</td><td>Completion Queue / Entry</td><td>Report requested completion notifications and errors. Batching or selective signaling need not produce one CQE per WQE.</td></tr>
-</tbody></table>
+<p>Each endpoint creates a PD, associates its QP and registered MRs with that domain, and assigns CQs to the QP. The endpoints exchange connection information and the MR addresses and rkeys needed for remote access. Section 1.2 defines these <a href="#rdma-objects-en">memory and queue objects</a>.</p>
 <p>An ordinary RDMA Write accesses a remote MR without a matching receive buffer for every write. Send/Recv and some operations with immediate data have different receive-resource and notification requirements. The communication library or application must also define when the receiver can consume the buffer.</p>
 {{setup}}
 
@@ -109,7 +147,7 @@
 
 <p>Zero-copy means payload can avoid staging through CPU memory. Initialization messages, address/key exchange, queue control and completion state remain on the control path. <code>nvidia-peermem</code> helps establish access resources; hardware moves the payload.</p>
 
-<h3 id="proxy-en">2.3 Submission and completion</h3>
+<h3 id="proxy-en">2.3 NET/IB CPU proxy</h3>
 <p>A CPU call to <code>ncclAllReduce()</code> selects an algorithm and connections, scheduling GPU kernels and required host work. One collective may combine local peer transfers with network transfers. The sequence shows <strong>one outgoing chunk in the ordinary NET/IB transport</strong>, with GPUDirect RDMA enabled for the connection. [[nccl-api|API entry]]</p>
 {{cpu}}
 <p><code>sendProxyProgress()</code> checks GPU / FIFO progress and calls the network plugin's <code>isend</code> when a chunk is ready. Once transmission can proceed, the internal IB implementation builds verbs work and passes it through <code>ibv_post_send()</code> to the mlx5 userspace provider. The provider writes the queue and notifies the NIC, which DMA-reads GPU payload and transmits it to the peer. [[nccl-proxy|Ready / isend / test]] · [[nccl-isend|NET/IB send]] · [[mlx5-send|mlx5 provider]]</p>
@@ -119,8 +157,8 @@
 <p>The CPU proxy submits descriptors and control information, while GPU payload can use GDR. Without GDR, or with a socket backend or another transport, the data path changes. The actual <code>ncclAllReduce()</code> call chain depends on the selected network plugin and its implementation.</p>
 <p>The pinned NCCL version can also select GIN kernels through its host API: the CPU initiates a collective whose kernel initiates network requests. This chapter describes the ordinary NET/IB CPU proxy transport. Identifying a path in a trace requires checking the algorithm, transport, GDR registration and proxy activity together. [[nccl-sym-gin|GIN kernel option for host APIs]]</p>
 
-<h2 id="nvshmem-en">3. NVSHMEM CPU proxy</h2>
-<p>An NVSHMEM kernel can delegate network submission to a CPU proxy. The sequence uses the <code>PROXY</code> device path for a remote target and IBRC as the host transport. Directly accessible local peers can still use loads/stores. [[nv-dispatch|Device dispatch]] · [[nv-select|Transport selection]]</p>
+<h2 id="nvshmem-en">3. NVSHMEM</h2>
+<p>NVSHMEM expresses one-sided communication through PEs and symmetric memory. Applications use the same put/get and synchronization interfaces; the device transport chooses peer access, CPU proxy, IBGDA or GPUNetIO according to target reachability and configuration. The network backends below use the same application example. [[nv-dispatch|Device dispatch]] · [[nv-select|Transport selection]]</p>
 
 <h3 id="symmetric-en">3.1 PEs and the symmetric heap</h3>
 <p>NVSHMEM provides one-sided communication: a caller specifies a target PE and puts/gets its symmetric memory. PEs establish corresponding objects through consistent collective allocation order. A symmetric address identifies the corresponding allocation and offset at a peer; numerical virtual addresses need not be identical across processes. [[nv-doc|NVSHMEM programming model]]</p>
@@ -129,31 +167,32 @@
 <p class="code-context">The example uses two PEs, each bound to one GPU. dst and signal are symmetric allocations; signal starts at 0 and src is ready. Each PE executes one round with one block and one thread. <code>nvshmemx_collective_launch</code> launches the kernel containing cross-PE waits. The [[nv-example|official ring-bcast example]] provides initialization and collective-launch code.</p>
 <p><code>put_signal_nbi</code> associates data transfer with remote notification. <code>quiet</code> completes prior operations issued by the calling thread; the receiver uses <code>signal_wait_until</code> to wait for data. Reusing remote storage also requires confirmation that the receiver has finished consuming it, or an iteration protocol. With multiple issuing threads, ensure their operations have been issued before the thread that calls quiet. [[nv-ordering|Memory ordering]] · [[nv-signal|Signals]]</p>
 
-<h3 id="nv-proxy-submit-en">3.2 Requests and completion</h3>
+<h3 id="nv-proxy-submit-en">3.2 CPU proxy / IBRC</h3>
+<p>An NVSHMEM kernel can delegate network submission to a CPU proxy. The sequence uses the <code>PROXY</code> device path for a remote target and IBRC as the host transport. Directly accessible local peers can still use loads/stores. [[nv-dispatch|Device dispatch]] · [[nv-select|Transport selection]]</p>
 <p><code>libnvshmem_host.so</code> establishes PEs, the symmetric heap and transports. IBRC creates connections and registers GPU memory through verbs/providers. Linux <code>ib_uverbs / ib_core</code>, <code>mlx5_ib / mlx5_core</code> and GPU registration interfaces prepare resources as described under <a href="#registration-en">GPU memory registration</a>.</p>
 {{nvproxy}}
 <p>The kernel publishes a request containing the PE, addresses and length. The CPU proxy consumes it; IBRC builds RDMA WRs and calls <code>ibv_post_send()</code>. CPU progress polls the CQ and updates completion state, while GPU quiet and the receiver's signal wait follow NVSHMEM completion semantics. The CPU constructs NIC requests while payload can move directly from GPU memory through the NIC. [[nv-proxy|IBRC submission]] · [[nv-proxy-cq|IBRC completion]]</p>
 
-<h2 id="ibgda-en">4. NVSHMEM IBGDA</h2>
+<h3 id="ibgda-en">3.3 IBGDA</h3>
 <p><strong>IBGDA</strong> is NVSHMEM's InfiniBand GPUDirect Async transport and directly manages mlx5 queues. Host code establishes resources and GPU-accessible NIC mappings; device code writes WQEs, publishes queue progress and rings the doorbell. <code>ibgda_post_send()</code> contains ordering operations, DBR updates and calls to <code>ibgda_ring_db()</code>. Supported mlx5 configurations can use RoCE as well as InfiniBand. [[ibgda-host|Host mapping]] · [[ibgda-db|GPU submission]]</p>
 
-<h3 id="ibgda-setup-en">4.1 Resources and configuration</h3>
+<h4 id="ibgda-setup-en">Resources and configuration</h4>
 <p>IBGDA host code uses verbs / mlx5 to create QPs, CQs and MRs, then prepares GPU-accessible queues and NIC mappings. GPU memory uses supported registration through peer memory or DMA-BUF; device code receives the addresses, keys and state needed for queue submission. [[ibgda-host|IBGDA host mapping]]</p>
 {{code:nv-ibgda-env}}
 <p class="code-context">Pass these variables to each PE. The launcher controls process count and GPU binding; the build and platform must support this transport.</p>
 
-<h3 id="ibgda-submit-en">4.2 GPU submission</h3>
+<h4 id="ibgda-submit-en">GPU submission</h4>
 {{ibgda-path}}
 <p>The application uses the <a href="#symmetric-en">same put / signal kernel</a>. After CPU resource setup, the IBGDA device transport builds WQEs, publishes queue state with the required memory ordering and notifies the NIC. Quiet waits for issued operations to complete; the remote signal establishes the receiver's data dependency. [[ibgda-db|WQEs and doorbells]] · [[nv-ordering|Completion semantics]]</p>
 
-<h3 id="ibgda-doorbell-en">4.3 Doorbell mode</h3>
+<h4 id="ibgda-doorbell-en">Doorbell mode</h4>
 <p><code>NVSHMEM_IBGDA_NIC_HANDLER=auto</code> prefers GPU doorbells and falls back to the CPU when unsupported. Explicit choices include <code>gpu</code>, <code>cpu</code> and <code>cpu_host_memory</code>; the latter two use different CPU-accessible memory mechanisms. [[nv-env|NIC handler configuration]]</p>
 <p>The sequence uses direct GPU doorbells. In CPU-assisted mode, the GPU prepares WQEs and publishes pending work, while the CPU progresses doorbells. Submission analysis therefore needs to identify both the WQE producer and the processor that rings the doorbell.</p>
 
-<h2 id="gpunetio-en">5. NVSHMEM GPUNetIO</h2>
+<h3 id="gpunetio-en">3.4 GPUNetIO</h3>
 <p><code>GPUNETIO_GDAKI</code> is another NVSHMEM device transport. NVSHMEM supplies PE, symmetric-address and synchronization semantics; GPUNetIO supplies queue operations. It is an alternative to IBGDA's direct mlx5 queue implementation. [[nv-dispatch|Dispatch]] · [[nv-gpunetio|QP creation]]</p>
 
-<h3 id="gpunetio-setup-en">5.1 Resource export</h3>
+<h4 id="gpunetio-setup-en">Resource export</h4>
 <p>GPUNetIO Verbs provides common interfaces for GPU access to NIC queues. CPU code creates QPs, CQs and MRs through verbs / mlx5 and exports device descriptors. GPU code calls functions such as <code>doca_gpu_dev_verbs_put()</code> to construct and submit WQEs and observe completion. NCCL's GDAKI backend and NVSHMEM's GPUNetIO transport can both use these interfaces. [[gpureadme|Open GPUNetIO implementation]]</p>
 <table><thead><tr><th>Stage</th><th>Representative interface</th><th>Execution</th></tr></thead><tbody>
 <tr><td>Resource creation</td><td><code>ibv_open_device</code>, <code>ibv_alloc_pd</code>, MR registration, <code>doca_verbs_*</code></td><td>CPU, entering the kernel where hardware setup requires it.</td></tr>
@@ -165,32 +204,95 @@
 {{code:nv-gpunetio-env}}
 <p>NVSHMEM 3.8.0 rejects enabling IBGDA and GPUNetIO GDAKI together. Pass the selected configuration to every PE through the launcher. [[nv-select|Mutual-exclusion check]]</p>
 
-<h3 id="gpunetio-submit-en">5.2 Device verbs</h3>
+<h4 id="gpunetio-submit-en">Device verbs</h4>
 {{nvgda}}
 <p>After resource export, the NVSHMEM device transport delegates put / signal to GPUNetIO. Device code constructs WQEs, submits the queue and observes CQEs; the NIC executes GPU-buffer DMA and network transfer. The receiving PE consumes data under the <a href="#symmetric-en">NVSHMEM signal protocol</a>. [[gpu-put|Device put]] · [[gpu-submit|Submit]] · [[gpu-cq|CQ]]</p>
 
-<h3 id="gpunetio-doorbell-en">5.3 CPU-assisted doorbells</h3>
+<h4 id="gpunetio-doorbell-en">CPU-assisted doorbells</h4>
 <p><code>NVSHMEM_GPUNETIO_NIC_HANDLER</code> supports <code>auto</code>, <code>gpu</code> and <code>cpu</code>. Auto prefers the GPU and falls back to the CPU when unsupported. [[nv-env|Configuration definitions]]</p>
 <p>With CPU-assisted doorbells, the GPU can construct WQEs and poll CQEs while the CPU handles the agreed doorbell progress. A higher-level request proxy instead consumes GPU-published requests and constructs verbs WRs on the CPU. [[gpu-cpu-db|CPU doorbell progress]] · [[gpu-submit|Device submission]] · [[gpu-cq|Device completion]]</p>
 <p>Open GPUNetIO focuses on one-sided RDMA GDAKI and supports standalone builds and project integration. Its <code>doca_*</code> interfaces can be used without the full DOCA SDK, which provides additional features. NCCL's bundled GPUNetIO revision may differ from the independent snapshot; source analysis should follow each project's actual call sites.</p>
 
-<h2 id="gin-en">6. NCCL GIN / GDAKI</h2>
+<h3 id="uar-map-en">3.5 UAR and GPU page tables</h3>
+<p>Both IBGDA and GPUNetIO require GPU access to NIC registers for direct doorbells. Their registration code illustrates the UAR mapping below. <a href="#gin-gdaki-en">NCCL GIN / GDAKI</a> uses the same mechanism through GPUNetIO.</p>
+<p>A UAR (User Access Region) exposes NIC registers to an application, including doorbell / BlueFlame registers. For a GPU to ring a doorbell directly, its virtual address must map to that region of the NIC BAR. CPU initialization establishes the mapping; the GPU then issues an MMIO store through the mapped address. [[uar-man|UAR interface]]</p>
 
-<h3 id="windows-en">6.1 Windows and resources</h3>
-<p>GIN (GPU-Initiated Networking) is the network interface in NCCL's Device API. An application kernel chooses the transfer timing and target rank, placing communication near data production or consumption. The host establishes communicators, memory windows, signals and network contexts.</p>
+<h4 id="uar-host-mapping-en">Registering the address</h4>
+<p><code>mlx5dv_devx_alloc_uar()</code> allocates a UAR. The provider allocates resources and calls <code>mmap</code> through a <code>/dev/infiniband/uverbsN</code> file descriptor. The returned <code>uar-&gt;reg_addr</code> is a <strong>CPU virtual address</strong> for doorbell access in that process. The NVIDIA driver can map the same I/O region into GPU address space. [[uar-provider|Provider ioctl and mmap]]</p>
+<p>This helper follows the registration steps in NVSHMEM's <code>ibgda_nic_mem_gpu_map()</code>. Pass <code>uar-&gt;reg_addr</code> as <code>cpu_reg</code> and the register span as <code>bytes</code>. In the pinned version, the dedicated NC branch uses 8 bytes; the BF branch derives the size from the device's <code>log_bf_reg_size</code>. [[ibgda-host|NVSHMEM registration]] · [[uar-allocation|UAR type and size]]</p>
+{{code:uar-map}}
+<p><code>Mapped</code> requests a GPU mapping. <code>IoMemory</code> identifies a device I/O region and marks it as non-cache-coherent and physically contiguous; <code>Portable</code> extends registration across CUDA contexts. <code>cudaHostGetDevicePointer()</code> returns the address for GPU access, which can differ numerically from the CPU pointer. The driver handles page mappings internally; <code>bytes</code> describes the registered range. [[uar-cuda-api|CUDA registration semantics]]</p>
+<p>NVSHMEM stores the GPU pointer in <code>dev_qp-&gt;tx_wq.bf</code> and configures the QP with the same UAR's <code>page_id</code>. GPUNetIO's <code>doca_gpu_verbs_export_uar()</code> performs the same registration and pointer lookup for device paths such as GDAKI. Once the GPU and QP have stopped using the UAR, call <code>cudaHostUnregister(cpu_reg)</code> before freeing the UAR. [[uar-qp|QP UAR configuration]] · [[uar-device-pointer|Device pointer assignment]] · [[uar-gpunetio|GPUNetIO export]]</p>
+
+<h4 id="uar-pte-en">PTE target and attributes</h4>
+<p>The open driver's I/O memory import path checks the CPU VMA for <code>VM_IO / VM_PFNMAP</code>, obtains the device resource's PFNs through the CPU mapping, and creates a descriptor marked <code>MEMDESC_FLAGS_PEER_IO_MEM</code>. This descriptor uses the <code>ADDR_SYSMEM</code> address class and handles GPU-visible bus addresses and IOMMU mappings. The system aperture also carries device MMIO. [[uar-pfn|CPU mapping and PFNs]] · [[uar-osdesc|I/O memory descriptor]]</p>
+<p><strong>Hopper's VER3 PTE</strong> combines permissions and cache attributes in <code>PCF</code> (Permission Control Flags). Blackwell UVM in the open driver copies Hopper's MMU HAL and retains <code>make_pte_hopper()</code> for leaf PTE construction. Other HAL members handle Blackwell's page-size extensions. The example below follows this shared construction path for a 4 KiB mapping. [[uar-pte-fields|GH100 VER3 fields]] · [[uar-pte-build|Hopper PTE construction]] · [[uar-pte-blackwell|Blackwell HAL inheritance]]</p>
+<p>This example selects a PCIe UAR mapping that ordinary user kernels can read and write, with GPU-uncached access, GPU atomics disabled, and access counters disabled. The values encode that configuration using the public format; CUDA constructs the actual page tables according to the platform and mapping policy.</p>
+<table><thead><tr><th>Field and bits</th><th>Example value</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>VALID [0]</code></td><td>1</td><td>Valid mapping.</td></tr>
+<tr><td><code>APERTURE [2:1]</code></td><td>3 · <code>SYSTEM_NON_COHERENT_MEMORY</code></td><td>Select the non-coherent system address path targeting the NIC's PCIe MMIO resource.</td></tr>
+<tr><td><code>PCF [7:3]</code></td><td><code>0x19</code> · <code>REGULAR_RW_NO_ATOMIC_UNCACHED_ACD</code></td><td>Regular access, read/write, GPU atomics disabled, GPU uncached, access counters disabled. [[uar-pcf|PCF selection]]</td></tr>
+<tr><td><code>KIND [11:8]</code></td><td><code>0x6</code> · <code>GENERIC_MEMORY</code></td><td>Use the UVM builder's generic memory layout. [[uar-kind|KIND definitions]]</td></tr>
+<tr><td><code>ADDRESS [51:12]</code></td><td>GPU-visible target page address <code>&gt;&gt; 12</code></td><td>Encode the NIC MMIO page in PTE bits 12–51 using the driver's bus / IOMMU mapping. The page offset selects the doorbell register.</td></tr>
+<tr><td><code>PEER_ID [63:61]</code></td><td>Left at 0 here</td><td>Used with the peer aperture; this example reaches the NIC through the system non-coherent aperture.</td></tr>
+</tbody></table>
+<p><code>PCF=0x19</code> selects a named combination of attributes: <code>REGULAR</code> permits ordinary kernels, <code>RW</code> permits loads and stores, <code>UNCACHED</code> specifies GPU-uncached access, and <code>ACD</code> means Access Counters Disabled. <code>NO_ATOMIC</code> restricts GPU atomics through this mapping; RDMA atomics execute on the NIC according to the WQE. The driver selects PCF according to permissions, caching and access-counter policy. For example, the corresponding encoding with access counters enabled is <code>0x09</code> (<code>ACE</code>). [[uar-pcf|Permissions and PCF]] · [[uar-rm-pcf|RM PCF construction]]</p>
+<p><code>APERTURE</code> selects the system coherency path, while PCF's <code>UNCACHED</code> selects the GPU cache policy. This helper assembles the example's fields into a 64-bit value following <code>make_pte_hopper()</code>. CUDA registration establishes the actual page tables. [[uar-aperture|Aperture selection]] · [[uar-pte-build|Field assembly]]</p>
+{{code:uar-pte}}
+<p>The low 12 bits are <code>0x6CF = (0x6 &lt;&lt; 8) | (0x19 &lt;&lt; 3) | (3 &lt;&lt; 1) | 1</code>. For a GPU-visible NIC page address of <code>0x0000800012345000</code>, the encoded PTE is <code>0x00008000123456CF</code>. A GPU virtual address with page offset <code>0x20</code> then targets NIC address <code>0x0000800012345020</code>. These addresses illustrate the calculation; actual values come from the driver's resource mapping.</p>
+
+<h4 id="uar-store-en">From store to PCIe</h4>
+<p>The GPU submitting thread prepares WQEs, updates the DBR, then writes the UAR. The DBR records queue progress in memory; the UAR doorbell is a device register. This helper isolates a 64-bit doorbell write following GPUNetIO's <code>fence + st.mmio.relaxed</code> submission pattern. It uses <code>fence.acq_rel.sys</code> to provide the required release ordering. <code>%0</code> is the GPU address, and <code>%1</code> is a doorbell value already encoded in mlx5 format and byte order. [[uar-mmio-submit|GPUNetIO submission]] · [[uar-mmio-instruction|MMIO store]]</p>
+{{code:uar-store}}
+<p><code>fence.acq_rel.sys</code> provides both acquire and release ordering; here, its release semantics publish the submitting thread's prior writes. <code>.mmio</code> specifies device-register access semantics, and <code>.sys</code> selects system scope. This instruction sequence requires a toolchain supporting PTX 8.2 MMIO and an <code>sm_70</code> or later target. With multiple queue producers, the submitting thread must also use the library's synchronization protocol to establish that their writes are ready. [[uar-ptx|PTX store semantics and target support]] · [[uar-fence|Fence semantics]]</p>
+<pre><code>GPU store [gpu_doorbell_ptr], encoded_doorbell
+    ↓ GPU TLB / page tables: address, aperture, caching, permissions
+GPU-visible NIC BAR address (with the platform's bus / IOMMU mapping)
+    ↓ PCIe Memory Write
+NIC UAR doorbell register
+    ↓ Fetch WQEs using the QP and queue progress
+NIC executes DMA and network operations; reports CQEs as configured</code></pre>
+<p>The register write carries doorbell control information; the NIC subsequently moves payload as described by the WQEs. VER3 PTE <code>PCF</code> includes cache attributes, while C++ <code>volatile</code>, PTX memory ordering and MMIO semantics constrain instruction behavior. NVSHMEM uses its own store / barrier helpers. GPUNetIO selects MMIO or another supported submission branch according to the toolchain and configuration. [[ibgda-db|NVSHMEM ordering]] · [[uar-mmio-submit|GPUNetIO branches]]</p>
+
+<h2 id="gin-en">4. NCCL GIN</h2>
+<p>GIN gives user CUDA kernels a networking interface built around ranks, windows and signals. CPU proxy and GDAKI implement the same <code>ncclGin</code> interface. Backend selection changes how NIC requests execute, while the application can reuse the put / signal example. [[gin-api|GIN interface]] · [[gin-select|Backend selection]]</p>
+
+<h3 id="windows-en">4.1 Windows and resources</h3>
+<p>CPU setup establishes communicators, memory windows, signals and network contexts for each rank. This common initialization retains the default <code>ginType</code>, allowing NCCL to select an available backend. The backend sections show how to request one explicitly.</p>
 {{code:gin-setup}}
-<p class="code-context">The initialization excerpt uses NCCL 2.32.3 and omits error checks and ordinary communicator initialization. Both ranks establish corresponding src / dst windows with the same bytes and initialize src. After execution, synchronize the kernel before releasing the device communicator, windows and allocations. Creation fails if GDAKI is explicitly requested but unavailable.</p>
+<p class="code-context">The initialization excerpt uses NCCL 2.32.3 and omits error checks and ordinary communicator initialization. Both ranks establish corresponding src / dst windows with the same bytes and initialize src. After execution, synchronize the kernel before releasing the device communicator, windows and allocations.</p>
 <p><code>ginType</code> requests a backend; its default allows selection of an available backend. CPU proxy, GDAKI and other implementations provide the same <code>ncclGin</code> interface, with the selected backend determining NIC submission. [[gin-reqs|Resource requirements]] · [[gin-select|Backend selection]]</p>
-<p>NCCL GDAKI contains both DMA-BUF and GPU MR registration paths. Allocation type, driver and platform capabilities determine the choice. GIN buffers backed by multiple cuMem segments require DMA-BUF. [[gdaki-reg|Registration source]] · [[device-doc|GIN requirements]]</p>
 
-<h3 id="gin-device-en">6.2 Kernel submission</h3>
+<h3 id="gin-device-en">4.2 Kernel interface</h3>
 <p>The example has two ranks, each writing one block to its peer. Each rank launches one thread for one round, with signal 0 initially zero. Waiting for the fixed value 1 avoids the race that arises when the wait target is computed as the current signal value plus one and the peer sends early.</p>
 {{code:gin-kernel}}
 <p><code>ncclGin_SignalInc</code> associates a remote signal increment with write completion; the receiver waits with acquire semantics. <code>flush</code> makes the local send source safe to reuse. By itself it does not guarantee that data has settled in remote memory. Repeated execution requires iteration-aware signals and coordination before overwriting receiver storage. [[gin-api|put / flush / waitSignal contracts]]</p>
+<h3 id="gin-proxy-en">4.3 CPU proxy</h3>
+<p>GIN CPU proxy provides the <code>ncclGin</code> rank, window and signal interfaces. A GPU kernel publishes request descriptors; host progress translates them into network operations. The diagram uses the built-in IB RMA backend to submit WRs through CPU verbs. With GDR enabled, the NIC directly accesses registered GPU buffers. [[gin-proxy|Descriptor processing]] · [[gin-verbs|IB submission]]</p>
+
+<h4 id="gin-proxy-setup-en">Backend and resources</h4>
+<p>Memory allocation, window registration and device-communicator lifetime follow the <a href="#windows-en">common initialization example</a>. Request the proxy backend before creation. Host setup establishes shared request queues, progress counters and network connections.</p>
+{{code:gin-proxy-setup}}
+<p class="code-context">This fragment replaces the requirements and creation calls in the initialization example. Allocation, window registration, execution and teardown follow that example. The build and network environment must support the selected backend. [[gin-reqs|Requirements]] · [[gin-select|Selection]]</p>
+
+<h4 id="gin-proxy-submit-en">Descriptors and completion</h4>
+{{ginproxy}}
+<p><code>proxyGinPollGfd()</code> reads GPU-published descriptors; <code>proxyGinProcessGfd()</code> dispatches to the RMA backend's <code>iput</code> / <code>iputSignal</code>. The IB backend builds WRs and posts them through <code>ibv_post_send()</code>. Host progress checks request completion and updates GPU-visible counters. [[gin-proxy|GFD consumption and dispatch]] · [[gin-verbs|WR submission]] · [[gin-proxy-completion|Completion counters]]</p>
+
+<h4 id="gin-proxy-scope-en">Interface and responsibilities</h4>
+<p>The application can use the <a href="#gin-device-en">same ncclGin kernel</a>, retaining local-source reuse after <code>flush</code> and receiver signal dependencies. GDAKI constructs NIC WQEs on the GPU. GIN CPU proxy publishes GIN descriptors on the GPU, then builds and submits network requests on the CPU. GPUNetIO CPU-assisted doorbells delegate only notification to the CPU; the GPU has already built the WQEs.</p>
+<p>Ordinary NCCL NET/IB CPU proxies progress collective-kernel chunks; GIN CPU proxies consume GIN operations from user kernels. Both can use CPU verbs and GPUDirect RDMA, with different upper-level protocols and progress objects.</p>
+
+<h3 id="gin-gdaki-en">4.4 GDAKI / GPUNetIO</h3>
+<p>Replace the requirements and creation block in the common initialization with this fragment to request GDAKI explicitly. NCCL uses GPUNetIO to establish GPU-accessible NIC resources; creation fails if the environment cannot support that backend.</p>
+{{code:gin-gdaki-setup}}
+<p>NCCL GDAKI contains both DMA-BUF and GPU MR registration paths. Allocation type, driver and platform capabilities determine the choice. GIN buffers backed by multiple cuMem segments require DMA-BUF. [[gdaki-reg|Registration source]] · [[device-doc|GIN requirements]]</p>
 {{gdaki}}
 <p>In the pinned version, <code>putImplMode()</code> resolves window keys and offsets, then calls <code>doca_gpu_dev_verbs_put*</code>. Host code creates QPs through GPUNetIO and exports their device descriptors. GIN supplies rank, window and synchronization semantics; GDAKI translates operations into GPU-executed NIC queue work. [[gdaki-put|GIN → GPUNetIO]] · [[gdaki-host|QP setup and export]]</p>
 
-<h3 id="ordering-en">6.3 Ordering and completion</h3>
+<p>The UAR registration, Hopper / Blackwell PTE encoding and MMIO store used for direct GPU doorbells are covered under <a href="#uar-map-en">UAR and GPU page tables</a>.</p>
+
+<h3 id="ordering-en">4.5 Ordering and completion</h3>
 <table><thead><tr><th>Point</th><th>Established condition</th><th>Still required</th></tr></thead><tbody>
 <tr><td>WQE constructed</td><td>A request descriptor is prepared.</td><td>Correctly publish the queue and notify the NIC.</td></tr>
 <tr><td>Doorbell submitted</td><td>The NIC receives or can observe notification of work.</td><td>DMA, network transactions and the relevant completion condition.</td></tr>
@@ -198,19 +300,3 @@
 <tr><td>Receiver's associated signal wait returns</td><td>The signal API's data-completion and ordering guarantees hold.</td><td>Actual receiver computation and coordination before the next overwrite.</td></tr>
 </tbody></table>
 <p>A multi-threaded implementation must identify the data-producing threads, communication participants and required memory scope. Extending the single-thread example so that every thread rings the same doorbell introduces queue concurrency and ordering requirements. Shared queues must follow GPUNetIO and GIN resource-sharing and cooperation contracts.</p>
-
-<h2 id="gin-proxy-en">7. NCCL GIN / CPU proxy</h2>
-<p>GIN CPU proxy provides the <code>ncclGin</code> rank, window and signal interfaces. A GPU kernel publishes request descriptors; host progress translates them into network operations. The diagram uses the built-in IB RMA backend to submit WRs through CPU verbs. With GDR enabled, the NIC directly accesses registered GPU buffers. [[gin-proxy|Descriptor processing]] · [[gin-verbs|IB submission]]</p>
-
-<h3 id="gin-proxy-setup-en">7.1 Backend and resources</h3>
-<p>Memory allocation, window registration and device-communicator lifetime follow the <a href="#windows-en">GDAKI example</a>. Request the proxy backend before creation. Host setup establishes shared request queues, progress counters and network connections.</p>
-{{code:gin-proxy-setup}}
-<p class="code-context">This fragment replaces the requirements and creation calls in the initialization example. Allocation, window registration, execution and teardown follow that example. The build and network environment must support the selected backend. [[gin-reqs|Requirements]] · [[gin-select|Selection]]</p>
-
-<h3 id="gin-proxy-submit-en">7.2 Descriptors and completion</h3>
-{{ginproxy}}
-<p><code>proxyGinPollGfd()</code> reads GPU-published descriptors; <code>proxyGinProcessGfd()</code> dispatches to the RMA backend's <code>iput</code> / <code>iputSignal</code>. The IB backend builds WRs and posts them through <code>ibv_post_send()</code>. Host progress checks request completion and updates GPU-visible counters. [[gin-proxy|GFD consumption and dispatch]] · [[gin-verbs|WR submission]] · [[gin-proxy-completion|Completion counters]]</p>
-
-<h3 id="gin-proxy-scope-en">7.3 Interface and responsibilities</h3>
-<p>The application can use the <a href="#gin-device-en">same ncclGin kernel</a>, retaining local-source reuse after <code>flush</code> and receiver signal dependencies. GDAKI constructs NIC WQEs on the GPU. GIN CPU proxy publishes GIN descriptors on the GPU, then builds and submits network requests on the CPU. GPUNetIO CPU-assisted doorbells delegate only notification to the CPU; the GPU has already built the WQEs.</p>
-<p>Ordinary NCCL NET/IB CPU proxies progress collective-kernel chunks; GIN CPU proxies consume GIN operations from user kernels. Both can use CPU verbs and GPUDirect RDMA, with different upper-level protocols and progress objects.</p>

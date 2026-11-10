@@ -1,24 +1,60 @@
 <h1>GPU 互联的软件与驱动</h1>
-<p class="article-lead">GPU 之间的通信有两类常见数据路径：通过 NVLink / PCIe 访问另一张卡的显存，或通过网卡执行 RDMA。CUDA 驱动建立显存映射，Linux RDMA 驱动建立网卡资源，NCCL 和 NVSHMEM 在这些资源之上组织传输。同一条显存到网卡的数据通路，可以由 CPU proxy 推进，也可以由 GPU kernel 提交请求。</p>
+<p class="article-lead">普通 NCCL、NVSHMEM 与 NCCL GIN 提供了三种组织 GPU 通信的方式：CPU 发起 collective、基于 symmetric memory 的一侧通信，以及用户 kernel 内的网络操作。NVSHMEM 和 GIN 各有可选后端，决定请求由 CPU proxy 还是 GPU 推进；驱动为这些后端建立网卡队列、显存注册和地址映射。即使请求由 CPU proxy 提交，payload 仍可通过 GPUDirect RDMA 直接在显存与网卡之间传输。</p>
 <p class="source-scope">源码基线：NCCL 2.32.3、NVSHMEM 3.8.0、rdma-core 61.0，核对日期 2026-11-09。图中链接固定到 commit。序列图展示源码调用顺序，activation bar 标示参与者的逻辑活动范围。</p>
 
-<h2 id="paths">1. 路径总览</h2>
+<h2 id="paths">1. 通信方案与基础</h2>
 
-<h3 id="submission">1.1 API、提交与搬运</h3>
-<p>GPU 0 向 GPU 1 传输数据时，<strong>应用接口的调用位置、硬件请求的提交位置和数据通路</strong>可以各不相同。例如，CPU 调用 <code>ncclAllReduce()</code>，由 CPU proxy 提交网络请求，数据仍可直接在 GPU 显存和网卡之间传输。</p>
-<table><thead><tr><th>路径</th><th>应用接口在哪里调用</th><th>谁提交传输请求</th><th>主要数据路径</th></tr></thead><tbody>
-<tr><td><a href="gpu-peer-to-peer-memory.html">CUDA peer 访问</a></td><td>CPU 建立映射；GPU kernel 执行 load/store</td><td>GPU 执行内存指令</td><td>GPU ↔ NVLink / PCIe ↔ GPU</td></tr>
-<tr><td><a href="#nccl-cpu">NCCL 常规 NET/IB 路径</a></td><td>CPU 调用 collective API</td><td>CPU proxy 提交网卡 WR</td><td>启用 GDR 时：GPU ↔ NIC ↔ 网络 ↔ NIC ↔ GPU</td></tr>
-<tr><td><a href="#nvshmem">NVSHMEM device API + proxy</a></td><td>GPU kernel 调用 put/get</td><td>GPU 写请求队列；CPU proxy 提交 WR</td><td>可使用同样的 GPUDirect RDMA 路径</td></tr>
-<tr><td><a href="#ibgda">NVSHMEM IBGDA</a></td><td>GPU kernel 调用 put/get</td><td>GPU 构造 WQE；doorbell 由 GPU 或辅助 CPU 提交</td><td>GPU ↔ NIC ↔ 网络 ↔ NIC ↔ GPU</td></tr>
-<tr><td><a href="#gpunetio">NVSHMEM GPUNetIO</a></td><td>GPU kernel 调用 put/get</td><td>GPU 构造 WQE；doorbell 由 GPU 或辅助 CPU 提交</td><td>GPU ↔ NIC ↔ 网络 ↔ NIC ↔ GPU</td></tr>
-<tr><td><a href="#gin">NCCL GIN + GDAKI</a></td><td>GPU kernel 调用 <code>ncclGin</code></td><td>GPU 经 GPUNetIO 构造 WQE；doorbell 模式取决于配置</td><td>GPU ↔ NIC ↔ 网络 ↔ NIC ↔ GPU</td></tr>
-<tr><td><a href="#gin-proxy">NCCL GIN + CPU proxy</a></td><td>GPU kernel 调用 <code>ncclGin</code></td><td>GPU 写描述符；CPU proxy 提交网络请求</td><td>取决于所选网络后端</td></tr>
+<h3 id="submission">1.1 三组通信方案</h3>
+<p>三组方案按应用入口和编程模型区分。GIN 属于 NCCL Device API，其 kernel 内调用方式与普通 collective API 分开讲解；表中的后端列对应各章展开的具体实现。</p>
+<table class="communication-summary" role="table"><thead><tr role="row"><th scope="col">通信方案</th><th scope="col">应用入口</th><th scope="col">本文展开的后端</th><th scope="col">请求如何推进</th></tr></thead><tbody>
+<tr role="row"><td role="cell" data-label="通信方案"><a href="#nccl-cpu">普通 NCCL</a></td><td role="cell" data-label="应用入口">CPU 调用 <code>ncclAllReduce()</code> 等 collective API。</td><td role="cell" data-label="本文展开的后端">常规 NET/IB transport。</td><td role="cell" data-label="请求如何推进">NCCL 安排 collective kernel；CPU proxy 根据 chunk 进度提交网卡请求。</td></tr>
+<tr role="row"><td role="cell" data-label="通信方案"><a href="#nvshmem">NVSHMEM</a></td><td role="cell" data-label="应用入口">PE 与 symmetric memory；本文使用 kernel 内的 put/get、signal、quiet。</td><td role="cell" data-label="本文展开的后端"><a href="#nv-proxy-submit">CPU proxy / IBRC</a><br><a href="#ibgda">IBGDA</a><br><a href="#gpunetio">GPUNetIO</a></td><td role="cell" data-label="请求如何推进">proxy 后端由 CPU 构造并提交网络请求；IBGDA / GPUNetIO 由 GPU 构造 WQE，doorbell 可由 GPU 或辅助 CPU 执行。</td></tr>
+<tr role="row"><td role="cell" data-label="通信方案"><a href="#gin">NCCL GIN</a></td><td role="cell" data-label="应用入口">用户 CUDA kernel 调用 <code>ncclGin</code>，使用 rank、window 和 signal。</td><td role="cell" data-label="本文展开的后端"><a href="#gin-proxy">CPU proxy</a><br><a href="#gin-gdaki">GDAKI / GPUNetIO</a></td><td role="cell" data-label="请求如何推进">CPU proxy 消费 GPU 发布的 GIN 请求；GDAKI 将网络操作交给 GPU 上的 GPUNetIO 队列实现。</td></tr>
 </tbody></table>
-<p>GPU 发起网络操作时，CPU 负责初始化、连接交换、内存注册和 kernel launch。GDAKI（GPUDirect Async Kernel-Initiated）把可由 kernel 执行的请求提交工作移入 GPU；GPUDirect RDMA 提供 GPU 显存与网卡之间的数据通路。两者分别描述请求提交和数据传输的能力。[[gpureadme|GPUNetIO 的 CPU / GPU 分工]] · [[nccl-proxy|NCCL proxy]] · [[nv-dispatch|NVSHMEM transport 分派]]</p>
+<p>应用调用位置、网卡请求提交位置与 payload 路径可以不同。CPU proxy 提交请求时，启用 GPUDirect RDMA 的 NIC 仍能直接访问显存。GDAKI（GPUDirect Async Kernel-Initiated）描述 kernel 发起网卡操作的能力；GPUDirect RDMA 描述显存与 NIC 之间的直接数据通路。[[nccl-proxy|NCCL proxy]] · [[nv-dispatch|NVSHMEM 后端分派]] · [[gin-select|GIN 后端选择]] · [[gpureadme|GPUNetIO 的 CPU / GPU 分工]]</p>
+<p><strong>CUDA peer / NVLink 是互联机制。</strong>GPU 通过 peer 映射 load/store 对方显存，这条路径可以被 NCCL 与 NVSHMEM 使用。NCCL Device API 中的 LSA 面向可直接 load/store 的 peer，GIN 面向网络操作。peer 访问的范围由 GPU 互联、驱动和地址映射能力共同决定，详见 <a href="#fabric-boundaries">CUDA peer 与 NVLink</a>。[[device-doc|LSA 与 GIN]]</p>
+<p><strong>库和内核模块是完整路径的依赖。</strong><code>libibverbs</code> 提供接口，<code>libmlx5</code> 实现 mlx5 用户态队列操作，<code>mlx5_ib</code> 管理内核侧 RDMA 资源，<code>nvidia-peermem</code> 参与显存注册协作。在支持的配置下，DMA-BUF 可替代这一注册协作机制；NCCL / NVSHMEM 仍负责上层通信语义与进度。具体依赖见 <a href="#stack">软件与驱动</a>。[[user-verbs|verbs 与驱动分工]] · [[peermem|peer-memory]] · [[dmabuf|DMA-BUF]]</p>
 
-<h3 id="stack">1.2 软件与驱动</h3>
+<h3 id="dma-rdma">1.2 DMA 与 RDMA</h3>
+<p>普通以太网卡收到数据包后，就可以把数据 DMA 写入本机内存中的接收缓冲区。DMA（Direct Memory Access，直接内存访问）让设备按驱动建立的地址映射读写内存，数据搬运由设备完成。CPU 负责准备缓冲区、描述符和映射，并处理提交与完成。[[dma-api|Linux DMA 地址与映射]]</p>
+<table><thead><tr><th>机制</th><th>解决的问题</th><th>典型数据路径</th></tr></thead><tbody>
+<tr><td>DMA</td><td>设备直接读写本机可访问的内存。</td><td>本机 NIC ↔ 主机内存</td></tr>
+<tr><td>RDMA<br>Remote Direct Memory Access</td><td>网卡执行远端内存操作。RDMA Read/Write 请求指定远端地址、长度和访问 key，网卡检查注册范围与权限并执行传输。</td><td>A 主机内存 ↔ A NIC ↔ 网络 ↔ B NIC ↔ B 主机内存</td></tr>
+<tr><td>GPUDirect RDMA</td><td>将 GPU 显存接入第三方设备的直接 DMA 路径；用于 RDMA 通信时，NIC 可直接访问已注册的显存。</td><td>A 显存 ↔ A NIC ↔ 网络 ↔ B NIC ↔ B 显存</td></tr>
+</tbody></table>
+<p><strong>“经过网卡”不等于“远程直接内存访问”。</strong>普通 TCP/IP 收发也使用本机 DMA。RDMA 增加了网卡能够理解的远端内存操作、访问保护和完成机制；两端提前完成内存注册，并交换远端访问所需的地址和 key。GPUDirect RDMA 则把显存纳入这套访问路径。[[rdma-guide|RDMA 操作]] · [[gdr-doc|GPUDirect RDMA]]</p>
+
+<h4 id="rdma-objects">内存与队列对象</h4>
+<p>一次 RDMA Read 需要先授权内存访问，再提交读取请求，最后取得完成结果。这几个环节分别使用以下对象。</p>
+<table><thead><tr><th>术语</th><th>含义与职责</th></tr></thead><tbody>
+<tr><td>MR · Memory Region<br>内存区域</td><td>向 RDMA 设备注册的一段内存，记录地址范围、访问权限和映射。它可以对应主机内存，也可以对应受支持的 GPU 显存。</td></tr>
+<tr><td><code>lkey</code> / <code>rkey</code><br>本地 / 远端访问 key</td><td>注册 MR 时取得的访问标识。<code>lkey</code> 用于本地 buffer，<code>rkey</code> 交给对端，用于远端内存访问校验。</td></tr>
+<tr><td>PD · Protection Domain<br>保护域</td><td>关联本地 QP、MR 等资源，限定哪些队列可以使用哪些注册内存。</td></tr>
+<tr><td>QP · Queue Pair<br>队列对</td><td>包含发送队列 SQ 和接收队列 RQ。RDMA Read/Write 由发起方提交到 SQ；RQ 存放接收请求，为 Send 等操作准备接收 buffer。</td></tr>
+<tr><td>WR · Work Request<br>工作请求</td><td>软件提交的操作描述。例如“把 B 的 4096 字节读入 A”，包含操作类型、本地 buffer、长度，以及远端地址和 <code>rkey</code>。</td></tr>
+<tr><td>WQE · Work Queue Element<br>工作队列项</td><td>网卡可解析的硬件格式描述符，放在工作队列中。CPU verbs 路径由 provider 把 WR 编码为 WQE；GPU 发起路径可由设备代码构造 WQE。</td></tr>
+<tr><td>Doorbell<br>门铃</td><td>通知网卡有新工作的机制。mlx5 先更新内存中的 DBR（Doorbell Record，队列进度记录），再写入映射的 MMIO doorbell，推动网卡处理 WQE。</td></tr>
+<tr><td>CQ / CQE<br>Completion Queue / Entry</td><td>CQ 是完成队列，CQE 是其中的一条完成记录，包含成功或错误状态。发送侧可选择哪些成功完成的请求生成 CQE，再从 CQ 取回结果。</td></tr>
+</tbody></table>
+<p>以启用完成通知的 CPU verbs 请求为例，路径是：<strong>构造 WR → provider 写入 WQE → 敲 doorbell → NIC 执行 → 从 CQ 读取 CQE</strong>。MR 提供请求访问内存时所需的映射与权限。[[rdma-guide|RDMA 对象]] · [[verbs-mr|内存注册]] · [[verbs-post-send|请求与完成选项]] · [[mlx5-doorbell|mlx5 门铃实现]]</p>
+
+<h4 id="rdma-read">一次显存 RDMA Read</h4>
+<p>A 要把 B 显存中的 <strong>4 KiB</strong> 数据读入自己的显存。两端已建立可靠连接（RC）的队列对 QP，并将相应 buffer 注册为内存区域 MR。B 授予源 MR 远端读权限，将远端地址和 <code>rkey</code> 交给 A；A 的目标 MR 允许本地写入。A 提交请求时指定 B 的地址与 <code>rkey</code>，以及自己的目标地址与 <code>lkey</code>。两种 key 分别标识远端和本地的内存访问资源。[[verbs-mr|MR 与访问权限]] · [[verbs-post-send|RDMA Read 请求字段]]</p>
+{{rdma-read}}
+<p>请求由 A 发出，数据从 B 流向 A。③ 和 ⑤ 分别是两端 NIC 的本地 DMA；① 和 ④ 承担网络上的 RDMA 请求与响应。B 的 NIC 使用预先注册的 MR 完成校验和读取。这个例子为 A 的请求启用完成通知，完成后 A 的完成队列 CQ 中出现 CQE；GPU 消费目标数据前，还需按所用通信库或 CUDA 接口完成可见性同步。[[rdma-guide|RDMA Read]] · [[verbs-post-send|完成通知]] · [[gdr-ordering|GPU 内存可见性]]</p>
+
+<h3 id="stack">1.3 软件与驱动</h3>
 {{architecture}}
+<h4 id="dma-software">DMA 的软件路径</h4>
+<p>以图中的 ConnectX 网卡为例，普通以太网与 RDMA 共用 NIC 和 <code>mlx5_core</code> 的设备基础设施。普通网络收发走 TCP/IP 与以太网驱动，RDMA 走 verbs 与 RDMA 驱动。DMA 本身由驱动通过 Linux DMA API 配置。[[mlx5-ethernet|mlx5e 与 mlx5_core]] · [[mlx5-dma|以太网发送中的 DMA 映射]]</p>
+<table><thead><tr><th>场景</th><th>用户态库与接口</th><th>Linux 模块与设备入口</th><th>与层级图的对应</th></tr></thead><tbody>
+<tr><td>普通网卡 DMA<br>以 TCP/IP 为例</td><td>libc 的 <code>socket</code>、<code>send</code>、<code>recv</code>，使用 socket fd。</td><td>TCP/IP 网络栈 → mlx5e 以太网驱动；mlx5e 编入 <code>mlx5_core.ko</code>。驱动使用 <code>dma_map_*</code> 等接口准备主机内存映射。</td><td>使用图中 NIC 与 <code>mlx5_core</code> 的以太网功能，数据经本机 DMA 进入或离开主机内存。[[mlx5-build|模块构建]]</td></tr>
+<tr><td>主机内存 RDMA</td><td><code>libibverbs</code> → <code>libmlx5</code>；注册 MR，提交 Read/Write 等 WR。</td><td><code>/dev/infiniband/uverbsN</code> → <code>ib_uverbs</code> / <code>ib_core</code> → <code>mlx5_ib</code> / <code>mlx5_core</code>。</td><td>对应图中的 verbs、uverbs、mlx5 和 NIC 节点；注册与 DMA 映射的目标为主机内存。[[user-verbs|用户态 verbs]]</td></tr>
+<tr><td>GPU 显存 RDMA</td><td>复用 verbs / provider；通过 <code>libcuda</code> 分配、识别或导出 GPU buffer。NCCL / NVSHMEM 封装这些操作。</td><td>在 RDMA 路径上加入 <code>/dev/nvidiactl</code>、<code>/dev/nvidiaN</code> 及 NVIDIA 驱动的资源管理；显存注册通过 <code>nvidia-peermem</code> 或受支持的 DMA-BUF 导出 / 导入路径。</td><td>对应图中的 CUDA、GPU 驱动、注册协作节点，以及 GPU ↔ NIC 紫色数据线。UVM 管理 GPU 虚拟地址空间，NIC 使用注册得到的 DMA 映射。[[gdr-doc|GPU 内存接入]] · [[gdaki-reg|注册实现]]</td></tr>
+</tbody></table>
+<p>GPU 适配的核心是<strong>建立 NIC 可访问的显存 DMA 映射，并管理这些映射的生命周期</strong>。在常规固定页注册中，Linux 驱动取得并固定主机内存页；显存则由 NVIDIA 驱动参与导出、映射和释放协调，RDMA 驱动据此建立 MR 与访问 key。RDMA Read/Write 的操作语义仍然沿用 verbs；GPU kernel 构造 WQE、敲 doorbell 属于后续 IBGDA / GDAKI 的请求提交扩展。[[peermem|peer-memory 协作]] · [[gdaki-reg|DMA-BUF 注册]] · [[gpureadme|GPU 提交接口]]</p>
+
+
 <h4 id="libraries">用户态与设备代码</h4>
 <p>同一通信库可以同时提供 CPU 和 GPU 代码。用户态库装载到主机进程中，device API 则在 GPU 上执行。</p>
 <table><thead><tr><th>组件</th><th>执行位置与职责</th><th>源码 / 接口</th></tr></thead><tbody>
@@ -34,6 +70,15 @@
 </tbody></table>
 <p><code>libmlx5</code> 是用户态 provider，<code>mlx5_ib.ko</code> 是内核模块。CPU 通过 <code>ibv_post_send()</code> 等 verbs 接口提交请求；GPUNetIO 的 GPU 设备函数有自己的队列操作实现。两端都使用预先建立的资源。</p>
 
+<h4 id="device-files">设备文件</h4>
+<p>用户态库先打开字符设备取得 fd，再通过这个 fd 请求内核建立资源、注册内存或创建映射。图中这组设备节点连接用户态库与 Linux 驱动，<code>N</code> 表示节点编号。[[verbs-open|verbs 打开设备]] · [[gpu-fops|NVIDIA 文件操作表]]</p>
+<table><thead><tr><th>设备文件</th><th>请求与分派</th><th>内核入口</th></tr></thead><tbody>
+<tr data-component-row="dev-uverbs"><td><code>/dev/infiniband/uverbsN</code></td><td><code>libibverbs</code> 打开 RDMA 设备取得 command fd，<code>libmlx5</code> 等 provider 使用它执行资源相关的 <code>ioctl</code> / <code>write</code> 和 <code>mmap</code>；<code>ib_uverbs</code> 接收请求并调用设备驱动。</td><td>[[uverbs-fops|uverbs_fops / uverbs_mmap_fops]] → <code>ib_uverbs</code> → <code>mlx5_ib</code></td></tr>
+<tr data-component-row="dev-core"><td><code>/dev/nvidiactl</code>、<code>/dev/nvidiaN</code></td><td><code>libcuda</code> 通过核心控制节点和各 GPU 的设备节点建立 GPU 资源、显存与映射。打开后，<code>ioctl</code>、<code>mmap</code> 等操作由核心驱动的文件操作表分派。</td><td>[[gpu-fops|nvidia_fops]] → <code>nvidia.ko</code></td></tr>
+<tr data-component-row="dev-uvm"><td><code>/dev/nvidia-uvm</code></td><td><code>libcuda</code> 通过 UVM 设备的 <code>ioctl</code> 配置地址空间，并通过 <code>mmap</code> 建立相应映射。</td><td>[[uvm-fops|uvm_fops]] → <code>nvidia-uvm.ko</code></td></tr>
+</tbody></table>
+<p>资源和映射建立后，CPU provider 或 GPU kernel 可直接操作工作队列和 doorbell，图中仍用独立箭头连接到 NIC。<code>nvidia-peermem.ko</code> 通过内核中的 peer-memory 回调参与注册；DMA-BUF 路径使用导出的 buffer fd。[[user-verbs|资源管理与快速路径]] · [[peermem|peer-memory 回调]] · [[gdaki-reg|DMA-BUF 注册]]</p>
+
 <h4 id="modules">Linux 与设备</h4>
 <table><thead><tr><th>组件</th><th>职责</th><th>相关接口</th></tr></thead><tbody>
 <tr data-component-row="nvidia"><td><code>nvidia.ko</code></td><td>核心 GPU 驱动 / Kernel RM，管理 GPU 资源、显存、映射和互联相关资源。</td><td>[[gpu-core|公开源码]]；<code>/dev/nvidiactl</code>、<code>/dev/nvidiaN</code></td></tr>
@@ -46,8 +91,8 @@
 </tbody></table>
 <p>这些 Linux 模块主要负责资源建立、映射和生命周期管理。队列及 doorbell 映射完成后，CPU verbs 的常见快速路径可直接访问这些资源，无需每次发送都执行系统调用。GPU 提交路径将其中的部分工作交给设备代码。[[user-verbs|userspace verbs 的 fast path]]</p>
 
-<h3 id="fabric-boundaries">1.3 CUDA peer</h3>
-<p>CUDA peer 路径使用 GPU 可访问的地址映射：CPU 驱动建立权限与页表，GPU 的 load/store 经 NVLink / PCIe 访问对端显存。RDMA 路径使用 NIC 队列、MR 和访问 key。两者的地址解释与请求提交机制不同。[[user-verbs|Linux userspace verbs]]</p>
+<h3 id="fabric-boundaries">1.4 CUDA peer 与 NVLink</h3>
+<p>CUDA peer 路径使用 GPU 可访问的地址映射：CPU 驱动建立权限与页表，GPU 的 load/store 经 NVLink / PCIe 直接访问对端显存。这次内存访问不经过 NIC RDMA 的队列提交路径。可访问哪些 GPU，取决于互联拓扑、驱动与映射能力；NIC RDMA 则通过 QP、MR 和访问 key 建立远端内存操作。[[device-doc|CUDA P2P、LSA 与 GIN]] · [[user-verbs|RDMA 资源接口]]</p>
 <p>[[peer-post|GPU P2P 访问]] 详述 peer load/store、同进程与跨进程映射、P100 PTE、NCCL LSA，以及 NVLink / PCIe 的链路选择。跨 OS 的 FABRIC handle 与 IMEX 见该文的 <a href="gpu-peer-to-peer-memory.html#zh-fabric-mapping">跨节点映射</a>。本节的组件表与共享时序图用于对照 NVLink 和网络路径的管理机制。</p>
 <div id="nvlink"><details class="path-reference"><summary>NVLink 管理组件与共享时序</summary>
 <h4 id="services">管理组件</h4>
@@ -62,7 +107,7 @@
 <p id="cross-os">IMEX 的管理连接协调共享生命周期；映射建立后的 payload 走 NVLink fabric。普通 CUDA IPC handle 的适用范围仍是同一节点，跨 OS 共享需兼容的 FABRIC handle、驱动与权限配置。[[vmm-doc|Fabric memory handles]]</p>
 </details></div>
 
-<h3 id="inspection">1.4 观察与源码</h3>
+<h3 id="inspection">1.5 观察与源码</h3>
 <details class="path-reference"><summary>拓扑、装载与命令输出</summary>
 <h4 id="commands">观察命令</h4>
 <p>这些排查命令均为只读操作。输出是<strong>格式示例</strong>；设备编号、库路径和服务位置以目标机器为准。</p>
@@ -83,20 +128,13 @@
 
 </details>
 
-<h2 id="nccl-cpu">2. NCCL CPU proxy</h2>
+<h2 id="nccl-cpu">2. 普通 NCCL</h2>
 <p>普通 NCCL NET/IB 路径由 CPU proxy 推进网络请求。<code>libnccl.so</code> 组织 collective，proxy 经 <code>libibverbs</code> 与 <code>libmlx5</code> 提交 WR；启用 GPUDirect RDMA 后，NIC 直接搬运 GPU buffer。连接与内存注册先完成，后续 chunk 复用这些资源。</p>
 
 <div id="resources"></div>
 <h3 id="queues">2.1 连接与队列</h3>
 <p>跨主机传输前，CPU 为两端准备队列、内存地址及访问权限。这些信息随后供 CPU 或 GPU 的提交代码使用。</p>
-<table><thead><tr><th>对象</th><th>含义</th><th>在一次写入中的用途</th></tr></thead><tbody>
-<tr><td>PD</td><td>Protection Domain，资源的保护域</td><td>关联 QP 与注册内存的访问权限。</td></tr>
-<tr><td>MR / lkey / rkey</td><td>Memory Region 及本地 / 远端访问 key</td><td>标识可被网卡访问的 buffer、范围与权限；远端地址和 rkey 需要交换。</td></tr>
-<tr><td>QP</td><td>Queue Pair，发送 / 接收工作队列</td><td>承载 WR 对应的硬件 WQE；具体使用哪条队列取决于操作类型。</td></tr>
-<tr><td>WR / WQE</td><td>Work Request / Work Queue Element</td><td>描述源地址、长度、目标地址、rkey 等。WR 是软件请求，WQE 是硬件队列表示。</td></tr>
-<tr><td>Doorbell</td><td>向网卡通知队列进展的机制</td><td>让 NIC 发现新工作；DBR 等内存记录与 MMIO doorbell 有不同作用。</td></tr>
-<tr><td>CQ / CQE</td><td>Completion Queue / Entry</td><td>报告已请求的完成通知与错误。批处理或 selective signaling 下不要求每个 WQE 都生成一个 CQE。</td></tr>
-</tbody></table>
+<p>每端建立 PD，将 QP 与注册的 MR 关联到同一保护域，并为 QP 关联 CQ。两端交换连接信息，以及远端访问所需的 MR 地址和 <code>rkey</code>。对象定义见 <a href="#rdma-objects">1.2 节的内存与队列对象</a>。</p>
 <p>普通 RDMA Write 直接访问远端 MR，无需为每次写入配对一个 receive buffer。Send/Recv，以及带 immediate 的某些操作，有不同的接收资源与通知要求。接收方何时消费 buffer，还需要通信库或应用定义同步协议。</p>
 {{setup}}
 
@@ -109,7 +147,7 @@
 
 <p>“零拷贝”指 payload 可以避免在 CPU 内存中转。初始化消息、地址与 key 的交换、队列控制和完成状态仍由控制路径处理。<code>nvidia-peermem</code> 参与访问资源的建立，实际 payload 由硬件搬运。</p>
 
-<h3 id="proxy">2.3 提交与完成</h3>
+<h3 id="proxy">2.3 NET/IB CPU proxy</h3>
 <p>CPU 调用 <code>ncclAllReduce()</code> 后，NCCL 选择算法与连接方式，安排 GPU kernel 和所需的主机工作。一个 AllReduce 可以同时使用节点内 peer 传输和节点间网络传输。图中展示<strong>普通 NET/IB transport 的一个发送 chunk</strong>，假设该连接已启用 GPUDirect RDMA。[[nccl-api|API 入口]]</p>
 {{cpu}}
 <p><code>sendProxyProgress()</code> 检查 GPU / FIFO 进度，在 chunk 就绪后调用网络插件的 <code>isend</code>。内置 IB 实现在满足发送条件时构造 verbs 请求，通过 <code>ibv_post_send()</code> 交给 mlx5 用户态 provider。provider 写入队列并通知网卡；网卡通过 DMA 读取 GPU payload，经网络发往对端。[[nccl-proxy|proxy 的 ready / isend / test]] · [[nccl-isend|NET/IB 发送]] · [[mlx5-send|mlx5 provider]]</p>
@@ -119,8 +157,8 @@
 <p>CPU proxy 提交描述符与控制信息，GPU payload 可以走 GDR。GDR 不可用、选用 socket 后端或其他 transport 时，数据流也随之改变。<code>ncclAllReduce()</code> 的实际调用链取决于所选网络插件及其实现。</p>
 <p>本文版本的 NCCL host API 也可能选择使用 GIN 的 kernel：collective 由 CPU 发起，网络请求在 kernel 内发起。本节描述的是普通 NET/IB CPU proxy transport。核对 trace 中的实际路径，需要同时查看算法、transport、GDR 注册和 proxy 活动。[[nccl-sym-gin|Host API 的 GIN kernel 选项]]</p>
 
-<h2 id="nvshmem">3. NVSHMEM CPU proxy</h2>
-<p>NVSHMEM kernel 可以通过 CPU proxy 提交网络操作。图示远端目标使用 <code>PROXY</code> device 路径，由 IBRC 主机 transport 执行网络请求；本地可直接访问的 peer 仍可走 load/store。[[nv-dispatch|device 分派]] · [[nv-select|transport 选择]]</p>
+<h2 id="nvshmem">3. NVSHMEM</h2>
+<p>NVSHMEM 用 PE 和 symmetric memory 表达跨 GPU 的一侧通信。应用使用同一组 put/get 与同步接口，device transport 按目标可达性和配置选择 peer 访问、CPU proxy、IBGDA 或 GPUNetIO。以下网络后端复用相同的应用示例。[[nv-dispatch|device 分派]] · [[nv-select|transport 选择]]</p>
 
 <h3 id="symmetric">3.1 PE 与 symmetric heap</h3>
 <p>NVSHMEM 提供一侧通信接口：调用方指定目标 PE，即可 put/get 对方的 symmetric memory。各 PE 按一致的 collective 分配顺序建立对应对象。symmetric address 标识对方对应的分配与偏移，各进程的虚拟地址数值不必相同。[[nv-doc|NVSHMEM 编程模型]]</p>
@@ -129,31 +167,32 @@
 <p class="code-context">示例中，两个 PE 各绑定一张 GPU，<code>dst</code>、<code>signal</code> 已通过 symmetric allocation 建立，signal 初值为 0，src 数据已就绪。两端各以单 block、单线程执行一轮，通过 <code>nvshmemx_collective_launch</code> 启动包含跨 PE 等待的 kernel。初始化与 collective launch 的完整写法见 [[nv-example|官方 ring-bcast 示例]]。</p>
 <p><code>put_signal_nbi</code> 将数据传输与远端通知关联；<code>quiet</code> 完成调用线程先前发出的操作，接收方通过 <code>signal_wait_until</code> 等待数据。复用远端 buffer 还需确认接收方已完成消费，或按轮次管理 buffer。多个线程发出操作时，应先保证其他线程的操作已发出，再由调用线程执行 quiet。[[nv-ordering|Memory ordering]] · [[nv-signal|信号接口]]</p>
 
-<h3 id="nv-proxy-submit">3.2 请求与完成</h3>
+<h3 id="nv-proxy-submit">3.2 CPU proxy / IBRC</h3>
+<p>NVSHMEM kernel 可以通过 CPU proxy 提交网络操作。图示远端目标使用 <code>PROXY</code> device 路径，由 IBRC 主机 transport 执行网络请求；本地可直接访问的 peer 仍可走 load/store。[[nv-dispatch|device 分派]] · [[nv-select|transport 选择]]</p>
 <p><code>libnvshmem_host.so</code> 建立 PE、symmetric heap 和 transport，IBRC 经 verbs/provider 建立连接并注册显存。Linux 的 <code>ib_uverbs / ib_core</code>、<code>mlx5_ib / mlx5_core</code> 和 GPU 内存注册接口参与资源准备，见 <a href="#registration">显存注册</a>。</p>
 {{nvproxy}}
 <p>kernel 发布包含目标 PE、地址和长度的请求，CPU proxy 取出请求，由 IBRC 构造 RDMA WR 并执行 <code>ibv_post_send()</code>。CPU 轮询 CQ、更新完成状态，GPU 的 quiet 与接收端 signal wait 按 NVSHMEM 的完成语义等待。网卡请求由 CPU 生成，payload 仍可从 GPU 显存直接经 NIC 传输。[[nv-proxy|IBRC 提交]] · [[nv-proxy-cq|IBRC completion]]</p>
 
-<h2 id="ibgda">4. NVSHMEM IBGDA</h2>
+<h3 id="ibgda">3.3 IBGDA</h3>
 <p><strong>IBGDA</strong> 是 NVSHMEM 的 InfiniBand GPUDirect Async transport，直接管理 mlx5 队列。主机端建立资源与 GPU 可访问的 NIC 映射，设备端写入 WQE、发布队列进度并触发 doorbell。<code>ibgda_post_send()</code> 包含内存顺序操作、DBR 更新和 <code>ibgda_ring_db()</code> 调用。除 InfiniBand 外，支持的 mlx5 配置也可使用 RoCE。[[ibgda-host|主机映射]] · [[ibgda-db|GPU 提交]]</p>
 
-<h3 id="ibgda-setup">4.1 资源与配置</h3>
+<h4 id="ibgda-setup">资源与配置</h4>
 <p>IBGDA 主机代码经 verbs / mlx5 建立 QP、CQ 和 MR，并准备 GPU 可访问的队列与 NIC 映射。显存通过 peer-memory 或 DMA-BUF 等受支持的方式注册；设备代码据此获得提交队列所需的地址、key 和状态。[[ibgda-host|IBGDA 主机映射]]</p>
 {{code:nv-ibgda-env}}
 <p class="code-context">将环境变量传给每个 PE。launcher 负责进程数量与 GPU 绑定；该配置需要相应构建和平台支持。</p>
 
-<h3 id="ibgda-submit">4.2 GPU 提交</h3>
+<h4 id="ibgda-submit">GPU 提交</h4>
 {{ibgda-path}}
 <p>应用沿用 <a href="#symmetric">同一段 put / signal 代码</a>。CPU 建立资源后，IBGDA device transport 构造 WQE，按要求的内存顺序发布队列状态，再通知 NIC。quiet 等待已发出的操作完成，远端 signal 建立接收方消费数据的依赖。[[ibgda-db|WQE 与 doorbell]] · [[nv-ordering|完成语义]]</p>
 
-<h3 id="ibgda-doorbell">4.3 Doorbell 模式</h3>
+<h4 id="ibgda-doorbell">Doorbell 模式</h4>
 <p><code>NVSHMEM_IBGDA_NIC_HANDLER=auto</code> 默认优先使用 GPU；平台不支持时回退到 CPU。<code>gpu</code>、<code>cpu</code> 与 <code>cpu_host_memory</code> 可显式选择处理方式，后两者使用不同的 CPU 可访问内存机制。[[nv-env|NIC handler 配置]]</p>
 <p>图中采用 GPU 直接 doorbell。CPU 辅助模式中，GPU 准备 WQE 并发布待提交进度，CPU 负责 doorbell 推进。因此，分析提交开销时要分别确认 WQE 的构造位置和 doorbell 的执行位置。</p>
 
-<h2 id="gpunetio">5. NVSHMEM GPUNetIO</h2>
+<h3 id="gpunetio">3.4 GPUNetIO</h3>
 <p><code>GPUNETIO_GDAKI</code> 是 NVSHMEM 的另一种 device transport。NVSHMEM 负责 PE、symmetric address 与同步语义，GPUNetIO 负责队列操作；它与直接管理 mlx5 队列的 IBGDA 是替代关系。[[nv-dispatch|分派入口]] · [[nv-gpunetio|QP 建立]]</p>
 
-<h3 id="gpunetio-setup">5.1 资源导出</h3>
+<h4 id="gpunetio-setup">资源导出</h4>
 <p>GPUNetIO Verbs 提供 GPU 访问网卡队列的公共接口。CPU 经 verbs / mlx5 创建 QP、CQ 和 MR，并导出设备侧描述符；GPU 调用 <code>doca_gpu_dev_verbs_put()</code> 等函数，构造、提交 WQE 并观察完成。NCCL 的 GDAKI 后端与 NVSHMEM 的 GPUNetIO transport 都可复用这套接口。[[gpureadme|GPUNetIO 开源实现]]</p>
 <table><thead><tr><th>阶段</th><th>代表接口</th><th>执行位置</th></tr></thead><tbody>
 <tr><td>建立资源</td><td><code>ibv_open_device</code>、<code>ibv_alloc_pd</code>、MR 注册、<code>doca_verbs_*</code></td><td>CPU；需要时进入内核配置硬件。</td></tr>
@@ -165,32 +204,95 @@
 {{code:nv-gpunetio-env}}
 <p>同一进程不能同时启用 IBGDA 与 GPUNetIO GDAKI；3.8.0 初始化代码会检查这个约束。配置随 launcher 传给每个 PE。[[nv-select|互斥检查]]</p>
 
-<h3 id="gpunetio-submit">5.2 Device verbs</h3>
+<h4 id="gpunetio-submit">Device verbs</h4>
 {{nvgda}}
 <p>资源导出后，NVSHMEM device transport 将 put / signal 交给 GPUNetIO。设备代码构造 WQE、提交队列并观察 CQE；NIC 执行 GPU buffer 的 DMA 和网络传输。接收 PE 按 <a href="#symmetric">NVSHMEM signal 协议</a>消费目标数据。[[gpu-put|device put]] · [[gpu-submit|submit]] · [[gpu-cq|CQ]]</p>
 
-<h3 id="gpunetio-doorbell">5.3 CPU 辅助 doorbell</h3>
+<h4 id="gpunetio-doorbell">CPU 辅助 doorbell</h4>
 <p><code>NVSHMEM_GPUNETIO_NIC_HANDLER</code> 支持 <code>auto</code>、<code>gpu</code> 和 <code>cpu</code>；auto 优先选择 GPU，不支持时回退到 CPU。[[nv-env|配置定义]]</p>
 <p>CPU 辅助 doorbell 模式中，GPU 可构造 WQE、轮询 CQE，CPU 只负责约定的 doorbell 推进。高层请求 proxy 的分工则是 GPU 发布请求，由 CPU 构造并提交 verbs WR。[[gpu-cpu-db|CPU doorbell progress]] · [[gpu-submit|设备提交]] · [[gpu-cq|设备 completion]]</p>
 <p>开源 GPUNetIO 聚焦 one-sided RDMA GDAKI，支持独立构建和项目集成；使用其中的 <code>doca_*</code> 接口无需安装完整 DOCA SDK。完整 SDK 还提供更多功能。NCCL 随版本提供的 GPUNetIO 代码可能与独立仓库快照不同，源码分析以各自调用点为准。</p>
 
-<h2 id="gin">6. NCCL GIN / GDAKI</h2>
+<h3 id="uar-map">3.5 UAR 与 GPU 页表</h3>
+<p>IBGDA 与 GPUNetIO 的 GPU doorbell 都需要访问 NIC 寄存器。这里结合两者的注册代码解释 UAR 映射；<a href="#gin-gdaki">NCCL GIN / GDAKI</a> 使用 GPUNetIO 时也复用这一机制。</p>
+<p>UAR（User Access Region）是网卡暴露给应用的寄存器访问区域，其中包含 doorbell / BlueFlame 寄存器。GPU 直接敲门铃，需要让一个 GPU 虚拟地址指向 NIC BAR 中的这块区域。CPU 在初始化时建立映射，GPU 随后通过这个地址执行 MMIO store。[[uar-man|UAR 接口]]</p>
 
-<h3 id="windows">6.1 Window 与资源</h3>
-<p>GIN（GPU-Initiated Networking）是 NCCL Device API 的网络通信接口。应用 kernel 决定传输时机和目标 rank，将通信安排在数据产生或消费的位置；主机负责建立 communicator、内存 window、signal 和网络 context。</p>
+<h4 id="uar-host-mapping">注册地址</h4>
+<p><code>mlx5dv_devx_alloc_uar()</code> 分配 UAR。其 provider 通过 <code>/dev/infiniband/uverbsN</code> 的 fd 执行资源分配与 <code>mmap</code>，返回的 <code>uar-&gt;reg_addr</code> 是进程内可访问 doorbell 的 <strong>CPU 虚拟地址</strong>。NVIDIA 驱动再为同一 I/O 区域建立 GPU 映射。[[uar-provider|provider 的 ioctl 与 mmap]]</p>
+<p>以下函数提取 NVSHMEM <code>ibgda_nic_mem_gpu_map()</code> 的注册步骤。<code>cpu_reg</code> 取自 <code>uar-&gt;reg_addr</code>；<code>bytes</code> 取对应 UAR 的寄存器跨度：本文版本的专用 NC 分支使用 8 字节，BF 分支按设备报告的 <code>log_bf_reg_size</code> 计算。[[ibgda-host|NVSHMEM 注册实现]] · [[uar-allocation|UAR 类型与大小]]</p>
+{{code:uar-map}}
+<p><code>Mapped</code> 请求 GPU 地址映射，<code>IoMemory</code> 将输入解释为设备 I/O 资源，并标记为非缓存一致、物理连续的区域；<code>Portable</code> 扩大注册的 CUDA context 适用范围。<code>cudaHostGetDevicePointer()</code> 返回 GPU 使用的地址；CPU 与 GPU 的指针数值可以不同。驱动内部按页处理映射，<code>bytes</code> 描述本次注册的区间。[[uar-cuda-api|CUDA 注册语义]]</p>
+<p>NVSHMEM 将返回值写入 <code>dev_qp-&gt;tx_wq.bf</code>，并把同一个 UAR 的 <code>page_id</code> 配入 QP。GPUNetIO 的 <code>doca_gpu_verbs_export_uar()</code> 也执行这组注册与取址操作，随后交给 GDAKI 等 device 路径使用。GPU 与 QP 停止使用该 UAR 后，先 <code>cudaHostUnregister(cpu_reg)</code>，再释放 UAR。[[uar-qp|QP 的 UAR 配置]] · [[uar-device-pointer|device 指针传递]] · [[uar-gpunetio|GPUNetIO 导出]]</p>
+
+<h4 id="uar-pte">PTE 的目标与属性</h4>
+<p>公开驱动的 I/O memory 导入路径会检查 CPU VMA 的 <code>VM_IO / VM_PFNMAP</code> 属性，沿 CPU 映射取得设备资源的 PFN，再建立标记为 <code>MEMDESC_FLAGS_PEER_IO_MEM</code> 的描述符。描述符使用 <code>ADDR_SYSMEM</code> 地址类别，并处理 GPU 可见的总线地址及 IOMMU 映射；这里的 system aperture 也承载设备 MMIO。[[uar-pfn|CPU 映射与 PFN]] · [[uar-osdesc|I/O memory 描述符]]</p>
+<p><strong>Hopper 的 VER3 PTE</strong> 将权限与缓存属性合并进 <code>PCF</code>（Permission Control Flags）字段。公开驱动中的 Blackwell UVM 复制 Hopper 的 MMU HAL，并沿用 <code>make_pte_hopper()</code> 构造叶子 PTE；Blackwell 的页大小扩展由其他 HAL 成员处理。下面用这条构造路径解释两代 GPU 的 4 KiB 映射。[[uar-pte-fields|GH100 的 VER3 位定义]] · [[uar-pte-build|Hopper PTE 构造]] · [[uar-pte-blackwell|Blackwell 的 HAL 继承]]</p>
+<p>本例选择普通用户 kernel 可读写、GPU uncached、禁用 GPU 原子访问和访问计数器的 PCIe UAR 映射。字段值按公开格式编码；实际注册时，CUDA 驱动根据平台和映射策略生成页表。</p>
+<table><thead><tr><th>字段与位位置</th><th>本例设置</th><th>作用</th></tr></thead><tbody>
+<tr><td><code>VALID [0]</code></td><td>1</td><td>映射有效。</td></tr>
+<tr><td><code>APERTURE [2:1]</code></td><td>3 · <code>SYSTEM_NON_COHERENT_MEMORY</code></td><td>选择非一致性的系统地址通路，地址落在 NIC 的 PCIe MMIO 资源上。</td></tr>
+<tr><td><code>PCF [7:3]</code></td><td><code>0x19</code> · <code>REGULAR_RW_NO_ATOMIC_UNCACHED_ACD</code></td><td>普通权限、可读写、禁止 GPU 原子访问、GPU 非缓存、关闭访问计数器。[[uar-pcf|PCF 的选择逻辑]]</td></tr>
+<tr><td><code>KIND [11:8]</code></td><td><code>0x6</code> · <code>GENERIC_MEMORY</code></td><td>沿用 UVM 构造函数的普通内存布局。[[uar-kind|KIND 定义]]</td></tr>
+<tr><td><code>ADDRESS [51:12]</code></td><td>GPU 可见目标页地址 <code>&gt;&gt; 12</code></td><td>编码 NIC MMIO 所在页；字段写回 PTE 的第 12–51 位，页内偏移定位到 doorbell 寄存器。地址来自驱动建立的总线 / IOMMU 映射。</td></tr>
+<tr><td><code>PEER_ID [63:61]</code></td><td>本例留 0</td><td>该字段用于 peer aperture；本例通过 system non-coherent aperture 访问 NIC。</td></tr>
+</tbody></table>
+<p><code>PCF=0x19</code> 对应驱动枚举中的一组属性：<code>REGULAR</code> 允许普通 kernel 访问，<code>RW</code> 允许 load / store，<code>UNCACHED</code> 指定 GPU 非缓存，<code>ACD</code> 表示 Access Counters Disabled。<code>NO_ATOMIC</code> 限制 GPU 对该映射发起的原子访问；RDMA atomic 由 NIC 根据 WQE 执行。驱动按权限、缓存和访问计数器策略选择 PCF；例如启用访问计数器的对应枚举是 <code>0x09</code>（<code>ACE</code>）。[[uar-pcf|权限与 PCF]] · [[uar-rm-pcf|RM 的 PCF 生成]]</p>
+<p><code>APERTURE</code> 选择系统一致性通路，PCF 中的 <code>UNCACHED</code> 选择 GPU 缓存策略。下面将本例字段组合成一个 64 位值，展示 <code>make_pte_hopper()</code> 的编码方式；CUDA 注册负责实际页表的建立。[[uar-aperture|aperture 选择]] · [[uar-pte-build|字段组合]]</p>
+{{code:uar-pte}}
+<p>本例低 12 位为 <code>0x6CF = (0x6 &lt;&lt; 8) | (0x19 &lt;&lt; 3) | (3 &lt;&lt; 1) | 1</code>。如果 GPU 可见的 NIC 页地址为 <code>0x0000800012345000</code>，编码结果就是 <code>0x00008000123456CF</code>；GPU 虚拟地址的页内偏移 <code>0x20</code> 会定位到 NIC 地址 <code>0x0000800012345020</code>。这些地址用于演算，实际值由驱动的资源映射决定。</p>
+
+<h4 id="uar-store">从 store 到 PCIe</h4>
+<p>GPU 提交线程先写好 WQE、更新 DBR，再写 UAR。DBR 是内存中的队列进度记录；UAR doorbell 是设备寄存器。下面抽出一次 64 位门铃写入，对应 GPUNetIO 的 <code>fence + st.mmio.relaxed</code> 提交方式。示例用 <code>fence.acq_rel.sys</code> 提供所需的发布顺序；<code>%0</code> 是 GPU 地址，<code>%1</code> 是已按 mlx5 格式与字节序编码的门铃值。[[uar-mmio-submit|GPUNetIO 门铃提交]] · [[uar-mmio-instruction|MMIO store]]</p>
+{{code:uar-store}}
+<p><code>fence.acq_rel.sys</code> 包含 acquire 与 release 两种顺序约束，这里使用其 release 语义发布提交线程先前的写入。<code>.mmio</code> 指定设备寄存器访问语义，<code>.sys</code> 指定系统作用域。这个指令组合要求支持 PTX 8.2 MMIO 的工具链及 <code>sm_70</code> 以上目标。多个线程协作写队列时，提交线程还需通过库的同步协议确认其他线程已完成写入。[[uar-ptx|PTX store 语义与支持范围]] · [[uar-fence|Fence 语义]]</p>
+<pre><code>GPU store [gpu_doorbell_ptr], encoded_doorbell
+    ↓ GPU TLB / 页表：地址、aperture、缓存与权限
+GPU 可见的 NIC BAR 地址（含平台所需的总线 / IOMMU 映射）
+    ↓ PCIe Memory Write
+NIC 的 UAR doorbell 寄存器
+    ↓ 根据 QP 与队列进度取得 WQE
+NIC 执行 DMA 与网络操作，按完成配置报告 CQE</code></pre>
+<p>这里写出的数据是门铃控制信息，payload 由 NIC 随后按 WQE 描述搬运。VER3 PTE 的 <code>PCF</code> 包含缓存属性；C++ <code>volatile</code>、PTX 内存顺序与 MMIO 语义属于指令侧约束。实际提交时，NVSHMEM 使用自己的 store / barrier helper，GPUNetIO 按工具链和配置选择 MMIO 或其他受支持的提交分支。[[ibgda-db|NVSHMEM 提交顺序]] · [[uar-mmio-submit|GPUNetIO 分支]]</p>
+
+<h2 id="gin">4. NCCL GIN</h2>
+<p>GIN 为用户 CUDA kernel 提供网络通信接口，以 rank、window 与 signal 表达传输及同步。CPU proxy 和 GDAKI 实现相同的 <code>ncclGin</code> 接口；后端选择改变网卡请求的执行路径，应用的 put / signal 示例可以复用。[[gin-api|GIN 接口]] · [[gin-select|后端选择]]</p>
+
+<h3 id="windows">4.1 Window 与资源</h3>
+<p>CPU 为各 rank 建立 communicator、内存 window、signal 和网络 context。下面的公共初始化保留 <code>ginType</code> 默认值，由 NCCL 选择可用后端；两种后端的小节给出显式选择方式。</p>
 {{code:gin-setup}}
-<p class="code-context">初始化片段采用 NCCL 2.32.3，省略错误检查与普通 communicator 初始化。两个 rank 都建立对应的 src / dst window，<code>bytes</code> 一致，src 已初始化。运行后须同步 kernel，再释放 devComm、window 和内存。显式请求 GDAKI 时，若环境不支持该后端，创建会失败。</p>
+<p class="code-context">初始化片段采用 NCCL 2.32.3，省略错误检查与普通 communicator 初始化。两个 rank 都建立对应的 src / dst window，<code>bytes</code> 一致，src 已初始化。运行后须同步 kernel，再释放 devComm、window 和内存。</p>
 <p><code>ginType</code> 指定请求的后端，默认值允许选择可用后端。CPU proxy、GDAKI 等实现提供相同的 <code>ncclGin</code> 接口，网卡请求的提交方式由实际后端决定。[[gin-reqs|资源需求结构]] · [[gin-select|后端选择]]</p>
-<p>NCCL GDAKI 的注册实现同时包含 DMA-BUF 和 GPU MR 注册路径；实际选择依赖分配类型、驱动及平台能力。NCCL 还要求由多个 cuMem segment 支撑的 GIN buffer 使用 DMA-BUF。[[gdaki-reg|GDAKI 注册源码]] · [[device-doc|GIN 要求]]</p>
 
-<h3 id="gin-device">6.2 Kernel 内提交</h3>
+<h3 id="gin-device">4.2 Kernel 接口</h3>
 <p>示例中的两个 rank 各向对方写入一块数据，每个 rank 启动一个线程，只执行一轮，signal 0 初值为 0。等待固定值 1，可避免以“当前 signal 值加 1”作为等待目标时与对端提前发送发生竞态。</p>
 {{code:gin-kernel}}
 <p><code>ncclGin_SignalInc</code> 把远端信号递增与写入完成关联起来，接收方通过 acquire 语义的 <code>waitSignal</code> 等待。<code>flush</code> 保障本地发送源可以复用；它单独不保证数据已经落定在远端内存。重复执行时需要按轮次维护 signal，并协调接收 buffer 的复用。[[gin-api|put / flush / waitSignal 契约]]</p>
+<h3 id="gin-proxy">4.3 CPU proxy</h3>
+<p>GIN CPU proxy 提供 <code>ncclGin</code> 的 rank、window 与 signal 接口。GPU kernel 发布请求描述符，主机 progress 线程将其转换为网络操作。图中采用内置 IB RMA 后端，经 CPU verbs 提交 WR；启用 GDR 后，NIC 直接访问已注册的 GPU buffer。[[gin-proxy|描述符处理]] · [[gin-verbs|IB 提交]]</p>
+
+<h4 id="gin-proxy-setup">后端与资源</h4>
+<p>内存分配、window 注册和 device communicator 的生命周期与 <a href="#windows">公共初始化示例</a>一致。创建前把需求中的后端改为 proxy；主机建立共享请求队列、进度计数和网络连接。</p>
+{{code:gin-proxy-setup}}
+<p class="code-context">此片段替换初始化示例中的 reqs 设置与创建调用，内存分配、window 注册、运行和释放流程沿用原例。实际构建与网络环境须支持所选后端。[[gin-reqs|需求结构]] · [[gin-select|后端选择]]</p>
+
+<h4 id="gin-proxy-submit">描述符与完成</h4>
+{{ginproxy}}
+<p><code>proxyGinPollGfd()</code> 读取 GPU 发布的描述符，<code>proxyGinProcessGfd()</code> 分派到 RMA backend 的 <code>iput</code> / <code>iputSignal</code>。IB backend 构造 WR 并通过 <code>ibv_post_send()</code> 提交。随后主机检查 request 的完成，更新 GPU 可见的 counter。[[gin-proxy|GFD 消费与分派]] · [[gin-verbs|WR 提交]] · [[gin-proxy-completion|完成计数]]</p>
+
+<h4 id="gin-proxy-scope">接口与分工</h4>
+<p>应用可使用 <a href="#gin-device">同一段 ncclGin kernel</a>，<code>flush</code> 的本地源复用保证与 signal 的接收端依赖保持不变。GDAKI 在 GPU 上构造网卡 WQE；GIN CPU proxy 由 GPU 发布 GIN 描述符，CPU 构造并提交网络请求。GPUNetIO 的 CPU 辅助 doorbell 只将通知步骤交给 CPU，WQE 已由 GPU 构造。</p>
+<p>普通 NCCL NET/IB CPU proxy 推进的是 collective kernel 的 chunk；GIN CPU proxy 消费的是用户 kernel 发出的 GIN 操作。两条路径都可使用 CPU verbs 和 GPUDirect RDMA，但上层协议与进度对象不同。</p>
+
+<h3 id="gin-gdaki">4.4 GDAKI / GPUNetIO</h3>
+<p>在公共初始化中，将需求与创建部分替换为下面的片段即可显式请求 GDAKI。NCCL 通过 GPUNetIO 建立 GPU 可访问的网卡资源；环境不支持该后端时，创建会失败。</p>
+{{code:gin-gdaki-setup}}
+<p>NCCL GDAKI 的注册实现同时包含 DMA-BUF 和 GPU MR 注册路径；实际选择依赖分配类型、驱动及平台能力。NCCL 还要求由多个 cuMem segment 支撑的 GIN buffer 使用 DMA-BUF。[[gdaki-reg|GDAKI 注册源码]] · [[device-doc|GIN 要求]]</p>
 {{gdaki}}
 <p>本文版本中，<code>putImplMode()</code> 读取 window 的 key 与偏移，再调用 <code>doca_gpu_dev_verbs_put*</code>。主机侧通过 GPUNetIO 创建 QP，并导出设备侧描述符。GIN 负责 rank、window 和同步语义，GDAKI 将操作转换为 GPU 可执行的网卡队列操作。[[gdaki-put|GIN → GPUNetIO]] · [[gdaki-host|QP 建立与导出]]</p>
 
-<h3 id="ordering">6.3 顺序与完成</h3>
+<p>直接 GPU doorbell 使用的 UAR 注册、Hopper / Blackwell PTE 和 MMIO store 见 <a href="#uar-map">UAR 与 GPU 页表</a>。</p>
+
+<h3 id="ordering">4.5 顺序与完成</h3>
 <table><thead><tr><th>时刻</th><th>已经成立的条件</th><th>接下来仍需等待的条件</th></tr></thead><tbody>
 <tr><td>WQE 已构造</td><td>请求描述符已准备好。</td><td>正确发布队列并通知 NIC。</td></tr>
 <tr><td>Doorbell 已提交</td><td>网卡收到或可以观察到新工作通知。</td><td>DMA、网络事务及相应完成条件。</td></tr>
@@ -198,19 +300,3 @@
 <tr><td>接收方等待关联 signal 返回</td><td>满足该信号 API 的数据完成与顺序保证。</td><td>接收 kernel 真正完成消费；下一轮覆盖前需要协调。</td></tr>
 </tbody></table>
 <p>多线程实现需要明确数据生产线程、共同调用通信接口的线程，以及内存顺序作用域。直接将单线程示例扩展为每个线程各敲一次同一个 doorbell，会引入队列并发和顺序问题；共享队列时须遵循 GPUNetIO 与 GIN 的资源共享及协作约定。</p>
-
-<h2 id="gin-proxy">7. NCCL GIN / CPU proxy</h2>
-<p>GIN CPU proxy 提供 <code>ncclGin</code> 的 rank、window 与 signal 接口。GPU kernel 发布请求描述符，主机 progress 线程将其转换为网络操作。图中采用内置 IB RMA 后端，经 CPU verbs 提交 WR；启用 GDR 后，NIC 直接访问已注册的 GPU buffer。[[gin-proxy|描述符处理]] · [[gin-verbs|IB 提交]]</p>
-
-<h3 id="gin-proxy-setup">7.1 后端与资源</h3>
-<p>内存分配、window 注册和 device communicator 的生命周期与 <a href="#windows">GDAKI 示例</a>一致。创建前把需求中的后端改为 proxy；主机建立共享请求队列、进度计数和网络连接。</p>
-{{code:gin-proxy-setup}}
-<p class="code-context">此片段替换初始化示例中的 reqs 设置与创建调用，内存分配、window 注册、运行和释放流程沿用原例。实际构建与网络环境须支持所选后端。[[gin-reqs|需求结构]] · [[gin-select|后端选择]]</p>
-
-<h3 id="gin-proxy-submit">7.2 描述符与完成</h3>
-{{ginproxy}}
-<p><code>proxyGinPollGfd()</code> 读取 GPU 发布的描述符，<code>proxyGinProcessGfd()</code> 分派到 RMA backend 的 <code>iput</code> / <code>iputSignal</code>。IB backend 构造 WR 并通过 <code>ibv_post_send()</code> 提交。随后主机检查 request 的完成，更新 GPU 可见的 counter。[[gin-proxy|GFD 消费与分派]] · [[gin-verbs|WR 提交]] · [[gin-proxy-completion|完成计数]]</p>
-
-<h3 id="gin-proxy-scope">7.3 接口与分工</h3>
-<p>应用可使用 <a href="#gin-device">同一段 ncclGin kernel</a>，<code>flush</code> 的本地源复用保证与 signal 的接收端依赖保持不变。GDAKI 在 GPU 上构造网卡 WQE；GIN CPU proxy 由 GPU 发布 GIN 描述符，CPU 构造并提交网络请求。GPUNetIO 的 CPU 辅助 doorbell 只将通知步骤交给 CPU，WQE 已由 GPU 构造。</p>
-<p>普通 NCCL NET/IB CPU proxy 推进的是 collective kernel 的 chunk；GIN CPU proxy 消费的是用户 kernel 发出的 GIN 操作。两条路径都可使用 CPU verbs 和 GPUDirect RDMA，但上层协议与进度对象不同。</p>
