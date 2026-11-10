@@ -1,0 +1,90 @@
+<h1>UVM managed memory 访存路径</h1>
+<p>Managed memory 让 CPU 和 GPU 使用同一个指针访问数据，UVM 负责维护各端映射，并按访问需求管理物理页面。一次访问可能直接命中现有映射，也可能触发缺页，由 UVM 决定补充映射、调整权限或迁移数据后恢复执行。理解这条路径，需要区分三件事：虚拟地址、当前物理位置，以及驱动保存的页面状态。</p>
+<p class="source-scope">本文围绕显式 <code>cudaMallocManaged()</code> 分配，介绍本地访问、远程映射与页面迁移。第 2、3 章选取 Linux UVM 独立页表路径中“已决定迁移”的分支说明函数与页表更新，源码固定为 NVIDIA open kernel modules <code>615.71.10 / 6f3be8c9c3fb</code>。PTE 使用 Hopper／Blackwell UVM 的 VER3 格式；HMM、ATS 路径的具体函数链和页表管理有所不同。[[release|源码版本]] · [[mmu-blackwell|Blackwell MMU]]</p>
+
+<h2 id="architecture">1. UVM 架构</h2>
+<h3 id="software-stack">1.1 软件与硬件</h3>
+<p>UVM（Unified Virtual Memory）是 CUDA Unified Memory 的驱动实现。应用通过 <code>libcudart.so</code> 调用 Runtime API，或直接使用 <code>libcuda.so.1</code> 的 Driver API。用户态驱动经 <code>ioctl</code>、<code>mmap</code> 等内核接口建立资源；Linux 上的 <code>nvidia-uvm.ko</code> 管理地址空间、页面驻留、缺页与迁移，并使用 <code>nvidia.ko</code> 提供的 RM 资源服务。[[driver-post|CUDA 软件与驱动分层]] · [[fops|UVM 内核接口]]</p>
+{{architecture}}
+<p><code>cudaMallocManaged(&amp;p, bytes)</code> 建立一段 managed 虚拟地址。在支持按需分页的配置下，返回时可以尚未分配全部物理页。UVM 的 managed <code>mmap</code> 路径安装 Linux VMA 回调，并创建类型为 <code>UVM_VA_RANGE_TYPE_MANAGED</code> 的地址区间记录；下属 VA block 保存各页的驻留位置、映射和权限。[[memory-api|分配语义]] · [[mmap|VMA 回调]] · [[range-create|区间创建]] · [[block-state|逐页状态]]</p>
+
+<h3 id="two-page-tables">1.2 映射与页面迁移</h3>
+<p>UVA 统一虚拟地址的组织，UVM 管理地址背后的页面。访存能否完成，取决于当前映射、权限和目标内存的可达性。图中用独立 CPU／GPU 页表展示一个具体状态：<strong>managed 页驻留主机，GPU 已建立远程映射</strong>，两端都把 <code>p</code> 映射到主机页 <code>H</code>。只要映射有效且权限满足，GPU 就能经互联读取它。[[memory-api|AccessedBy 与主机页映射]]</p>
+{{page_tables}}
+<div class="cuda-note"><p><strong>Grace Hopper：CPU 直接访问 GPU 驻留的 managed 页。</strong> 在支持主机直接访问且映射已建立的配置下，CPU 可以通过 NVLink-C2C 读写 Hopper HBM 中的数据。应用等待相关 GPU 工作完成后，CPU 执行 <code>float value = p[i]</code> 就是在解引用同一个 managed 指针；页面可以继续驻留显存。互联传输所需数据、填充 CPU 缓存，与把整个页面迁回主机内存是不同的操作。[[grace-memory|Grace Hopper 内存互联]] · [[host-direct|Host 直接访问]]</p>
+<p>应用查询 <code>cudaDevAttrDirectManagedMemAccessFromHost</code>，并用面向 Host 的 <code>cudaMemAdviseSetAccessedBy</code> 配置访问建议。实际能力取决于驱动的内存管理模式，例如 CDMM 文档列出的该属性为 <code>0</code>，应以运行时查询为准。这里的 <code>p</code> 来自 <code>cudaMallocManaged()</code>。Grace Hopper 的 ATS 还可以让 GPU 使用 CPU 页表提供的翻译，因此上图的两套独立页表是其中一种实现。[[host-direct|访问条件]] · [[cdmm|驱动模式]] · [[hardware-coherence|ATS 与页表]]</p></div>
+<p><strong>页面何时迁移、迁到哪里，由 UVM 结合访问需求、策略和平台能力决定。</strong> 缺页可以通过补充映射或调整权限解决；迁移也可以在没有缺页时发生。</p>
+<table class="uvm-migration-triggers"><thead><tr><th>触发条件</th><th>可能采取的动作</th></tr></thead><tbody>
+<tr><td><strong>缺页：</strong>当前映射不存在或不满足访问要求</td><td>根据策略选择迁移、建立可用的远程映射，或调整访问权限</td></tr>
+<tr><td><strong>显式预取：</strong>调用 <code>cudaMemPrefetchAsync</code></td><td>按流顺序将数据迁往指定位置，提前准备后续访问，无需等待缺页</td></tr>
+<tr><td><strong>远程访问计数：</strong>GPU 频繁访问其他处理器的内存</td><td>在支持并启用 access-counter migration 时，驱动可据此迁移热点页面</td></tr>
+<tr><td><strong>内存压力：</strong>例如显存容量不足</td><td>将可迁移页面移到主机内存，腾出显存</td></tr>
+</tbody></table>
+<p class="source-scope">[[residency-policy|缺页后的驻留选择]] · [[memory-api|预取与显存驱逐]] · [[access-counters|访问计数器迁移]]</p>
+<p>访问建议会影响 UVM 对驻留位置与映射的选择：</p>
+<table class="uvm-policy-table"><thead><tr><th>策略</th><th>设置方式</th><th>对迁移与映射的影响</th></tr></thead><tbody>
+<tr><td><code>PreferredLocation</code>：驻留偏好</td><td><code>cudaMemAdviseSetPreferredLocation</code></td><td>引导 UVM 选择驻留位置；设置时不立即迁移，也不阻止后续显式预取</td></tr>
+<tr><td><code>AccessedBy</code>：访问方</td><td><code>cudaMemAdviseSetAccessedBy</code></td><td>在可达条件下建立该处理器的映射；此建议本身不要求把数据搬到访问方</td></tr>
+<tr><td><code>ReadMostly</code>：以读为主</td><td><code>cudaMemAdviseSetReadMostly</code></td><td>在支持的配置中允许建立只读副本；写入时需使其他副本失效</td></tr>
+</tbody></table>
+<p>这些建议通过 <code>cudaMemAdvise()</code> 传入。<code>PreferredLocation</code> 是策略属性，<code>SetPreferredLocation</code> 是设置它的建议值；查询到的偏好位置不等于页面当前实际位置。例如，主机驻留的 managed 页配合 CPU 驻留偏好和 GPU 的 <code>AccessedBy</code>，可以维持图中的远程映射。[[memory-api|cudaMemAdvise 与策略查询]]</p>
+
+<h3 id="tbe-uvm">1.3 TBE 的 UVM 权重</h3>
+<p>FBGEMM GPU 的 TBE（Table Batched Embedding）将 UVM 用于大型 embedding 表。采用 <code>MANAGED_CACHING</code> 时，完整权重可存于 managed memory，GPU 显存用于缓存常用行。[[tbe-placement|存储选项]]</p>
+<p>在默认分配配置 <code>enforce_hbm=False</code>、<code>uvm_host_mapped=False</code> 下，底层调用 <code>cudaMallocManaged()</code>，并设置 <code>SetPreferredLocation=CPU</code>、<code>SetAccessedBy=当前 GPU</code>。权重倾向驻留主机，GPU 通过建立的远程映射访问它，体现了上一节的驻留与映射策略。[[tbe-allocation|分配路径]] · [[tbe-managed|Managed 分配]] · [[tbe-advice|访问建议]]</p>
+<p><code>tbe.prefetch()</code> 按本批次索引把所需行填入显存缓存 <code>lxu_cache_weights</code>。<strong>TBE 管理 embedding 行缓存，UVM 管理底层页面的映射与迁移</strong>；这里的缓存预取与 <code>cudaMemPrefetchAsync()</code> 请求的页面迁移属于两个层次。[[tbe-cache|缓存分配]] · [[tbe-prefetch|缓存预取]]</p>
+
+<h2 id="cpu-fault">2. CPU 缺页迁移</h2>
+<h3 id="cpu-entry">2.1 异常入口</h3>
+<p>考虑数据驻留在显存页 <code>D</code>、CPU 尚无可用映射的状态。应用先等待相关 GPU 工作完成，再由 CPU 读取 <code>p[i]</code>。CPU MMU 找不到可用映射，产生同步缺页异常。以下采用 Linux UVM managed VMA 路径：Linux 内存管理沿 VMA 的 <code>fault</code> 回调进入 UVM，处理发生在触发缺页的 CPU 线程上下文中。[[linux-fault|Linux 的 VMA 回调]] · [[cpu-fault|uvm_vm_fault]]</p>
+<p><code>uvm_vm_fault()</code> 调用 <code>uvm_va_space_cpu_fault_managed()</code>，后者根据进程地址空间与故障地址定位 managed VA block，再进入 <code>uvm_va_block_cpu_fault()</code>。UVM 检查访问权限、选择驻留位置，并通过 <code>uvm_va_block_service_locked()</code> 执行页面服务。[[cpu-dispatch|区间与 block 定位]] · [[cpu-block|CPU fault 服务]]</p>
+<p>下图选取<strong>UVM 决定迁回主机</strong>的分支，具体函数调用对应上述独立页表实现。支持 CPU 远程访问的平台还可以保留 <code>D</code>，建立或恢复 CPU 对它的映射；已有可用映射时，CPU 直接完成访问。硬件一致性平台的 ATS／Linux MM 路径应按对应实现分析。[[cpu-residency|CPU fault 的驻留选择]] · [[host-direct|主机远程访问]] · [[hardware-coherence|硬件一致性页表]]</p>
+{{cpu_fault}}
+
+<h3 id="cpu-mappings">2.2 迁回主机与页表更新</h3>
+<p>图中采用“显存页 <code>D</code> 迁回主机页 <code>H</code>”的路径。<code>uvm_va_block_make_resident_copy()</code> 先撤销待迁移页面的旧映射，再准备目标页、复制数据；<code>uvm_va_block_service_finish()</code> 更新驻留记录并建立需要的映射。[[resident-copy|迁移准备与复制]] · [[service-finish|完成页面服务]]</p>
+<ol>
+<li><strong>GPU 页表：</strong>清除旧的 <code>p → D</code> 映射，并使相应 GPU TLB 翻译失效，防止继续使用旧位置。[[gpu-clear|清除 GPU PTE 与 TLB 维护]] 迁移完成后，UVM 根据访问策略与目标可达性，决定是否在 GPU 页表中补建指向新主机页的 <code>p → H</code> 映射。[[service-finish|迁移后的映射处理]]</li>
+<li><strong>复制与等待：</strong>把数据从 <code>D</code> 复制到 <code>H</code>。<code>block_map_cpu_page_to()</code> 在插入 CPU PTE 前调用 <code>uvm_tracker_wait()</code>，等待先前的数据复制和 GPU 页表更新完成。[[cpu-map-wait|CPU 映射前的等待]]</li>
+<li><strong>CPU 页表：</strong><code>uvm_cpu_insert_page()</code> 调用 Linux 的 <code>vm_insert_page()</code>，建立 <code>p → H</code>。缺页处理返回后，CPU 重试原来的访存指令。CPU 页表及相关 TLB 维护由 Linux MM 负责。[[cpu-insert|插入 CPU 映射]] · [[linux-tlb|Linux TLB 规则]]</li>
+</ol>
+<p>CPU 首次触碰尚无物理存储的 managed 页时，同样进入这条 CPU fault 路径，但无需从显存复制旧数据。若策略允许 GPU 继续远程访问主机页，UVM 还可以为 GPU 建立 <code>p → H</code> 的 system-memory 映射。[[service-finish|其他处理器的映射策略]]</p>
+
+<h2 id="gpu-fault">3. GPU 缺页迁移</h2>
+<h3 id="gpu-entry">3.1 故障记录与调度</h3>
+<p>反过来，CPU 已写好主机页 <code>H</code>，GPU 尚无可用映射。Kernel 执行普通 <code>ld.global</code>，地址翻译缺失或权限不足会触发 page fault。单纯 TLB 未命中只需遍历页表；若找到权限满足的主机页映射，GPU 就能直接访问它。正常 load 的地址翻译由硬件完成，不调用 CPU 上的 UVM 区间查找函数。[[ptx|GPU load 指令]] · [[mmu-hopper|页表层级]]</p>
+<p>GPU 将可重放故障写入 fault buffer，并通过中断通知主机。<code>nvidia.ko</code> 的 RM 中断路径调用 <code>uvm_isr_top_half()</code>；UVM 将工作排入 <code>nv_kthread_q</code>，由 <code>replayable_faults_isr_bottom_half()</code> 调用 <code>uvm_parent_gpu_service_replayable_faults()</code>。该内核线程批量读取、合并故障，再根据 GPU 上下文和地址找到 VA space、range 与 block。[[irq-top|中断入口]] · [[irq-queue|工作队列]] · [[irq-bottom|线程回调]] · [[fault-range|故障分派]]</p>
+<p>随后 UVM 选择驻留位置和访问方式。以下序列图展示<strong>选择迁入显存</strong>的分支；若策略允许保留 <code>H</code>，则可以补建 GPU 的 <code>p → H</code> 映射后重放，无需这条迁移分支中的 H2D 复制与 CPU 映射撤销。[[gpu-residency|GPU fault 的驻留选择]] · [[residency-policy|策略与可达性判断]]</p>
+{{gpu_fault}}
+
+<h3 id="gpu-mappings">3.2 迁入显存与重放</h3>
+<p>下面采用 UVM 决定把 <code>H</code> 迁到本地显存页 <code>D</code> 的路径。CPU 与 GPU fault 都会使用 VA block 的页面服务，但映射的建立方式和恢复执行的机制不同。</p>
+<ol>
+<li><strong>CPU 页表：</strong><code>block_unmap_cpu()</code> 调用 <code>unmap_mapping_range()</code>，由 Linux 撤销 <code>p → H</code> 并处理 CPU TLB 失效。其他需要撤销的 GPU 映射也在迁移准备阶段清除。[[cpu-unmap|撤销 CPU 映射]] · [[resident-copy|撤销旧映射]]</li>
+<li><strong>GPU 页表：</strong>准备显存页并完成 <code>H → D</code> 复制后，<code>uvm_va_block_map()</code> 进入 GPU 映射路径。驱动构造指向 <code>D</code> 的 PTE，提交页表写入及 GPU TLB 维护，使新的 <code>p → D</code> 可供硬件使用。[[gpu-map|GPU 映射]] · [[gpu-write|PTE 构造、写入与失效]]</li>
+<li><strong>恢复访问：</strong><code>push_replay_on_gpu()</code> 带着 tracker 依赖提交 replay，保证必要的前置 GPU 工作完成后再重放受影响的访问。CPU 不必在每一步同步等待。[[fault-replay|依赖与 replay]]</li>
+</ol>
+<p>这次迁移后，CPU 再访问时是否缺页，取决于此时的 CPU 映射。若平台支持并已建立对 <code>D</code> 的远程映射，CPU 可以直接访问显存；若缺少可用映射，则进入相应的缺页处理路径，再决定补建映射或迁移。故障记录会批量合并，因此 fault 数、中断数和迁移次数没有一一对应关系。[[host-direct|CPU 远程访问]] · [[block-service|共享页面服务]] · [[fault-batch|批处理循环]]</p>
+
+<h2 id="pinned-pte">4. Managed 与 pinned</h2>
+<h3 id="pinned-mapping">4.1 页锁定与访问目标</h3>
+<p>Mapped pinned memory 的物理页驻留在主机内存，OS／驱动在注册或分配期间保持页面稳定，并为 GPU 建立可访问的映射。GPU 直接读取这些页时，事务经过主机互联；managed memory 则允许 UVM 改变同一虚拟地址背后的驻留位置。[[mapped|CUDA mapped host memory]] · [[pin-linux|Linux DMA pinning]]</p>
+<table><thead><tr><th>维度</th><th>Managed memory</th><th>Mapped pinned host memory</th></tr></thead><tbody>
+<tr><td>典型接口</td><td><code>cudaMallocManaged</code></td><td><code>cudaHostAlloc</code>（mapped）+ <code>cudaHostGetDevicePointer</code></td></tr>
+<tr><td>物理位置</td><td>由 UVM 管理，可迁移至主机或 GPU</td><td>保持在主机内存，供 GPU 直接访问</td></tr>
+<tr><td>GPU 指令</td><td>普通 load/store</td><td>普通 load/store</td></tr>
+<tr><td>GPU PTE 目标</td><td>随映射选择 local、peer 或 system</td><td>直接映射选择 system memory</td></tr>
+<tr><td>软件状态</td><td>managed 区间、驻留、映射与策略</td><td>主机分配、注册与页面锁定状态</td></tr>
+</tbody></table>
+<p>Pinned 页作为 <code>cudaMemcpyAsync</code> 的源缓冲区时，显式复制后的 kernel 读取另一块设备内存；表中比较的是 GPU 直接读取 mapped pinned 页的情况。</p>
+
+<h3 id="pte-fields">4.2 Hopper／Blackwell PTE</h3>
+<p>Hopper VER3 PTE 是 64 位硬件条目；本文版本的 Blackwell UVM 继承 Hopper 的 PTE 构造函数。<code>Valid</code> 表示有效性，<code>Address</code> 保存页地址，<code>Aperture</code> 指定 local／peer／system 目标，<code>PCF</code> 组合编码权限、缓存与访问计数器属性。[[pte|字段定义]] · [[pte-make|PTE 构造]] · [[mmu-blackwell|Blackwell HAL]]</p>
+{{pte}}
+<p><code>Aperture=10/11</code> 区分 coherent／non-coherent system memory 的访问属性，涉及 CPU 缓存的一致性处理；它们都只说明当前映射指向系统内存。<code>PCF</code> 的解释还依赖 <code>Valid</code>，无效项采用另一组编码。[[coherent|System memory 一致性定义]] · [[pte-invalid|无效项编码]]</p>
+
+<h3 id="managed-identity">4.3 分配身份与 PTE</h3>
+<p><strong>PTE 没有专门的 managed 位，也没有 host-pinned 位。</strong> GPU 只需根据当前条目完成地址翻译与权限检查。Mapped pinned 页和仍驻留主机的 managed 页，都可能表现为 system-memory 映射；页锁定和 managed 身份分别保存在 OS／驱动的软件状态中。</p>
+<p>Managed 区间即使尚无有效叶子 PTE，UVM 仍能通过“地址空间 + 故障地址”找到它的类型、策略与页面状态。缺页也可能发生在上级页目录，单靠叶子 PTE 无法覆盖这些情况。因此，把分配身份保存在软件中、把当前翻译保存在硬件页表中，已经能完成上述访问与恢复流程。这是依据公开实现作出的设计分析，NVIDIA 并未在这些资料中给出“不设置 managed 位”的官方理由。[[range-type|Managed 类型]] · [[fault-space|地址空间识别]] · [[fault-range|故障地址查找]]</p>
+<p>应用查询分配类型可用 <code>cudaPointerGetAttributes()</code>；返回 managed 类型表示分配身份，不表示该页当前驻留在主机还是 GPU。[[pointer|指针属性 API]]</p>
+<details class="uvm-extra"><summary>可运行示例</summary><p><a href="../assets/inside-cuda/managed-memory/managed_vs_pinned.cu" download>managed_vs_pinned.cu</a> 用同一个 kernel 比较 managed 与 mapped pinned 输入，检查输出并打印分配类型。示例适用于 CUDA 12+，本文未附 GPU 实测结果。</p>{{code:run}}</details>
