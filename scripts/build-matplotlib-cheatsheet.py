@@ -338,8 +338,8 @@ def build() -> None:
     assert section_count == 38, section_count
     assert link_count == 63, link_count
 
-    zh = "Matplotlib 绘图、配色、坐标轴与标注速查，保留 3.5.0 版的紧凑分栏、代码和图例。"
-    en = "A compact reference for plots, colors, axes, and annotations, preserving the code and visual examples from the Matplotlib 3.5.0 cheatsheet."
+    zh = '对照 Matplotlib 的绘图代码与图例，查找图形样式、坐标轴和标注的设置方法。参考内容沿用 3.5.0 版，图例与参数速记旁提供 API 文档入口。'
+    en = 'Compare Matplotlib code with visual examples to find plot styles, axis settings, and annotation options. The reference retains the 3.5.0 examples and provides API links alongside diagrams and parameter reminders.'
     # Keep the article metadata stable; the body is deterministic from the PDF.
     head = POST.read_text().split("<body>")[0]
     for field, value in [("summary", zh), ("summary_en", en)]:

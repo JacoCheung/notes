@@ -330,8 +330,8 @@ def main():
         'slug':'cheatsheet-adb','date':'2026-11-03',
         'tags':'ADB, Android, CLI, Cheatsheet','tags_en':'ADB, Android, CLI, Cheatsheet',
         'reading':'速查表','reading_en':'Reference sheet',
-        'summary':f'{count} 组 ADB 常用指令，覆盖无线连接、文件、应用、日志、截图录屏与端口转发，支持搜索、复制和打印。',
-        'summary_en':f'{count} ADB examples covering wireless connections, files, apps, logs, screen capture, and port forwarding, with search, copy, and print controls.',
+        'summary':f'{count} 组 ADB 示例按调试任务组织，可查找并复制所需指令。条目注明设备选择、参数替换及适用条件，便于执行 Android 设备连接、应用管理和日志排查。',
+        'summary_en':f'Find and copy ADB commands by debugging task. The {count} examples include device selection, parameter substitutions, and usage conditions for connecting to Android devices, managing apps, and inspecting logs.',
         'series':'cheatsheets','series_title':'Cheatsheets','series_title_en':'Cheatsheets','series_order':'10',
     }
     meta = '\n'.join(f'<meta name="post:{key}" content="{escape(value,quote=True)}">' for key,value in metadata.items())

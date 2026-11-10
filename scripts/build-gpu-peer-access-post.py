@@ -2,6 +2,7 @@
 """Build the bilingual GPU P2P article from its downloadable CUDA examples."""
 from html import escape
 from pathlib import Path
+from post_series import render_series_nav
 import re
 import textwrap
 
@@ -372,6 +373,7 @@ ZH = r'''
 <p>GPU P2P（Peer-to-Peer）让一张 GPU 的 kernel 通过有效映射，直接读写另一张 GPU 的显存。源数据可以留在原来的 GPU 上，消费者使用普通指针访问它，省去经 CPU 内存中转的数据拷贝。这条路径贯穿 CUDA 的访问授权、GPU 地址转换、NCCL Device API，以及 NVLink／PCIe 互联：驱动建立映射，GPU 硬件执行访问，通信库提供 peer 指针与同步接口。</p>
 <aside class="p2p-note"><p>同进程与节点内 IPC 示例采用 Linux 64 位、同一主机内两张支持 P2P 的 GPU 与 cudaMalloc 分配；跨节点示例采用 VMM fabric handle。P100 的 GP100 页表格式用于说明地址转换；NCCL LSA 示例采用 2.32.3（12df1a11afad）的接口、ncclMemAlloc 分配和支持 Device API 的设备。</p></aside>
 
+<p>在 PyTorch 中建立同类 peer 映射并编写计算 kernel，可接着阅读<a href="pytorch-symmetric-memory.html#zh-internals">《PyTorch 对称内存与 GPU P2P 访问》第三章</a>：其中逐项对照本章的 CUDA IPC、VMM 与 fabric handle，并给出双卡 Triton 和 MegaMoE 场景。</p>
 
 <h2 id="zh-kernel">1. Kernel 与访问映射</h2>
 <h3 id="zh-load">同一条 load</h3>
@@ -546,6 +548,7 @@ EN = r'''
 <p>GPU peer-to-peer access lets a kernel address another GPU's device memory through an authorized mapping. The producer's data can stay on its GPU while a consumer reads it through an ordinary pointer, avoiding a staging copy through CPU memory. This connects CUDA access control, GPU address translation, the NCCL Device API, and NVLink or PCIe: the driver establishes mappings, hardware executes accesses, and the communication library provides peer pointers and synchronization interfaces.</p>
 <aside class="p2p-note"><p>The same-process and intra-node IPC examples use 64-bit Linux, two P2P-capable GPUs in one host, and cudaMalloc allocations; the cross-node example uses VMM fabric handles. P100's GP100 page-table format illustrates address translation. The NCCL LSA example uses version 2.32.3, commit 12df1a11afad, ncclMemAlloc allocations, and devices that support the Device API.</p></aside>
 
+<p>For PyTorch peer mappings and custom compute kernels, see <a href="pytorch-symmetric-memory.html#en-internals">PyTorch Symmetric Memory and GPU P2P Access, chapter 3</a>, which cross-references this article’s CUDA IPC, VMM, and fabric-handle paths and includes Triton and MegaMoE examples.</p>
 
 <h2 id="en-kernel">1. Kernels and access mappings</h2>
 <h3 id="en-load">The same load instruction</h3>
@@ -734,8 +737,8 @@ def main():
         'tags':'CUDA, GPU, P2P, NCCL, NVLink, 页表',
         'tags_en':'CUDA, GPU, P2P, NCCL, NVLink, Page Tables',
         'reading':'25 分钟', 'reading_en':'25 min',
-        'summary':'从普通 load kernel、同进程与跨进程映射，到 P100 PTE、NCCL Device API LSA 和 NVLink／PCIe 路由，解析 GPU peer 显存访问。',
-        'summary_en':'Trace GPU peer memory access from a load kernel and process-local mappings through P100 PTEs, the NCCL Device API LSA workflow, and NVLink or PCIe routing.',
+        'summary':'映射建立后，kernel 用普通 load/store 指令访问另一张 GPU 的显存。地址翻译与硬件路由将请求送往对端，数据经 NVLink 或 PCIe 传输，省去 CPU 内存中转。',
+        'summary_en':'GPU P2P lets kernels access remote GPU memory with ordinary loads and stores through driver-established mappings and permissions. Address translation and hardware routing direct traffic over NVLink or PCIe without staging the payload in CPU memory.',
         'series':'inside-cuda', 'series_title':'Inside CUDA',
         'series_title_en':'Inside CUDA', 'series_order':'4',
     }
@@ -748,7 +751,7 @@ def main():
 <link rel="stylesheet" href="../assets/inside-cuda/gpu-peer-access/style.css?v=content-fit-4">
 <script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <script src="../assets/inside-cuda/gpu-peer-access/page.js" defer></script>
-</head><body><div class="layout"><aside class="toc"><div class="toc-title">目录 · TOC</div></aside><main class="content">
+</head><body><div class="layout"><aside class="toc"><div class="toc-title">目录 · TOC</div>{render_series_nav(meta, ROOT / 'posts')}</aside><main class="content">
 <div class="lang-zh">{expand(ZH,'zh')}</div><div class="lang-en">{expand(EN,'en')}</div>
 </main></div></body></html>
 '''

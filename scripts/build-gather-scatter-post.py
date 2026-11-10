@@ -67,8 +67,23 @@ def lab(lang):
         ('indices', [('repeated', '重复索引' if zh else 'Repeated'), ('unique', '唯一目标' if zh else 'Unique targets')]),
     ]
     controls = ''.join(f'<label>{label}<select data-{key}>' + ''.join(f'<option value="{value}">{text}</option>' for value, text in options) + '</select></label>' for label, (key, options) in zip(labels, choices))
-    intro = '切换操作、前后向和坐标轴。dim=0 使用所有示例张量的转置，便于比较同一组对应关系。粗边框标记重复索引指向的目标。' if zh else 'Switch the operator, pass, and axis. dim=0 transposes every example tensor to preserve the same mapping. Heavy borders mark targets referenced more than once.'
-    return f'<div class="gs-lab" data-lang="{lang}"><p>{intro}</p><div class="gs-controls">{controls}</div><code data-equation></code><div class="gs-matrices"></div><div aria-live="polite"><p data-explanation></p><p data-warning hidden></p></div><noscript><p>' + ('交互演示需要 JavaScript；正文中的公式、数值和图示可直接阅读。' if zh else 'Enable JavaScript for the interactive example. The article’s formulas, values, and figures are available without it.') + '</p></noscript></div>'
+    intro = '每个元素依次经历“选中索引、读取源值、更新目标”。dim=0 使用示例张量的转置。播放顺序用于解释坐标映射，不代表 GPU 线程的执行顺序。' if zh else 'Each element goes through index selection, a source read, and a destination update. dim=0 transposes the example tensors. Playback illustrates the mapping, not GPU thread execution order.'
+    buttons = [('play', '播放' if zh else 'Play'), ('step', '单步' if zh else 'Step'),
+               ('reset', '复位' if zh else 'Reset'), ('end', '查看结果' if zh else 'Result')]
+    playback = ''.join(f'<button type="button" data-{key}' + (' aria-pressed="false"' if key == 'play' else '') + f'>{label}</button>' for key, label in buttons)
+    speed_label = '速度' if zh else 'Speed'
+    phases = ['选中索引', '读取源值', '更新目标'] if zh else ['Select index', 'Read source', 'Update target']
+    phase_list = ''.join(f'<li data-phase aria-current="false">{i+1}. {label}</li>' for i, label in enumerate(phases))
+    gif_label = '下载当前 GIF' if zh else 'Download this GIF'
+    return f'''<div class="gs-lab" data-lang="{lang}"><p>{intro}</p>
+<div class="gs-controls">{controls}</div>
+<div class="gs-playback">{playback}<label>{speed_label}<select data-speed><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select></label></div>
+<div class="gs-progress"><input data-seek type="range" min="0" max="18" value="0" step="1" aria-label="{'动画进度' if zh else 'Animation progress'}"><output data-status role="status" aria-live="polite"></output></div>
+<ol class="gs-phases">{phase_list}</ol><code data-equation></code>
+<div class="gs-stage"><div class="gs-matrices"></div></div>
+<p data-explanation></p><p data-warning hidden></p>
+<p class="gs-download"><a data-gif href="../assets/pytorch-internals/gather-scatter/gifs/gather-forward-dim1-repeated.gif" download>{gif_label}</a></p>
+<noscript><p>{'播放控件需要 JavaScript；可下载 GIF 查看动画。' if zh else 'The playback controls require JavaScript. Download the GIF to view the animation.'}</p></noscript></div>'''
 
 
 ZH = r'''
@@ -84,6 +99,17 @@ ZH = r'''
 </tbody></table></div>
 <p>Gather 的索引用在等号右边，决定<strong>从哪里读</strong>；Scatter 的索引用在等号左边，决定<strong>写到哪里</strong>。表中的 i、j 遍历 index 的 shape；它们在 Gather 中也是输出坐标，在 Scatter 中也是参与写入的源坐标。<a href="https://docs.pytorch.org/docs/2.8/generated/torch.gather.html">Gather API</a> · <a href="https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.scatter_.html">Scatter API</a></p>
 <p><code>base.scatter(dim, index, src)</code> 先以 base 的值作为输出的初始内容，再覆盖被索引命中的位置。未命中的位置保留 base，输出 shape 也与 base 相同。Gather 的输出 shape 则等于 index.shape。</p>
+<h3 id="zh-pull-push">Pull 与 Push</h3>
+<div class="gs-table"><table><thead><tr><th>维度</th><th>gather</th><th>scatter</th></tr></thead><tbody>
+<tr><td>数据流视角</td><td>接收端取数（get）</td><td>发送端派送（put）</td></tr>
+<tr><td>index 指向</td><td>源位置 src（本文的 x）</td><td>目标位置 dst（本文的 out）</td></tr>
+<tr><td>覆盖行为</td><td>src 被请求 0 次或更多次，送到<strong>不同</strong>位置</td><td>src 被请求 1 次，不同 src 可派送到相同位置</td></tr>
+<tr><td>后处理</td><td>无</td><td><code>scatter_add</code></td></tr>
+<tr><td>原地操作</td><td>不修改输入；默认返回新 Tensor</td><td><a href="https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.scatter.html"><code>scatter</code></a> 返回新 Tensor；<a href="https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.scatter_.html"><code>scatter_</code></a> 原地修改目标 base</td></tr>
+<tr><td>类比动作</td><td>pull：按需拉取</td><td>push：按址推送</td></tr>
+</tbody></table></div>
+<p>例如沿 <code>dim=1</code> 做 Gather，若 <code>index[0,:] = [2,0,2]</code>，输出位置 <code>out[0,0]</code> 和 <code>out[0,2]</code> 都请求 <code>x[0,2]</code>，因此同一个源值会出现在两个输出位置。</p>
+<p>Scatter 的参与范围由 <code>index.shape</code> 决定；当 <code>src.shape == index.shape</code> 时，每个源元素都派送一次。多个源位置指向同一目标时，<code>scatter</code> 会竞争覆盖；可选用 <code>scatter_add</code> 在写入时累加。表中的“后处理”指这种目标端合并方式。这里的接收端、发送端描述数据流视角。<a href="https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.scatter_.html">Scatter 的范围与重复索引规则</a></p>
 <h3 id="zh-notation">参数与范围</h3>
 <p>下面的数值示例使用浮点数据和 <code>torch.long</code> 索引，默认 <code>import torch</code>。Scatter 指不带 reduce 的 Tensor 源覆盖操作；累加使用独立的 <code>scatter_add</code>。示例采用返回新 Tensor 的版本，带下划线的 <code>scatter_</code>、<code>scatter_add_</code> 会原地修改接收者。API 与源码固定到 PyTorch 2.8.0，验证环境为 2.8.0+cpu。</p>
 
@@ -107,6 +133,7 @@ ZH = r'''
 # dim=0: out[index[i,j], j] += src[i,j]
 # dim=1: out[i, index[i,j]] += src[i,j]</pre>
 <p>若把列索引改为 [2,0,2]，第一行的 src[0,0]=10 和 src[0,2]=30 都累加到列 2。该位置结果为 <code>base[0,2] + 10 + 30 = 43</code>。初始化为零时，它就是按索引分组求和。<a href="https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.scatter_add_.html">Scatter add API</a></p>
+<h3 id="zh-animation">逐步动画</h3>
 {lab}
 
 <h2 id="zh-gather-backward">3. Gather 的反向</h2>
@@ -193,6 +220,17 @@ EN = r'''
 </tbody></table></div>
 <p>Gather applies the index on the right-hand side to choose <strong>where to read</strong>. Scatter applies it on the left-hand side to choose <strong>where to write</strong>. The coordinates i,j range over index.shape: they are output coordinates for Gather and participating source coordinates for Scatter. <a href="https://docs.pytorch.org/docs/2.8/generated/torch.gather.html">Gather API</a> · <a href="https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.scatter_.html">Scatter API</a></p>
 <p><code>base.scatter(dim,index,src)</code> starts with base's values and overwrites the addressed positions. Unwritten positions keep their original values, and the output has base.shape. Gather returns index.shape.</p>
+<h3 id="en-pull-push">Pull and push</h3>
+<div class="gs-table"><table><thead><tr><th>Aspect</th><th>gather</th><th>scatter</th></tr></thead><tbody>
+<tr><td>Data-flow perspective</td><td>The receiver fetches a value (get)</td><td>The sender delivers a value (put)</td></tr>
+<tr><td>index points to</td><td>A source position, src (x in this article)</td><td>A destination position, dst (out in this article)</td></tr>
+<tr><td>Coverage</td><td>A source is requested zero or more times, into <strong>different</strong> positions</td><td>A source is requested once; different sources may share a destination</td></tr>
+<tr><td>Post-processing</td><td>None</td><td><code>scatter_add</code></td></tr>
+<tr><td>In-place operation</td><td>Preserves the input; returns a new tensor by default</td><td><a href="https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.scatter.html"><code>scatter</code></a> returns a new tensor; <a href="https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.scatter_.html"><code>scatter_</code></a> modifies the destination base in place</td></tr>
+<tr><td>Analogy</td><td>pull: fetch on demand</td><td>push: send to an address</td></tr>
+</tbody></table></div>
+<p>For example, Gather along <code>dim=1</code> with <code>index[0,:] = [2,0,2]</code> makes both <code>out[0,0]</code> and <code>out[0,2]</code> request <code>x[0,2]</code>. The same source value therefore appears at two output positions.</p>
+<p>Scatter's participating region is determined by <code>index.shape</code>. When <code>src.shape == index.shape</code>, every source element sends once. With a shared destination, <code>scatter</code> has competing overwrites; choosing <code>scatter_add</code> accumulates values during the writes. “Post-processing” in the table refers to this destination-side combination. Sender and receiver describe the data-flow perspective. <a href="https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.scatter_.html">Scatter scope and duplicate-index rules</a></p>
 <h3 id="en-notation">Parameters and scope</h3>
 <p>Examples use floating-point data and torch.long indices, with <code>import torch</code> assumed. Scatter means the Tensor-source overwrite overload without reduce; addition uses scatter_add. Examples return new tensors. The underscore variants scatter_ and scatter_add_ modify the receiver in place. APIs and source are pinned to PyTorch 2.8.0; examples were checked with 2.8.0+cpu.</p>
 
@@ -216,6 +254,7 @@ EN = r'''
 # dim=0: out[index[i,j], j] += src[i,j]
 # dim=1: out[i, index[i,j]] += src[i,j]</pre>
 <p>With column indices [2,0,2], src[0,0]=10 and src[0,2]=30 both contribute to column 2. The result there is <code>base[0,2]+10+30=43</code>. A zero base gives a grouped sum. <a href="https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.scatter_add_.html">Scatter add API</a></p>
+<h3 id="en-animation">Step-by-step animation</h3>
 {lab}
 
 <h2 id="en-gather-backward">3. Gather backward</h2>
@@ -304,8 +343,8 @@ def main():
         'slug': 'pytorch-gather-scatter', 'date': '2026-11-09',
         'tags': 'PyTorch, Autograd, Tensor, 索引', 'tags_en': 'PyTorch, Autograd, Tensor, Indexing',
         'reading': '15 分钟', 'reading_en': '15 min',
-        'summary': '从二维坐标赋值推导 gather、scatter 和 scatter_add 的数据流与梯度，解释重复索引、覆盖位置和梯度累加，附交互演示与可运行验证。',
-        'summary_en': 'Derive gather, scatter, and scatter_add from two-dimensional coordinate assignments, including repeated indices, overwritten values, and gradient accumulation, with an interactive example and runnable checks.',
+        'summary': 'Gather 按索引选取输入，反向将多条读取路径的梯度累加回源位置。Scatter 按索引写入目标；重复目标在覆盖时产生竞争，在 scatter_add 中按加法合并。',
+        'summary_en': 'Gather selects inputs by index, then accumulates gradients back along the read paths. Scatter uses indices to select write destinations: repeated destinations create competing overwrites, while scatter_add combines their contributions by addition.',
         'series': 'pytorch-internals', 'series_title': 'PyTorch 内部机制',
         'series_title_en': 'PyTorch Internals', 'series_order': '12',
     }
@@ -315,9 +354,10 @@ def main():
 <title>{metadata['title']}</title>
 {meta}
 <link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
-<link rel="stylesheet" href="../assets/pytorch-internals/gather-scatter/style.css">
+<link rel="stylesheet" href="../assets/pytorch-internals/gather-scatter/style.css?v=animation-1">
 <script src="../lang-toggle.js?v=post-toc-3" defer></script>
-<script src="../assets/pytorch-internals/gather-scatter/lab.js" defer></script>
+<script src="../assets/pytorch-internals/gather-scatter/animation-model.js?v=animation-1" defer></script>
+<script src="../assets/pytorch-internals/gather-scatter/lab.js?v=animation-1" defer></script>
 </head><body><div class="layout"><aside class="toc"><div class="toc-title">目录 · TOC</div></aside><main class="content">
 <div class="lang-zh">{expand(ZH, 'zh')}</div><div class="lang-en">{expand(EN, 'en')}</div>
 </main></div></body></html>

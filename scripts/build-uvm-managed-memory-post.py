@@ -6,6 +6,7 @@ reading column, intrinsic tables/code, theme, TOC and diagram size controls.
 """
 from html import escape
 from pathlib import Path
+from post_series import render_series_nav
 import re
 import textwrap
 
@@ -319,14 +320,14 @@ def expand(lang):
 
 
 def main():
-    meta=dict(title='UVM managed memory 访存路径',title_en='UVM managed memory access paths',slug='cuda-uvm-managed-memory',date='2026-11-10',tags='CUDA, UVM, Unified Memory, MMU, Linux',tags_en='CUDA, UVM, Unified Memory, MMU, Linux',reading='15 分钟',reading_en='15 min',summary='从 UVM 软件分层与两套页表出发，分别追踪 CPU、GPU 缺页的迁移和映射更新，再对照 pinned memory 与 Hopper／Blackwell PTE。',summary_en='Follow CPU and GPU faults through UVM, migration and page-table updates; compare pinned memory and Hopper / Blackwell PTE fields.',series='inside-cuda',series_title='Inside CUDA',series_title_en='Inside CUDA',series_order='3')
+    meta=dict(title='UVM managed memory 访存路径',title_en='UVM managed memory access paths',slug='cuda-uvm-managed-memory',date='2026-11-10',tags='CUDA, UVM, Unified Memory, MMU, Linux',tags_en='CUDA, UVM, Unified Memory, MMU, Linux',reading='15 分钟',reading_en='15 min',summary='UVM 为同一 managed 指针维护 CPU 和 GPU 的映射。页面驻留位置可随访问需求变化；缺页时，驱动选择补建映射、调整权限或迁移页面，再恢复访问。',summary_en='UVM maintains CPU and GPU mappings for the same managed pointer. When an access faults, the driver can add a mapping, adjust permissions, or migrate the page before resuming execution.',series='inside-cuda',series_title='Inside CUDA',series_title_en='Inside CUDA',series_order='3')
     metadata='\n'.join(f'<meta name="post:{k}" content="{escape(v,quote=True)}">' for k,v in meta.items())
     html=f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{meta['title']}</title>
 {metadata}
 <link rel="stylesheet" href="../assets/site.css?v=post-toc-3"><link rel="stylesheet" href="{SHARED}style.css?v=gpu-stack-5"><link rel="stylesheet" href="{BASE}style.css?v=3">
 <script src="../lang-toggle.js?v=post-toc-3" defer></script><script src="{SHARED}page.js?v=component-info-4" defer></script>
-</head><body><div class="layout"><aside class="toc"><div class="toc-title">目录 · TOC</div></aside><main class="content cuda-article uvm-article"><div class="lang-zh">{expand('zh')}</div><div class="lang-en">{expand('en')}</div></main></div></body></html>'''
+</head><body><div class="layout"><aside class="toc"><div class="toc-title">目录 · TOC</div>{render_series_nav(meta, ROOT / 'posts')}</aside><main class="content cuda-article uvm-article"><div class="lang-zh">{expand('zh')}</div><div class="lang-en">{expand('en')}</div></main></div></body></html>'''
     target=ROOT/'posts/cuda-uvm-managed-memory.html'
     target.write_text(html)
     print('Wrote',target)

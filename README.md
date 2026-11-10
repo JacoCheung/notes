@@ -39,13 +39,24 @@ python3 -m http.server -d . 8080
 # 浏览器访问 http://localhost:8080
 ```
 
+## 文章排版
+
+文章共用 `assets/site.css` 和 `lang-toggle.js`。页面宽度随视口变化，正文阅读栏居中并控制行长，标题和段落保持左对齐。代码、表格及插图与阅读栏共享中心线；宽图和交互工具可使用更宽的内容区。桌面目录位于左侧，窄屏目录移入正文。
+
+- 普通表格和代码块按内容占宽并居中，内部文字左对齐；超出可用宽度时在组件内横向滚动。
+- 静态 SVG 根据 `viewBox` 限制放大，窄屏缩小适配；图示已有的缩放控件继续可用。
+- 并排代码用内容决定列宽，整组居中；窄屏滚动整个对照组，保持两栏的对应关系。
+- Cheatsheet 和交互工具保留各自的网格布局。
+
+公共尺寸集中在 `--post-content-max`、`--post-prose-max`、`--post-rail-width` 等 CSS 变量中。新增文章应沿用公共规则，避免为 `main.content` 单独设固定宽度或强制所有组件铺满。
+
 ## 功能
 
 - KaTeX 渲染数学公式（CDN）
 - ☀️ / 🌙 / 🌓 三态主题切换（localStorage 持久化）
 - 📖 左侧目录导航（IntersectionObserver 高亮当前段）
 - ⬇ 一键导出 Markdown 源
-- 🏷️ 标签过滤（landing 页）
+- 首页按系列分组并默认折叠，支持中英文搜索与系列筛选
 - 💬 Giscus 评论（基于 GitHub Discussions）
 
 ## License

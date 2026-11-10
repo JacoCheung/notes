@@ -6,6 +6,7 @@ Reuse the series' accessible popovers and proportional window-fit controls.
 """
 from html import escape
 from pathlib import Path
+from post_series import render_series_nav
 import json
 import re
 import textwrap
@@ -392,7 +393,7 @@ CAPTIONS = {
     'nvgda':('CPU 建立并导出资源；GPU 调用 GPUNetIO device verbs。图示直接 doorbell，CPU 辅助模式改变通知步骤。','The CPU creates and exports resources; GPU code calls GPUNetIO device verbs. Shows direct doorbells; CPU assistance changes the notification step.'),
     'ginproxy':('内置 IB RMA 后端示意。GPU 发布 GIN 描述符，CPU 生成 WR；这与 GPU 已构造 WQE 后由 CPU 辅助敲 doorbell 的分工不同。','Built-in IB RMA backend. GPU code publishes GIN descriptors and the CPU builds WRs. With CPU-assisted doorbells, the GPU has already built the WQEs.'),
     'gdaki':('图示 direct-GPU doorbell 模式。CPU-assisted 模式会增加 GPU → CPU notification → NIC doorbell；payload 路径保持直接 DMA。','Direct-GPU doorbell mode. CPU-assisted mode adds GPU → CPU notification → NIC doorbell; payload still uses direct DMA.'),
-    'fabric':('逻辑依赖示意，非 IMEX RPC 时序实测。Fabric Manager / NVLSM 已按平台完成 fabric 配置；管理连接与 NVLink payload 分开。','Logical dependencies, not an IMEX RPC trace. Platform services have configured the fabric; management traffic is distinct from NVLink payload.'),
+    'fabric':('图示跨 OS 显存共享的逻辑依赖。Fabric Manager / NVLSM 已按平台完成 fabric 配置；管理连接与 NVLink payload 分开。','Logical dependencies in cross-OS GPU memory sharing. Platform services have configured the fabric; management traffic is distinct from NVLink payload.'),
 }
 
 
@@ -425,7 +426,7 @@ def inspection(lang):
     zh=lang=='zh'
     items=[
         ('GPU 拓扑' if zh else 'GPU topology','nvidia-smi topo -m','        GPU0  GPU1  NIC0\nGPU0     X    NV18  PIX\nGPU1    NV18   X    SYS',
-         'NV# 表示一组 NVLink；PIX / SYS 描述 PCIe / 系统拓扑关系。矩阵本身不能证明应用已经启用 peer access 或 GDR。' if zh else 'NV# denotes bonded NVLinks; PIX / SYS describe PCIe / system paths. The matrix does not prove that an application enabled peer access or GDR.'),
+         'NV# 表示一组 NVLink；PIX / SYS 描述 PCIe / 系统拓扑关系。应用是否启用 peer access 或 GDR，需结合配置与运行日志确认。' if zh else 'NV# denotes bonded NVLinks; PIX / SYS describe PCIe / system paths. Check application configuration and runtime logs to confirm whether peer access or GDR is enabled.'),
         ('RDMA 端口' if zh else 'RDMA port','rdma link show','link mlx5_0/1 state ACTIVE physical_state LINK_UP netdev eth2',
          '确认端口和对应设备；随后用 ibv_devinfo 核对 link_layer、能力与端口状态。' if zh else 'Identify the port and device, then inspect link_layer, capabilities and port state with ibv_devinfo.'),
         ('驱动绑定' if zh else 'Driver binding',"lspci -nnk | grep -A3 -Ei 'NVIDIA|Mellanox'",'Network controller: Mellanox Technologies ...\n    Kernel driver in use: mlx5_core',
@@ -435,7 +436,7 @@ def inspection(lang):
     ]
     out='<div class="cuda-inspection">'
     for title,cmd,output,note in items:
-        out+=f'<section class="inspection-item"><div class="inspection-heading"><strong>{title}</strong><span>{"格式示例 · 非实测" if zh else "Illustrative format · not captured"}</span></div><pre class="inspection-command"><code>{escape(cmd)}</code></pre><pre class="inspection-output"><code>{escape(output)}</code></pre><p>{note}</p></section>'
+        out+=f'<section class="inspection-item"><div class="inspection-heading"><strong>{title}</strong><span>{"示例输出" if zh else "Example output"}</span></div><pre class="inspection-command"><code>{escape(cmd)}</code></pre><pre class="inspection-output"><code>{escape(output)}</code></pre><p>{note}</p></section>'
     return out+'</div>'
 
 
@@ -450,14 +451,14 @@ def expand(lang):
 
 
 def main():
-    meta=dict(title='GPU 互联的软件与驱动',title_en='GPU interconnect software and drivers',slug='gpu-interconnect-software-stack',date='2026-11-09',tags='CUDA, NCCL, NVSHMEM, RDMA, NVLink',tags_en='CUDA, NCCL, NVSHMEM, RDMA, NVLink',reading='25 分钟',reading_en='25 min',summary='从资源建立、请求提交到数据传输，解析 NCCL CPU proxy、NVSHMEM IBGDA、GPUNetIO Verbs、NCCL GIN/GDAKI，以及 Linux 驱动与 NVLink fabric 管理。',summary_en='Follow setup, request submission and payload movement through NCCL CPU proxies, NVSHMEM IBGDA, GPUNetIO Verbs, NCCL GIN/GDAKI, Linux drivers and NVLink fabric services.',series='inside-cuda',series_title='Inside CUDA',series_title_en='Inside CUDA',series_order='2')
+    meta=dict(title='GPU 互联的软件与驱动',title_en='GPU interconnect software and drivers',slug='gpu-interconnect-software-stack',date='2026-11-09',tags='CUDA, NCCL, NVSHMEM, RDMA, NVLink',tags_en='CUDA, NCCL, NVSHMEM, RDMA, NVLink',reading='25 分钟',reading_en='25 min',summary='GPUDirect RDMA 允许网卡直接搬运已注册的 GPU 显存。CPU proxy 与 GPU 直接提交请求的路径可以使用相同的数据通路，区别在于谁构造并提交网卡请求，以及谁推进完成状态。',summary_en='GPUDirect RDMA lets a NIC transfer data directly to and from registered GPU memory. CPU proxies and GPU submission paths can use the same data path; they differ in who constructs and submits NIC requests and handles completion.',series='inside-cuda',series_title='Inside CUDA',series_title_en='Inside CUDA',series_order='2')
     metadata='\n'.join(f'<meta name="post:{key}" content="{escape(value,quote=True)}">' for key,value in meta.items())
     html=f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{meta['title']}</title>
 {metadata}
 <link rel="stylesheet" href="../assets/site.css?v=post-toc-3"><link rel="stylesheet" href="{SHARED}style.css?v=gpu-stack-5"><link rel="stylesheet" href="{BASE}style.css?v=3">
 <script src="../lang-toggle.js?v=post-toc-3" defer></script><script src="{SHARED}page.js?v=component-info-4" defer></script><script src="{BASE}page.js?v=1" defer></script>
-</head><body><div class="layout"><aside class="toc"><div class="toc-title">目录 · TOC</div></aside><main class="content cuda-article interconnect-article"><div class="lang-zh">{expand('zh')}</div><div class="lang-en">{expand('en')}</div></main></div></body></html>'''
+</head><body><div class="layout"><aside class="toc"><div class="toc-title">目录 · TOC</div>{render_series_nav(meta, ROOT / 'posts')}</aside><main class="content cuda-article interconnect-article"><div class="lang-zh">{expand('zh')}</div><div class="lang-en">{expand('en')}</div></main></div></body></html>'''
     target=ROOT/'posts/gpu-interconnect-software-stack.html'
     target.write_text(html)
     print('Wrote',target)

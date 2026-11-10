@@ -6,6 +6,7 @@ Use the site's layout and theme; no additional framework or font dependency.
 """
 from html import escape
 from pathlib import Path
+from post_series import render_series_nav
 import json
 import re
 import textwrap
@@ -714,8 +715,8 @@ def main():
         'slug':'cuda-linux-driver-stack', 'date':'2026-11-09',
         'tags':'CUDA, Linux, GPU, 驱动, 系统调用', 'tags_en':'CUDA, Linux, GPU, Driver, Syscalls',
         'reading':'20 分钟', 'reading_en':'20 min',
-        'summary':'从 libcudart、libcuda 到 NVIDIA Linux 内核模块与 GSP，结合 H100 上真实的 strace / ltrace 日志，解析 CUDA 软件层级、设备文件和系统调用。',
-        'summary_en':'Map CUDA libraries, NVIDIA Linux modules and GSP to source, then inspect device files and syscalls using a real H100 strace / ltrace capture.',
+        'summary':'CUDA 用户态驱动经 Linux 设备接口建立 GPU 资源、映射和提交通道，GPU 执行计算与搬运。H100 实测日志展示了 API 调用与设备文件、驱动入口的对应关系。',
+        'summary_en':'CUDA user-space drivers establish GPU resources, mappings, and submission channels through Linux device interfaces, while the GPU executes computation and transfers. H100 strace/ltrace captures connect API calls with device files and driver entry points.',
         'series':'inside-cuda', 'series_title':'Inside CUDA', 'series_title_en':'Inside CUDA', 'series_order':'1',
     }
     metadata = '\n'.join(f'<meta name="post:{k}" content="{escape(v,quote=True)}">' for k,v in meta.items())
@@ -727,7 +728,7 @@ def main():
 <link rel="stylesheet" href="{BASE}style.css?v=gpu-stack-5">
 <script src="../lang-toggle.js?v=post-toc-3" defer></script>
 <script src="{BASE}page.js?v=component-info-4" defer></script>
-</head><body><div class="layout"><aside class="toc"><div class="toc-title">目录 · TOC</div></aside><main class="content cuda-article">
+</head><body><div class="layout"><aside class="toc"><div class="toc-title">目录 · TOC</div>{render_series_nav(meta, ROOT / 'posts')}</aside><main class="content cuda-article">
 <div class="lang-zh">{expand(ZH,'zh')}</div><div class="lang-en">{expand(EN,'en')}</div>
 </main></div></body></html>
 '''

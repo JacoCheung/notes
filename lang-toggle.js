@@ -393,6 +393,42 @@
     });
   }
 
+  function sizeStaticFigures(main) {
+    const figures = new Set(main.querySelectorAll('figure, .diagram-frame, .flow-frame'));
+    // Older articles put a standalone SVG directly in a scrolling div.
+    main.querySelectorAll('div > svg[viewBox]').forEach(svg => {
+      if (!svg.closest('figure, .diagram-frame, .flow-frame')) figures.add(svg.parentElement);
+    });
+    figures.forEach(figure => {
+      if (figure.closest('.gs-lab, .dt-app, .cheatsheet-sheet')) return;
+      const setWidth = width => {
+        if (!Number.isFinite(width) || width < 200) return;
+        // Include frame padding and the viewport border without scaling up art.
+        const style = getComputedStyle(figure);
+        const padding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+        figure.style.setProperty('--post-figure-width', `${width + padding + 2}px`);
+        figure.classList.add('post-static-figure');
+      };
+      const svg = Array.from(figure.querySelectorAll('svg[viewBox]'))
+        .find(element => element.viewBox.baseVal.width >= 200 &&
+          !element.closest('button, .diagram-toolbar, .p2p-toolbar'));
+      if (svg) {
+        setWidth(svg.viewBox.baseVal.width);
+        return;
+      }
+      const object = figure.querySelector('object[type="image/svg+xml"]');
+      if (object) {
+        const readSize = () => {
+          try { setWidth(object.contentDocument?.documentElement.viewBox?.baseVal.width); }
+          catch (_) { /* Cross-origin figures retain their declared layout. */ }
+        };
+        setWidth(Number(figure.dataset.width));
+        readSize();
+        object.addEventListener('load', readSize);
+      }
+    });
+  }
+
   let tocEntries = [];
   function collectTocEntries() {
     tocEntries = Array.from(document.querySelectorAll('aside.toc a[href^="#"], nav.toc a[href^="#"]'))
@@ -456,6 +492,7 @@
       moveTocIntoReadingOrder(main, header);
       createTableOfContents(main);
       addHeadingAnchors(main);
+      sizeStaticFigures(main);
     }
     createSeriesNavigation();
     attachTocTracking();

@@ -431,8 +431,8 @@ def main():
         'tags': 'PyTorch, CUDA, CUPTI, 显存, VMM',
         'tags_en': 'PyTorch, CUDA, CUPTI, Memory, VMM',
         'reading': '25 分钟', 'reading_en': '25 min',
-        'summary': '从 CUPTI Callback / Activity 接口到可编译追踪器，用同一段 PyTorch 程序对比 cudaMalloc、缓存复用与 driver VMM 映射。',
-        'summary_en': 'Build a CUPTI callback tracer to compare cudaMalloc, cache reuse, and driver VMM mappings in the same PyTorch allocation workload.',
+        'summary': 'PyTorch 的 native caching allocator 优先复用缓存块，缓存不足时向 CUDA 申请资源。CUPTI 回调记录 API 参数和结果，可据此区分缓存复用、cudaMalloc 分配与 VMM 映射。',
+        'summary_en': 'The native PyTorch caching allocator reuses cached blocks before requesting more CUDA resources. CUPTI callbacks record API arguments and results, allowing allocation traces to distinguish cache reuse, cudaMalloc allocations, and driver VMM mappings.',
         'series': 'pytorch-internals', 'series_title': 'PyTorch 内部机制',
         'series_title_en': 'PyTorch Internals', 'series_order': '11',
     }

@@ -251,8 +251,8 @@ def main():
         'slug': 'cheatsheet-adb-reference', 'date': '2026-11-03',
         'tags': 'ADB, Android, PM, AM, Cheatsheet', 'tags_en': 'ADB, Android, PM, AM, Cheatsheet',
         'reading': '命令手册', 'reading_en': 'Command manual',
-        'summary': 'man page 风格的 ADB 命令手册：全局选项、主命令、pm / am、Intent 与环境变量，支持搜索、复制和打印。',
-        'summary_en': 'A concise man-style ADB reference: global options, commands, pm / am, Intent arguments, and environment variables, with search, copy, and print.',
+        'summary': '按命令查询 ADB 的调用格式与选项，区分主机端命令和设备端 pm／am 操作。可搜索参数说明、复制命令，并打印为离线参考，便于调试时核对具体用法。',
+        'summary_en': 'Look up ADB command syntax and options, including host commands and device-side pm/am operations. Search parameter descriptions, copy commands, or print the reference to check usage while debugging.',
         'series': 'cheatsheets', 'series_title': 'Cheatsheets', 'series_title_en': 'Cheatsheets', 'series_order': '11',
     }
     meta = '\n'.join(f'<meta name="post:{key}" content="{escape(value, quote=True)}">' for key, value in metadata.items())

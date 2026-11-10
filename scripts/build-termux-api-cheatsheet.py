@@ -242,8 +242,8 @@ def main():
         'slug':'cheatsheet-termux-api','date':'2026-10-30',
         'tags':'Termux, Android, CLI, Cheatsheet','tags_en':'Termux, Android, CLI, Cheatsheet',
         'reading':'速查表','reading_en':'Reference sheet',
-        'summary':'57 个 Termux:API 命令的紧凑分栏速查，涵盖设备、文件、通知、音频、定位与任务，支持搜索、复制和打印。',
-        'summary_en':'A compact, multi-column reference for 57 Termux:API commands, with examples, search, copying, and printing.',
+        'summary':'在 Termux 中调用 Android 功能时，查找对应的 Termux:API 命令、参数和权限要求。57 个命令条目附有使用示例，可按用途搜索、复制或打印。',
+        'summary_en':'Look up Termux:API commands for accessing Android features from Termux, with arguments, permission requirements, and usage examples. The 57 command entries can be searched by purpose, copied, or printed.',
         'series':'cheatsheets','series_title':'Cheatsheets','series_title_en':'Cheatsheets','series_order':'9',
     }
     meta = '\n'.join(f'<meta name="post:{key}" content="{escape(value,quote=True)}">' for key,value in metadata.items())

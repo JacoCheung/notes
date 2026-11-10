@@ -551,8 +551,8 @@ def main():
         'slug':'pytorch-dataloader','date':'2026-10-26',
         'tags':'PyTorch, 深度学习, DataLoader, DDP','tags_en':'PyTorch, Deep Learning, DataLoader, DDP',
         'reading':'25 分钟','reading_en':'25 min',
-        'summary':'围绕五个样本解释 map-style DataLoader 的采样、分批、读取与组装，从单进程、单 worker 扩展到多 worker 预取和 DDP 分片。',
-        'summary_en':'Follow five samples through map-style sampling, batching, fetching, collation, worker prefetch, and distributed rank sharding.',
+        'summary':'启用自动分批的多 worker DataLoader 在主进程生成 map-style 数据集的批次索引，由 worker 完成读取和组装。预取让不同批次提前并行准备，默认按任务顺序交付结果。',
+        'summary_en':'With automatic batching and multiple workers, a map-style DataLoader generates batch indices in the main process and sends them to workers for reading and collation. Prefetching prepares batches concurrently ahead of consumption, with results delivered in task order by default.',
         'series':'pytorch-internals','series_title':'PyTorch 内部机制','series_title_en':'PyTorch Internals','series_order':'10',
     }
     meta='\n'.join(f'<meta name="post:{key}" content="{escape(value,quote=True)}">' for key,value in metadata.items())
