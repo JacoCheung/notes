@@ -29,7 +29,83 @@ def code(value):
     return '<pre><code>' + escape(textwrap.dedent(value).strip()) + '</code></pre>'
 
 
+# rdma-core 61.0 providers/mlx5/qp.c lines 754-802, verbatim; tabs shown as four spaces.
+MLX5_DB_LISTING = '''\
+754  static inline void post_send_db(struct mlx5_qp *qp, struct mlx5_bf *bf,
+755                  int nreq, int inl, int size, void *ctrl)
+756  {
+757      struct mlx5_context *ctx;
+758
+759      if (unlikely(!nreq))
+760          return;
+761
+762      qp->sq.head += nreq;
+763
+764      /*
+765       * Make sure that descriptors are written before
+766       * updating doorbell record and ringing the doorbell
+767       */
+768      udma_to_device_barrier();
+769      qp->db[MLX5_SND_DBR] = htobe32(qp->sq.cur_post & 0xffff);
+770
+771      /* Make sure that the doorbell write happens before the memcpy
+772       * to WC memory below
+773       */
+774      ctx = to_mctx(qp->ibv_qp->context);
+775      if (bf->need_lock)
+776          mmio_wc_spinlock(&bf->lock.lock);
+777      else
+778          mmio_wc_start();
+779
+780      if (!ctx->shut_up_bf && nreq == 1 && bf->uuarn &&
+781          (inl || ctx->prefer_bf) && size > 1 &&
+782          size <= bf->buf_size / 16)
+783          mlx5_bf_copy(bf->reg + bf->offset, ctrl,
+784                   align(size * 16, 64), qp);
+785      else
+786          mmio_write64_be(bf->reg + bf->offset, *(__be64 *)ctrl);
+787
+788      /*
+789       * use mmio_flush_writes() to ensure write combining buffers are
+790       * flushed out of the running CPU. This must be carried inside
+791       * the spinlock. Otherwise, there is a potential race. In the
+792       * race, CPU A writes doorbell 1, which is waiting in the WC
+793       * buffer. CPU B writes doorbell 2, and it's write is flushed
+794       * earlier. Since the mmio_flush_writes is CPU local, this will
+795       * result in the HCA seeing doorbell 2, followed by doorbell 1.
+796       * Flush before toggling bf_offset to be latency oriented.
+797       */
+798      mmio_flush_writes();
+799      bf->offset ^= bf->buf_size;
+800      if (bf->need_lock)
+801          mlx5_spin_unlock(&bf->lock);
+802  }'''
+
 CODE = {
+    'verbs-write': '''
+        // Level 2: the same 4 KiB as an RC RDMA Write. PD, MR, CQ and an RTS QP
+        // exist; remote_addr and rkey arrived from B out of band.
+        struct ibv_sge sge = {
+            .addr = (uintptr_t)buf, .length = 4096, .lkey = mr->lkey,
+        };
+        struct ibv_send_wr wr = {
+            .sg_list = &sge, .num_sge = 1,
+            .opcode = IBV_WR_RDMA_WRITE,
+            .send_flags = IBV_SEND_SIGNALED,            // request a CQE
+            .wr.rdma = { .remote_addr = remote_addr, .rkey = rkey },
+        };
+        struct ibv_send_wr *bad_wr;
+        if (ibv_post_send(qp, &wr, &bad_wr))            // libmlx5: WQE ①, doorbell ②
+            abort();
+
+        struct ibv_wc wc;
+        int n;
+        while ((n = ibv_poll_cq(cq, 1, &wc)) == 0)      // read the CQ ring; no syscall
+            ;
+        if (n < 0 || wc.status != IBV_WC_SUCCESS)
+            abort();
+    ''',
+    'mlx5-db': MLX5_DB_LISTING,
     'uar-map': '''
         #include <cuda_runtime.h>
         #include <cstdint>
@@ -96,17 +172,6 @@ CODE = {
             }
         }
     ''',
-    'nv-ibgda-env': "NVSHMEM_IB_ENABLE_IBGDA=1 ./your_nvshmem_app",
-    'nv-gpunetio-env': "NVSHMEM_IB_ENABLE_IBGDA=0 \\\nNVSHMEM_REMOTE_TRANSPORT=gpunetio \\\nNVSHMEM_GPUNETIO_ENABLE_GDAKI=1 ./your_nvshmem_app",
-    'gin-proxy-setup': '''
-        ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-        reqs.ginType = NCCL_GIN_TYPE_PROXY;
-        reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
-        reqs.ginContextCount = 1;
-        reqs.ginSignalCount = 1;
-        ncclDevComm devComm;
-        ncclDevCommCreate(comm, &reqs, &devComm);
-    ''',
     'gin-setup': '''
         // NCCL 2.32.3. Run on both ranks after communicator initialization.
         void *src, *dst;
@@ -117,16 +182,7 @@ CODE = {
         ncclCommWindowRegister(comm, dst, bytes, &dstWin, NCCL_WIN_COLL_SYMMETRIC);
 
         ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-        reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
-        reqs.ginContextCount = 1;
-        reqs.ginSignalCount = 1;
-        ncclDevComm devComm;
-        ncclDevCommCreate(comm, &reqs, &devComm);
-    ''',
-    'gin-gdaki-setup': '''
-        // Replace the requirements/create block in the common setup.
-        ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-        reqs.ginType = NCCL_GIN_TYPE_GDAKI;
+        reqs.ginType = NCCL_GIN_TYPE_PROXY;  // level 3; NCCL_GIN_TYPE_GDAKI for levels 4-5
         reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
         reqs.ginContextCount = 1;
         reqs.ginSignalCount = 1;
@@ -166,25 +222,25 @@ def svg_start(name, height, title, interactive=False):
 NETWORK_PATHS = 'cpu proxy ibgda nvgda gdaki ginproxy'
 ALL_PATHS = NETWORK_PATHS + ' peer'
 COMPONENTS = {
-    'nccl': ('libraries', 'nccl-api', 'cpu gdaki ginproxy'),
-    'nvhost': ('libraries', 'nv-select', 'proxy ibgda nvgda'),
-    'cuda': ('libraries', 'vmm-doc', ALL_PATHS),
-    'verbs': ('libraries', 'user-verbs', NETWORK_PATHS),
-    'mlx5': ('libraries', 'mlx5-send', NETWORK_PATHS),
-    'gpunetio': ('gpunetio', 'gpureadme', 'nvgda gdaki'),
-    'nvdevice': ('libraries', 'nv-dispatch', 'proxy ibgda nvgda'),
-    'ibgda': ('ibgda', 'ibgda-db', 'ibgda'),
-    'gin': ('windows', 'gin-api', 'gdaki ginproxy'),
-    'nvidia': ('modules', 'gpu-core', ALL_PATHS),
-    'uvm': ('modules', 'uvm', ALL_PATHS),
-    'peermem': ('registration', 'gdaki-reg', NETWORK_PATHS),
-    'rdma': ('modules', 'user-verbs', NETWORK_PATHS),
-    'mlx5kernel': ('modules', 'user-verbs', NETWORK_PATHS),
-    'gpu': ('modules', 'peer-post', ALL_PATHS),
-    'nic': ('modules', 'gpureadme', NETWORK_PATHS),
-    'dev-uverbs': ('device-files', 'uverbs-fops', NETWORK_PATHS),
-    'dev-core': ('device-files', 'gpu-fops', ALL_PATHS),
-    'dev-uvm': ('device-files', 'uvm-fops', ALL_PATHS),
+    'nccl': ('gpu-apis', 'nccl-api', 'cpu gdaki ginproxy'),
+    'nvhost': ('gpu-apis', 'nv-select', 'proxy ibgda nvgda'),
+    'cuda': ('nvidia-modules', 'vmm-doc', ALL_PATHS),
+    'verbs': ('nic-driver', 'user-verbs', NETWORK_PATHS),
+    'mlx5': ('nic-driver', 'mlx5-send', NETWORK_PATHS),
+    'gpunetio': ('gpu-doorbell-impls', 'gpureadme', 'nvgda gdaki'),
+    'nvdevice': ('gpu-apis', 'nv-dispatch', 'proxy ibgda nvgda'),
+    'ibgda': ('gpu-doorbell-impls', 'ibgda-db', 'ibgda'),
+    'gin': ('gpu-apis', 'gin-api', 'gdaki ginproxy'),
+    'nvidia': ('nvidia-modules', 'gpu-core', ALL_PATHS),
+    'uvm': ('nvidia-modules', 'uvm', ALL_PATHS),
+    'peermem': ('gpu-registration', 'gdaki-reg', NETWORK_PATHS),
+    'rdma': ('nic-driver', 'user-verbs', NETWORK_PATHS),
+    'mlx5kernel': ('nic-driver', 'user-verbs', NETWORK_PATHS),
+    'gpu': ('nvidia-modules', 'peer-post', ALL_PATHS),
+    'nic': ('nic-driver', 'gpureadme', NETWORK_PATHS),
+    'dev-uverbs': ('nic-driver', 'uverbs-fops', NETWORK_PATHS),
+    'dev-core': ('nvidia-modules', 'gpu-fops', ALL_PATHS),
+    'dev-uvm': ('nvidia-modules', 'uvm-fops', ALL_PATHS),
 }
 
 
@@ -304,26 +360,32 @@ def architecture(lang):
 # Message labels describe logical work; each arrow links to its implementation
 # or, for hardware data movement, the public mechanism documentation.
 SEQUENCES = {
-    'rdma-read': {
-        'actors': [('GPU A memory','local destination'),('NIC A','RDMA requester'),('NIC B','RDMA responder'),('GPU B memory','remote source')],
-        'actors_zh': [('A 显存','本地目标 buffer'),('A 网卡','RDMA 请求方'),('B 网卡','RDMA 响应方'),('B 显存','远端源 buffer')],
+    'rdma-write': {
+        'actors': [('CPU A','libmlx5'),('A memory','SQ · CQ · 4 KiB'),('NIC A','RDMA requester'),('NIC B','RDMA responder'),('B memory','registered MR')],
+        'actors_zh': [('A 的 CPU','libmlx5'),('A 主机内存','SQ · CQ · 4 KiB'),('A 网卡','RDMA 请求方'),('B 网卡','RDMA 响应方'),('B 主机内存','已注册 MR')],
         'rows': [
-            (1,2,'① RDMA Read request: B address + rkey; 4096 B','control','rdma-guide'),
-            (2,2,'② Validate MR range, rkey and remote-read permission','control','verbs-mr'),
-            (3,2,'③ NIC B DMA-reads 4096 B from GPU B','payload','gdr-doc'),
-            (2,1,'④ RDMA Read response: 4096 B','payload','rdma-guide'),
-            (1,0,'⑤ NIC A DMA-writes 4096 B into GPU A','payload','gdr-doc'),
-            (1,1,'Requested completion: CQE on A','control','verbs-post-send'),
+            (0,1,'① Write the RDMA Write WQE into the SQ ring; update the DBR','control','mlx5-send'),
+            (0,2,'② MMIO doorbell write to the UAR page','control','mlx5-doorbell'),
+            (1,2,'③ NIC A fetches the WQE and DMA-reads 4096 B','payload','dma-api'),
+            (2,3,'④ RDMA Write: B address + rkey + 4096 B','payload','rdma-guide'),
+            (3,3,'⑤ Validate rkey and MR access','control','verbs-mr'),
+            (3,4,'⑥ NIC B DMA-writes 4096 B into B memory','payload','verbs-mr'),
+            (3,2,'⑦ Acknowledgement','control','rdma-guide'),
+            (2,1,'⑧ NIC A DMA-writes a CQE into the CQ ring','control','verbs-post-send'),
+            (1,0,'⑨ ibv_poll_cq reads the CQE','control','mlx5-cq'),
         ],
         'labels_zh': [
-            '① RDMA Read 请求：B 的地址 + rkey；4096 B',
-            '② 校验 MR 范围、rkey 与远端读权限',
-            '③ B 网卡 DMA 读取 B 显存的 4096 B',
-            '④ RDMA Read 响应：返回 4096 B',
-            '⑤ A 网卡 DMA 写入 A 显存的 4096 B',
-            '按请求产生完成通知：A 侧 CQE',
+            '① 在 SQ 环写入 RDMA Write 的 WQE，更新 DBR',
+            '② 向 UAR 页写 doorbell（MMIO）',
+            '③ A 网卡取得 WQE，DMA 读取 4096 B',
+            '④ RDMA Write：B 的地址 + rkey + 4096 B',
+            '⑤ 校验 rkey、MR 范围与远端写权限',
+            '⑥ B 网卡把 4096 B DMA 写入 B 的内存',
+            '⑦ 确认（ACK）',
+            '⑧ A 网卡把 CQE DMA 写入 CQ 环',
+            '⑨ ibv_poll_cq 读到 CQE',
         ],
-        'bars': [(0,4,4),(1,0,5),(2,0,3),(3,2,2)],
+        'bars': [(0,0,1),(0,8,8),(1,0,0),(1,2,2),(1,7,8),(2,1,7),(3,3,6),(4,5,5)],
     },
     'setup': {
         'actors':[('CPU library','host setup'),('verbs / mlx5','userspace provider'),('Linux drivers','RDMA + GPU'),('NIC','QP / MR'),('GPU memory','registered payload')],
@@ -331,25 +393,12 @@ SEQUENCES = {
             (0,1,'Open device; allocate PD / CQ / QP','control','user-verbs'),
             (1,2,'uverbs: configure resources; map CPU queues / registers','control','user-verbs'),
             (2,3,'Create NIC resources and access protection','control','user-verbs'),
-            (0,2,'Register GPU buffer: peer memory OR DMA-BUF','control','nccl-reg'),
+            (0,2,'Register GPU buffer: peer memory OR DMA-BUF','control','peermem'),
             (0,0,'Prepare connection information and memory access keys','control','user-verbs'),
             (1,3,'After setup: CPU provider submits a WR','control','mlx5-send'),
             (3,4,'NIC DMA accesses the registered GPU buffer','payload','gdr-doc'),
         ],
         'bars':[(0,0,4),(1,0,5),(2,1,3),(3,2,6),(4,6,6)],
-    },
-    'cpu': {
-        'actors':[('Application','CPU thread'),('GPU 0','NCCL kernel'),('CPU proxy','NET/IB'),('Local NIC','verbs queues'),('Remote NIC / GPU','receive side')],
-        'rows':[
-            (0,1,'ncclAllReduce: schedule collective work on a CUDA stream','control','nccl-api'),
-            (1,2,'Publish chunk readiness / FIFO progress','gpu','nccl-proxy'),
-            (2,3,'isend → ncclIbIsend → ibv_post_send → mlx5','control','nccl-isend'),
-            (1,3,'NIC DMA reads registered GPU payload','payload','gdr-doc'),
-            (3,4,'Network transfer → remote registered GPU buffer','payload','gdr-doc'),
-            (3,2,'test → ibv_poll_cq: observe completion','control','nccl-cq'),
-            (2,1,'Update GPU-visible head / progress','control','nccl-proxy'),
-        ],
-        'bars':[(0,0,0),(1,0,6),(2,1,6),(3,2,5),(4,4,5)],
     },
     'nvproxy': {
         'actors':[('User kernel','NVSHMEM API'),('Device transport','PROXY'),('CPU proxy','IBRC host transport'),('NIC','verbs / DMA'),('Peer GPU','target + signal')],
@@ -377,60 +426,6 @@ SEQUENCES = {
         ],
         'bars':[(0,0,0),(1,1,5),(2,0,5),(3,3,4),(4,4,6)],
     },
-    'nvgda': {
-        'actors':[('Host transport','NVSHMEM / GPUNetIO'),('User kernel','NVSHMEM API'),('GPUNetIO device','exported QP / CQ'),('NIC','RDMA work'),('Peer GPU','target + signal')],
-        'rows':[
-            (0,2,'Create resources; export GPU queue descriptors','control','gpu-export'),
-            (1,2,'GPUNETIO_GDAKI: put / signal through device verbs','gpu','nv-dispatch'),
-            (2,2,'doca_gpu_dev_verbs_put_signal: prepare WQEs','gpu','gpu-put'),
-            (2,3,'Direct-GPU mode: publish queue and ring doorbell','gpu','gpu-submit'),
-            (3,4,'NIC DMA / network transfer; ordered remote signal','payload','nv-signal'),
-            (3,2,'Device-side CQ polling observes local completion','gpu','gpu-cq'),
-            (2,1,'Complete the NVSHMEM quiet dependency','gpu','nv-ordering'),
-            (4,4,'signal_wait_until: receiver data dependency','gpu','nv-signal'),
-        ],
-        'bars':[(0,0,0),(1,1,6),(2,0,6),(3,3,5),(4,4,7)],
-    },
-    'ginproxy': {
-        'actors':[('User kernel','NCCL GIN'),('GIN device proxy','request descriptors'),('CPU progress','IB RMA backend'),('NIC','verbs / DMA'),('Peer kernel','target + signal')],
-        'rows':[
-            (0,1,'gin.put: use the CPU-proxy backend','gpu','gin-api'),
-            (1,2,'Publish GFD; proxyGinPollGfd consumes the request','gpu','gin-proxy'),
-            (2,3,'iputSignal → build WRs → ibv_post_send','control','gin-verbs'),
-            (3,4,'DMA / network writes payload and associated signal','payload','gin-api'),
-            (3,2,'RMA backend test observes request completion','control','gin-proxy-completion'),
-            (2,1,'Update the GPU-visible completion counter','control','gin-proxy-completion'),
-            (0,0,'gin.flush: local source reuse is safe','gpu','gin-api'),
-            (4,4,'waitSignal: receiver data dependency','gpu','gin-api'),
-        ],
-        'bars':[(0,0,6),(1,0,5),(2,1,5),(3,2,4),(4,3,7)],
-    },
-    'gdaki': {
-        'actors':[('User kernel','NCCL GIN'),('GDAKI backend','GPUNetIO device'),('Local NIC','GPU-accessible QP'),('Remote NIC','RDMA target'),('Peer kernel','signal wait')],
-        'rows':[
-            (0,1,'gin.put: resolve peer, window keys and offsets','gpu','gdaki-put'),
-            (1,1,'doca_gpu_dev_verbs_put_signal: build / publish WQEs','gpu','gpu-put'),
-            (1,2,'Direct-GPU mode: ring the NIC doorbell','gpu','gpu-submit'),
-            (2,3,'NIC reads source VRAM; network carries the write','payload','gdr-doc'),
-            (3,4,'Write destination VRAM; publish the associated signal','payload','gin-api'),
-            (2,1,'CQE / completion: device-side wait or poll','gpu','gpu-cq'),
-            (0,0,'gin.flush: local source reuse is safe','gpu','gin-api'),
-            (4,4,'waitSignal: acquire the incoming data dependency','gpu','gin-api'),
-        ],
-        'bars':[(0,0,6),(1,0,5),(2,2,5),(3,3,4),(4,4,7)],
-    },
-    'fabric': {
-        'actors':[('Node A','exporter / GPU'),('IMEX / driver A','compute node A'),('IMEX / driver B','compute node B'),('Node B','importer / GPU'),('NVLink fabric','GPU / NVSwitch')],
-        'rows':[
-            (0,1,'Create / export allocation with a FABRIC handle','control','vmm-doc'),
-            (0,3,'Application exchanges the shareable handle','control','vmm-doc'),
-            (3,2,'Import and map allocation with permitted IMEX access','control','imex-doc'),
-            (1,2,'IMEX control coordination over TCP / gRPC','control','rack-doc'),
-            (3,4,'After mapping: GPU load/store transactions over NVLink','payload','vmm-doc'),
-            (4,0,'Peer GPU memory participates through the fabric','payload','peer-post'),
-        ],
-        'bars':[(0,0,1),(1,0,3),(2,2,3),(3,1,4),(4,4,5)],
-    },
 }
 
 
@@ -440,7 +435,7 @@ def sequence(kind,lang):
     height = 104 + len(spec['rows'])*62 + 26
     actors = spec.get('actors_zh', spec['actors']) if lang == 'zh' else spec['actors']
     xs = [145,435,725,1015] if len(actors) == 4 else [120,350,580,810,1040]
-    title = TITLES[kind][0 if lang == 'zh' else 1] if kind == 'rdma-read' else kind+' communication sequence'
+    title = TITLES[kind][0 if lang == 'zh' else 1]
     out = svg_start(name,height,title)
     for i,(title,sub) in enumerate(actors):
         x=xs[i]
@@ -456,16 +451,17 @@ def sequence(kind,lang):
         y=112+i*62
         x1,x2=xs[a],xs[b]
         # Keep labels inside the viewBox even for self-calls in the last lane.
-        label_width = sum(14 if ord(char) > 255 else 8.5 for char in label) if kind == 'rdma-read' else len(label)*7.25
+        label_width = sum(14 if ord(char) > 255 else 8.5 for char in label) if 'labels_zh' in spec else len(label)*7.25
         w=min(1100,max(label_width, len(REFS[ref]['label'])*6.1)+14)
-        lx=max(26,min(min(x1,x2)+18,1138-w))
+        # Self-calls start right of their loop when space allows, so the source label can sit beside it.
+        lx=max(26,min(min(x1,x2)+(40 if a==b else 18),1138-w))
         path=f'M{x1+6} {y}H{x1+30}V{y+16}H{x1+6}' if a==b else f'M{x1+(6 if b>a else -6)} {y}H{x2+(-7 if b>a else 7)}'
         url=escape(REFS[ref]['url'],quote=True)
         out+=f'<a class="sequence-message" href="{url}" target="_blank" rel="noopener"><path class="seq-edge {kind_}" d="{path}" marker-end="url(#{name}-{kind_})"/>'
         out+=f'<rect class="message-paper" x="{lx-4}" y="{y-27}" width="{w}" height="21" rx="2"/>'
         out+=txt(lx,y-11,label,14,'start',f'msg-{kind_}',500)
         # Inline source links remain visible without overwhelming message labels.
-        sy=y+23 if a!=b else y+34
+        sy=y+23 if a!=b or lx>=x1+36 else y+34
         source=REFS[ref]['label'] if 'path' in REFS[ref] else 'documentation ↗'
         sw=len(source)*6.1+10
         out+=f'<rect class="message-paper" x="{lx-4}" y="{sy-12}" width="{sw}" height="17" rx="2"/>'
@@ -474,28 +470,18 @@ def sequence(kind,lang):
 
 
 TITLES = {
-    'rdma-read':('GPU RDMA Read · 从 B 显存读入 A 显存','GPU RDMA Read · GPU B memory to GPU A memory'),
+    'rdma-write':('RDMA Write · 把 4 KiB 从 A 写到 B','RDMA Write · 4 KiB from A to B'),
     'architecture':('GPU 互联：依赖与调用关系','GPU interconnect: dependencies and calls'),
     'setup':('资源建立 · CPU 控制路径','Resource setup · CPU control path'),
-    'cpu':('NCCL NET/IB · 一个发送 chunk','NCCL NET/IB · one outgoing chunk'),
     'nvproxy':('NVSHMEM CPU proxy · IBRC','NVSHMEM CPU proxy · IBRC'),
     'ibgda-path':('NVSHMEM IBGDA · GPU 直接提交','NVSHMEM IBGDA · direct GPU submission'),
-    'nvgda':('NVSHMEM GPUNetIO · GPU 直接提交','NVSHMEM GPUNetIO · direct GPU submission'),
-    'ginproxy':('NCCL GIN · CPU proxy 提交','NCCL GIN · CPU proxy submission'),
-    'gdaki':('NCCL GIN / GDAKI · GPU 直接 doorbell','NCCL GIN / GDAKI · direct GPU doorbell'),
-    'fabric':('跨 OS 的 NVLink 内存共享','NVLink memory sharing across operating systems'),
 }
 CAPTIONS = {
-    'rdma-read':('两端已建立连接并注册显存。蓝色表示请求、校验与完成，紫色箭头沿数据流向绘制；③、⑤是各端 NIC 执行的本地 DMA。', 'Connections and GPU memory registration are already established. Blue marks requests, validation and completion; purple arrows follow data. Steps ③ and ⑤ are local DMA by each NIC.'),
-    'architecture':('箭头表示主要调用、资源依赖或数据流，分支按所选 backend 执行。选择路径可同时高亮节点与连线；点击节点查看说明，点击连线查看源码。GPU → NIC 展示直接 doorbell 模式；CPU 辅助模式见各路径的 doorbell 说明。','Arrows show principal calls, resource dependencies or data flow; branches depend on the backend. Select a path to highlight its nodes and edges. Nodes open explanations; edges link to source. GPU → NIC shows direct doorbells; CPU assistance is described with each path.'),
-    'setup':('两端都要建立资源；图示 CPU verbs 路径一侧的准备与首次提交。后续 chunk 复用连接和注册信息。','Both endpoints establish resources. Shows setup and the first CPU verbs submission; later chunks reuse connections and registrations.'),
-    'cpu':('假设 GDR 已启用。紫色表示 payload；蓝色表示 CPU 控制；绿色表示 GPU 工作。接收端的 proxy 与可见性处理合并展示。','Assumes GDR. Purple: payload. Blue: CPU control. Teal: GPU work. Receiver-side proxy and visibility handling are summarized.'),
+    'rdma-write':('两端已注册 MR，QP 处于 RTS，A 已拿到 B 的地址和 rkey。蓝色为控制，紫色为 payload。①② 由 A 的 CPU 在用户态完成；B 的 CPU 不参与。BlueFlame 写入时，② 把整个 WQE 一并写进 UAR（1.4 节）。', 'Both MRs are registered, the QP is in RTS, and A holds B\'s address and rkey. Blue: control. Purple: payload. A\'s CPU performs ① and ② in user space; B\'s CPU takes no part. With BlueFlame, ② also writes the whole WQE into the UAR (§1.4).'),
+    'architecture':('箭头表示主要调用、资源依赖或数据流，分支按所选后端执行。选择路径可同时高亮节点与连线；点击节点查看说明，点击连线查看源码。GPU → NIC 展示直接 doorbell；CPU 代敲见第 4 章。','Arrows show principal calls, resource dependencies or data flow; branches depend on the backend. Select a path to highlight its nodes and edges. Nodes open explanations; edges link to source. GPU → NIC shows direct doorbells; CPU-rung doorbells are covered in chapter 4.'),
+    'setup':('两端都要建立资源；图示一侧的准备与首次提交，显存注册二选一。之后的请求复用连接和注册信息。','Both endpoints establish resources. Shows one side\'s setup and first submission, with either GPU registration path. Later requests reuse connections and registrations.'),
     'nvproxy':('GPU 发布请求，CPU 构造并提交网卡 WR。图示远端 IBRC 路径与 GDR payload；接收端通知遵循 NVSHMEM signal 契约。','The GPU publishes requests; the CPU constructs and submits NIC WRs. Shows the remote IBRC path with GDR payload and NVSHMEM signal ordering.'),
-    'ibgda-path':('图示 GPU 直接 doorbell；CPU 辅助模式另见本章。与 NVSHMEM CPU proxy 使用相同应用 API，队列提交由 IBGDA device 实现。','Direct GPU doorbells; CPU-assisted mode is covered in this chapter. The application API is unchanged; IBGDA device code implements queue submission.'),
-    'nvgda':('CPU 建立并导出资源；GPU 调用 GPUNetIO device verbs。图示直接 doorbell，CPU 辅助模式改变通知步骤。','The CPU creates and exports resources; GPU code calls GPUNetIO device verbs. Shows direct doorbells; CPU assistance changes the notification step.'),
-    'ginproxy':('内置 IB RMA 后端示意。GPU 发布 GIN 描述符，CPU 生成 WR；这与 GPU 已构造 WQE 后由 CPU 辅助敲 doorbell 的分工不同。','Built-in IB RMA backend. GPU code publishes GIN descriptors and the CPU builds WRs. With CPU-assisted doorbells, the GPU has already built the WQEs.'),
-    'gdaki':('图示 direct-GPU doorbell 模式。CPU-assisted 模式会增加 GPU → CPU notification → NIC doorbell；payload 路径保持直接 DMA。','Direct-GPU doorbell mode. CPU-assisted mode adds GPU → CPU notification → NIC doorbell; payload still uses direct DMA.'),
-    'fabric':('图示跨 OS 显存共享的逻辑依赖。Fabric Manager / NVLSM 已按平台完成 fabric 配置；管理连接与 NVLink payload 分开。','Logical dependencies in cross-OS GPU memory sharing. Platform services have configured the fabric; management traffic is distinct from NVLink payload.'),
+    'ibgda-path':('图示 GPU 直接 doorbell（级别 5），CPU 代敲见第 4 章。应用 API 与 3.2 节的 IBRC 图相同，队列提交由 IBGDA 设备代码完成。','Direct GPU doorbells (level 5); CPU-rung doorbells are covered in chapter 4. The application API matches the IBRC sequence in §3.2; IBGDA device code performs queue submission.'),
 }
 
 
@@ -516,7 +502,7 @@ def figure(kind,lang):
     focus=''
     if kind=='architecture':
         groups=[('普通 NCCL' if idx==0 else 'Ordinary NCCL',[('cpu','NET/IB · CPU proxy')]),('NVSHMEM',[('proxy','CPU proxy / IBRC'),('ibgda','IBGDA'),('nvgda','GPUNetIO')]),('NCCL GIN',[('ginproxy','CPU proxy'),('gdaki','GDAKI / GPUNetIO')]),('互联机制' if idx==0 else 'Interconnect mechanism',[('peer','CUDA peer / NVLink')])]
-        destinations={'all':'#submission','cpu':'#nccl-cpu','proxy':'#nv-proxy-submit','ibgda':'#ibgda','nvgda':'#gpunetio','gdaki':'#gin-gdaki','ginproxy':'#gin-proxy','peer':'gpu-peer-to-peer-memory.html'}
+        destinations={'all':'#backend-map','cpu':'#proxy-compare','proxy':'#proxy-compare','ibgda':'#gpu-doorbell-impls','nvgda':'#gpu-doorbell-impls','gdaki':'#gpu-doorbell-impls','ginproxy':'#proxy-compare','peer':'gpu-peer-to-peer-memory.html'}
         destinations={key:href+('-en' if lang=='en' and href.startswith('#') else '') for key,href in destinations.items()}
         options=f'<option value="all" data-path-href="{destinations["all"]}">{"全部" if idx==0 else "All"}</option>'
         for group,items in groups:
@@ -536,12 +522,16 @@ def inspection(lang):
          '确认端口和对应设备；随后用 ibv_devinfo 核对 link_layer、能力与端口状态。' if zh else 'Identify the port and device, then inspect link_layer, capabilities and port state with ibv_devinfo.'),
         ('驱动绑定' if zh else 'Driver binding',"lspci -nnk | grep -A3 -Ei 'NVIDIA|Mellanox'",'Network controller: Mellanox Technologies ...\n    Kernel driver in use: mlx5_core',
          'mlx5_core 是 PCI 设备驱动；RDMA 功能还涉及 mlx5_ib、ib_core 等模块。' if zh else 'mlx5_core binds the PCI device; RDMA also involves mlx5_ib, ib_core and related modules.'),
+        ('模块与辅助设备' if zh else 'Modules and auxiliary devices',"modinfo mlx5_ib | grep -E '^(alias|depends)'",'alias:          auxiliary:mlx5_core.rdma-rep\nalias:          auxiliary:mlx5_core.multiport\nalias:          auxiliary:mlx5_core.rdma\ndepends:        mlx5_core,ib_core,mlx_compat,ib_uverbs',
+         'mlx5_ib 绑定 mlx5_core 创建的 .rdma 等辅助设备。mlx_compat 是 MLNX_OFED 的兼容层；发行版自带模块的依赖为 mlx5_core、ib_uverbs、ib_core。对 mlx5_core 执行同样的命令，可以看到 .eth 等别名。' if zh else 'mlx5_ib binds the .rdma and related auxiliary devices created by mlx5_core. mlx_compat is the MLNX_OFED compatibility layer; the distribution module depends on mlx5_core, ib_uverbs and ib_core. The same command on mlx5_core shows the .eth aliases.',
+         '实测输出 · Linux 6.1.62 + MLNX_OFED 24.01' if zh else 'Measured · Linux 6.1.62 + MLNX_OFED 24.01'),
         ('运行时装载' if zh else 'Runtime libraries',"grep -E 'libnccl|nvshmem|libibverbs|libmlx5|gpunetio' /proc/12345/maps",'... /usr/lib/.../libnccl.so.2\n... /usr/lib/.../libibverbs.so.1\n... /usr/lib/.../libmlx5.so.1',
          '12345 替换为自己的进程 PID。dlopen 的 transport/provider 不一定出现在 ldd 中；静态链接或集成的代码也不一定表现为独立 .so。' if zh else 'Replace 12345 with your process PID. dlopen-loaded transports/providers may not appear in ldd; static or integrated code need not appear as a separate .so.'),
     ]
     out='<div class="cuda-inspection">'
-    for title,cmd,output,note in items:
-        out+=f'<section class="inspection-item"><div class="inspection-heading"><strong>{title}</strong><span>{"示例输出" if zh else "Example output"}</span></div><pre class="inspection-command"><code>{escape(cmd)}</code></pre><pre class="inspection-output"><code>{escape(output)}</code></pre><p>{note}</p></section>'
+    for title,cmd,output,note,*label in items:
+        label=label[0] if label else ('示例输出' if zh else 'Example output')
+        out+=f'<section class="inspection-item"><div class="inspection-heading"><strong>{title}</strong><span>{label}</span></div><pre class="inspection-command"><code>{escape(cmd)}</code></pre><pre class="inspection-output"><code>{escape(output)}</code></pre><p>{note}</p></section>'
     return out+'</div>'
 
 
