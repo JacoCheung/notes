@@ -1,0 +1,148 @@
+<h1>URL、域名与 DNS</h1>
+<p class="article-lead">网页地址连接着两套系统：域名系统为浏览器提供服务器的网络地址，Web 服务器按请求选择资源。一个域名可以对应多台服务器，一台服务器也可以承载多个域名；同一页面还可以通过不同的域名和路径访问。域名解析、应用路由和页面跳转分别控制这些对应关系。</p>
+<p>本文以 <code>https://dev.example.com/</code> 和 <code>https://example.com/dev</code> 为例，解释地址的组成、域名的管理层级、DNS 的查询过程，以及两个地址如何进入同一个页面处理函数。文中的域名使用保留的 <code>example.com</code>，DNS 配置与 <code>203.0.113.10</code> 地址用于示意；最后的 HTTP 路由示例可在本机运行。[[reserved|示例域名]]</p>
+
+<h2 id="url">1. URL 的组成</h2>
+<h3 id="url-fields">1.1 主机名与资源位置</h3>
+<p>URL（Uniform Resource Locator，统一资源定位符）描述资源的位置和访问方式。常见的 HTTP / HTTPS 地址由以下几部分组成，方括号表示可选项：</p>
+<pre data-language="text"><code>scheme://hostname[:port]/path[?query][#fragment]
+
+https://dev.example.com:443/guide/start.html?lang=zh#install</code></pre>
+<table class="url-fields"><thead><tr><th>部分</th><th>本例的值</th><th>作用</th></tr></thead><tbody>
+<tr><td>scheme</td><td><code>https</code></td><td>选择访问协议；HTTPS 使用加密连接。</td></tr>
+<tr><td>hostname</td><td><code>dev.example.com</code></td><td>标识请求的主机；这里是需要解析的域名。</td></tr>
+<tr><td>port</td><td><code>443</code></td><td>指定服务端口。HTTPS 默认 443，HTTP 默认 80，默认端口可以省略。</td></tr>
+<tr><td>path</td><td><code>/guide/start.html</code></td><td>标识服务器上的资源，由 Web 服务器或应用解释。</td></tr>
+<tr><td>query</td><td><code>lang=zh</code></td><td>随请求发送的查询信息。<code>key=value</code> 是常见约定，具体含义由应用决定。</td></tr>
+<tr><td>fragment</td><td><code>install</code></td><td>通常标识页面内的位置。浏览器处理片段，HTTP 请求目标中不包含它。</td></tr>
+</tbody></table>
+<p><code>://</code> 中的冒号结束 scheme，随后两个斜杠引出 authority（网络访问端点）部分，本例为主机名和端口。主机也可以写成 IP 地址，例如 <code>http://127.0.0.1:8000/</code>；IPv6 地址需要方括号，例如 <code>http://[::1]:8000/</code>。[[uri|URL 的通用结构]]</p>
+<p><strong>点与斜杠的含义取决于所在位置。</strong> <code>dev.example.com</code> 中的点分隔域名标签；<code>start.html</code> 中的点属于路径字符，扩展名只是命名习惯。路径中的斜杠分隔路径段，服务器可以把这些段映射到文件，也可以交给应用函数处理。例如 <code>/users/42</code> 完全可以由程序查询数据库后生成。</p>
+
+<h3 id="relative-urls">1.2 相对地址</h3>
+<p>页面中的链接可以省略主机名甚至整个路径。浏览器把相对地址与基准 URL 合并，得到完整地址。以 <code>https://example.com/guide/page.html</code> 为基准：</p>
+<table><thead><tr><th>相对地址</th><th>解析结果</th></tr></thead><tbody>
+<tr><td><code>./image.svg</code></td><td><code>https://example.com/guide/image.svg</code></td></tr>
+<tr><td><code>../index.html</code></td><td><code>https://example.com/index.html</code></td></tr>
+<tr><td><code>/logo.svg</code></td><td><code>https://example.com/logo.svg</code></td></tr>
+<tr><td><code>#install</code></td><td><code>https://example.com/guide/page.html#install</code></td></tr>
+</tbody></table>
+<p>作为完整路径段时，<code>.</code> 表示当前层，<code>..</code> 表示上一层。尾部斜杠也影响合并：相对地址 <code>image.svg</code> 在 <code>https://example.com/dev</code> 下得到 <code>/image.svg</code>，在 <code>https://example.com/dev/</code> 下则得到 <code>/dev/image.svg</code>。应用将页面挂到新路径后，图片或脚本失效，常常与这个基准变化有关。[[relative|相对地址解析]]</p>
+
+<h2 id="domains">2. 域名与子域</h2>
+<h3 id="domain-tree">2.1 名称层级</h3>
+<p>DNS（Domain Name System，域名系统）把名称组织成一棵树。域名从右向左逐级具体化：<code>com</code> 是顶级域，<code>example.com</code> 位于它之下，<code>dev.example.com</code> 又位于 <code>example.com</code> 之下。</p>
+<pre data-language="text"><code>.                         根
+└── com                   com.
+    └── example           example.com.
+        ├── www           www.example.com.
+        └── dev           dev.example.com.
+            └── api       api.dev.example.com.</code></pre>
+<p>点之间的一段称为标签（label）。<code>dev</code> 是一个标签，<code>dev.example.com</code> 才是这里的完整子域名。上面的每个名称都是域名；“子域”描述的是两个名称之间的包含关系。末尾的点表示根，日常书写通常省略。[[terms|域名、标签与子域]]</p>
+<p>URL 中的“主机名”描述这个名称的用途，不代表它固定对应一台物理主机。<code>www</code>、<code>dev</code>、<code>api</code> 只是常见标签，DNS 不会根据它们的拼写自动分配网站、开发环境或接口服务。</p>
+<details><summary>域名长度与标签数量</summary><p>DNS 中每个标签最多 63 字节，完整名称的未压缩编码最多 255 字节，包含每个标签的长度字节和末尾根标签。若每个标签只有 1 字节，<code>127 × (1 + 1) + 1 = 255</code>，因此最多可以容纳 127 个非空标签。普通 ASCII 写法不计末尾根点时，完整名称最多 253 个字符；国际化域名要按转换后的编码检查长度。实际注册平台可以有更严格的命名规则。[[dns-size|DNS 长度限制]]</p></details>
+
+<h3 id="domain-control">2.2 注册与管理</h3>
+<p>注册一个可注册域名后，持有人在有效期内获得该名称下的管理权，通常可以自行创建 <code>dev</code>、<code>api.dev</code> 等子域名，无需逐个再向注册商购买。为子域添加地址记录，再配置网站服务，才能让它成为可访问的地址。域名注册、DNS 托管和运行网站的服务器是三项独立服务，可以由不同供应商提供。[[subdomains|创建子域记录]]</p>
+<p>域名树也允许分工管理。DNS 区域（zone）是一段共同管理的域名空间，由其权威服务器保存并回答记录。管理员可以在现有区域中保存 <code>dev.example.com</code> 的记录，也可以添加 NS 记录，指定另一组权威服务器负责这个名称及其下属名称。后者称为委派，会形成新的区域边界；单纯增加一个标签则无需增加服务器。[[delegation|区域与委派]]</p>
+
+<h2 id="dns">3. DNS 解析</h2>
+<h3 id="dns-records">3.1 名称与记录</h3>
+<p>DNS 查询包含名称和记录类型。浏览器需要连接 <code>dev.example.com</code> 时，可以查询它的 A 或 AAAA 记录，取得 IPv4 或 IPv6 地址。DNS 还保存名称别名、管理委派等信息：</p>
+<table><thead><tr><th>类型</th><th>记录内容</th><th>示意</th></tr></thead><tbody>
+<tr><td>A</td><td>IPv4 地址</td><td><code>dev.example.com → 203.0.113.10</code></td></tr>
+<tr><td>AAAA</td><td>IPv6 地址</td><td><code>dev.example.com → 2001:db8::10</code></td></tr>
+<tr><td>CNAME</td><td>另一个域名，即别名的目标</td><td><code>www.example.com → example.com</code></td></tr>
+<tr><td>NS</td><td>该区域的权威名称服务器</td><td><code>example.com → ns1.example.net</code></td></tr>
+</tbody></table>
+<p>权威服务器保存并回答某个区域的记录。CNAME 的目标仍然是域名，解析器继续查询目标名称的地址。它不能填写 <code>https://example.com/dev</code> 这样的完整 URL，也不会把浏览器地址栏改为目标名称。[[records|资源记录]] · [[aaaa|AAAA 记录]]</p>
+<p>假设管理员写入以下两条 A 记录，两个主机名就能解析到同一地址。<code>IN</code> 表示 Internet 类，<code>300</code> 是 TTL（Time to Live），表示记录允许缓存的时间为 300 秒：</p>
+<pre data-language="text"><code>example.com.      300  IN  A  203.0.113.10
+dev.example.com.  300  IN  A  203.0.113.10</code></pre>
+<p>同一个名称也可以有多条地址记录，供客户端选择连接目标。因此名称和 IP 地址是多对多关系。这里的 A / AAAA 查询只处理主机名；<code>/dev</code>、查询参数和片段不参与这次地址解析。</p>
+
+<h3 id="dns-lookup">3.2 递归查询与委派</h3>
+<p>客户端通常把查询交给一个<strong>递归解析器</strong>，由它寻找最终答案。操作系统中负责发出这类请求的轻量组件称为 stub resolver；递归解析器则可能由路由器、运营商、企业或公共 DNS 服务提供。</p>
+<p>根服务器和顶级域服务器也属于权威服务器，分别负责根区和顶级域区域；本例中单列的“权威服务器”特指负责 <code>example.com</code> 区域的服务器。</p>
+<table id="dns-operators"><thead><tr><th>角色</th><th>维护者与实例</th></tr></thead><tbody>
+<tr><td>根服务器</td><td>由 12 家独立运营机构维护 A–M 共 13 个根服务器标识。例如 Verisign 运行 A、J，互联网系统协会（ISC）运行 F，ICANN 运行 L。每个标识可由多地服务器实例提供服务。[[root-operators|完整运营名单]]</td></tr>
+<tr><td>顶级域服务器</td><td>由相应顶级域的注册管理机构（registry）负责。例如 <code>.com</code> 由 [[tld-com|Verisign]] 管理，<code>.cn</code> 由[[tld-cn|中国互联网络信息中心（CNNIC）]]管理。</td></tr>
+<tr><td>域名的权威服务器</td><td>域名持有人或授权管理员维护区域记录，服务器可以自行运行，也可以交给 DNS 托管商运行，例如 [[authoritative-hosting|Cloudflare DNS]]。</td></tr>
+<tr><td>递归解析服务器</td><td>由网络运营商、企业或校园网管理员、公共 DNS 服务提供者维护，个人也可以自建。例如 Google 提供 [[recursive-google|8.8.8.8]]，Cloudflare 提供 [[recursive-cloudflare|1.1.1.1]]。</td></tr>
+</tbody></table>
+<p>例如，在注册商 A 购买域名后，可以把 NS 设置为 Cloudflare 分配的服务器：注册商办理注册与续费，Cloudflare 运行权威 DNS，域名管理员在 Cloudflare 修改记录。访问者仍可使用 Google 或网络运营商的递归解析器，两边的选择相互独立。[[authoritative-hosting|权威 DNS 托管配置]]</p>
+<p>假设本机与递归解析器都没有相关缓存，解析器已知根服务器入口，且 <code>example.com</code> 直接管理 <code>dev</code>。一次地址查询沿管理委派向下进行：</p>
+{{dns-sequence}}
+<p>根服务器返回 <code>com</code> 的权威服务器线索，<code>com</code> 的服务器再返回 <code>example.com</code> 的委派信息。最后，<code>example.com</code> 的权威服务器回答 <code>dev.example.com</code> 的 A 记录。递归解析器把地址交给客户端，并缓存可复用的记录。[[dns|解析器算法]]</p>
+<p>解析器跟随的是<strong>委派边界</strong>。即使名称写成 <code>api.dev.example.com</code>，若所有记录都在 <code>example.com</code> 区域中，仍可由同一组权威服务器回答。实际查询还可能跟随 CNAME，或补查名称服务器的地址。</p>
+
+<h3 id="dns-cache">3.3 缓存与查询入口</h3>
+<p>缓存命中时，客户端或递归解析器可以直接复用结果，省去部分或全部上游查询。修改权威记录后，已有缓存通常在各自 TTL 到期后更新；“域名不存在”的答案也能被缓存。因此新建记录后，先前查询过该名称的客户端可能暂时仍收到不存在的结果。[[negative-cache|否定缓存]]</p>
+<p>浏览器也可以通过 DoH（DNS over HTTPS）直接向配置的解析器发起加密查询，从而使用不同于操作系统的查询入口。VPN、企业网络和应用代理还可能影响解析器选择或名称解析所在的位置，相关流量路径见<a href="vpn-proxy-routing-cases.html">VPN 与应用代理的路由分析</a>。[[doh|DoH 协议]]</p>
+
+<h2 id="mapping">4. 多个 URL，同一页面</h2>
+<h3 id="http-routing">4.1 主机名与路径路由</h3>
+<p>下面两个 URL 的主机名和路径都不同：</p>
+<table class="url-comparison"><thead><tr><th>地址</th><th>主机名</th><th>路径</th></tr></thead><tbody>
+<tr><td><code>https://dev.example.com/</code></td><td><code>dev.example.com</code></td><td><code>/</code></td></tr>
+<tr><td><code>https://example.com/dev</code></td><td><code>example.com</code></td><td><code>/dev</code></td></tr>
+</tbody></table>
+<p>采用上一节的 DNS 配置时，它们都能连接到 <code>203.0.113.10:443</code>。连接到达后，服务器仍然可以从请求中区分它们。用 HTTP/1.1 的表示形式写出两个请求：</p>
+<pre data-language="http"><code>GET / HTTP/1.1
+Host: dev.example.com
+
+GET /dev HTTP/1.1
+Host: example.com</code></pre>
+<p><code>Host</code> 字段携带请求的主机及必要的端口，HTTP/2 和 HTTP/3 使用相应的 <code>:authority</code> 伪首部。服务器根据主机名选择站点，再根据路径选择资源或应用处理函数。多个站点共用同一监听地址的配置称为虚拟主机。[[host|Host 与 authority]] · [[nginx|Web 服务器的请求分派]]</p>
+{{mapping-diagram}}
+<p>两条路由都调用 <code>development_page()</code>，所以返回相同页面。DNS 把两个名称解析到服务入口的 IP，HTTP 路由再选择这个函数。如果路由配置不同，共用 IP 的两个名称也可以访问完全不同的网站。</p>
+
+<h3 id="redirect-proxy">4.2 内部映射与重定向</h3>
+<p>同样的页面内容可以通过几种方式提供，它们对浏览器的影响不同：</p>
+<table><thead><tr><th>机制</th><th>服务器如何处理</th><th>浏览器地址</th></tr></thead><tbody>
+<tr><td>内部路由</td><td>两个主机名与路径组合指向同一处理函数或文件，直接返回 200 响应。</td><td>保留各自的 URL。</td></tr>
+<tr><td>反向代理</td><td>前端服务器把两个请求转发到同一后端；转发时可改写主机名和路径。</td><td>仅做内部转发时保留原 URL。</td></tr>
+<tr><td>HTTP 重定向</td><td>返回 301、302、307 或 308 等状态码，并通过 <code>Location</code> 提供目标地址。</td><td>跟随重定向后变为目标 URL，并发起新请求。</td></tr>
+</tbody></table>
+<p>反向代理把后端请求留在服务器之间完成，具体配置见 [[proxy|proxy_pass]]。重定向则让浏览器重新访问一个地址；网站迁移时常用永久重定向统一入口。DNS 的 CNAME 只改变名称查询过程，HTTP 重定向才向浏览器提供新的 URL。[[redirect|重定向状态码]]</p>
+
+<h3 id="https-origin">4.3 HTTPS 与浏览器来源</h3>
+<p>HTTPS 在发送 HTTP 请求前建立 TLS（Transport Layer Security）连接。客户端通常通过 SNI（Server Name Indication）告诉服务器请求的主机名，服务器据此选择证书；证书需要覆盖客户端访问的名称。共用一个 IP 的两个 HTTPS 站点仍需各自满足证书验证。[[sni|TLS 主机名指示]]</p>
+<p>浏览器按 <strong>scheme、主机名、有效端口</strong> 判断 HTTP(S) 页面的来源（origin）。因此 <code>https://dev.example.com/</code> 与 <code>https://example.com/dev</code> 属于不同来源，即使页面内容和服务器相同；<code>https://example.com/</code> 与 <code>https://example.com/dev</code> 则同源。跨来源的脚本读写与存储访问仍受浏览器规则约束。[[origin|来源的定义]]</p>
+
+<h2 id="local-demo">5. 本地路由验证</h2>
+<h3 id="shared-handler">5.1 两个入口</h3>
+<p><a href="../assets/networking-basics/url-domain-dns/route_demo.py" download>下载 route_demo.py</a>，使用 Python 3.8 或更新版本运行。示例在本机回环地址提供 HTTP 服务，路由表的核心只有两个条目：</p>
+{{route-code}}
+<p>服务器从 <code>Host</code> 中取出主机名，从请求目标中取出路径，以这两个值查询 <code>ROUTES</code>。两个条目引用同一函数；查询参数在本例中不参与路由。启动命令如下，在终端按 Ctrl-C 停止：</p>
+<pre data-language="bash"><code>python3 route_demo.py --port 8000</code></pre>
+<p>另开一个终端发起两个请求。<code>--resolve</code> 让本次 curl 调用把指定主机和端口连接到回环地址，同时保留原来的 HTTP 主机名。<code>--noproxy '*'</code> 使这两个本地请求直接连接，不经过环境中设置的代理。[[curl|curl 的地址覆盖选项]]</p>
+<pre data-language="bash"><code>curl --noproxy '*' --resolve dev.example.com:8000:127.0.0.1 \
+  http://dev.example.com:8000/
+
+curl --noproxy '*' --resolve example.com:8000:127.0.0.1 \
+  http://example.com:8000/dev</code></pre>
+<p>两次请求都返回 200，响应正文逐字节相同：</p>
+<pre data-language="html"><code>&lt;!doctype html&gt;&lt;title&gt;Development&lt;/title&gt;&lt;h1&gt;Shared development page&lt;/h1&gt;</code></pre>
+<p class="source-scope">本例已用 Python 3.11 与 curl 在本机验证。<code>--resolve</code> 仅覆盖该次 curl 的解析结果，不修改系统 DNS；示例地址在浏览器中不会因此自动生效。</p>
+
+<h3 id="redirect-demo">5.2 重定向入口</h3>
+<p>同一个脚本还为 <code>example.com/redirect-dev</code> 配置了重定向。<code>-I</code> 发送 HEAD 请求，只检查响应首部：</p>
+<pre data-language="bash"><code>curl --noproxy '*' --resolve example.com:8000:127.0.0.1 \
+  -I http://example.com:8000/redirect-dev</code></pre>
+<pre data-language="http"><code>HTTP/1.1 302 Found
+Location: http://dev.example.com:8000/
+Content-Length: 0</code></pre>
+<p>这里仅列出与重定向有关的首部。curl 默认停在这次响应；加入 <code>-L</code> 并为目标主机也配置解析后，它会跟随 <code>Location</code>，再请求共享页面：</p>
+<pre data-language="bash"><code>curl --noproxy '*' \
+  --resolve example.com:8000:127.0.0.1 \
+  --resolve dev.example.com:8000:127.0.0.1 \
+  -L http://example.com:8000/redirect-dev</code></pre>
+<p>服务日志会依次出现 <code>GET /redirect-dev</code> 的 302 和 <code>GET /</code> 的 200。内部映射只需一次请求；通过重定向取得这份页面，则需要第二次请求。</p>
+
+<h2 id="references">参考资料</h2>
+<ul class="references">
+<li>[[uri|RFC 3986：地址组成与相对引用]]。</li>
+<li>[[terms|RFC 9499：DNS 术语]]；[[dns|RFC 1034：域名解析]]；[[records|RFC 1035：资源记录]]。</li>
+<li>[[host|RFC 9110：HTTP 主机信息]]；[[nginx|nginx：请求处理与虚拟主机]]。</li>
+</ul>

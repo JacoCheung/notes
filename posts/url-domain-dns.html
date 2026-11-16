@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>URL、域名与 DNS</title>
+<meta name="post:title" content="URL、域名与 DNS">
+<meta name="post:title_en" content="URLs, domains, and DNS">
+<meta name="post:slug" content="url-domain-dns">
+<meta name="post:date" content="2026-11-12">
+<meta name="post:tags" content="URL, DNS, 域名, HTTP">
+<meta name="post:tags_en" content="URL, DNS, Domains, HTTP">
+<meta name="post:reading" content="12 分钟">
+<meta name="post:reading_en" content="12 min">
+<meta name="post:summary" content="子域名和路径不同的两个地址，可以打开同一页面。通过域名解析序列图和本地路由示例，解释域名如何找到服务器、请求如何选中页面，以及重定向为何改变地址。">
+<meta name="post:summary_en" content="Different hostnames and paths can lead to one page. A name resolution diagram and runnable routing example explain how servers select pages and redirect requests.">
+<meta name="post:series" content="networking-basics">
+<meta name="post:series_title" content="网络入门原理">
+<meta name="post:series_title_en" content="Networking Fundamentals">
+<meta name="post:series_order" content="6">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
+<link rel="stylesheet" href="../assets/networking-basics/url-domain-dns/style.css?v=1">
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
+<script src="../assets/networking-basics/url-domain-dns/page.js?v=1" defer></script>
+</head><body><div class="layout"><aside class="toc"><div class="toc-title">目录 · TOC</div><section class="post-series-nav" data-static-series="networking-basics" aria-label="网络入门原理"><div class="post-series-title"><span class="lang-zh">网络入门原理</span><span class="lang-en">Networking Fundamentals</span></div><ol class="post-series-list"><li class=""><span class="post-series-order">01</span><a href="vpn-routing-wireguard.html"><span class="lang-zh">VPN 原理与路由</span><span class="lang-en">VPN fundamentals and routing</span></a></li><li class=""><span class="post-series-order">02</span><a href="http-proxy-configuration.html"><span class="lang-zh">HTTP 代理与应用配置</span><span class="lang-en">HTTP proxies and application configuration</span></a></li><li class=""><span class="post-series-order">03</span><a href="ssh-tunnels-forwarding.html"><span class="lang-zh">SSH 转发与隧道</span><span class="lang-en">SSH forwarding and tunnels</span></a></li><li class=""><span class="post-series-order">04</span><a href="vpn-proxy-routing-cases.html"><span class="lang-zh">VPN 与多重代理选路</span><span class="lang-en">Routing with VPNs and multiple proxies</span></a></li><li class="current"><span class="post-series-order">05</span><span class="post-series-current" aria-current="page"><span class="lang-zh">URL、域名与 DNS</span><span class="lang-en">URLs, domains, and DNS</span></span></li></ol></section></aside><main class="content url-article"><div class="lang-zh"><h1>URL、域名与 DNS</h1>
+<p class="article-lead">网页地址连接着两套系统：域名系统为浏览器提供服务器的网络地址，Web 服务器按请求选择资源。一个域名可以对应多台服务器，一台服务器也可以承载多个域名；同一页面还可以通过不同的域名和路径访问。域名解析、应用路由和页面跳转分别控制这些对应关系。</p>
+<p>本文以 <code>https://dev.example.com/</code> 和 <code>https://example.com/dev</code> 为例，解释地址的组成、域名的管理层级、DNS 的查询过程，以及两个地址如何进入同一个页面处理函数。文中的域名使用保留的 <code>example.com</code>，DNS 配置与 <code>203.0.113.10</code> 地址用于示意；最后的 HTTP 路由示例可在本机运行。<a href="https://www.iana.org/help/example-domains" target="_blank" rel="noopener">示例域名</a></p>
+
+<h2 id="url">1. URL 的组成</h2>
+<h3 id="url-fields">1.1 主机名与资源位置</h3>
+<p>URL（Uniform Resource Locator，统一资源定位符）描述资源的位置和访问方式。常见的 HTTP / HTTPS 地址由以下几部分组成，方括号表示可选项：</p>
+<pre data-language="text"><code>scheme://hostname[:port]/path[?query][#fragment]
+
+https://dev.example.com:443/guide/start.html?lang=zh#install</code></pre>
+<table class="url-fields"><thead><tr><th>部分</th><th>本例的值</th><th>作用</th></tr></thead><tbody>
+<tr><td>scheme</td><td><code>https</code></td><td>选择访问协议；HTTPS 使用加密连接。</td></tr>
+<tr><td>hostname</td><td><code>dev.example.com</code></td><td>标识请求的主机；这里是需要解析的域名。</td></tr>
+<tr><td>port</td><td><code>443</code></td><td>指定服务端口。HTTPS 默认 443，HTTP 默认 80，默认端口可以省略。</td></tr>
+<tr><td>path</td><td><code>/guide/start.html</code></td><td>标识服务器上的资源，由 Web 服务器或应用解释。</td></tr>
+<tr><td>query</td><td><code>lang=zh</code></td><td>随请求发送的查询信息。<code>key=value</code> 是常见约定，具体含义由应用决定。</td></tr>
+<tr><td>fragment</td><td><code>install</code></td><td>通常标识页面内的位置。浏览器处理片段，HTTP 请求目标中不包含它。</td></tr>
+</tbody></table>
+<p><code>://</code> 中的冒号结束 scheme，随后两个斜杠引出 authority（网络访问端点）部分，本例为主机名和端口。主机也可以写成 IP 地址，例如 <code>http://127.0.0.1:8000/</code>；IPv6 地址需要方括号，例如 <code>http://[::1]:8000/</code>。<a href="https://www.rfc-editor.org/rfc/rfc3986.html#section-3" target="_blank" rel="noopener">URL 的通用结构</a></p>
+<p><strong>点与斜杠的含义取决于所在位置。</strong> <code>dev.example.com</code> 中的点分隔域名标签；<code>start.html</code> 中的点属于路径字符，扩展名只是命名习惯。路径中的斜杠分隔路径段，服务器可以把这些段映射到文件，也可以交给应用函数处理。例如 <code>/users/42</code> 完全可以由程序查询数据库后生成。</p>
+
+<h3 id="relative-urls">1.2 相对地址</h3>
+<p>页面中的链接可以省略主机名甚至整个路径。浏览器把相对地址与基准 URL 合并，得到完整地址。以 <code>https://example.com/guide/page.html</code> 为基准：</p>
+<table><thead><tr><th>相对地址</th><th>解析结果</th></tr></thead><tbody>
+<tr><td><code>./image.svg</code></td><td><code>https://example.com/guide/image.svg</code></td></tr>
+<tr><td><code>../index.html</code></td><td><code>https://example.com/index.html</code></td></tr>
+<tr><td><code>/logo.svg</code></td><td><code>https://example.com/logo.svg</code></td></tr>
+<tr><td><code>#install</code></td><td><code>https://example.com/guide/page.html#install</code></td></tr>
+</tbody></table>
+<p>作为完整路径段时，<code>.</code> 表示当前层，<code>..</code> 表示上一层。尾部斜杠也影响合并：相对地址 <code>image.svg</code> 在 <code>https://example.com/dev</code> 下得到 <code>/image.svg</code>，在 <code>https://example.com/dev/</code> 下则得到 <code>/dev/image.svg</code>。应用将页面挂到新路径后，图片或脚本失效，常常与这个基准变化有关。<a href="https://www.rfc-editor.org/rfc/rfc3986.html#section-5" target="_blank" rel="noopener">相对地址解析</a></p>
+
+<h2 id="domains">2. 域名与子域</h2>
+<h3 id="domain-tree">2.1 名称层级</h3>
+<p>DNS（Domain Name System，域名系统）把名称组织成一棵树。域名从右向左逐级具体化：<code>com</code> 是顶级域，<code>example.com</code> 位于它之下，<code>dev.example.com</code> 又位于 <code>example.com</code> 之下。</p>
+<pre data-language="text"><code>.                         根
+└── com                   com.
+    └── example           example.com.
+        ├── www           www.example.com.
+        └── dev           dev.example.com.
+            └── api       api.dev.example.com.</code></pre>
+<p>点之间的一段称为标签（label）。<code>dev</code> 是一个标签，<code>dev.example.com</code> 才是这里的完整子域名。上面的每个名称都是域名；“子域”描述的是两个名称之间的包含关系。末尾的点表示根，日常书写通常省略。<a href="https://www.rfc-editor.org/rfc/rfc9499.html#section-2" target="_blank" rel="noopener">域名、标签与子域</a></p>
+<p>URL 中的“主机名”描述这个名称的用途，不代表它固定对应一台物理主机。<code>www</code>、<code>dev</code>、<code>api</code> 只是常见标签，DNS 不会根据它们的拼写自动分配网站、开发环境或接口服务。</p>
+<details><summary>域名长度与标签数量</summary><p>DNS 中每个标签最多 63 字节，完整名称的未压缩编码最多 255 字节，包含每个标签的长度字节和末尾根标签。若每个标签只有 1 字节，<code>127 × (1 + 1) + 1 = 255</code>，因此最多可以容纳 127 个非空标签。普通 ASCII 写法不计末尾根点时，完整名称最多 253 个字符；国际化域名要按转换后的编码检查长度。实际注册平台可以有更严格的命名规则。<a href="https://www.rfc-editor.org/rfc/rfc1035.html#section-2.3.4" target="_blank" rel="noopener">DNS 长度限制</a></p></details>
+
+<h3 id="domain-control">2.2 注册与管理</h3>
+<p>注册一个可注册域名后，持有人在有效期内获得该名称下的管理权，通常可以自行创建 <code>dev</code>、<code>api.dev</code> 等子域名，无需逐个再向注册商购买。为子域添加地址记录，再配置网站服务，才能让它成为可访问的地址。域名注册、DNS 托管和运行网站的服务器是三项独立服务，可以由不同供应商提供。<a href="https://developers.cloudflare.com/dns/manage-dns-records/how-to/create-subdomain/" target="_blank" rel="noopener">创建子域记录</a></p>
+<p>域名树也允许分工管理。DNS 区域（zone）是一段共同管理的域名空间，由其权威服务器保存并回答记录。管理员可以在现有区域中保存 <code>dev.example.com</code> 的记录，也可以添加 NS 记录，指定另一组权威服务器负责这个名称及其下属名称。后者称为委派，会形成新的区域边界；单纯增加一个标签则无需增加服务器。<a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-4.2" target="_blank" rel="noopener">区域与委派</a></p>
+
+<h2 id="dns">3. DNS 解析</h2>
+<h3 id="dns-records">3.1 名称与记录</h3>
+<p>DNS 查询包含名称和记录类型。浏览器需要连接 <code>dev.example.com</code> 时，可以查询它的 A 或 AAAA 记录，取得 IPv4 或 IPv6 地址。DNS 还保存名称别名、管理委派等信息：</p>
+<table><thead><tr><th>类型</th><th>记录内容</th><th>示意</th></tr></thead><tbody>
+<tr><td>A</td><td>IPv4 地址</td><td><code>dev.example.com → 203.0.113.10</code></td></tr>
+<tr><td>AAAA</td><td>IPv6 地址</td><td><code>dev.example.com → 2001:db8::10</code></td></tr>
+<tr><td>CNAME</td><td>另一个域名，即别名的目标</td><td><code>www.example.com → example.com</code></td></tr>
+<tr><td>NS</td><td>该区域的权威名称服务器</td><td><code>example.com → ns1.example.net</code></td></tr>
+</tbody></table>
+<p>权威服务器保存并回答某个区域的记录。CNAME 的目标仍然是域名，解析器继续查询目标名称的地址。它不能填写 <code>https://example.com/dev</code> 这样的完整 URL，也不会把浏览器地址栏改为目标名称。<a href="https://www.rfc-editor.org/rfc/rfc1035.html#section-3.2" target="_blank" rel="noopener">资源记录</a> · <a href="https://www.rfc-editor.org/rfc/rfc3596.html#section-2.1" target="_blank" rel="noopener">AAAA 记录</a></p>
+<p>假设管理员写入以下两条 A 记录，两个主机名就能解析到同一地址。<code>IN</code> 表示 Internet 类，<code>300</code> 是 TTL（Time to Live），表示记录允许缓存的时间为 300 秒：</p>
+<pre data-language="text"><code>example.com.      300  IN  A  203.0.113.10
+dev.example.com.  300  IN  A  203.0.113.10</code></pre>
+<p>同一个名称也可以有多条地址记录，供客户端选择连接目标。因此名称和 IP 地址是多对多关系。这里的 A / AAAA 查询只处理主机名；<code>/dev</code>、查询参数和片段不参与这次地址解析。</p>
+
+<h3 id="dns-lookup">3.2 递归查询与委派</h3>
+<p>客户端通常把查询交给一个<strong>递归解析器</strong>，由它寻找最终答案。操作系统中负责发出这类请求的轻量组件称为 stub resolver；递归解析器则可能由路由器、运营商、企业或公共 DNS 服务提供。</p>
+<p>根服务器和顶级域服务器也属于权威服务器，分别负责根区和顶级域区域；本例中单列的“权威服务器”特指负责 <code>example.com</code> 区域的服务器。</p>
+<table id="dns-operators"><thead><tr><th>角色</th><th>维护者与实例</th></tr></thead><tbody>
+<tr><td>根服务器</td><td>由 12 家独立运营机构维护 A–M 共 13 个根服务器标识。例如 Verisign 运行 A、J，互联网系统协会（ISC）运行 F，ICANN 运行 L。每个标识可由多地服务器实例提供服务。<a href="https://www.iana.org/domains/root/servers" target="_blank" rel="noopener">完整运营名单</a></td></tr>
+<tr><td>顶级域服务器</td><td>由相应顶级域的注册管理机构（registry）负责。例如 <code>.com</code> 由 <a href="https://www.iana.org/domains/root/db/com.html" target="_blank" rel="noopener">Verisign</a> 管理，<code>.cn</code> 由<a href="https://www.iana.org/domains/root/db/cn.html" target="_blank" rel="noopener">中国互联网络信息中心（CNNIC）</a>管理。</td></tr>
+<tr><td>域名的权威服务器</td><td>域名持有人或授权管理员维护区域记录，服务器可以自行运行，也可以交给 DNS 托管商运行，例如 <a href="https://developers.cloudflare.com/dns/zone-setups/full-setup/setup/" target="_blank" rel="noopener">Cloudflare DNS</a>。</td></tr>
+<tr><td>递归解析服务器</td><td>由网络运营商、企业或校园网管理员、公共 DNS 服务提供者维护，个人也可以自建。例如 Google 提供 <a href="https://developers.google.com/speed/public-dns/docs/using" target="_blank" rel="noopener">8.8.8.8</a>，Cloudflare 提供 <a href="https://developers.cloudflare.com/1.1.1.1/" target="_blank" rel="noopener">1.1.1.1</a>。</td></tr>
+</tbody></table>
+<p>例如，在注册商 A 购买域名后，可以把 NS 设置为 Cloudflare 分配的服务器：注册商办理注册与续费，Cloudflare 运行权威 DNS，域名管理员在 Cloudflare 修改记录。访问者仍可使用 Google 或网络运营商的递归解析器，两边的选择相互独立。<a href="https://developers.cloudflare.com/dns/zone-setups/full-setup/setup/" target="_blank" rel="noopener">权威 DNS 托管配置</a></p>
+<p>假设本机与递归解析器都没有相关缓存，解析器已知根服务器入口，且 <code>example.com</code> 直接管理 <code>dev</code>。一次地址查询沿管理委派向下进行：</p>
+<figure class="network-figure" data-size="fit" id="dns-sequence-zh">
+<div class="diagram-toolbar"><strong>DNS 查询：沿委派寻找答案</strong><button type="button" data-network-size aria-pressed="false" data-actual-label="原始尺寸" data-fit-label="适应宽度">原始尺寸</button></div>
+<div class="diagram-viewport" tabindex="0" role="region" aria-label="DNS 查询：沿委派寻找答案"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 638" width="1000" height="638" role="img" aria-labelledby="dns-sequence-zh-title"><title id="dns-sequence-zh-title">DNS 查询：沿委派寻找答案</title>
+<defs><marker id="dns-sequence-zh-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" class="arrow-head"/></marker></defs><path class="lifeline" d="M100 76V612"/><rect class="actor" x="10" y="16" width="180" height="60" rx="4"/><text x="100" y="41" text-anchor="middle" class="actor-title">客户端</text><text x="100" y="63" text-anchor="middle" class="muted">stub / browser</text><path class="lifeline" d="M300 76V612"/><rect class="actor" x="210" y="16" width="180" height="60" rx="4"/><text x="300" y="41" text-anchor="middle" class="actor-title">递归解析器</text><text x="300" y="63" text-anchor="middle" class="muted">resolver</text><path class="lifeline" d="M500 76V612"/><rect class="actor" x="410" y="16" width="180" height="60" rx="4"/><text x="500" y="41" text-anchor="middle" class="actor-title">根服务器</text><text x="500" y="63" text-anchor="middle" class="muted">.</text><path class="lifeline" d="M700 76V612"/><rect class="actor" x="610" y="16" width="180" height="60" rx="4"/><text x="700" y="41" text-anchor="middle" class="actor-title">顶级域服务器</text><text x="700" y="63" text-anchor="middle" class="muted">com.</text><path class="lifeline" d="M900 76V612"/><rect class="actor" x="810" y="16" width="180" height="60" rx="4"/><text x="900" y="41" text-anchor="middle" class="actor-title">权威服务器</text><text x="900" y="63" text-anchor="middle" class="muted">example.com.</text><rect class="activation" x="95" y="120" width="10" height="482" rx="1"/><rect class="activation" x="295" y="120" width="10" height="482" rx="1"/><rect class="activation" x="495" y="186" width="10" height="86" rx="1"/><rect class="activation" x="695" y="318" width="10" height="86" rx="1"/><rect class="activation" x="895" y="450" width="10" height="86" rx="1"/><a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener"><title>RFC 1034 §5.3.3</title><path class="edge" d="M105 130H294" marker-end="url(#dns-sequence-zh-arrow)"/><rect class="message-paper" x="111" y="103" width="270" height="22" rx="2"/><text x="115" y="119" text-anchor="start" class="">① 查询 dev.example.com 的 A 记录</text></a><a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener"><title>RFC 1034 §5.3.3</title><path class="edge" d="M305 196H494" marker-end="url(#dns-sequence-zh-arrow)"/><rect class="message-paper" x="311" y="169" width="150" height="22" rx="2"/><text x="315" y="185" text-anchor="start" class="">② 查找 com 的委派</text></a><a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener"><title>RFC 1034 §5.3.3</title><path class="edge reply" d="M495 262H306" marker-end="url(#dns-sequence-zh-arrow)"/><rect class="message-paper" x="311" y="235" width="195" height="22" rx="2"/><text x="315" y="251" text-anchor="start" class="">③ 返回 com 的服务器线索</text></a><a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener"><title>RFC 1034 §5.3.3</title><path class="edge" d="M305 328H694" marker-end="url(#dns-sequence-zh-arrow)"/><rect class="message-paper" x="311" y="301" width="214" height="22" rx="2"/><text x="315" y="317" text-anchor="start" class="">④ 查找 example.com 的委派</text></a><a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener"><title>RFC 1034 §5.3.3</title><path class="edge reply" d="M695 394H306" marker-end="url(#dns-sequence-zh-arrow)"/><rect class="message-paper" x="311" y="367" width="259" height="22" rx="2"/><text x="315" y="383" text-anchor="start" class="">⑤ 返回 example.com 的服务器线索</text></a><a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener"><title>RFC 1034 §5.3.3</title><path class="edge" d="M305 460H894" marker-end="url(#dns-sequence-zh-arrow)"/><rect class="message-paper" x="311" y="433" width="209" height="22" rx="2"/><text x="315" y="449" text-anchor="start" class="">⑥ 查询 A dev.example.com</text></a><a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener"><title>RFC 1034 §5.3.3</title><path class="edge reply" d="M895 526H306" marker-end="url(#dns-sequence-zh-arrow)"/><rect class="message-paper" x="311" y="499" width="250" height="22" rx="2"/><text x="315" y="515" text-anchor="start" class="">⑦ A = 203.0.113.10；TTL = 300</text></a><a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener"><title>RFC 1034 §5.3.3</title><path class="edge reply" d="M295 592H106" marker-end="url(#dns-sequence-zh-arrow)"/><rect class="message-paper" x="111" y="565" width="170" height="22" rx="2"/><text x="115" y="581" text-anchor="start" class="">⑧ 缓存记录，返回地址</text></a></svg></div>
+<figcaption>无相关缓存，example.com 区域直接管理 dev。实线为查询，虚线为应答；活动条标示请求处理范围。点击消息查看解析器规范。</figcaption></figure>
+<p>根服务器返回 <code>com</code> 的权威服务器线索，<code>com</code> 的服务器再返回 <code>example.com</code> 的委派信息。最后，<code>example.com</code> 的权威服务器回答 <code>dev.example.com</code> 的 A 记录。递归解析器把地址交给客户端，并缓存可复用的记录。<a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener">解析器算法</a></p>
+<p>解析器跟随的是<strong>委派边界</strong>。即使名称写成 <code>api.dev.example.com</code>，若所有记录都在 <code>example.com</code> 区域中，仍可由同一组权威服务器回答。实际查询还可能跟随 CNAME，或补查名称服务器的地址。</p>
+
+<h3 id="dns-cache">3.3 缓存与查询入口</h3>
+<p>缓存命中时，客户端或递归解析器可以直接复用结果，省去部分或全部上游查询。修改权威记录后，已有缓存通常在各自 TTL 到期后更新；“域名不存在”的答案也能被缓存。因此新建记录后，先前查询过该名称的客户端可能暂时仍收到不存在的结果。<a href="https://www.rfc-editor.org/rfc/rfc2308.html#section-5" target="_blank" rel="noopener">否定缓存</a></p>
+<p>浏览器也可以通过 DoH（DNS over HTTPS）直接向配置的解析器发起加密查询，从而使用不同于操作系统的查询入口。VPN、企业网络和应用代理还可能影响解析器选择或名称解析所在的位置，相关流量路径见<a href="vpn-proxy-routing-cases.html">VPN 与应用代理的路由分析</a>。<a href="https://www.rfc-editor.org/rfc/rfc8484.html#section-1" target="_blank" rel="noopener">DoH 协议</a></p>
+
+<h2 id="mapping">4. 多个 URL，同一页面</h2>
+<h3 id="http-routing">4.1 主机名与路径路由</h3>
+<p>下面两个 URL 的主机名和路径都不同：</p>
+<table class="url-comparison"><thead><tr><th>地址</th><th>主机名</th><th>路径</th></tr></thead><tbody>
+<tr><td><code>https://dev.example.com/</code></td><td><code>dev.example.com</code></td><td><code>/</code></td></tr>
+<tr><td><code>https://example.com/dev</code></td><td><code>example.com</code></td><td><code>/dev</code></td></tr>
+</tbody></table>
+<p>采用上一节的 DNS 配置时，它们都能连接到 <code>203.0.113.10:443</code>。连接到达后，服务器仍然可以从请求中区分它们。用 HTTP/1.1 的表示形式写出两个请求：</p>
+<pre data-language="http"><code>GET / HTTP/1.1
+Host: dev.example.com
+
+GET /dev HTTP/1.1
+Host: example.com</code></pre>
+<p><code>Host</code> 字段携带请求的主机及必要的端口，HTTP/2 和 HTTP/3 使用相应的 <code>:authority</code> 伪首部。服务器根据主机名选择站点，再根据路径选择资源或应用处理函数。多个站点共用同一监听地址的配置称为虚拟主机。<a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-7.2" target="_blank" rel="noopener">Host 与 authority</a> · <a href="https://nginx.org/en/docs/http/request_processing.html" target="_blank" rel="noopener">Web 服务器的请求分派</a></p>
+<figure class="network-figure" data-size="fit" id="url-mapping-zh">
+<div class="diagram-toolbar"><strong>名称解析与应用路由</strong><button type="button" data-network-size aria-pressed="false" data-actual-label="原始尺寸" data-fit-label="适应宽度">原始尺寸</button></div>
+<div class="diagram-viewport" tabindex="0" role="region" aria-label="名称解析与应用路由"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 310" width="1000" height="310" role="img" aria-labelledby="url-mapping-zh-title"><title id="url-mapping-zh-title">名称解析与应用路由</title>
+<defs><marker id="url-mapping-zh-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" class="arrow-head"/></marker></defs><rect class="actor" x="16" y="55" width="320" height="70" rx="4"/><text x="176" y="83" text-anchor="middle" class="mono">https://dev.example.com/</text><text x="176" y="106" text-anchor="middle" class="muted">Host: dev.example.com · /</text><rect class="actor" x="16" y="195" width="320" height="70" rx="4"/><text x="176" y="223" text-anchor="middle" class="mono">https://example.com/dev</text><text x="176" y="246" text-anchor="middle" class="muted">Host: example.com · /dev</text><rect class="actor" x="422" y="55" width="230" height="210" rx="4"/><text x="537" y="101" text-anchor="middle" class="actor-title">Web server</text><text x="537" y="131" text-anchor="middle" class="mono">203.0.113.10:443</text><text x="537" y="187" text-anchor="middle" class="actor-title">Host + path</text><text x="537" y="219" text-anchor="middle" class="muted">路由分派</text><rect class="handler" x="738" y="122" width="246" height="80" rx="4"/><text x="861" y="154" text-anchor="middle" class="mono">development_page()</text><text x="861" y="181" text-anchor="middle" class="muted">同一个页面</text><path class="edge" d="M336 90H420" marker-end="url(#url-mapping-zh-arrow)"/><path class="edge" d="M336 230H420" marker-end="url(#url-mapping-zh-arrow)"/><text x="378" y="155" text-anchor="middle" class="muted">DNS</text><path class="edge" d="M652 162H736" marker-end="url(#url-mapping-zh-arrow)"/><text x="695" y="145" text-anchor="middle" class="muted">HTTP</text></svg></div>
+<figcaption>两个名称可以指向同一 IP；服务器再把两个 Host / path 组合映射到同一函数。</figcaption></figure>
+<p>两条路由都调用 <code>development_page()</code>，所以返回相同页面。DNS 把两个名称解析到服务入口的 IP，HTTP 路由再选择这个函数。如果路由配置不同，共用 IP 的两个名称也可以访问完全不同的网站。</p>
+
+<h3 id="redirect-proxy">4.2 内部映射与重定向</h3>
+<p>同样的页面内容可以通过几种方式提供，它们对浏览器的影响不同：</p>
+<table><thead><tr><th>机制</th><th>服务器如何处理</th><th>浏览器地址</th></tr></thead><tbody>
+<tr><td>内部路由</td><td>两个主机名与路径组合指向同一处理函数或文件，直接返回 200 响应。</td><td>保留各自的 URL。</td></tr>
+<tr><td>反向代理</td><td>前端服务器把两个请求转发到同一后端；转发时可改写主机名和路径。</td><td>仅做内部转发时保留原 URL。</td></tr>
+<tr><td>HTTP 重定向</td><td>返回 301、302、307 或 308 等状态码，并通过 <code>Location</code> 提供目标地址。</td><td>跟随重定向后变为目标 URL，并发起新请求。</td></tr>
+</tbody></table>
+<p>反向代理把后端请求留在服务器之间完成，具体配置见 <a href="https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_pass" target="_blank" rel="noopener">proxy_pass</a>。重定向则让浏览器重新访问一个地址；网站迁移时常用永久重定向统一入口。DNS 的 CNAME 只改变名称查询过程，HTTP 重定向才向浏览器提供新的 URL。<a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-15.4" target="_blank" rel="noopener">重定向状态码</a></p>
+
+<h3 id="https-origin">4.3 HTTPS 与浏览器来源</h3>
+<p>HTTPS 在发送 HTTP 请求前建立 TLS（Transport Layer Security）连接。客户端通常通过 SNI（Server Name Indication）告诉服务器请求的主机名，服务器据此选择证书；证书需要覆盖客户端访问的名称。共用一个 IP 的两个 HTTPS 站点仍需各自满足证书验证。<a href="https://www.rfc-editor.org/rfc/rfc6066.html#section-3" target="_blank" rel="noopener">TLS 主机名指示</a></p>
+<p>浏览器按 <strong>scheme、主机名、有效端口</strong> 判断 HTTP(S) 页面的来源（origin）。因此 <code>https://dev.example.com/</code> 与 <code>https://example.com/dev</code> 属于不同来源，即使页面内容和服务器相同；<code>https://example.com/</code> 与 <code>https://example.com/dev</code> 则同源。跨来源的脚本读写与存储访问仍受浏览器规则约束。<a href="https://www.rfc-editor.org/rfc/rfc6454.html#section-4" target="_blank" rel="noopener">来源的定义</a></p>
+
+<h2 id="local-demo">5. 本地路由验证</h2>
+<h3 id="shared-handler">5.1 两个入口</h3>
+<p><a href="../assets/networking-basics/url-domain-dns/route_demo.py" download>下载 route_demo.py</a>，使用 Python 3.8 或更新版本运行。示例在本机回环地址提供 HTTP 服务，路由表的核心只有两个条目：</p>
+<pre data-language="python"><code>def development_page():
+    return b&quot;&lt;!doctype html&gt;&lt;title&gt;Development&lt;/title&gt;&lt;h1&gt;Shared development page&lt;/h1&gt;\n&quot;
+
+
+ROUTES = {
+    (&quot;dev.example.com&quot;, &quot;/&quot;): development_page,
+    (&quot;example.com&quot;, &quot;/dev&quot;): development_page,
+}</code></pre>
+<p>服务器从 <code>Host</code> 中取出主机名，从请求目标中取出路径，以这两个值查询 <code>ROUTES</code>。两个条目引用同一函数；查询参数在本例中不参与路由。启动命令如下，在终端按 Ctrl-C 停止：</p>
+<pre data-language="bash"><code>python3 route_demo.py --port 8000</code></pre>
+<p>另开一个终端发起两个请求。<code>--resolve</code> 让本次 curl 调用把指定主机和端口连接到回环地址，同时保留原来的 HTTP 主机名。<code>--noproxy '*'</code> 使这两个本地请求直接连接，不经过环境中设置的代理。<a href="https://curl.se/docs/manpage.html#--resolve" target="_blank" rel="noopener">curl 的地址覆盖选项</a></p>
+<pre data-language="bash"><code>curl --noproxy '*' --resolve dev.example.com:8000:127.0.0.1 \
+  http://dev.example.com:8000/
+
+curl --noproxy '*' --resolve example.com:8000:127.0.0.1 \
+  http://example.com:8000/dev</code></pre>
+<p>两次请求都返回 200，响应正文逐字节相同：</p>
+<pre data-language="html"><code>&lt;!doctype html&gt;&lt;title&gt;Development&lt;/title&gt;&lt;h1&gt;Shared development page&lt;/h1&gt;</code></pre>
+<p class="source-scope">本例已用 Python 3.11 与 curl 在本机验证。<code>--resolve</code> 仅覆盖该次 curl 的解析结果，不修改系统 DNS；示例地址在浏览器中不会因此自动生效。</p>
+
+<h3 id="redirect-demo">5.2 重定向入口</h3>
+<p>同一个脚本还为 <code>example.com/redirect-dev</code> 配置了重定向。<code>-I</code> 发送 HEAD 请求，只检查响应首部：</p>
+<pre data-language="bash"><code>curl --noproxy '*' --resolve example.com:8000:127.0.0.1 \
+  -I http://example.com:8000/redirect-dev</code></pre>
+<pre data-language="http"><code>HTTP/1.1 302 Found
+Location: http://dev.example.com:8000/
+Content-Length: 0</code></pre>
+<p>这里仅列出与重定向有关的首部。curl 默认停在这次响应；加入 <code>-L</code> 并为目标主机也配置解析后，它会跟随 <code>Location</code>，再请求共享页面：</p>
+<pre data-language="bash"><code>curl --noproxy '*' \
+  --resolve example.com:8000:127.0.0.1 \
+  --resolve dev.example.com:8000:127.0.0.1 \
+  -L http://example.com:8000/redirect-dev</code></pre>
+<p>服务日志会依次出现 <code>GET /redirect-dev</code> 的 302 和 <code>GET /</code> 的 200。内部映射只需一次请求；通过重定向取得这份页面，则需要第二次请求。</p>
+
+<h2 id="references">参考资料</h2>
+<ul class="references">
+<li><a href="https://www.rfc-editor.org/rfc/rfc3986.html#section-3" target="_blank" rel="noopener">RFC 3986：地址组成与相对引用</a>。</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9499.html#section-2" target="_blank" rel="noopener">RFC 9499：DNS 术语</a>；<a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener">RFC 1034：域名解析</a>；<a href="https://www.rfc-editor.org/rfc/rfc1035.html#section-3.2" target="_blank" rel="noopener">RFC 1035：资源记录</a>。</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-7.2" target="_blank" rel="noopener">RFC 9110：HTTP 主机信息</a>；<a href="https://nginx.org/en/docs/http/request_processing.html" target="_blank" rel="noopener">nginx：请求处理与虚拟主机</a>。</li>
+</ul>
+</div><div class="lang-en"><h1>URLs, domains, and DNS</h1>
+<p class="article-lead">A web address connects two systems: DNS supplies a network address, and a web server selects a resource from the request. A domain can lead to several servers, a server can host several domains, and a page can be available under different hostnames and paths. Name resolution, application routing, and redirects control these relationships at different stages.</p>
+<p>This article follows <code>https://dev.example.com/</code> and <code>https://example.com/dev</code> through URL parsing, domain administration, DNS lookup, and a shared page handler. The reserved domain <code>example.com</code>, the DNS records, and <code>203.0.113.10</code> serve as examples. The final HTTP routing demo runs locally. <a href="https://www.iana.org/help/example-domains" target="_blank" rel="noopener">Example domains</a></p>
+
+<h2 id="url-en">1. URL structure</h2>
+<h3 id="url-fields-en">1.1 Host and resource</h3>
+<p>A URL (Uniform Resource Locator) describes a resource's location and how to access it. A typical HTTP or HTTPS URL has this structure; square brackets mark optional parts:</p>
+<pre data-language="text"><code>scheme://hostname[:port]/path[?query][#fragment]
+
+https://dev.example.com:443/guide/start.html?lang=zh#install</code></pre>
+<table class="url-fields"><thead><tr><th>Part</th><th>Example value</th><th>Purpose</th></tr></thead><tbody>
+<tr><td>scheme</td><td><code>https</code></td><td>Selects the access protocol. HTTPS uses an encrypted connection.</td></tr>
+<tr><td>hostname</td><td><code>dev.example.com</code></td><td>Identifies the requested host; here, a domain name to resolve.</td></tr>
+<tr><td>port</td><td><code>443</code></td><td>Selects the service port. HTTPS defaults to 443 and HTTP to 80; the default may be omitted.</td></tr>
+<tr><td>path</td><td><code>/guide/start.html</code></td><td>Identifies a resource, interpreted by the web server or application.</td></tr>
+<tr><td>query</td><td><code>lang=zh</code></td><td>Carries query information in the request. Applications assign meaning to it; <code>key=value</code> is a common convention.</td></tr>
+<tr><td>fragment</td><td><code>install</code></td><td>Usually identifies a location within a page. The browser handles it; the HTTP request target excludes it.</td></tr>
+</tbody></table>
+<p>In <code>://</code>, the colon ends the scheme and the two slashes introduce the authority: the hostname and port in this example. An IP address can occupy the host field, as in <code>http://127.0.0.1:8000/</code>. IPv6 addresses require brackets: <code>http://[::1]:8000/</code>. <a href="https://www.rfc-editor.org/rfc/rfc3986.html#section-3" target="_blank" rel="noopener">Generic URL structure</a></p>
+<p><strong>Dots and slashes take their meaning from their position.</strong> Dots in <code>dev.example.com</code> separate domain labels. The dot in <code>start.html</code> is a path character; the extension is a naming convention. Slashes separate path segments. A server can map those segments to files or pass them to a handler: <code>/users/42</code> might generate a page from a database query.</p>
+
+<h3 id="relative-urls-en">1.2 Relative references</h3>
+<p>A page link may omit the hostname or even the entire path. The browser resolves it against a base URL. With <code>https://example.com/guide/page.html</code> as the base:</p>
+<table><thead><tr><th>Reference</th><th>Resolved URL</th></tr></thead><tbody>
+<tr><td><code>./image.svg</code></td><td><code>https://example.com/guide/image.svg</code></td></tr>
+<tr><td><code>../index.html</code></td><td><code>https://example.com/index.html</code></td></tr>
+<tr><td><code>/logo.svg</code></td><td><code>https://example.com/logo.svg</code></td></tr>
+<tr><td><code>#install</code></td><td><code>https://example.com/guide/page.html#install</code></td></tr>
+</tbody></table>
+<p>As whole path segments, <code>.</code> means the current level and <code>..</code> the parent level. A trailing slash also changes resolution: <code>image.svg</code> resolves to <code>/image.svg</code> under <code>https://example.com/dev</code>, but to <code>/dev/image.svg</code> under <code>https://example.com/dev/</code>. This base change can break images or scripts when an application moves to a new path. <a href="https://www.rfc-editor.org/rfc/rfc3986.html#section-5" target="_blank" rel="noopener">Relative reference resolution</a></p>
+
+<h2 id="domains-en">2. Domains and subdomains</h2>
+<h3 id="domain-tree-en">2.1 The name hierarchy</h3>
+<p>DNS (Domain Name System) arranges names in a tree. A domain name becomes more specific from right to left: <code>com</code> is a top-level domain, <code>example.com</code> sits beneath it, and <code>dev.example.com</code> sits beneath <code>example.com</code>.</p>
+<pre data-language="text"><code>.                         root
+└── com                   com.
+    └── example           example.com.
+        ├── www           www.example.com.
+        └── dev           dev.example.com.
+            └── api       api.dev.example.com.</code></pre>
+<p>Each component between dots is a <em>label</em>. <code>dev</code> is one label; <code>dev.example.com</code> is the complete subdomain name here. Every name in the tree is a domain name, and “subdomain” describes its relationship to an ancestor. The final dot represents the root and is usually omitted in everyday writing. <a href="https://www.rfc-editor.org/rfc/rfc9499.html#section-2" target="_blank" rel="noopener">Domains, labels, and subdomains</a></p>
+<p>“Hostname” describes a name's role in a URL; it need not identify one fixed physical machine. <code>www</code>, <code>dev</code>, and <code>api</code> are conventional labels. Their spelling does not cause DNS to create a website, development environment, or API service.</p>
+<details><summary>Name length and label count</summary><p>Each DNS label can contain at most 63 bytes. An uncompressed name occupies at most 255 bytes, including each label's length byte and the final root label. With one-byte labels, <code>127 × (1 + 1) + 1 = 255</code>, allowing at most 127 nonempty labels. Ordinary ASCII presentation allows up to 253 characters without the trailing root dot. Internationalized names must satisfy the limits after encoding; registration services can impose stricter naming rules. <a href="https://www.rfc-editor.org/rfc/rfc1035.html#section-2.3.4" target="_blank" rel="noopener">DNS size limits</a></p></details>
+
+<h3 id="domain-control-en">2.2 Registration and administration</h3>
+<p>Registering a domain gives its holder control beneath that name for the registration period. The holder can normally create names such as <code>dev</code> and <code>api.dev</code> beneath it without buying each one from the registrar. Address records and a configured web service make those names usable. Domain registration, DNS hosting, and the web server are separate services and can come from different providers. <a href="https://developers.cloudflare.com/dns/manage-dns-records/how-to/create-subdomain/" target="_blank" rel="noopener">Creating subdomain records</a></p>
+<p>The tree also supports delegated administration. A DNS <em>zone</em> is a portion of the namespace managed together; its authoritative servers hold and answer for its records. An administrator can keep <code>dev.example.com</code> in the existing zone or add NS records assigning that name and its descendants to another set of authoritative servers. This assignment, called delegation, creates a zone boundary. Adding a label alone needs no additional server. <a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-4.2" target="_blank" rel="noopener">Zones and delegation</a></p>
+
+<h2 id="dns-en">3. DNS resolution</h2>
+<h3 id="dns-records-en">3.1 Names and records</h3>
+<p>A DNS query contains a name and a record type. To connect to <code>dev.example.com</code>, a browser can look up A or AAAA records for IPv4 or IPv6 addresses. DNS also stores aliases and delegation information:</p>
+<table><thead><tr><th>Type</th><th>Contents</th><th>Example</th></tr></thead><tbody>
+<tr><td>A</td><td>An IPv4 address</td><td><code>dev.example.com → 203.0.113.10</code></td></tr>
+<tr><td>AAAA</td><td>An IPv6 address</td><td><code>dev.example.com → 2001:db8::10</code></td></tr>
+<tr><td>CNAME</td><td>Another domain name: the alias target</td><td><code>www.example.com → example.com</code></td></tr>
+<tr><td>NS</td><td>An authoritative name server for the zone</td><td><code>example.com → ns1.example.net</code></td></tr>
+</tbody></table>
+<p>An authoritative server holds and answers for a zone's records. A CNAME points to a domain name whose address the resolver continues to look up. Its target cannot be a full URL such as <code>https://example.com/dev</code>, and following it does not change the browser's address bar. <a href="https://www.rfc-editor.org/rfc/rfc1035.html#section-3.2" target="_blank" rel="noopener">Resource records</a> · <a href="https://www.rfc-editor.org/rfc/rfc3596.html#section-2.1" target="_blank" rel="noopener">AAAA records</a></p>
+<p>Suppose an administrator creates these two A records. Both hostnames resolve to the same address. <code>IN</code> denotes the Internet class, and <code>300</code> is the TTL (Time to Live), allowing the records to be cached for 300 seconds:</p>
+<pre data-language="text"><code>example.com.      300  IN  A  203.0.113.10
+dev.example.com.  300  IN  A  203.0.113.10</code></pre>
+<p>A name can also have several address records from which a client selects a connection target. Names and IP addresses therefore have a many-to-many relationship. These A / AAAA lookups use the hostname; <code>/dev</code>, query parameters, and fragments do not participate.</p>
+
+<h3 id="dns-lookup-en">3.2 Recursive lookup and referrals</h3>
+<p>A client normally asks a <strong>recursive resolver</strong> to find the final answer. The lightweight component sending these requests from the operating system is called a <em>stub resolver</em>. A router, ISP, enterprise, or public DNS service may provide the recursive resolver.</p>
+<p>Root and top-level domain servers are also authoritative servers, serving the root zone and a top-level domain zone respectively. The separate “authoritative server” in this example serves the <code>example.com</code> zone.</p>
+<table id="dns-operators-en"><thead><tr><th>Role</th><th>Operators and examples</th></tr></thead><tbody>
+<tr><td>Root servers</td><td>Twelve independent organizations operate the 13 root server identities, A–M. For example, Verisign operates A and J, the Internet Systems Consortium (ISC) operates F, and ICANN operates L. Each identity can be served by instances at multiple locations. <a href="https://www.iana.org/domains/root/servers" target="_blank" rel="noopener">Full operator list</a></td></tr>
+<tr><td>Top-level domain servers</td><td>The corresponding top-level domain registry is responsible. For example, <a href="https://www.iana.org/domains/root/db/com.html" target="_blank" rel="noopener">Verisign</a> manages <code>.com</code>, and the <a href="https://www.iana.org/domains/root/db/cn.html" target="_blank" rel="noopener">China Internet Network Information Center (CNNIC)</a> manages <code>.cn</code>.</td></tr>
+<tr><td>A domain's authoritative servers</td><td>The domain holder or an authorized administrator maintains the zone's records. They can run the servers themselves or use a DNS hosting provider such as <a href="https://developers.cloudflare.com/dns/zone-setups/full-setup/setup/" target="_blank" rel="noopener">Cloudflare DNS</a>.</td></tr>
+<tr><td>Recursive resolvers</td><td>Operators include ISPs, enterprise or campus network administrators, and public DNS providers; individuals can also run their own. Google provides <a href="https://developers.google.com/speed/public-dns/docs/using" target="_blank" rel="noopener">8.8.8.8</a>, and Cloudflare provides <a href="https://developers.cloudflare.com/1.1.1.1/" target="_blank" rel="noopener">1.1.1.1</a>.</td></tr>
+</tbody></table>
+<p>For example, a domain bought through registrar A can use the name servers assigned by Cloudflare. The registrar handles registration and renewal, Cloudflare operates the authoritative DNS service, and the domain administrator edits its records at Cloudflare. Visitors can still use Google or their ISP for recursive resolution; the two choices are independent. <a href="https://developers.cloudflare.com/dns/zone-setups/full-setup/setup/" target="_blank" rel="noopener">Authoritative DNS hosting setup</a></p>
+<p>Assume neither the client nor the recursive resolver has relevant cached records, the resolver knows how to reach root servers, and the <code>example.com</code> zone directly manages <code>dev</code>. The lookup follows the delegation chain:</p>
+<figure class="network-figure" data-size="fit" id="dns-sequence-en">
+<div class="diagram-toolbar"><strong>DNS lookup: follow the delegations</strong><button type="button" data-network-size aria-pressed="false" data-actual-label="Actual size" data-fit-label="Fit width">Actual size</button></div>
+<div class="diagram-viewport" tabindex="0" role="region" aria-label="DNS lookup: follow the delegations"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 638" width="1000" height="638" role="img" aria-labelledby="dns-sequence-en-title"><title id="dns-sequence-en-title">DNS lookup: follow the delegations</title>
+<defs><marker id="dns-sequence-en-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" class="arrow-head"/></marker></defs><path class="lifeline" d="M100 76V612"/><rect class="actor" x="10" y="16" width="180" height="60" rx="4"/><text x="100" y="41" text-anchor="middle" class="actor-title">Client</text><text x="100" y="63" text-anchor="middle" class="muted">stub / browser</text><path class="lifeline" d="M300 76V612"/><rect class="actor" x="210" y="16" width="180" height="60" rx="4"/><text x="300" y="41" text-anchor="middle" class="actor-title">Recursive resolver</text><text x="300" y="63" text-anchor="middle" class="muted">resolver</text><path class="lifeline" d="M500 76V612"/><rect class="actor" x="410" y="16" width="180" height="60" rx="4"/><text x="500" y="41" text-anchor="middle" class="actor-title">Root server</text><text x="500" y="63" text-anchor="middle" class="muted">.</text><path class="lifeline" d="M700 76V612"/><rect class="actor" x="610" y="16" width="180" height="60" rx="4"/><text x="700" y="41" text-anchor="middle" class="actor-title">TLD server</text><text x="700" y="63" text-anchor="middle" class="muted">com.</text><path class="lifeline" d="M900 76V612"/><rect class="actor" x="810" y="16" width="180" height="60" rx="4"/><text x="900" y="41" text-anchor="middle" class="actor-title">Authoritative server</text><text x="900" y="63" text-anchor="middle" class="muted">example.com.</text><rect class="activation" x="95" y="120" width="10" height="482" rx="1"/><rect class="activation" x="295" y="120" width="10" height="482" rx="1"/><rect class="activation" x="495" y="186" width="10" height="86" rx="1"/><rect class="activation" x="695" y="318" width="10" height="86" rx="1"/><rect class="activation" x="895" y="450" width="10" height="86" rx="1"/><a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener"><title>RFC 1034 §5.3.3</title><path class="edge" d="M105 130H294" marker-end="url(#dns-sequence-en-arrow)"/><rect class="message-paper" x="111" y="103" width="251" height="22" rx="2"/><text x="115" y="119" text-anchor="start" class="">① Query A for dev.example.com</text></a><a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener"><title>RFC 1034 §5.3.3</title><path class="edge" d="M305 196H494" marker-end="url(#dns-sequence-en-arrow)"/><rect class="message-paper" x="311" y="169" width="251" height="22" rx="2"/><text x="315" y="185" text-anchor="start" class="">② Find the delegation for com</text></a><a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener"><title>RFC 1034 §5.3.3</title><path class="edge reply" d="M495 262H306" marker-end="url(#dns-sequence-en-arrow)"/><rect class="message-paper" x="311" y="235" width="219" height="22" rx="2"/><text x="315" y="251" text-anchor="start" class="">③ Referral to com servers</text></a><a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener"><title>RFC 1034 §5.3.3</title><path class="edge" d="M305 328H694" marker-end="url(#dns-sequence-en-arrow)"/><rect class="message-paper" x="311" y="301" width="315" height="22" rx="2"/><text x="315" y="317" text-anchor="start" class="">④ Find the delegation for example.com</text></a><a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener"><title>RFC 1034 §5.3.3</title><path class="edge reply" d="M695 394H306" marker-end="url(#dns-sequence-en-arrow)"/><rect class="message-paper" x="311" y="367" width="283" height="22" rx="2"/><text x="315" y="383" text-anchor="start" class="">⑤ Referral to example.com servers</text></a><a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener"><title>RFC 1034 §5.3.3</title><path class="edge" d="M305 460H894" marker-end="url(#dns-sequence-en-arrow)"/><rect class="message-paper" x="311" y="433" width="219" height="22" rx="2"/><text x="315" y="449" text-anchor="start" class="">⑥ Query A dev.example.com</text></a><a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener"><title>RFC 1034 §5.3.3</title><path class="edge reply" d="M895 526H306" marker-end="url(#dns-sequence-en-arrow)"/><rect class="message-paper" x="311" y="499" width="251" height="22" rx="2"/><text x="315" y="515" text-anchor="start" class="">⑦ A = 203.0.113.10; TTL = 300</text></a><a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener"><title>RFC 1034 §5.3.3</title><path class="edge reply" d="M295 592H106" marker-end="url(#dns-sequence-en-arrow)"/><rect class="message-paper" x="111" y="565" width="299" height="22" rx="2"/><text x="115" y="581" text-anchor="start" class="">⑧ Cache records; return the address</text></a></svg></div>
+<figcaption>No relevant cache; the example.com zone manages dev directly. Solid: queries. Dashed: responses. Activation bars mark request-handling scopes. Click a message for the resolver specification.</figcaption></figure>
+<p>A root server supplies a referral to <code>com</code> servers. A <code>com</code> server supplies the delegation for <code>example.com</code>. An authoritative server for <code>example.com</code> then answers with the A record for <code>dev.example.com</code>. The recursive resolver returns the address to the client and caches reusable records. <a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener">Resolver algorithm</a></p>
+<p>The resolver follows <strong>delegation boundaries</strong>. Even <code>api.dev.example.com</code> can be answered by the same authoritative servers if its records remain in the <code>example.com</code> zone. A lookup may also follow CNAME records or obtain missing name-server addresses.</p>
+
+<h3 id="dns-cache-en">3.3 Caches and resolver selection</h3>
+<p>A cache hit lets the client or resolver reuse an answer and skip some or all upstream queries. After an authoritative record changes, existing cached copies normally update as their TTLs expire. “Name does not exist” answers can also be cached, so clients that previously queried a newly created name may temporarily keep receiving a negative answer. <a href="https://www.rfc-editor.org/rfc/rfc2308.html#section-5" target="_blank" rel="noopener">Negative caching</a></p>
+<p>A browser can use DoH (DNS over HTTPS) to send encrypted queries directly to its configured resolver, choosing a different entry point from the operating system. VPNs, corporate networks, and application proxies can also affect resolver selection or where resolution happens. See <a href="vpn-proxy-routing-cases.html">VPN and application proxy routing</a> for those traffic paths. <a href="https://www.rfc-editor.org/rfc/rfc8484.html#section-1" target="_blank" rel="noopener">DoH protocol</a></p>
+
+<h2 id="mapping-en">4. Multiple URLs, one page</h2>
+<h3 id="http-routing-en">4.1 Host and path routing</h3>
+<p>These URLs differ in both hostname and path:</p>
+<table class="url-comparison"><thead><tr><th>URL</th><th>Hostname</th><th>Path</th></tr></thead><tbody>
+<tr><td><code>https://dev.example.com/</code></td><td><code>dev.example.com</code></td><td><code>/</code></td></tr>
+<tr><td><code>https://example.com/dev</code></td><td><code>example.com</code></td><td><code>/dev</code></td></tr>
+</tbody></table>
+<p>With the DNS configuration above, both connect to <code>203.0.113.10:443</code>. The server can still distinguish their requests. In HTTP/1.1 notation:</p>
+<pre data-language="http"><code>GET / HTTP/1.1
+Host: dev.example.com
+
+GET /dev HTTP/1.1
+Host: example.com</code></pre>
+<p>The <code>Host</code> field carries the requested host and, when needed, its port. HTTP/2 and HTTP/3 use the corresponding <code>:authority</code> pseudo-header. The server selects a site by hostname, then a resource or handler by path. Configuring several sites on the same listening address is called virtual hosting. <a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-7.2" target="_blank" rel="noopener">Host and authority</a> · <a href="https://nginx.org/en/docs/http/request_processing.html" target="_blank" rel="noopener">Request dispatch</a></p>
+<figure class="network-figure" data-size="fit" id="url-mapping-en">
+<div class="diagram-toolbar"><strong>Name resolution and application routing</strong><button type="button" data-network-size aria-pressed="false" data-actual-label="Actual size" data-fit-label="Fit width">Actual size</button></div>
+<div class="diagram-viewport" tabindex="0" role="region" aria-label="Name resolution and application routing"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 310" width="1000" height="310" role="img" aria-labelledby="url-mapping-en-title"><title id="url-mapping-en-title">Name resolution and application routing</title>
+<defs><marker id="url-mapping-en-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" class="arrow-head"/></marker></defs><rect class="actor" x="16" y="55" width="320" height="70" rx="4"/><text x="176" y="83" text-anchor="middle" class="mono">https://dev.example.com/</text><text x="176" y="106" text-anchor="middle" class="muted">Host: dev.example.com · /</text><rect class="actor" x="16" y="195" width="320" height="70" rx="4"/><text x="176" y="223" text-anchor="middle" class="mono">https://example.com/dev</text><text x="176" y="246" text-anchor="middle" class="muted">Host: example.com · /dev</text><rect class="actor" x="422" y="55" width="230" height="210" rx="4"/><text x="537" y="101" text-anchor="middle" class="actor-title">Web server</text><text x="537" y="131" text-anchor="middle" class="mono">203.0.113.10:443</text><text x="537" y="187" text-anchor="middle" class="actor-title">Host + path</text><text x="537" y="219" text-anchor="middle" class="muted">Route dispatch</text><rect class="handler" x="738" y="122" width="246" height="80" rx="4"/><text x="861" y="154" text-anchor="middle" class="mono">development_page()</text><text x="861" y="181" text-anchor="middle" class="muted">One shared page</text><path class="edge" d="M336 90H420" marker-end="url(#url-mapping-en-arrow)"/><path class="edge" d="M336 230H420" marker-end="url(#url-mapping-en-arrow)"/><text x="378" y="155" text-anchor="middle" class="muted">DNS</text><path class="edge" d="M652 162H736" marker-end="url(#url-mapping-en-arrow)"/><text x="695" y="145" text-anchor="middle" class="muted">HTTP</text></svg></div>
+<figcaption>Two names can resolve to one IP. The server maps both Host / path pairs to the same function.</figcaption></figure>
+<p>Both routes call <code>development_page()</code>, returning the same page. DNS resolves the names to the service's IP address, and HTTP routing selects this function. Different routing rules can send names sharing an IP to entirely different websites.</p>
+
+<h3 id="redirect-proxy-en">4.2 Internal routing and redirects</h3>
+<p>Several mechanisms can deliver identical page content, with different effects on the browser:</p>
+<table><thead><tr><th>Mechanism</th><th>Server behavior</th><th>Browser address</th></tr></thead><tbody>
+<tr><td>Internal routing</td><td>Two host-and-path pairs select the same handler or file and return 200 directly.</td><td>Each URL remains visible.</td></tr>
+<tr><td>Reverse proxy</td><td>A front server forwards both requests to one backend, optionally rewriting the host and path.</td><td>Internal forwarding alone preserves the original URL.</td></tr>
+<tr><td>HTTP redirect</td><td>The server returns a status such as 301, 302, 307, or 308 with a destination in <code>Location</code>.</td><td>Following it changes the URL and issues another request.</td></tr>
+</tbody></table>
+<p>A reverse proxy keeps the backend request between servers; see <a href="https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_pass" target="_blank" rel="noopener">proxy_pass</a> for configuration. A redirect asks the browser to visit another address. Sites commonly use permanent redirects to consolidate entry points during migrations. A DNS CNAME changes name resolution; an HTTP redirect supplies a new URL to the browser. <a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-15.4" target="_blank" rel="noopener">Redirection status codes</a></p>
+
+<h3 id="https-origin-en">4.3 HTTPS and origins</h3>
+<p>HTTPS establishes a TLS (Transport Layer Security) connection before sending the HTTP request. The client normally supplies the hostname through SNI (Server Name Indication), allowing the server to select a certificate. That certificate must cover the requested name. Two HTTPS sites sharing an IP must each satisfy certificate validation. <a href="https://www.rfc-editor.org/rfc/rfc6066.html#section-3" target="_blank" rel="noopener">TLS server name indication</a></p>
+<p>For HTTP(S), a browser identifies an <strong>origin by scheme, hostname, and effective port</strong>. Thus <code>https://dev.example.com/</code> and <code>https://example.com/dev</code> have different origins even when their content and server match. <code>https://example.com/</code> and <code>https://example.com/dev</code> share an origin. Browser rules still govern cross-origin script and storage access. <a href="https://www.rfc-editor.org/rfc/rfc6454.html#section-4" target="_blank" rel="noopener">Origin definition</a></p>
+
+<h2 id="local-demo-en">5. Local routing demo</h2>
+<h3 id="shared-handler-en">5.1 Two entry points</h3>
+<p><a href="../assets/networking-basics/url-domain-dns/route_demo.py" download>Download route_demo.py</a> and run it with Python 3.8 or later. It serves HTTP on the loopback address. The routing table has two entries:</p>
+<pre data-language="python"><code>def development_page():
+    return b&quot;&lt;!doctype html&gt;&lt;title&gt;Development&lt;/title&gt;&lt;h1&gt;Shared development page&lt;/h1&gt;\n&quot;
+
+
+ROUTES = {
+    (&quot;dev.example.com&quot;, &quot;/&quot;): development_page,
+    (&quot;example.com&quot;, &quot;/dev&quot;): development_page,
+}</code></pre>
+<p>The server extracts the hostname from <code>Host</code> and the path from the request target, then uses the pair to look up <code>ROUTES</code>. Both entries reference the same function. This demo leaves query parameters out of routing. Start it with the following command; Ctrl-C stops it:</p>
+<pre data-language="bash"><code>python3 route_demo.py --port 8000</code></pre>
+<p>In another terminal, send two requests. <code>--resolve</code> connects the specified host and port to the loopback address for that curl invocation, preserving the original HTTP hostname. <code>--noproxy '*'</code> makes these local requests connect directly, bypassing proxies configured in the environment. <a href="https://curl.se/docs/manpage.html#--resolve" target="_blank" rel="noopener">curl address overrides</a></p>
+<pre data-language="bash"><code>curl --noproxy '*' --resolve dev.example.com:8000:127.0.0.1 \
+  http://dev.example.com:8000/
+
+curl --noproxy '*' --resolve example.com:8000:127.0.0.1 \
+  http://example.com:8000/dev</code></pre>
+<p>Both requests return 200 with byte-for-byte identical bodies:</p>
+<pre data-language="html"><code>&lt;!doctype html&gt;&lt;title&gt;Development&lt;/title&gt;&lt;h1&gt;Shared development page&lt;/h1&gt;</code></pre>
+<p class="source-scope">Verified locally with Python 3.11 and curl. <code>--resolve</code> overrides resolution only for that invocation, leaving system DNS unchanged; it does not make the example addresses resolve in a browser.</p>
+
+<h3 id="redirect-demo-en">5.2 A redirect entry point</h3>
+<p>The script also redirects <code>example.com/redirect-dev</code>. The <code>-I</code> option sends a HEAD request to inspect response headers:</p>
+<pre data-language="bash"><code>curl --noproxy '*' --resolve example.com:8000:127.0.0.1 \
+  -I http://example.com:8000/redirect-dev</code></pre>
+<pre data-language="http"><code>HTTP/1.1 302 Found
+Location: http://dev.example.com:8000/
+Content-Length: 0</code></pre>
+<p>Only the redirect-related headers are shown. curl stops at this response by default. Adding <code>-L</code> and a resolution override for the destination makes it follow <code>Location</code> and request the shared page:</p>
+<pre data-language="bash"><code>curl --noproxy '*' \
+  --resolve example.com:8000:127.0.0.1 \
+  --resolve dev.example.com:8000:127.0.0.1 \
+  -L http://example.com:8000/redirect-dev</code></pre>
+<p>The server log records a 302 for <code>GET /redirect-dev</code>, followed by a 200 for <code>GET /</code>. The internal mapping needed one request; this redirect needs a second request to retrieve the same page.</p>
+
+<h2 id="references-en">References</h2>
+<ul class="references">
+<li><a href="https://www.rfc-editor.org/rfc/rfc3986.html#section-3" target="_blank" rel="noopener">RFC 3986: address syntax and relative references</a>.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9499.html#section-2" target="_blank" rel="noopener">RFC 9499: DNS terminology</a>; <a href="https://www.rfc-editor.org/rfc/rfc1034.html#section-5.3.3" target="_blank" rel="noopener">RFC 1034: name resolution</a>; <a href="https://www.rfc-editor.org/rfc/rfc1035.html#section-3.2" target="_blank" rel="noopener">RFC 1035: resource records</a>.</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc9110.html#section-7.2" target="_blank" rel="noopener">RFC 9110: HTTP host information</a>; <a href="https://nginx.org/en/docs/http/request_processing.html" target="_blank" rel="noopener">nginx: request processing and virtual hosts</a>.</li>
+</ul>
+</div></main></div></body></html>
