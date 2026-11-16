@@ -1,0 +1,130 @@
+<h1>NICs and RDMA: from sockets to verbs</h1>
+<p class="article-lead">DMA allows a NIC to access host memory directly, but ordinary TCP sockets still require substantial CPU work, including protocol processing and buffer management (moving data between user and kernel memory). RDMA reduces CPU involvement: after user-space memory buffers are registered directly and access permissions are established, the application can submit read and write requests from user space, and the NIC accesses the specified remote memory directly.</p>
+<p>A 4 KiB transfer between nodes provides a common example for comparing TCP sockets and RDMA Write. The mlx5 source shows how descriptors, doorbells and completion queues work together, and how user-space libraries and kernel drivers divide responsibility for establishing resources and permissions through device files, submitting requests from user space and reporting completion to the application.</p>
+<p class="source-scope">Source baseline: Linux 6.12 and rdma-core 61.0, checked on 2026-11-10; the send wrapper uses glibc 2.40. Source links are pinned to tags or commits and collected by section in the <a href="#source-map-en">source index</a>. The RDMA Write sequence diagram follows source-level call order; activation bars mark each participant's logical activity scope.</p>
+
+<h2 id="nic-device-en">1. NICs and memory</h2>
+<p>A PCIe NIC interacts with the CPU through two kinds of address. Its BARs (Base Address Registers) describe device address windows. <u>Once the driver maps a register region, CPU loads and stores issue MMIO (Memory-Mapped I/O) accesses to the device.</u> To access host memory, the NIC uses DMA (Direct Memory Access) mappings established through the Linux DMA API. The IOMMU is part of the host I/O subsystem. With address translation enabled, the NIC issues DMA requests using I/O virtual addresses (IOVAs). After a request reaches the host over PCIe, the IOMMU translates its IOVA to a host physical address and checks access permissions. [[dma-api|DMA addresses and mappings]] · [[vtd-arch|Host DMA remapping]]</p>
+<p>The CPU describes where to read data and how many bytes to send, then places that descriptor in a ring in memory. The NIC reads it and executes the transfer. The conventional mlx5 send path has four steps:</p>
+<table><thead><tr><th>Step</th><th>Performed by</th><th>Action</th></tr></thead><tbody>
+<tr><td>① Write the descriptor</td><td>CPU</td><td>Write a WQE (Work Queue Element) into the send queue (SQ) ring, recording the operation, buffer address and length.</td></tr>
+<tr><td>② Ring the doorbell</td><td>CPU</td><td>Record the new producer index in the DBR (Doorbell Record) in memory, then write the doorbell register on a UAR (User Access Region) page in the BAR, an MMIO write that reaches the NIC over PCIe.</td></tr>
+<tr><td>③ Execute</td><td>NIC</td><td>DMA-read the WQE and the data it points to, then transmit the data.</td></tr>
+<tr><td>④ Complete</td><td>NIC</td><td>DMA-write CQEs (Completion Queue Entries) into the completion queue (CQ) as configured, then raise an interrupt or wait for software to poll, as configured.</td></tr>
+</tbody></table>
+<p>Software performs ① and ②; the NIC performs ③ and ④. Sockets and RDMA verbs both use this queue mechanism. The socket path in <a href="#socket-en">section 2</a> submits work from the kernel Ethernet driver; the verbs path in <a href="#verbs-en">section 3</a> submits it from the user-space driver <code>libmlx5</code>. The hardware is shared, while request submission runs in different places.</p>
+
+<h2 id="socket-en">2. The TCP socket path</h2>
+<p>A sends 4 KiB to B over an established IPv4 TCP connection using ordinary copying <code>send()</code> and <code>recv()</code> calls. For this example, each call handles all 4096 bytes. <code>send()</code> is declared in <code>&lt;sys/socket.h&gt;</code>; the application calls a C-library wrapper before entering the kernel. On Linux x86-64 with glibc 2.40, the path is:</p>
+<pre><code>User space
+  send(fd, buf, 4096, 0)                    # application socket-send API
+    → __libc_send()                         # glibc wrapper
+    → sendto(fd, buf, 4096, 0, NULL, 0)      # select the sendto system call
+                ↓ syscall: enter kernel mode
+
+Kernel space
+  __sys_sendto()
+    → sockfd_lookup_light(fd, ...)          # find the socket by fd
+    → __sock_sendmsg()
+    → sock_sendmsg_nosec()                  # dispatch to the socket's sendmsg op
+    → inet_sendmsg()                        # IPv4 socket in this example
+    → tcp_sendmsg()                         # socket protocol selects TCP
+    → tcp_sendmsg_locked()                  # copy 4 KiB into skb pages
+    → tcp_write_xmit() … dev_queue_xmit()   # TCP/IP send path to the NIC driver
+    → mlx5e_xmit()                          # DMA-map pages, write a WQE in SQ  ①
+    → mlx5e_notify_hw()                     # write DBR, then UAR doorbell      ②
+
+NIC A: DMA-read the data and transmit Ethernet frames                           ③</code></pre>
+<p>The <code>NULL, 0</code> destination arguments tell <code>sendto</code> to use the socket's associated peer. After looking up the socket by fd, the kernel dispatches through its operation tables to the IPv4 and TCP implementations, then continues through the protocol stack and NIC driver. [[glibc-send|glibc send wrapper]] · [[send-syscall|x86-64 syscall table]] · [[socket-send|Kernel sendto entry]] · [[socket-dispatch|Socket dispatch]] · [[inet-send|TCP / UDP dispatch]] · [[tcp-send-entry|tcp_sendmsg]]</p>
+<p>On this socket path, B's NIC writes into receive buffers posted by the driver. B's CPU then processes TCP/IP, and the application obtains the data through <code>recv()</code>:</p>
+<pre><code>NIC B: DMA-write into a posted receive buffer, write a CQE, interrupt  ④
+mlx5_eq_comp_int() → napi_schedule()       # the interrupt only schedules NAPI
+mlx5e_napi_poll() → mlx5e_poll_rx_cq()     # softirq: read CQEs, build skbs
+  napi_gro_receive() … tcp_v4_rcv()        # TCP processing, socket receive queue
+recv(fd, buf, 4096, 0)                     # system call: copy to the user buffer</code></pre>
+<p>This example copies the payload once between user and kernel memory at each endpoint. The CPUs also handle system calls, protocol processing and driver queues. On receive, an interrupt schedules NAPI, which processes completion entries in batches. TCP is a byte stream: applications must use the return values of <code>send()</code> and <code>recv()</code> to handle remaining bytes. Neither system calls nor interrupts have a one-to-one relationship with the 4 KiB transfer. <a href="https://man7.org/linux/man-pages/man2/send.2.html" target="_blank" rel="noopener">send(2)</a> · <a href="https://man7.org/linux/man-pages/man2/recv.2.html" target="_blank" rel="noopener">recv(2)</a></p>
+<p>After a copying send returns successfully, the application can reuse the portion of its source buffer accepted by the kernel, even if the peer application has not read the data. <code>MSG_ZEROCOPY</code> replaces the sending-side copy with page pinning and a completion notification; the buffer remains in use until that notification. Linux documents a typical benefit above roughly 10 KB per write, so the 4 KiB example here keeps the copying path. [[msg-zerocopy|MSG_ZEROCOPY]]</p>
+<p>Ordinary socket traffic already uses local DMA. RDMA adds remote-memory operations that the NIC can execute: A names B's address and access key in the request, and B's NIC checks them before writing directly into the destination buffer. This removes the receiving protocol-stack work and user-space copy from that data delivery. [[rdma-guide|RDMA operations]]</p>
+
+<h2 id="verbs-en">3. The RDMA Write path</h2>
+<p>The same 4 KiB now travels as an RDMA Write over RC (Reliable Connection). Both endpoints register memory and establish a connection before A posts the write. Applications call the common verbs API; a device-specific user-space implementation, called a provider, performs the hardware operations. For ConnectX, that provider is <code>libmlx5</code>. The socket column compares the purpose of each step.</p>
+<table><thead><tr><th>Order</th><th>Verbs call</th><th>What it yields</th><th>Socket counterpart</th></tr></thead><tbody>
+<tr><td>1</td><td><code>ibv_open_device()</code></td><td>A device context holding the command fd from opening <code>/dev/infiniband/uverbsN</code>.</td><td><code>socket()</code></td></tr>
+<tr><td>2</td><td><code>ibv_alloc_pd()</code></td><td>A protection domain (PD). A QP uses local MRs from the same PD.</td><td>None</td></tr>
+<tr><td>3</td><td><code>ibv_reg_mr()</code></td><td>A memory region (MR): it pins the buffer's pages, builds the NIC's address translation and access rights, and returns <code>lkey</code> and <code>rkey</code>. Local requests use <code>lkey</code>; <code>rkey</code> goes to the peer for remote access checks.</td><td>This example copies data through kernel buffers</td></tr>
+<tr><td>4</td><td><code>ibv_create_cq()</code></td><td>A completion queue (CQ): the completion ring in memory.</td><td>None</td></tr>
+<tr><td>5</td><td><code>ibv_create_qp()</code>, <code>ibv_modify_qp()</code></td><td>An RC queue pair (QP) with a send queue (SQ) and a receive queue (RQ). It moves through INIT, RTR and RTS and is given the peer's QP number, address and starting packet sequence number.</td><td><code>connect()</code> / <code>accept()</code></td></tr>
+<tr><td>6</td><td><code>ibv_post_send()</code></td><td>Posts an RDMA Write WR (Work Request). <code>libmlx5</code> encodes it as a WQE in the SQ ring (①), then rings the doorbell (②).</td><td><code>send()</code></td></tr>
+<tr><td>7</td><td><code>ibv_poll_cq()</code></td><td>Checks that the CQE reports success before reusing the source buffer.</td><td><code>send()</code> returns</td></tr>
+<tr><td>—</td><td>None</td><td>B posts no receive request for this ordinary RDMA Write.</td><td>B's <code>recv()</code></td></tr>
+</tbody></table>
+<p>Steps 1–5 establish resources through the control path and require kernel participation. The resulting MRs, QPs and CQs can serve many transfers. Steps 6–7 form the mlx5 data path: user-space code writes queues, rings doorbells and polls completions. The endpoints also exchange QP connection parameters, and B gives A its destination address and <code>rkey</code>. An application can exchange these over TCP, or use <code>rdma_cm</code> to establish the connection and exchange memory information through its own protocol. [[rdma-cm|Connection management]]</p>
+{{code:verbs-write}}
+<p class="code-context">The fragment compiles against the rdma-core 61.0 headers and omits the control path. <code>IBV_SEND_SIGNALED</code> requests a CQE for this request. [[verbs-post-send|Request fields]]</p>
+{{rdma-write}}
+<p>The NICs carry out the transfer in the diagram. B's NIC locates the MR using <code>rkey</code>, checks the range and remote-write permission, then DMA-writes the destination. B's CPU prepared those resources during setup; this ordinary RDMA Write requires no per-transfer receive posting or interrupt handling from it. Once A polls a successful completion, it can reuse the source buffer. B's application needs a notification protocol to know when the data is ready, such as a subsequent Send or RDMA Write with immediate data. [[rdma-guide|RDMA Write and notifications]]</p>
+<div class="aside"><span class="label">Aside: other verbs operations</span>
+<p>RDMA Read reverses the data direction. A posts a read naming B's address and <code>rkey</code>; B's NIC returns the data, and A waits for local read completion. B's CPU does not handle each read request. Send/Recv requires the receiver to post a buffer with <code>ibv_post_recv()</code>; an arriving Send fills it and produces a receive CQE. RDMA Write with immediate data also consumes a receive request and produces a receive CQE, while placing the payload at the remote address specified by the sender.</p>
+<p>Basic fetch-and-add and compare-and-swap operations act atomically on an 8-byte remote object. UD (Unreliable Datagram) is connectionless, supports Send/Recv and limits each message to the path MTU. InfiniBand and RoCE share the verbs programming model; RoCE v2 carries the InfiniBand transport in UDP/IP over Ethernet. [[rdma-guide|Operations and transport modes]]</p></div>
+
+<h2 id="nic-driver-en">4. Drivers and device files</h2>
+<p>Applications call both <code>send()</code> and <code>ibv_post_send()</code> from user space. The difference is when they enter the kernel and which work they delegate to it. Ordinary TCP sockets pass each send to the protocol stack. With mlx5 user-space RDMA verbs, the kernel first establishes resources, then the provider directly operates the queues and registers it has permission to access.</p>
+<table id="socket-verbs-comparison-en"><thead><tr><th>Stage</th><th>Ordinary TCP socket</th><th>User-space RDMA verbs</th></tr></thead><tbody>
+<tr><td>Establish resources</td><td>The <code>socket()</code> system call creates a communication endpoint and returns a socket fd.</td><td>The library opens <code>/dev/infiniband/uverbsN</code> and uses <code>ioctl</code> / <code>write</code> / <code>mmap</code> to create queues, register memory and establish mappings.</td></tr>
+<tr><td>Submit data</td><td><code>send()</code> enters the kernel through a system call and hands data to the TCP/IP stack.</td><td><code>ibv_post_send()</code> calls the provider, which directly writes the mapped queues and doorbell.</td></tr>
+<tr><td>Process each transfer</td><td>The kernel protocol stack, NIC driver and NIC share the work.</td><td>The provider submits descriptors, and the NIC executes RDMA operations.</td></tr>
+</tbody></table>
+<p>A socket fd represents a communication endpoint created by <code>socket()</code> and installed in the process's fd table. To send data, the kernel stack calls the network driver through <code>net_device_ops.ndo_start_xmit</code>; mlx5e assigns <code>mlx5e_xmit()</code> to that callback. This kernel call path reaches the driver directly, without opening a NIC device file. [[socket-create|Socket creation]] · [[socket-fd|FD allocation]] · [[netdev-send|Network-driver dispatch]] · [[mlx5e-netdev|mlx5e callback]]</p>
+<p>The uverbs fd is a device-resource management interface. Through it, the user-space library requests MRs, QPs, CQs and UAR mappings, while the kernel checks ownership, memory and access rights. Once mapped, the provider can submit queue work in user space. The kernel continues to manage resource lifetime, including explicit release and process exit. [[user-verbs|User-space verbs and resource management]] ConnectX divides these responsibilities among the following components:</p>
+<table><thead><tr><th>Component</th><th>Responsibility</th><th>Location</th></tr></thead><tbody>
+<tr data-component-row="verbs"><td><code>libibverbs.so</code></td><td>The common verbs interface: device contexts, PDs, MRs, QPs and CQs, plus submission and completion. It loads a provider for each device.</td><td>User space</td></tr>
+<tr data-component-row="mlx5"><td><code>libmlx5</code> provider</td><td>The mlx5 verbs implementation: it allocates SQ / CQ rings and DBRs in process memory, encodes WQEs, writes doorbells and polls CQEs. It also exposes device-specific interfaces such as mlx5dv / DevX.</td><td>User space</td></tr>
+<tr data-component-row="dev-uverbs"><td><code>/dev/infiniband/uverbsN</code></td><td><code>libibverbs</code> opens it to obtain the command fd. Resource commands go through <code>ioctl</code> / <code>write</code>; mappings such as UARs go through <code>mmap</code>.</td><td>Device file</td></tr>
+<tr data-component-row="rdma"><td><code>ib_uverbs.ko</code>, <code>ib_core.ko</code></td><td>The RDMA user-space interface and common object layer: they parse commands, check object ownership and permissions, pin user memory and call the device driver.</td><td>Kernel</td></tr>
+<tr data-component-row="mlx5kernel"><td><code>mlx5_ib.ko</code></td><td>The mlx5 RDMA driver, a separate module. It binds the <code>.rdma</code> auxiliary device created by <code>mlx5_core</code>, implements QPs, CQs, MRs and <code>mmap</code>, and issues firmware commands through <code>mlx5_core</code>.</td><td>Kernel</td></tr>
+<tr><td><code>mlx5_core.ko</code></td><td>The PCI driver, the firmware command channel and shared resources; the mlx5e Ethernet driver is built into it.</td><td>Kernel</td></tr>
+<tr data-component-row="nic"><td>ConnectX NIC</td><td>Reads work queues, checks memory access permissions, performs DMA and network protocol work, and writes CQEs.</td><td>Hardware</td></tr>
+</tbody></table>
+<p>A ConnectX PCI function can expose both Ethernet and RDMA interfaces. After binding the PCI device, <code>mlx5_core</code> creates auxiliary devices such as <code>mlx5_core.eth.0</code> and <code>mlx5_core.rdma.0</code>. The mlx5e driver binds <code>.eth</code> and is compiled into <code>mlx5_core.ko</code>. The separate <code>mlx5_ib.ko</code> module binds <code>.rdma</code> and depends on the mlx5 core and common RDMA modules. [[mlx5-build|Makefile]] · [[mlx5-adev|Auxiliary-device table]] · [[mlx5-ib-aux|mlx5_ib binding]] The <code>modinfo</code> output below shows the aliases and dependencies:</p>
+{{code:modinfo}}
+<p class="code-context">Measured on Linux 6.1.62 with MLNX_OFED 24.01. <code>mlx_compat</code> is the MLNX_OFED compatibility layer; the distribution module depends on <code>mlx5_core</code>, <code>ib_uverbs</code> and <code>ib_core</code>. The same command on <code>mlx5_core</code> shows the <code>.eth</code> aliases.</p>
+
+<h3 id="control-path-en">Control path</h3>
+<p>Creating QPs and CQs and registering MRs involves device resources, pinned memory and access permissions, which the kernel checks and establishes. The <code>ibv_create_qp()</code> path associates the user-space queue memory with a hardware QP:</p>
+<pre><code>ibv_create_qp()                 # libmlx5's create_qp()
+  mlx5_alloc_qp_buf()           # allocate the SQ / RQ ring in process memory
+  mlx5_alloc_dbrec()            # allocate the DBR
+  ioctl / write(cmd_fd)         # system call: /dev/infiniband/uverbsN
+    ib_uverbs → ib_core         # parse the command, check objects and rights
+      mlx5_ib_create_qp()       # mlx5_ib.ko
+        ib_umem_get()           # pin the ring's pages for NIC DMA
+        mlx5_ib_db_map_user()   # pin the DBR's page
+        mlx5_qpc_create_qp()    # build the CREATE_QP firmware command
+          mlx5_cmd_exec()       # mlx5_core.ko's command channel</code></pre>
+<p>The rings and the DBR that the NIC reads live in process memory and are allocated by <code>libmlx5</code>; the kernel pins those pages and passes their addresses to the NIC through firmware commands. [[mlx5-create-qp|Addresses from libmlx5]] · [[mlx5-ib-qp|Pinning and commands in mlx5_ib]] The device-file mechanism itself (<code>open</code> returns an fd, <code>ioctl</code> dispatches through the driver's file-operations table, <code>mmap</code> establishes mappings) is covered in the <a href="cuda-linux-driver-stack.html#device-files-en">device files</a> section of the CUDA Internals post <em>CUDA layers and the Linux driver</em>.</p>
+
+<h3 id="data-path-en">Data path</h3>
+<p><code>ibv_post_send()</code> and <code>ibv_poll_cq()</code> are inline functions in <code>verbs.h</code> that call the provider's function pointers without entering the kernel. [[verbs-inline|verbs.h]] <code>libmlx5</code> encodes the WR as a WQE: the control segment holds the opcode and WQE index, the remote-address segment holds <code>remote_addr</code> and <code>rkey</code>, and the data segment holds the local address, length and <code>lkey</code>. [[mlx5-send|WQE encoding]] After writing the WQE, it runs the doorbell code below:</p>
+{{code:mlx5-db}}
+<p class="code-context">rdma-core 61.0, <code>providers/mlx5/qp.c</code> lines 754–802, verbatim; the left column shows source line numbers. [[mlx5-doorbell|Source]]</p>
+<p>Lines 768–769 publish queue progress. A barrier orders the WQE stores before the DBR update, which records the new producer index in its send slot. Lines 774–778 prepare write-combining access and acquire a lock if several threads share the BlueFlame register.</p>
+<p>Lines 780–786 notify the NIC. When the conditions hold, <code>mlx5_bf_copy()</code> writes the WQE into the UAR page's BlueFlame buffer, delivering the descriptor directly. The conditions include one WR in this call, BlueFlame support, inline data or a preference for BlueFlame, and a WQE that fits. The other branch writes only the control segment's first 8 bytes, containing the WQE index, opcode and QP number. Both branches use MMIO.</p>
+<p>Line 798 flushes the write-combining buffer before releasing the lock, ordering this register write ahead of another thread's submission. Line 799 switches to the other half of the BlueFlame buffer for the next doorbell. The lock and barriers preserve ordering among submitters.</p>
+<p><code>ibv_poll_cq()</code> also stays in user space: the provider checks the ownership bit to see whether the NIC has written the next CQE in the CQ ring, reads it, and writes the consumer index back to the CQ's DBR. [[mlx5-cq|mlx5_poll_cq]]</p>
+<p><code>bf-&gt;reg</code> points to the UAR mapping in the current process. <code>libmlx5</code> allocates the UAR through the command fd and maps it with <code>mmap()</code>. <code>mlx5_ib</code> uses <code>rdma_user_mmap_io()</code> for the BAR page, selecting write-combining attributes for BlueFlame pages and uncached attributes for doorbell-only pages. Once mapped, CPU MMIO stores can notify the NIC without a system call for each doorbell. [[uar-provider|Allocation and mapping in libmlx5]] · [[mlx5-ib-mmap|mlx5_ib mmap]]</p>
+
+<h2 id="source-map-en">Source index</h2>
+<details class="path-reference"><summary>Source and documentation entry points by section</summary>
+<table><thead><tr><th>Question</th><th>Entry points</th></tr></thead><tbody>
+<tr><td>1 Host IOMMU and DMA addresses</td><td>[[dma-api|Linux DMA mapping]]; [[vtd-arch|Intel VT-d architecture]]</td></tr>
+<tr><td>2 The send wrapper and kernel entry</td><td>[[glibc-send|__libc_send]] → [[send-syscall|sendto system call]] → [[socket-send|__sys_sendto]] → [[socket-dispatch|__sock_sendmsg]] → [[inet-send|inet_sendmsg]] → [[tcp-send-entry|tcp_sendmsg]]</td></tr>
+<tr><td>2 Copies and doorbells on the socket path</td><td>[[tcp-copy|tcp_sendmsg_locked]] → [[mlx5-dma|mlx5e_txwqe_build_dsegs]] → [[mlx5e-db|mlx5e_notify_hw]]; receive: [[mlx5e-rx|mlx5e_napi_poll]] → [[tcp-recv|tcp_recvmsg_locked]]; [[msg-zerocopy|MSG_ZEROCOPY]]</td></tr>
+<tr><td>3 Verbs fields, states and connections</td><td>[[verbs-mr|ibv_reg_mr]], [[verbs-modify-qp|ibv_modify_qp]], [[verbs-post-send|ibv_post_send]], [[rdma-cm|rdma_cm]], [[rdma-guide|RDMA programming guide]], [[verbs|libibverbs]]</td></tr>
+<tr><td>4 Socket and verbs kernel interfaces</td><td>[[socket-create|__sys_socket]] → [[socket-fd|sock_map_fd]]; [[netdev-send|ndo_start_xmit dispatch]] → [[mlx5e-netdev|mlx5e_xmit callback]]; [[user-verbs|uverbs resource management]]</td></tr>
+<tr><td>4 Modules and auxiliary devices</td><td>[[mlx5-build|Makefile]], [[mlx5-adev|Auxiliary-device table]], [[mlx5e-aux|mlx5e binds .eth]], [[mlx5-ib-aux|mlx5_ib binds .rdma]], [[mlx5-ethernet|Kernel documentation]]</td></tr>
+<tr><td>4 Control path</td><td>[[verbs-open|Open uverbs]] → [[uverbs-fops|uverbs file operations]] → [[uverbs-ioctl|ioctl dispatch]] → [[mlx5-ib-qp|QP creation in mlx5_ib]] → [[mlx5-qpc|CREATE_QP]] → [[mlx5-cmd|mlx5_cmd_exec]]; [[mlx5-create-qp|Addresses from libmlx5]], [[umem-get|Pinning user pages]], [[user-verbs|Kernel documentation]]</td></tr>
+<tr><td>4 Data path and UAR</td><td>[[verbs-inline|ibv_post_send]] → [[mlx5-send|_mlx5_post_send]] → [[mlx5-doorbell|post_send_db]]; [[mlx5-cq|poll_cq]]; [[uar-provider|UAR allocation and mmap]] → [[mlx5-ib-mmap|mlx5_ib mmap]]</td></tr>
+</tbody></table>
+<p class="source-scope">The <a href="../assets/networking-basics/nic-rdma/sources.json">version and source-link manifest</a> supports comparison with other revisions.</p>
+</details>
+<p>In this series: <a href="vpn-routing-wireguard.html">VPN fundamentals and routing</a> · <a href="http-proxy-configuration.html">HTTP proxies and application configuration</a> · <a href="ssh-tunnels-forwarding.html">SSH forwarding and tunnels</a> · <a href="vpn-proxy-routing-cases.html">Routing with VPNs and multiple proxies</a></p>

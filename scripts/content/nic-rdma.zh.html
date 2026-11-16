@@ -1,0 +1,130 @@
+<h1>网卡与 RDMA：从 socket 到 verbs</h1>
+<p class="article-lead">DMA 技术允许网卡直接访问 host 内存，但是普通的 TCP socket 模式仍然需要 CPU 参与大量工作，比如处理协议、管理缓冲区（用户态和内核态数据搬运）。而 RDMA 则减少了 CPU 的参与：直接注册用户态内存 buffer、建立访问权限后，应用可以在用户态提交读写请求，由网卡直接访问对端指定的内存。</p>
+<p>本文以 4 KiB 跨节点传输为例，对照 TCP socket 与 RDMA Write 的数据路径，结合 mlx5 源码解释描述符、doorbell 和完成队列的协作。重点分析用户态库与内核驱动的分工：如何通过设备文件建立资源与访问权限，如何在用户态提交请求，以及应用如何确认传输完成。</p>
+<p class="source-scope">源码基线：Linux 6.12、rdma-core 61.0，核对日期 2026-11-10；send 封装采用 glibc 2.40。链接固定到 tag 或 commit，按节汇总在<a href="#source-map">源码索引</a>中。RDMA Write 序列图按源码调用顺序绘制，activation bar 标示参与者的逻辑活动范围。</p>
+
+<h2 id="nic-device">1. 网卡与内存</h2>
+<p>以 PCIe 网卡为例，CPU 与网卡通过两类地址交互。网卡的 BAR（Base Address Register）描述设备的地址窗口；<u>驱动映射其中的寄存器区域后，CPU 的 load / store 就能发起 MMIO（Memory-Mapped I/O，内存映射 I/O）访问。</u>网卡访问主机内存则使用 DMA（Direct Memory Access，直接内存访问），由驱动通过 Linux DMA API 建立映射。IOMMU 位于主机的 I/O 子系统中。启用地址翻译时，网卡用 I/O 虚拟地址（IOVA）发起 DMA 请求；请求经 PCIe 到达主机后，IOMMU 将 IOVA 转换为主机物理地址，并检查访问权限。[[dma-api|DMA 地址与映射]] · [[vtd-arch|主机侧 DMA 重映射]]</p>
+<p>CPU 把“从哪里取数据、发多少字节”写成描述符，放进内存中的环形队列；网卡读取描述符后执行传输。在 mlx5 的常规发送路径中，一次请求经过以下四步：</p>
+<table><thead><tr><th>步骤</th><th>执行者</th><th>动作</th></tr></thead><tbody>
+<tr><td>① 写描述符</td><td>CPU</td><td>在发送队列 SQ 的环中写一个 WQE（Work Queue Element），记录操作类型、buffer 地址和长度。</td></tr>
+<tr><td>② 敲 doorbell</td><td>CPU</td><td>先在内存中的 DBR（Doorbell Record）记下新的生产者序号，再写 BAR 中 UAR（User Access Region）页上的 doorbell 寄存器。后者是一次 MMIO 写，经 PCIe 到达网卡。</td></tr>
+<tr><td>③ 执行</td><td>网卡</td><td>DMA 读取 WQE 及其指向的数据，按协议发往网络。</td></tr>
+<tr><td>④ 完成</td><td>网卡</td><td>按完成配置将 CQE（Completion Queue Entry）DMA 写入完成队列 CQ，按配置触发中断，或等待软件轮询。</td></tr>
+</tbody></table>
+<p>软件负责 ①②，网卡负责 ③④。socket 和 RDMA verbs 都使用这类队列机制：<a href="#socket">第 2 节</a>的 socket 路径由内核以太网驱动提交工作，<a href="#verbs">第 3 节</a>的 verbs 路径由用户态驱动 <code>libmlx5</code> 提交。两者共用网卡，却把请求提交放在了不同的执行位置。</p>
+
+<h2 id="socket">2. TCP socket 路径</h2>
+<p>A 通过一条已建立的 IPv4 TCP 连接把 4 KiB 发给 B。这里采用普通的拷贝式 <code>send()</code> / <code>recv()</code>，并取两次调用都完整处理 4096 字节的情况。<code>send()</code> 声明在 <code>&lt;sys/socket.h&gt;</code>，应用先调用 C 库封装，再进入内核。以 Linux x86-64 和 glibc 2.40 为例，发送路径如下：</p>
+<pre><code>用户态
+  send(fd, buf, 4096, 0)                    # 应用调用 socket 发送接口
+    → __libc_send()                         # glibc 的封装
+    → sendto(fd, buf, 4096, 0, NULL, 0)      # 选择 sendto 系统调用
+                ↓ syscall：进入内核态
+
+内核态
+  __sys_sendto()
+    → sockfd_lookup_light(fd, ...)          # 根据 fd 查找 socket
+    → __sock_sendmsg()
+    → sock_sendmsg_nosec()                  # 分派到 socket 的 sendmsg 操作
+    → inet_sendmsg()                        # 本例为 IPv4 socket
+    → tcp_sendmsg()                         # 按 socket 的协议选择 TCP
+    → tcp_sendmsg_locked()                  # 把 4 KiB 拷进 skb 的页
+    → tcp_write_xmit() … dev_queue_xmit()   # TCP/IP 发送路径，交给网卡驱动
+    → mlx5e_xmit()                          # DMA 映射数据页，在 SQ 环写 WQE  ①
+    → mlx5e_notify_hw()                     # 写 DBR，再写 UAR doorbell      ②
+
+网卡 A：DMA 读取数据，按以太网帧发出                                            ③</code></pre>
+<p><code>sendto</code> 的目标地址参数为 <code>NULL, 0</code>，表示使用 socket 已关联的对端。内核根据 fd 找到 socket 后，经操作表选择 IPv4 和 TCP 的实现，再进入原有的协议栈与网卡驱动路径。[[glibc-send|glibc send 封装]] · [[send-syscall|x86-64 系统调用表]] · [[socket-send|内核 sendto 入口]] · [[socket-dispatch|socket 操作分派]] · [[inet-send|TCP / UDP 分派]] · [[tcp-send-entry|tcp_sendmsg]]</p>
+<p>在这条 socket 路径中，B 的网卡先把数据写入驱动预先投递的接收 buffer。B 的 CPU 随后处理 TCP/IP 协议，应用通过 <code>recv()</code> 取得数据：</p>
+<pre><code>网卡 B：DMA 写入预先投递的接收 buffer，写 CQE，触发中断               ④
+mlx5_eq_comp_int() → napi_schedule()       # 中断里只调度 NAPI
+mlx5e_napi_poll() → mlx5e_poll_rx_cq()     # 软中断中读 CQE，构造 skb
+  napi_gro_receive() … tcp_v4_rcv()        # TCP 处理，挂进 socket 接收队列
+recv(fd, buf, 4096, 0)                     # 系统调用：拷贝到用户 buffer</code></pre>
+<p>这个例子中，两端各经过一次用户态与内核态之间的数据拷贝；CPU 还负责系统调用、协议处理和驱动队列管理。接收侧用中断唤起 NAPI，再批量处理完成队列。TCP 是字节流，实际程序要根据 <code>send()</code> 和 <code>recv()</code> 的返回值继续处理剩余字节，系统调用次数和中断次数都不与 4 KiB 一一对应。<a href="https://man7.org/linux/man-pages/man2/send.2.html" target="_blank" rel="noopener">send(2)</a> · <a href="https://man7.org/linux/man-pages/man2/recv.2.html" target="_blank" rel="noopener">recv(2)</a></p>
+<p>拷贝式发送成功返回后，应用可以复用已被内核接收的那部分源 buffer；此时对端应用可能还没有读到数据。<code>MSG_ZEROCOPY</code> 则用页面固定和完成通知替代发送侧拷贝，源 buffer 要等通知后才能复用。Linux 文档给出的经验范围是约 10 KB 以上的写入才通常受益，因此这里的 4 KiB 例子仍采用拷贝路径。[[msg-zerocopy|MSG_ZEROCOPY]]</p>
+<p>普通 socket 收发已经使用本机 DMA。RDMA 增加的是网卡可执行的远端内存操作：A 在请求中指定 B 的内存地址和访问 key，B 的网卡校验后直接写入该 buffer，省去本次数据交付中的接收端协议栈处理与用户态拷贝。[[rdma-guide|RDMA 操作]]</p>
+
+<h2 id="verbs">3. RDMA Write 路径</h2>
+<p>仍然传输同一块 4 KiB 数据，改用 RC（Reliable Connection，可靠连接）上的 RDMA Write。两端先注册内存、建立连接，A 再提交写请求。应用调用通用的 verbs API，由设备专用的用户态实现 provider 完成硬件操作；ConnectX 对应的 provider 是 <code>libmlx5</code>。表中 socket 一列用于比较各步骤的用途。</p>
+<table><thead><tr><th>顺序</th><th>verbs 调用</th><th>得到什么</th><th>socket 中的对应</th></tr></thead><tbody>
+<tr><td>1</td><td><code>ibv_open_device()</code></td><td>设备 context，内含打开 <code>/dev/infiniband/uverbsN</code> 得到的命令 fd。</td><td><code>socket()</code></td></tr>
+<tr><td>2</td><td><code>ibv_alloc_pd()</code></td><td>保护域 PD（Protection Domain）。QP 使用的本地 MR 属于同一 PD。</td><td>无</td></tr>
+<tr><td>3</td><td><code>ibv_reg_mr()</code></td><td>内存区域 MR（Memory Region）：固定 buffer 所在的页，为网卡建立地址翻译和访问权限，返回 <code>lkey</code> 与 <code>rkey</code>。本端提交请求时用 <code>lkey</code>；<code>rkey</code> 交给对端，用于远端访问校验。</td><td>本例通过内核缓冲区拷贝数据</td></tr>
+<tr><td>4</td><td><code>ibv_create_cq()</code></td><td>完成队列 CQ，即内存中的完成环。</td><td>无</td></tr>
+<tr><td>5</td><td><code>ibv_create_qp()</code>、<code>ibv_modify_qp()</code></td><td>RC 队列对 QP（Queue Pair），含发送队列 SQ 和接收队列 RQ。依次切换到 INIT、RTR、RTS，并填入对端的 QP 号、地址和起始包序号。</td><td><code>connect()</code> / <code>accept()</code></td></tr>
+<tr><td>6</td><td><code>ibv_post_send()</code></td><td>提交一个 RDMA Write WR（Work Request）。<code>libmlx5</code> 把它编码成 WQE 写进 SQ 环（①），再敲 doorbell（②）。</td><td><code>send()</code></td></tr>
+<tr><td>7</td><td><code>ibv_poll_cq()</code></td><td>检查 CQE 为成功状态后，确认请求完成并复用源 buffer。</td><td><code>send()</code> 返回</td></tr>
+<tr><td>—</td><td>无</td><td>本次普通 RDMA Write 无需 B 投递接收请求。</td><td>B 的 <code>recv()</code></td></tr>
+</tbody></table>
+<p>1–5 属于资源建立的控制路径，需要内核参与；建好的 MR、QP 和 CQ 可以供后续多次传输复用。6–7 是 mlx5 的数据路径，在用户态写队列、敲 doorbell 和轮询完成。双方还需交换 QP 连接参数，B 则把目标地址和 <code>rkey</code> 交给 A。应用可以使用 TCP 交换这些信息，也可以用 <code>rdma_cm</code> 建立连接，再通过应用协议交换内存信息。[[rdma-cm|连接管理]]</p>
+{{code:verbs-write}}
+<p class="code-context">片段可以用 rdma-core 61.0 的头文件编译，省略了控制路径。<code>IBV_SEND_SIGNALED</code> 要求这次请求产生 CQE。[[verbs-post-send|请求字段]]</p>
+{{rdma-write}}
+<p>图中的数据传输由两端网卡完成。B 的网卡用 <code>rkey</code> 查找 MR，校验范围与远端写权限，再将数据 DMA 写入目标内存；B 的 CPU 已在初始化时准备好这些资源，本次普通 RDMA Write 无需它投递接收请求或处理中断。A 轮询到成功的完成记录后可复用源 buffer。B 上的程序要知道数据何时就绪，还需要通知协议，例如后续 Send 或 RDMA Write with immediate。[[rdma-guide|RDMA Write 与完成通知]]</p>
+<div class="aside"><span class="label">旁注：其他 verbs 操作</span>
+<p>RDMA Read 把传输方向反过来：A 提交带有 B 地址和 <code>rkey</code> 的读请求，B 的网卡取回数据，A 等待本端读取完成。B 的 CPU 无需逐次处理读请求。Send/Recv 则要求接收方先用 <code>ibv_post_recv()</code> 投递 buffer；Send 到达后填入 buffer，并产生接收侧 CQE。RDMA Write with immediate 也会消耗接收请求并产生接收侧 CQE，但 payload 仍写入发送方指定的远端地址。</p>
+<p>基本的 fetch-and-add 与 compare-and-swap 对远端 8 字节对象执行原子操作。UD（Unreliable Datagram）是无连接传输，支持 Send/Recv，单条消息受路径 MTU 限制。InfiniBand 与 RoCE 共用 verbs 编程模型；RoCE v2 将 InfiniBand 传输层封装在 UDP/IP 中，经以太网传输。[[rdma-guide|操作与传输模式]]</p></div>
+
+<h2 id="nic-driver">4. 驱动与设备文件</h2>
+<p><code>send()</code> 和 <code>ibv_post_send()</code> 都是应用在用户态调用的函数。两者的区别在于何时进入内核，以及把哪些工作交给内核。普通 TCP socket 将逐次发送交给协议栈；mlx5 的用户态 RDMA verbs 先经内核建立资源，再直接操作获准访问的队列与寄存器。</p>
+<table id="socket-verbs-comparison"><thead><tr><th>阶段</th><th>普通 TCP socket</th><th>用户态 RDMA verbs</th></tr></thead><tbody>
+<tr><td>建立资源</td><td><code>socket()</code> 系统调用创建通信端点，返回 socket fd。</td><td>库打开 <code>/dev/infiniband/uverbsN</code>，通过 <code>ioctl</code> / <code>write</code> / <code>mmap</code> 创建队列、注册内存、建立映射。</td></tr>
+<tr><td>提交数据</td><td><code>send()</code> 经系统调用，把数据交给内核 TCP/IP 协议栈。</td><td><code>ibv_post_send()</code> 调用 provider，直接写已映射的队列和 doorbell。</td></tr>
+<tr><td>谁处理逐次传输</td><td>内核协议栈、网卡驱动和网卡共同处理。</td><td>provider 提交描述符，网卡执行 RDMA 操作。</td></tr>
+</tbody></table>
+<p>socket fd 表示通信端点，由 <code>socket()</code> 创建并装入进程的 fd 表。发送数据时，内核协议栈通过 <code>net_device_ops.ndo_start_xmit</code> 调用网络驱动；mlx5e 将这个回调设为 <code>mlx5e_xmit()</code>。这条内核调用路径直接到达驱动，无需再打开网卡的设备文件。[[socket-create|socket 创建]] · [[socket-fd|fd 分配]] · [[netdev-send|网络驱动分派]] · [[mlx5e-netdev|mlx5e 回调]]</p>
+<p>uverbs fd 则是设备资源管理接口。用户态库通过它请求建立 MR、QP、CQ 和 UAR 映射，内核检查资源归属、内存与访问权限。映射建立后，provider 可以在用户态完成队列提交；进程退出或释放资源时，内核仍负责资源生命周期。[[user-verbs|用户态 verbs 与资源管理]] ConnectX 的具体组件如下：</p>
+<table><thead><tr><th>组件</th><th>职责</th><th>位置</th></tr></thead><tbody>
+<tr data-component-row="verbs"><td><code>libibverbs.so</code></td><td>通用 verbs 接口：设备 context、PD、MR、QP、CQ，以及提交和完成操作；按设备加载 provider。</td><td>用户态</td></tr>
+<tr data-component-row="mlx5"><td><code>libmlx5</code> provider</td><td>mlx5 的 verbs 实现：在进程内存中分配 SQ / CQ 环和 DBR，编码 WQE，写 doorbell，轮询 CQE；另提供 mlx5dv / DevX 等设备专用接口。</td><td>用户态</td></tr>
+<tr data-component-row="dev-uverbs"><td><code>/dev/infiniband/uverbsN</code></td><td><code>libibverbs</code> 打开它取得命令 fd；资源命令经 <code>ioctl</code> / <code>write</code> 下发，UAR 等映射经 <code>mmap</code> 建立。</td><td>设备文件</td></tr>
+<tr data-component-row="rdma"><td><code>ib_uverbs.ko</code>、<code>ib_core.ko</code></td><td>RDMA 的用户态接口与公共对象层：解析命令，检查对象归属与权限，固定用户内存，再调用设备驱动。</td><td>内核</td></tr>
+<tr data-component-row="mlx5kernel"><td><code>mlx5_ib.ko</code></td><td>mlx5 的 RDMA 驱动，是独立模块。它绑定 <code>mlx5_core</code> 创建的 <code>.rdma</code> 辅助设备，实现 QP、CQ、MR 与 <code>mmap</code>，经 <code>mlx5_core</code> 向网卡固件下发命令。</td><td>内核</td></tr>
+<tr><td><code>mlx5_core.ko</code></td><td>PCI 驱动、固件命令通道和共享资源；mlx5e 以太网驱动也编在其中。</td><td>内核</td></tr>
+<tr data-component-row="nic"><td>ConnectX 网卡</td><td>读取工作队列，检查内存访问权限，执行 DMA 与网络协议，写 CQE。</td><td>硬件</td></tr>
+</tbody></table>
+<p>同一个 ConnectX PCI 功能可以同时提供以太网和 RDMA 接口。<code>mlx5_core</code> 绑定 PCI 设备后，创建 <code>mlx5_core.eth.0</code>、<code>mlx5_core.rdma.0</code> 等辅助设备（auxiliary device）。mlx5e 绑定 <code>.eth</code>，代码编入 <code>mlx5_core.ko</code>；<code>mlx5_ib.ko</code> 绑定 <code>.rdma</code>，作为独立模块依赖 mlx5 核心和 RDMA 公共模块。[[mlx5-build|Makefile]] · [[mlx5-adev|辅助设备表]] · [[mlx5-ib-aux|mlx5_ib 的绑定]] 下面的 <code>modinfo</code> 输出展示了模块别名和依赖：</p>
+{{code:modinfo}}
+<p class="code-context">实测输出：Linux 6.1.62 + MLNX_OFED 24.01。<code>mlx_compat</code> 是 MLNX_OFED 的兼容层；发行版自带模块的依赖为 <code>mlx5_core</code>、<code>ib_uverbs</code>、<code>ib_core</code>。对 <code>mlx5_core</code> 执行同样的命令，可以看到 <code>.eth</code> 等别名。</p>
+
+<h3 id="control-path">控制路径</h3>
+<p>创建 QP、CQ 和注册 MR 涉及设备资源、内存固定和访问权限，由内核检查并建立。<code>ibv_create_qp()</code> 的路径把用户态队列内存与网卡的 QP 资源关联起来：</p>
+<pre><code>ibv_create_qp()                 # libmlx5 的 create_qp()
+  mlx5_alloc_qp_buf()           # 在进程内存中分配 SQ / RQ 环
+  mlx5_alloc_dbrec()            # 分配 DBR
+  ioctl / write(cmd_fd)         # 系统调用：/dev/infiniband/uverbsN
+    ib_uverbs → ib_core         # 解析命令，检查对象与权限
+      mlx5_ib_create_qp()       # mlx5_ib.ko
+        ib_umem_get()           # 固定环所在的页，供网卡 DMA
+        mlx5_ib_db_map_user()   # 固定 DBR 所在的页
+        mlx5_qpc_create_qp()    # 组装 CREATE_QP 固件命令
+          mlx5_cmd_exec()       # mlx5_core.ko 的命令通道</code></pre>
+<p>网卡要读的环和 DBR 都在进程内存中，由 <code>libmlx5</code> 分配；内核固定这些页，再通过固件命令把它们的地址交给网卡。[[mlx5-create-qp|libmlx5 传入的地址]] · [[mlx5-ib-qp|mlx5_ib 的固定与命令]] 设备文件本身的机制（<code>open</code> 取得 fd，<code>ioctl</code> 经驱动的文件操作表分派，<code>mmap</code> 建立映射）见 CUDA Internals 系列《CUDA 分层与 Linux 驱动》的<a href="cuda-linux-driver-stack.html#device-files">设备文件</a>一节。</p>
+
+<h3 id="data-path">数据路径</h3>
+<p><code>ibv_post_send()</code> 和 <code>ibv_poll_cq()</code> 是 <code>verbs.h</code> 中的内联函数，直接调用 provider 的函数指针，不进入内核。[[verbs-inline|verbs.h]] <code>libmlx5</code> 把 WR 编码成 WQE：控制段写操作码和 WQE 序号，远端地址段写 <code>remote_addr</code> 与 <code>rkey</code>，数据段写本端地址、长度和 <code>lkey</code>。[[mlx5-send|WQE 编码]] 写完 WQE 后执行下面这段 doorbell 代码：</p>
+{{code:mlx5-db}}
+<p class="code-context">rdma-core 61.0，<code>providers/mlx5/qp.c</code> 第 754–802 行，原文照录，左侧为源文件行号。[[mlx5-doorbell|源码]]</p>
+<p>第 768–769 行发布队列进度：屏障保证 WQE 写入先于 DBR 更新，DBR 的发送槽记录新的生产者序号。第 774–778 行准备写合并（write-combining）访问；多个线程共用 BlueFlame 寄存器时，先取得锁。</p>
+<p>第 780–786 行通知网卡。条件满足时，<code>mlx5_bf_copy()</code> 将 WQE 写入 UAR 页上的 BlueFlame buffer，网卡可以直接取得描述符；条件包括本次只提交一个 WR、UAR 支持 BlueFlame、启用 inline 或偏好 BlueFlame，以及 WQE 大小符合限制。另一分支只写控制段的前 8 字节，其中包含 WQE 序号、操作码和 QP 号。两条分支都使用 MMIO。</p>
+<p>第 798 行在释放锁之前刷新写合并缓冲，保证这一轮寄存器写入先于下一个线程的提交；第 799 行切换 BlueFlame buffer 的半区，供下一次 doorbell 使用。锁和屏障共同维护了多个提交者之间的顺序。</p>
+<p><code>ibv_poll_cq()</code> 同样停留在用户态：provider 按所有权位判断 CQ 环中的下一条 CQE 是否已由网卡写好，读出后把消费者序号写回 CQ 的 DBR。[[mlx5-cq|mlx5_poll_cq]]</p>
+<p><code>bf-&gt;reg</code> 指向 UAR 在当前进程中的映射。<code>libmlx5</code> 通过命令 fd 分配 UAR，再调用 <code>mmap()</code>；<code>mlx5_ib</code> 用 <code>rdma_user_mmap_io()</code> 映射对应的 BAR 页，BlueFlame 页采用写合并属性，doorbell-only 页采用非缓存属性。映射建立后，CPU 可用 MMIO 写指令通知网卡，无需为每次 doorbell 再执行系统调用。[[uar-provider|libmlx5 的分配与映射]] · [[mlx5-ib-mmap|mlx5_ib 的 mmap]]</p>
+
+<h2 id="source-map">源码索引</h2>
+<details class="path-reference"><summary>按节列出的源码与文档入口</summary>
+<table><thead><tr><th>要确认的问题</th><th>入口</th></tr></thead><tbody>
+<tr><td>1 主机侧 IOMMU 与 DMA 地址</td><td>[[dma-api|Linux DMA 映射]]、[[vtd-arch|Intel VT-d 架构]]</td></tr>
+<tr><td>2 send 的用户态封装与内核入口</td><td>[[glibc-send|__libc_send]] → [[send-syscall|sendto 系统调用]] → [[socket-send|__sys_sendto]] → [[socket-dispatch|__sock_sendmsg]] → [[inet-send|inet_sendmsg]] → [[tcp-send-entry|tcp_sendmsg]]</td></tr>
+<tr><td>2 socket 路径的拷贝与 doorbell</td><td>[[tcp-copy|tcp_sendmsg_locked]] → [[mlx5-dma|mlx5e_txwqe_build_dsegs]] → [[mlx5e-db|mlx5e_notify_hw]]；接收：[[mlx5e-rx|mlx5e_napi_poll]] → [[tcp-recv|tcp_recvmsg_locked]]；[[msg-zerocopy|MSG_ZEROCOPY]]</td></tr>
+<tr><td>3 verbs 的字段、状态与连接</td><td>[[verbs-mr|ibv_reg_mr]]、[[verbs-modify-qp|ibv_modify_qp]]、[[verbs-post-send|ibv_post_send]]、[[rdma-cm|rdma_cm]]、[[rdma-guide|RDMA 编程指南]]、[[verbs|libibverbs]]</td></tr>
+<tr><td>4 socket 与 verbs 的内核入口</td><td>[[socket-create|__sys_socket]] → [[socket-fd|sock_map_fd]]；[[netdev-send|ndo_start_xmit 分派]] → [[mlx5e-netdev|mlx5e_xmit 回调]]；[[user-verbs|uverbs 资源管理]]</td></tr>
+<tr><td>4 模块与辅助设备</td><td>[[mlx5-build|Makefile]]、[[mlx5-adev|辅助设备表]]、[[mlx5e-aux|mlx5e 绑定 .eth]]、[[mlx5-ib-aux|mlx5_ib 绑定 .rdma]]、[[mlx5-ethernet|内核文档]]</td></tr>
+<tr><td>4 控制路径</td><td>[[verbs-open|打开 uverbs]] → [[uverbs-fops|uverbs 文件操作]] → [[uverbs-ioctl|ioctl 分派]] → [[mlx5-ib-qp|mlx5_ib 建 QP]] → [[mlx5-qpc|CREATE_QP]] → [[mlx5-cmd|mlx5_cmd_exec]]；[[mlx5-create-qp|libmlx5 传入的地址]]、[[umem-get|固定用户页]]、[[user-verbs|内核文档]]</td></tr>
+<tr><td>4 数据路径与 UAR</td><td>[[verbs-inline|ibv_post_send]] → [[mlx5-send|_mlx5_post_send]] → [[mlx5-doorbell|post_send_db]]；[[mlx5-cq|poll_cq]]；[[uar-provider|UAR 分配与 mmap]] → [[mlx5-ib-mmap|mlx5_ib 的 mmap]]</td></tr>
+</tbody></table>
+<p class="source-scope"><a href="../assets/networking-basics/nic-rdma/sources.json">本篇版本及源码链接清单</a>可用于对照其他版本。</p>
+</details>
+<p>同系列：<a href="vpn-routing-wireguard.html">VPN 原理与路由</a> · <a href="http-proxy-configuration.html">HTTP 代理与应用配置</a> · <a href="ssh-tunnels-forwarding.html">SSH 转发与隧道</a> · <a href="vpn-proxy-routing-cases.html">VPN 与多重代理选路</a></p>
