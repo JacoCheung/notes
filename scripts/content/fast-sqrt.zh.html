@@ -1,0 +1,75 @@
+<h1>快速平方根与逆平方根近似</h1>
+<p class="article-lead">把向量 <code>(3, 4)</code> 归一化，需要将两个分量都乘以 <code>1/√25 = 0.2</code>。这个公共因子可以由浮点位模式估计，再用乘法修正。Quake III 公开源码中的 <code>Q_rsqrt</code> 就采用这条路径：一次整数右移、一次减法生成初值，随后执行一次牛顿迭代。[[quake|Q_rsqrt]] · [[normalize|向量归一化中的调用]]</p>
+<p>用输入 <code>x = 25</code> 可以逐步核算初值和迭代结果，再将逆平方根乘以输入，得到平方根近似。实现、位模式演示和误差测量程序均采用 IEEE 754 的 32 位二进制浮点格式。</p>
+
+<h2 id="zh-target">1. 平方根与归一化</h2>
+<p>平方根和逆平方根对应两个计算目标：</p>
+<div class="fs-equation">\[s=\sqrt{x},\qquad y=\frac{1}{\sqrt{x}},\qquad s=xy\quad(x&gt;0).\]</div>
+<p>对于向量归一化，先求平方长度，再求它的逆平方根，各分量就能复用同一个缩放因子。以 <code>(3, 4)</code> 为例，平方长度为 25；因子为 0.2，输出为 <code>(0.6, 0.8)</code>。如果任务需要长度本身，则还要计算 <code>25 × 0.2 = 5</code>。</p>
+<p>直接求平方根也可以使用牛顿法。对方程 \(s^2-x=0\) 求根，更新式为：</p>
+<div class="fs-equation">\[s_{n+1}=\frac12\left(s_n+\frac{x}{s_n}\right).\]</div>
+<p>取 <code>x = 25</code>、<code>s₀ = 6</code>，前两次更新分别得到约 5.083333 和 5.000683。每轮包含一次除法。经典快速逆平方根选择另一个求根方程，用乘法和加减法完成修正。位级初值先将估计带到真值附近，再由一两轮迭代缩小误差。</p>
+
+<h2 id="zh-seed">2. 浮点编码与位级初值</h2>
+<h3 id="zh-format">2.1 浮点数的整数位模式</h3>
+<p>一个 32 位浮点数包含 1 位符号、8 位指数字段和 23 位小数字段。对正的正规数，符号位为零，数值与字段之间满足：</p>
+<div class="fs-equation">\[x=(1+m)2^{E-127},\qquad m=\frac{M}{2^{23}},\quad 1\le E\le254.\]</div>
+<p>这里 \(E\) 是存储的带偏置指数字段，\(M\) 是 23 位小数字段对应的整数；实际指数为 \(E-127\)。最高有效位的 1 隐含在正规数的编码规则中。[[binary32|32 位浮点格式]]</p>
+{{bits25}}
+<p>25 的十六进制位模式为 <code>0x41c80000</code>，其中 <code>E = 131</code>、<code>M = 0x480000</code>，所以 <code>m = 0.5625</code>，数值为 <code>1.5625 × 2⁴</code>。把相同的 32 位按无符号整数解释，得到整数 \(I\)：</p>
+<div class="fs-equation">\[I=2^{23}E+M=2^{23}(E+m).\]</div>
+<p>整数 \(I\) 同时包含指数和小数部分。程序在这个整数上做右移和减法，再把结果的位模式解释为浮点数，便得到逆平方根的初值。现代 C++ 可用 <code>std::bit_cast</code> 完成这两次对象表示转换。[[bitcast|C++20 bit_cast]]</p>
+
+<h3 id="zh-log">2.2 逆平方根的对数线性近似</h3>
+<p>开平方在对数域中对应乘以二分之一，取倒数对应变号。浮点位模式可用来近似对数，因此这两种操作可以合成一次整数变换。</p>
+<div class="fs-equation">\[\log_2x=E-127+\log_2(1+m).\]</div>
+<p>在 \(0\le m&lt;1\) 内，用直线 \(m+\sigma\) 近似 \(\log_2(1+m)\)。\(\sigma\) 用来调整这条直线的位置。令 \(L=2^{23}\)，则：</p>
+<div class="fs-equation">\[\log_2x\approx\frac{I}{L}-127+\sigma.\]</div>
+<p>设逆平方根初值的整数位模式为 \(J\)。对输入和输出使用同一近似，并代入 \(\log_2y=-\tfrac12\log_2x\)，得到：</p>
+<div class="fs-equation">\[\frac{J}{L}-127+\sigma\approx-\frac12\left(\frac{I}{L}-127+\sigma\right),\qquad J\approx\frac32L(127-\sigma)-\frac12I.\]</div>
+<p>由此得到整数表达式 <code>J = R - (I &gt;&gt; 1)</code>。右移一位实现无符号整数除以二并向下取整，常量 \(R\) 则合并指数偏置和直线修正。取 \(\sigma=0\) 时，常量为 <code>0x5f400000</code>；Quake III 采用的 <code>0x5f3759df</code> 对应 \(\sigma\approx0.0450466\)。直线近似给出了常量的形式，具体数值还取决于所选的误差目标。[[quake|所采用的常量]]</p>
+<p>代入 <code>x = 25</code>，整数运算为：</p>
+<pre><code class="language-text">I       = 0x41c80000
+I &gt;&gt; 1  = 0x20e40000
+R       = 0x5f3759df
+J       = 0x3e5359df</code></pre>
+<p>将 <code>J</code> 按浮点位模式解释，得到初值约 <code>0.2063975</code>，已经接近目标 0.2。下一步利用方程本身修正这个估计。</p>
+
+<h2 id="zh-newton">3. 牛顿迭代与误差收敛</h2>
+<p>选择 \(f(y)=y^{-2}-x\)，它在正数范围内的根就是 \(1/\sqrt{x}\)。将导数 \(f'(y)=-2y^{-3}\) 代入牛顿更新式，并消去分式：</p>
+<div class="fs-equation">\[y_{n+1}=y_n-\frac{y_n^{-2}-x}{-2y_n^{-3}}=y_n\left(\frac32-\frac12xy_n^2\right).\]</div>
+<p>当估计略大于真值时，\(xy_n^2\) 大于 1，括号中的修正系数使估计减小。每次更新会消去误差的一阶项。令 \(y_n=(1+\varepsilon_n)/\sqrt{x}\)，在实数运算下可得：</p>
+<div class="fs-equation">\[\varepsilon_{n+1}=-\frac32\varepsilon_n^2-\frac12\varepsilon_n^3.\]</div>
+<p>当误差较小时，下一轮误差主要由平方项决定。约 3% 的初值误差经过一轮可降至千分量级，再一轮降至百万分量级；32 位浮点运算还会叠加各步的舍入误差。<code>x = 25</code> 的实际结果如下。</p>
+{{example-table}}
+<p>实数乘法下，\(xy_n\) 与 \(\sqrt{x}\) 具有相同的相对误差；最终的浮点乘法还会增加一次舍入。因此，用逆平方根恢复平方根时，验证程序分别统计两个输出。</p>
+{{explorer}}
+
+<h2 id="zh-implementation">4. 实现与中间量范围</h2>
+<p>下面的 C++20 实现来自附带验证程序。它在入口检查有限、正的正规数，保留 <code>0x5f3759df</code> 初值构造，并允许选择零到两次修正。</p>
+{{algorithm}}
+<p><code>std::bit_cast&lt;std::uint32_t&gt;</code> 保留输入的位模式，整数减法构造初值，再用 <code>std::bit_cast&lt;float&gt;</code> 解释结果。普通数值转换会把 25 转为整数 25，得到的含义与这里的编码 \(I\) 不同。原始代码用 <code>long*</code> 读取浮点对象；本实现用固定宽度整数和 <code>bit_cast</code> 明确对象表示转换的规则。[[bitcast|对象表示转换]] · [[aliasing|C++ 对象访问规则]]</p>
+<p>牛顿式中的乘法顺序也影响浮点行为。实现先算 <code>x * y</code> 和 <code>0.5f * y</code>，再将两者相乘。因为 \(y\approx1/\sqrt{x}\)，前一个中间量约为 \(\sqrt{x}\)，两者的乘积约为二分之一；这个排列在正规正数输入范围内保持了合适的中间量尺度。</p>
+<p>若先计算 <code>0.5f * x</code>，最小正规输入 \(x=2^{-126}\) 会产生次正规中间量 \(2^{-127}\)。支持渐进下溢时，这个值仍能精确表示；开启次正规数清零后，它会变成零，修正项随之改变。验证程序在 x86 上保存并临时切换浮点控制寄存器，运行以下对照后恢复原设置。</p>
+{{ftz-table}}
+<p>该函数的输入范围为 \(2^{-126}\le x\le(2-2^{-23})2^{127}\)。公共接口可按目标数学语义处理零、负数、无穷和非数，并为次正规输入提供缩放或专用路径。</p>
+<p>融合乘加对乘法与加法的合并结果只舍入一次，可能改变结果末位。为使代码、网页演示和误差表采用相同的运算步骤，本次构建关闭了乘加融合和激进浮点重排。</p>
+
+<h2 id="zh-measurements">5. 可复现的误差测量</h2>
+<p>验证程序穷举区间 <code>[1, 4)</code> 的全部 <code>16,777,216</code> 个 32 位浮点输入。这个集合覆盖两个相邻指数字段及其全部小数字段。参考值由双精度 <code>std::sqrt</code> 计算，报告的量是绝对相对误差：</p>
+<div class="fs-equation">\[e_y=\left|y\sqrt{x}-1\right|,\qquad e_s=\left|\frac{s}{\sqrt{x}}-1\right|.\]</div>
+{{error-table}}
+<p>程序还在全部 254 个正规指数字段中抽取小数字段，并检查最小、最大正规输入。表中的最大值对应所列的穷举集合；其他指数的结果保存在随文的测量文件中。</p>
+{{environment}}
+<p>下载 <a href="../assets/special-optimization/fast-sqrt/verify.cpp" download>完整验证程序</a>和<a href="../assets/special-optimization/fast-sqrt/results.json">测量结果</a>后，可按同样的编译选项复现：</p>
+{{build-command}}
+<p>程序统计数值误差，并输出样例的位模式与各轮结果。这些数据用于判断近似精度；应用的耗时还取决于编译后指令、数据依赖、向量化和调用规模。</p>
+
+<h2 id="zh-hardware">6. 现代硬件上的平方根路径</h2>
+<p>位级初值利用数值表示取得估计，再用方程修正。现代处理器也提供平方根或逆平方根指令，工程实现可以依据指令规定的精度和舍入规则选择计算路径。</p>
+<p>以 CUDA 13.1.1 对应的 PTX ISA 9.1 为例，<code>rsqrt.approx.f32</code> 在默认次正规数处理模式下，对正有限输入给出的最大相对误差为 \(2^{-22.9}\)。<code>sqrt.rn.f32</code> 则给出最近值、平局取偶数的平方根舍入语义。指令名称中的 <code>approx</code> 和 <code>rn</code> 明确区分了这两类契约。[[ptx-rsqrt|逆平方根指令]] · [[ptx-sqrt|平方根指令]]</p>
+<p>计算路径取决于输出要求。归一化直接使用逆平方根；需要正确舍入的平方根时，选择具有相应语义的库函数或指令；允许近似误差的融合计算，则同时检查允许的误差和生成的机器码。<code>x * rsqrt.approx(x)</code> 还包含最后一次乘法舍入，评估结果误差时应将它计入。</p>
+<p>同系列的<a href="silu-tanh-exp2-instruction-path.html">《SiLU 的 tanh 与 exp2 实现》</a>讨论了另一类等价改写：数学式决定候选实现，依赖链、舍入和目标硬件决定实际取舍。</p>
+
+<h2 id="zh-references">参考资料</h2>
+{{references}}

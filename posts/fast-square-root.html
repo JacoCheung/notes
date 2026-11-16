@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>快速平方根与逆平方根近似</title>
+<meta name="post:title" content="快速平方根与逆平方根近似">
+<meta name="post:title_en" content="Fast square roots and reciprocal square roots">
+<meta name="post:slug" content="fast-square-root">
+<meta name="post:date" content="2026-11-16">
+<meta name="post:tags" content="数值计算, 浮点数, 牛顿迭代, C++">
+<meta name="post:tags_en" content="Numerical Computing, Floating Point, Newton Iteration, C++">
+<meta name="post:reading" content="12 分钟">
+<meta name="post:reading_en" content="12 min">
+<meta name="post:summary" content="一次整数移位与减法，就能给平方根倒数提供可用的初值。文章用浮点编码和牛顿迭代解释这一近似，并给出可运行实现、误差实测和位模式交互演示。">
+<meta name="post:summary_en" content="An integer shift and subtraction can seed a reciprocal square root. Bit-level examples and Newton iteration explain the approximation, supported by runnable accuracy measurements.">
+<meta name="post:series" content="special-optimization">
+<meta name="post:series_title" content="特殊优化">
+<meta name="post:series_title_en" content="Specialized Optimization">
+<meta name="post:series_order" content="2">
+<link rel="stylesheet" href="../assets/site.css?v=post-toc-3">
+<link rel="stylesheet" href="../assets/special-optimization/fast-sqrt/style.css?v=1">
+<script>window.MathJax={tex:{inlineMath:[['\\(','\\)']],displayMath:[['\\[','\\]']]},options:{skipHtmlTags:['script','style','pre','code']}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-mml-chtml.js" defer></script>
+<script src="../lang-toggle.js?v=post-toc-3" defer></script>
+<script src="../assets/special-optimization/fast-sqrt/page.js?v=1" defer></script>
+</head><body><div class="layout"><aside class="toc"><div class="toc-title">目录 · TOC</div>
+<section class="post-series-nav" data-static-series="special-optimization" aria-label="特殊优化"><div class="post-series-title"><span class="lang-zh">特殊优化</span><span class="lang-en">Specialized Optimization</span></div><ol class="post-series-list"><li class=""><span class="post-series-order">01</span><a href="silu-tanh-exp2-instruction-path.html"><span class="lang-zh">SiLU 的 tanh 与 exp2 实现</span><span class="lang-en">SiLU with tanh and exp2</span></a></li><li class="current"><span class="post-series-order">02</span><span class="post-series-current" aria-current="page"><span class="lang-zh">快速平方根与逆平方根近似</span><span class="lang-en">Fast square roots and reciprocal square roots</span></span></li></ol></section></aside><main class="content fast-sqrt-article"><div class="lang-zh"><h1>快速平方根与逆平方根近似</h1>
+<p class="article-lead">把向量 <code>(3, 4)</code> 归一化，需要将两个分量都乘以 <code>1/√25 = 0.2</code>。这个公共因子可以由浮点位模式估计，再用乘法修正。Quake III 公开源码中的 <code>Q_rsqrt</code> 就采用这条路径：一次整数右移、一次减法生成初值，随后执行一次牛顿迭代。<a href="https://github.com/id-Software/Quake-III-Arena/blob/dbe4ddb10315479fc00086f08e25d968b4b43c49/code/game/q_math.c#L548-L572">Q_rsqrt</a> · <a href="https://github.com/id-Software/Quake-III-Arena/blob/dbe4ddb10315479fc00086f08e25d968b4b43c49/code/game/q_math.c#L185-L198">向量归一化中的调用</a></p>
+<p>用输入 <code>x = 25</code> 可以逐步核算初值和迭代结果，再将逆平方根乘以输入，得到平方根近似。实现、位模式演示和误差测量程序均采用 IEEE 754 的 32 位二进制浮点格式。</p>
+
+<h2 id="zh-target">1. 平方根与归一化</h2>
+<p>平方根和逆平方根对应两个计算目标：</p>
+<div class="fs-equation">\[s=\sqrt{x},\qquad y=\frac{1}{\sqrt{x}},\qquad s=xy\quad(x&gt;0).\]</div>
+<p>对于向量归一化，先求平方长度，再求它的逆平方根，各分量就能复用同一个缩放因子。以 <code>(3, 4)</code> 为例，平方长度为 25；因子为 0.2，输出为 <code>(0.6, 0.8)</code>。如果任务需要长度本身，则还要计算 <code>25 × 0.2 = 5</code>。</p>
+<p>直接求平方根也可以使用牛顿法。对方程 \(s^2-x=0\) 求根，更新式为：</p>
+<div class="fs-equation">\[s_{n+1}=\frac12\left(s_n+\frac{x}{s_n}\right).\]</div>
+<p>取 <code>x = 25</code>、<code>s₀ = 6</code>，前两次更新分别得到约 5.083333 和 5.000683。每轮包含一次除法。经典快速逆平方根选择另一个求根方程，用乘法和加减法完成修正。位级初值先将估计带到真值附近，再由一两轮迭代缩小误差。</p>
+
+<h2 id="zh-seed">2. 浮点编码与位级初值</h2>
+<h3 id="zh-format">2.1 浮点数的整数位模式</h3>
+<p>一个 32 位浮点数包含 1 位符号、8 位指数字段和 23 位小数字段。对正的正规数，符号位为零，数值与字段之间满足：</p>
+<div class="fs-equation">\[x=(1+m)2^{E-127},\qquad m=\frac{M}{2^{23}},\quad 1\le E\le254.\]</div>
+<p>这里 \(E\) 是存储的带偏置指数字段，\(M\) 是 23 位小数字段对应的整数；实际指数为 \(E-127\)。最高有效位的 1 隐含在正规数的编码规则中。<a href="https://docs.oracle.com/cd/E19957-01/806-3568/ncg_math.html">32 位浮点格式</a></p>
+<figure class="fs-bits"><div><span><small>符号</small><code>0</code></span><span><small>指数 E</small><code>10000011</code></span><span><small>小数 M</small><code>10010000000000000000000</code></span></div><figcaption>25 = 1.5625 × 2⁴ · 0x41c80000</figcaption></figure>
+<p>25 的十六进制位模式为 <code>0x41c80000</code>，其中 <code>E = 131</code>、<code>M = 0x480000</code>，所以 <code>m = 0.5625</code>，数值为 <code>1.5625 × 2⁴</code>。把相同的 32 位按无符号整数解释，得到整数 \(I\)：</p>
+<div class="fs-equation">\[I=2^{23}E+M=2^{23}(E+m).\]</div>
+<p>整数 \(I\) 同时包含指数和小数部分。程序在这个整数上做右移和减法，再把结果的位模式解释为浮点数，便得到逆平方根的初值。现代 C++ 可用 <code>std::bit_cast</code> 完成这两次对象表示转换。<a href="https://github.com/cplusplus/draft/blob/6aea7f6be0895b9dd361c6562bdee2f3809e4fa0/source/numerics.tex#L1324-L1365">C++20 bit_cast</a></p>
+
+<h3 id="zh-log">2.2 逆平方根的对数线性近似</h3>
+<p>开平方在对数域中对应乘以二分之一，取倒数对应变号。浮点位模式可用来近似对数，因此这两种操作可以合成一次整数变换。</p>
+<div class="fs-equation">\[\log_2x=E-127+\log_2(1+m).\]</div>
+<p>在 \(0\le m&lt;1\) 内，用直线 \(m+\sigma\) 近似 \(\log_2(1+m)\)。\(\sigma\) 用来调整这条直线的位置。令 \(L=2^{23}\)，则：</p>
+<div class="fs-equation">\[\log_2x\approx\frac{I}{L}-127+\sigma.\]</div>
+<p>设逆平方根初值的整数位模式为 \(J\)。对输入和输出使用同一近似，并代入 \(\log_2y=-\tfrac12\log_2x\)，得到：</p>
+<div class="fs-equation">\[\frac{J}{L}-127+\sigma\approx-\frac12\left(\frac{I}{L}-127+\sigma\right),\qquad J\approx\frac32L(127-\sigma)-\frac12I.\]</div>
+<p>由此得到整数表达式 <code>J = R - (I &gt;&gt; 1)</code>。右移一位实现无符号整数除以二并向下取整，常量 \(R\) 则合并指数偏置和直线修正。取 \(\sigma=0\) 时，常量为 <code>0x5f400000</code>；Quake III 采用的 <code>0x5f3759df</code> 对应 \(\sigma\approx0.0450466\)。直线近似给出了常量的形式，具体数值还取决于所选的误差目标。<a href="https://github.com/id-Software/Quake-III-Arena/blob/dbe4ddb10315479fc00086f08e25d968b4b43c49/code/game/q_math.c#L548-L572">所采用的常量</a></p>
+<p>代入 <code>x = 25</code>，整数运算为：</p>
+<pre><code class="language-text">I       = 0x41c80000
+I &gt;&gt; 1  = 0x20e40000
+R       = 0x5f3759df
+J       = 0x3e5359df</code></pre>
+<p>将 <code>J</code> 按浮点位模式解释，得到初值约 <code>0.2063975</code>，已经接近目标 0.2。下一步利用方程本身修正这个估计。</p>
+
+<h2 id="zh-newton">3. 牛顿迭代与误差收敛</h2>
+<p>选择 \(f(y)=y^{-2}-x\)，它在正数范围内的根就是 \(1/\sqrt{x}\)。将导数 \(f'(y)=-2y^{-3}\) 代入牛顿更新式，并消去分式：</p>
+<div class="fs-equation">\[y_{n+1}=y_n-\frac{y_n^{-2}-x}{-2y_n^{-3}}=y_n\left(\frac32-\frac12xy_n^2\right).\]</div>
+<p>当估计略大于真值时，\(xy_n^2\) 大于 1，括号中的修正系数使估计减小。每次更新会消去误差的一阶项。令 \(y_n=(1+\varepsilon_n)/\sqrt{x}\)，在实数运算下可得：</p>
+<div class="fs-equation">\[\varepsilon_{n+1}=-\frac32\varepsilon_n^2-\frac12\varepsilon_n^3.\]</div>
+<p>当误差较小时，下一轮误差主要由平方项决定。约 3% 的初值误差经过一轮可降至千分量级，再一轮降至百万分量级；32 位浮点运算还会叠加各步的舍入误差。<code>x = 25</code> 的实际结果如下。</p>
+<div class="fs-scroll" tabindex="0" role="region" aria-label="x = 25：逐轮结果，参考值为 0.2 与 5"><table><caption>x = 25：逐轮结果，参考值为 0.2 与 5</caption><thead><tr><th scope="col">迭代次数</th><th scope="col">逆平方根 y</th><th scope="col">相对误差</th><th scope="col">平方根 x × y</th></tr></thead><tbody><tr><td>0</td><td>0.2063975185</td><td>+3.1987593%</td><td>5.159937859</td></tr><tr><td>1</td><td>0.1996897608</td><td>-0.1551196%</td><td>4.992244244</td></tr><tr><td>2</td><td>0.1999992728</td><td>-0.0003636%</td><td>4.999981880</td></tr></tbody></table></div>
+<p>实数乘法下，\(xy_n\) 与 \(\sqrt{x}\) 具有相同的相对误差；最终的浮点乘法还会增加一次舍入。因此，用逆平方根恢复平方根时，验证程序分别统计两个输出。</p>
+<section class="fs-explorer" data-fs-explorer data-language="zh" aria-labelledby="zh-explorer-title">
+<h3 id="zh-explorer-title">位模式与迭代演示</h3><p>改变 x，观察整数位模式、初值和两次修正。每步按 32 位浮点数舍入。</p>
+<form class="fs-controls"><label for="zh-fs-input">输入 x</label>
+<input id="zh-fs-input" data-fs-input type="number" value="25" step="any" aria-describedby="zh-fs-message">
+<button type="button" data-fs-preset="25">x = 25</button><button type="button" data-fs-preset="4">x = 4</button>
+<button type="button" data-fs-preset="1.1754943508222875e-38">最小正规数</button></form>
+<p class="fs-message" id="zh-fs-message" data-fs-message role="status" aria-live="polite"></p>
+<div data-fs-results><dl class="fs-state"><dt>实际浮点输入</dt><dd data-fs-value></dd>
+<dt>I = bits(x)</dt><dd data-fs-bits></dd><dt>E / M</dt><dd data-fs-fields></dd>
+<dt>I &gt;&gt; 1</dt><dd data-fs-shift></dd><dt>J = 0x5f3759df − (I &gt;&gt; 1)</dt><dd data-fs-seed></dd></dl>
+<div class="fs-scroll" tabindex="0" role="region" aria-label="位模式与迭代演示"><table><thead><tr><th scope="col">迭代次数</th><th scope="col">y</th><th scope="col">y 相对误差</th><th scope="col">x × y</th><th scope="col">x × y 相对误差</th></tr></thead><tbody data-fs-rows></tbody></table></div></div>
+<noscript><p>交互需要 JavaScript；本节上方保留 x = 25 的完整计算结果。</p></noscript></section>
+
+<h2 id="zh-implementation">4. 实现与中间量范围</h2>
+<p>下面的 C++20 实现来自附带验证程序。它在入口检查有限、正的正规数，保留 <code>0x5f3759df</code> 初值构造，并允许选择零到两次修正。</p>
+<figure><pre><code class="language-cpp">static_assert(sizeof(float) == sizeof(std::uint32_t));
+static_assert(std::numeric_limits&lt;float&gt;::is_iec559);
+static_assert(std::numeric_limits&lt;float&gt;::radix == 2);
+static_assert(std::numeric_limits&lt;float&gt;::digits == 24);
+static_assert(std::numeric_limits&lt;float&gt;::min_exponent == -125);
+static_assert(std::numeric_limits&lt;float&gt;::max_exponent == 128);
+static_assert(FLT_EVAL_METHOD == 0,
+              &quot;This experiment requires float expressions evaluated as float.&quot;);
+
+constexpr std::uint32_t magic = 0x5f3759dfu;
+
+bool in_domain(float x) {
+    return x &gt; 0.0f &amp;&amp; std::isnormal(x);
+}
+
+// The seed and refinement expect a positive, finite, normal binary32 input.
+float inverse_sqrt_seed(float x) {
+    const auto bits = std::bit_cast&lt;std::uint32_t&gt;(x);
+    return std::bit_cast&lt;float&gt;(magic - (bits &gt;&gt; 1));
+}
+
+float newton_step(float x, float y) {
+    // Keep x*y near sqrt(x) and the product of the two factors near 1/2.
+    // Preserve this grouping; the build disables contraction and reassociation.
+    return y * (1.5f - (x * y) * (0.5f * y));
+}
+
+float approximate_inverse_sqrt(float x, int steps = 1) {
+    // Zero, negative, subnormal, infinity and NaN need a separate policy.
+    if (!in_domain(x)) throw std::domain_error(&quot;Expected positive normal float&quot;);
+    if (steps &lt; 0 || steps &gt; 2) throw std::invalid_argument(&quot;Use 0, 1 or 2 steps&quot;);
+    float y = inverse_sqrt_seed(x);
+    for (int step = 0; step &lt; steps; ++step) y = newton_step(x, y);
+    return y;
+}
+
+float approximate_sqrt(float x, int steps = 1) {
+    return x * approximate_inverse_sqrt(x, steps);
+}</code></pre><figcaption>verify.cpp · 29–67</figcaption></figure>
+<p><code>std::bit_cast&lt;std::uint32_t&gt;</code> 保留输入的位模式，整数减法构造初值，再用 <code>std::bit_cast&lt;float&gt;</code> 解释结果。普通数值转换会把 25 转为整数 25，得到的含义与这里的编码 \(I\) 不同。原始代码用 <code>long*</code> 读取浮点对象；本实现用固定宽度整数和 <code>bit_cast</code> 明确对象表示转换的规则。<a href="https://github.com/cplusplus/draft/blob/6aea7f6be0895b9dd361c6562bdee2f3809e4fa0/source/numerics.tex#L1324-L1365">对象表示转换</a> · <a href="https://github.com/cplusplus/draft/blob/6aea7f6be0895b9dd361c6562bdee2f3809e4fa0/source/expressions.tex#L289-L303">C++ 对象访问规则</a></p>
+<p>牛顿式中的乘法顺序也影响浮点行为。实现先算 <code>x * y</code> 和 <code>0.5f * y</code>，再将两者相乘。因为 \(y\approx1/\sqrt{x}\)，前一个中间量约为 \(\sqrt{x}\)，两者的乘积约为二分之一；这个排列在正规正数输入范围内保持了合适的中间量尺度。</p>
+<p>若先计算 <code>0.5f * x</code>，最小正规输入 \(x=2^{-126}\) 会产生次正规中间量 \(2^{-127}\)。支持渐进下溢时，这个值仍能精确表示；开启次正规数清零后，它会变成零，修正项随之改变。验证程序在 x86 上保存并临时切换浮点控制寄存器，运行以下对照后恢复原设置。</p>
+<div class="fs-scroll" tabindex="0" role="region" aria-label="x = 2⁻¹²⁶，一次逆平方根迭代的相对误差"><table><caption>x = 2⁻¹²⁶，一次逆平方根迭代的相对误差</caption><thead><tr><th scope="col">模式</th><th scope="col">0.5 × x 的位模式</th><th scope="col">原始排列误差</th><th scope="col">调整排列误差</th></tr></thead><tbody><tr><td>渐进下溢</td><td>0x00400000</td><td>-0.1692832%</td><td>-0.1692832%</td></tr><tr><td>次正规数清零</td><td>0x00000000</td><td>+44.9322581%</td><td>-0.1692832%</td></tr></tbody></table></div>
+<p>该函数的输入范围为 \(2^{-126}\le x\le(2-2^{-23})2^{127}\)。公共接口可按目标数学语义处理零、负数、无穷和非数，并为次正规输入提供缩放或专用路径。</p>
+<p>融合乘加对乘法与加法的合并结果只舍入一次，可能改变结果末位。为使代码、网页演示和误差表采用相同的运算步骤，本次构建关闭了乘加融合和激进浮点重排。</p>
+
+<h2 id="zh-measurements">5. 可复现的误差测量</h2>
+<p>验证程序穷举区间 <code>[1, 4)</code> 的全部 <code>16,777,216</code> 个 32 位浮点输入。这个集合覆盖两个相邻指数字段及其全部小数字段。参考值由双精度 <code>std::sqrt</code> 计算，报告的量是绝对相对误差：</p>
+<div class="fs-equation">\[e_y=\left|y\sqrt{x}-1\right|,\qquad e_s=\left|\frac{s}{\sqrt{x}}-1\right|.\]</div>
+<div class="fs-scroll" tabindex="0" role="region" aria-label="[1, 4) 全部 16,777,216 个输入的最大绝对相对误差"><table><caption>[1, 4) 全部 16,777,216 个输入的最大绝对相对误差</caption><thead><tr><th scope="col">迭代次数</th><th scope="col">逆平方根最大相对误差</th><th scope="col">平方根乘积最大相对误差</th></tr></thead><tbody><tr><td>0</td><td>3.4375773%</td><td>3.4375773%</td></tr><tr><td>1</td><td>0.1752339%</td><td>0.1752322%</td></tr><tr><td>2</td><td>0.0004733%</td><td>0.0004756%</td></tr></tbody></table></div>
+<p>程序还在全部 254 个正规指数字段中抽取小数字段，并检查最小、最大正规输入。表中的最大值对应所列的穷举集合；其他指数的结果保存在随文的测量文件中。</p>
+<p class="fs-environment">测量环境：GCC 13.1.1 20230614 (Red Hat 13.1.1-4) · AMD EPYC-Genoa Processor · x86_64. 最近值舍入；主扫描启用渐进下溢。</p>
+<p>下载 <a href="../assets/special-optimization/fast-sqrt/verify.cpp" download>完整验证程序</a>和<a href="../assets/special-optimization/fast-sqrt/results.json">测量结果</a>后，可按同样的编译选项复现：</p>
+<pre><code class="language-bash">c++ -O3 -std=c++20 -ffp-contract=off -fno-fast-math \
+    -Wall -Wextra -Wpedantic verify.cpp -o verify
+./verify &gt; measurements.json</code></pre>
+<p>程序统计数值误差，并输出样例的位模式与各轮结果。这些数据用于判断近似精度；应用的耗时还取决于编译后指令、数据依赖、向量化和调用规模。</p>
+
+<h2 id="zh-hardware">6. 现代硬件上的平方根路径</h2>
+<p>位级初值利用数值表示取得估计，再用方程修正。现代处理器也提供平方根或逆平方根指令，工程实现可以依据指令规定的精度和舍入规则选择计算路径。</p>
+<p>以 CUDA 13.1.1 对应的 PTX ISA 9.1 为例，<code>rsqrt.approx.f32</code> 在默认次正规数处理模式下，对正有限输入给出的最大相对误差为 \(2^{-22.9}\)。<code>sqrt.rn.f32</code> 则给出最近值、平局取偶数的平方根舍入语义。指令名称中的 <code>approx</code> 和 <code>rn</code> 明确区分了这两类契约。<a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#floating-point-instructions-rsqrt">逆平方根指令</a> · <a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#floating-point-instructions-sqrt">平方根指令</a></p>
+<p>计算路径取决于输出要求。归一化直接使用逆平方根；需要正确舍入的平方根时，选择具有相应语义的库函数或指令；允许近似误差的融合计算，则同时检查允许的误差和生成的机器码。<code>x * rsqrt.approx(x)</code> 还包含最后一次乘法舍入，评估结果误差时应将它计入。</p>
+<p>同系列的<a href="silu-tanh-exp2-instruction-path.html">《SiLU 的 tanh 与 exp2 实现》</a>讨论了另一类等价改写：数学式决定候选实现，依赖链、舍入和目标硬件决定实际取舍。</p>
+
+<h2 id="zh-references">参考资料</h2>
+<ul class="fs-references"><li><a href="https://github.com/id-Software/Quake-III-Arena/blob/dbe4ddb10315479fc00086f08e25d968b4b43c49/code/game/q_math.c#L548-L572">Quake III Q_rsqrt, q_math.c:548–572</a></li><li><a href="https://github.com/id-Software/Quake-III-Arena/blob/dbe4ddb10315479fc00086f08e25d968b4b43c49/code/game/q_math.c#L185-L198">Quake III VectorNormalizeFast, q_math.c:185–198</a></li><li><a href="https://docs.oracle.com/cd/E19957-01/806-3568/ncg_math.html">Oracle Numerical Computation Guide: IEEE single format</a></li><li><a href="https://github.com/cplusplus/draft/blob/6aea7f6be0895b9dd361c6562bdee2f3809e4fa0/source/numerics.tex#L1324-L1365">C++20 draft N4861: bit_cast</a></li><li><a href="https://github.com/cplusplus/draft/blob/6aea7f6be0895b9dd361c6562bdee2f3809e4fa0/source/expressions.tex#L289-L303">C++20 draft N4861: object access</a></li><li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#floating-point-instructions-rsqrt">CUDA 13.1.1 / PTX ISA 9.1: rsqrt</a></li><li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#floating-point-instructions-sqrt">CUDA 13.1.1 / PTX ISA 9.1: sqrt</a></li></ul>
+</div><div class="lang-en"><h1>Fast square roots and reciprocal square roots</h1>
+<p class="article-lead">Normalizing the vector <code>(3, 4)</code> means multiplying both components by <code>1/√25 = 0.2</code>. Floating-point bits can provide an estimate of this shared factor, and multiplication can refine it. The classic <code>Q_rsqrt</code> implementation in the public Quake III source follows that sequence: one integer shift and subtraction produce the seed, followed by one Newton iteration. <a href="https://github.com/id-Software/Quake-III-Arena/blob/dbe4ddb10315479fc00086f08e25d968b4b43c49/code/game/q_math.c#L548-L572">Q_rsqrt</a> · <a href="https://github.com/id-Software/Quake-III-Arena/blob/dbe4ddb10315479fc00086f08e25d968b4b43c49/code/game/q_math.c#L185-L198">Vector normalization call site</a></p>
+<p>This article follows <code>x = 25</code> through the seed and refinement, then multiplies the reciprocal square root by the input to approximate the square root. The implementation uses IEEE 754 binary32, with a bit-pattern explorer and a runnable accuracy measurement program.</p>
+
+<h2 id="en-target">1. Square roots and normalization</h2>
+<p>A square root and a reciprocal square root serve different computational purposes:</p>
+<div class="fs-equation">\[s=\sqrt{x},\qquad y=\frac{1}{\sqrt{x}},\qquad s=xy\quad(x&gt;0).\]</div>
+<p>For vector normalization, compute the squared length and its reciprocal square root, then reuse that factor for each component. The squared length of <code>(3, 4)</code> is 25. Multiplying by 0.2 gives <code>(0.6, 0.8)</code>. To recover the length itself, compute <code>25 × 0.2 = 5</code>.</p>
+<p>Newton iteration can compute the square root directly. Applying it to \(s^2-x=0\) gives:</p>
+<div class="fs-equation">\[s_{n+1}=\frac12\left(s_n+\frac{x}{s_n}\right).\]</div>
+<p>With <code>x = 25</code> and <code>s₀ = 6</code>, the first two updates produce approximately 5.083333 and 5.000683. Each iteration includes a division. Fast reciprocal square root uses a different equation whose update simplifies to multiplication and addition or subtraction. The bit-level seed is close enough for one or two updates to reduce the error.</p>
+
+<h2 id="en-seed">2. Floating-point encoding and the seed</h2>
+<h3 id="en-format">2.1 Reading the same bits as an integer</h3>
+<p>A binary32 value has one sign bit, eight exponent bits, and 23 fraction bits. For a positive normal number, the sign is zero and:</p>
+<div class="fs-equation">\[x=(1+m)2^{E-127},\qquad m=\frac{M}{2^{23}},\quad 1\le E\le254.\]</div>
+<p>Here \(E\) is the stored, biased exponent field and \(M\) is the integer represented by the fraction field. The actual exponent is \(E-127\), and the leading significand bit is implicit in the normal-number encoding. <a href="https://docs.oracle.com/cd/E19957-01/806-3568/ncg_math.html">Binary32 format</a></p>
+<figure class="fs-bits"><div><span><small>Sign</small><code>0</code></span><span><small>Exponent E</small><code>10000011</code></span><span><small>Fraction M</small><code>10010000000000000000000</code></span></div><figcaption>25 = 1.5625 × 2⁴ · 0x41c80000</figcaption></figure>
+<p>The bits of 25 are <code>0x41c80000</code>: <code>E = 131</code> and <code>M = 0x480000</code>. Thus <code>m = 0.5625</code>, giving <code>1.5625 × 2⁴</code>. Interpreting those same bits as an unsigned integer produces \(I\):</p>
+<div class="fs-equation">\[I=2^{23}E+M=2^{23}(E+m).\]</div>
+<p>The integer contains both the exponent and the fraction. Shifting and subtracting it, then interpreting the resulting bits as a float, produces a reciprocal-square-root seed. C++20 provides <code>std::bit_cast</code> to convert between these object representations. <a href="https://github.com/cplusplus/draft/blob/6aea7f6be0895b9dd361c6562bdee2f3809e4fa0/source/numerics.tex#L1324-L1365">C++20 bit_cast</a></p>
+
+<h3 id="en-log">2.2 A linear transformation in logarithmic space</h3>
+<p>Taking a square root halves a logarithm; taking a reciprocal changes its sign. Floating-point encoding lets us approximate that logarithm and combine the two operations in one integer transformation.</p>
+<div class="fs-equation">\[\log_2x=E-127+\log_2(1+m).\]</div>
+<p>For \(0\le m&lt;1\), approximate \(\log_2(1+m)\) with the line \(m+\sigma\). The offset \(\sigma\) adjusts its position. Writing \(L=2^{23}\) gives:</p>
+<div class="fs-equation">\[\log_2x\approx\frac{I}{L}-127+\sigma.\]</div>
+<p>Let \(J\) be the integer bits of the reciprocal-square-root seed. Applying the same approximation to the input and output, with \(\log_2y=-\tfrac12\log_2x\), yields:</p>
+<div class="fs-equation">\[\frac{J}{L}-127+\sigma\approx-\frac12\left(\frac{I}{L}-127+\sigma\right),\qquad J\approx\frac32L(127-\sigma)-\frac12I.\]</div>
+<p>This explains the form <code>J = R - (I &gt;&gt; 1)</code>. The shift divides the unsigned integer by two, rounding down; \(R\) absorbs the exponent bias and line offset. Setting \(\sigma=0\) gives <code>0x5f400000</code>. The Quake III constant <code>0x5f3759df</code> corresponds to \(\sigma\approx0.0450466\). The linear approximation explains the family of constants; the specific choice also depends on the error objective. <a href="https://github.com/id-Software/Quake-III-Arena/blob/dbe4ddb10315479fc00086f08e25d968b4b43c49/code/game/q_math.c#L548-L572">The chosen constant</a></p>
+<p>For the running example <code>x = 25</code>, the integer operations are:</p>
+<pre><code class="language-text">I       = 0x41c80000
+I &gt;&gt; 1  = 0x20e40000
+R       = 0x5f3759df
+J       = 0x3e5359df</code></pre>
+<p>Interpreting <code>J</code> as a float produces approximately <code>0.2063975</code>, already close to the target 0.2. A Newton iteration refines that estimate.</p>
+
+<h2 id="en-newton">3. Newton iteration and error reduction</h2>
+<p>Choose \(f(y)=y^{-2}-x\), whose positive root is \(1/\sqrt{x}\). Using its derivative \(f'(y)=-2y^{-3}\), the Newton update simplifies to:</p>
+<div class="fs-equation">\[y_{n+1}=y_n-\frac{y_n^{-2}-x}{-2y_n^{-3}}=y_n\left(\frac32-\frac12xy_n^2\right).\]</div>
+<p>When the estimate is too large, \(xy_n^2\) exceeds 1, and the correction factor reduces it. Near the root, the update cancels the first-order error. Substituting \(y_n=(1+\varepsilon_n)/\sqrt{x}\) gives, in real arithmetic:</p>
+<div class="fs-equation">\[\varepsilon_{n+1}=-\frac32\varepsilon_n^2-\frac12\varepsilon_n^3.\]</div>
+<p>The squared term dominates once the error is small. An initial error of roughly 3% can fall to a few parts per thousand after one update and a few parts per million after another. Binary32 arithmetic adds rounding at each operation. The measured results for <code>x = 25</code> are:</p>
+<div class="fs-scroll" tabindex="0" role="region" aria-label="x = 25: iteration results, with references 0.2 and 5"><table><caption>x = 25: iteration results, with references 0.2 and 5</caption><thead><tr><th scope="col">Updates</th><th scope="col">Reciprocal root y</th><th scope="col">Relative error</th><th scope="col">Square root x × y</th></tr></thead><tbody><tr><td>0</td><td>0.2063975185</td><td>+3.1987593%</td><td>5.159937859</td></tr><tr><td>1</td><td>0.1996897608</td><td>-0.1551196%</td><td>4.992244244</td></tr><tr><td>2</td><td>0.1999992728</td><td>-0.0003636%</td><td>4.999981880</td></tr></tbody></table></div>
+<p>In real arithmetic, \(xy_n\) has the same relative error against \(\sqrt{x}\) as the reciprocal-square-root estimate. The final floating-point multiplication rounds the product once more, so the verification program measures both outputs.</p>
+<section class="fs-explorer" data-fs-explorer data-language="en" aria-labelledby="en-explorer-title">
+<h3 id="en-explorer-title">Bit patterns and iteration</h3><p>Change x to inspect the bits, seed, and two updates. Each arithmetic step rounds to binary32.</p>
+<form class="fs-controls"><label for="en-fs-input">Input x</label>
+<input id="en-fs-input" data-fs-input type="number" value="25" step="any" aria-describedby="en-fs-message">
+<button type="button" data-fs-preset="25">x = 25</button><button type="button" data-fs-preset="4">x = 4</button>
+<button type="button" data-fs-preset="1.1754943508222875e-38">Smallest normal</button></form>
+<p class="fs-message" id="en-fs-message" data-fs-message role="status" aria-live="polite"></p>
+<div data-fs-results><dl class="fs-state"><dt>Rounded input</dt><dd data-fs-value></dd>
+<dt>I = bits(x)</dt><dd data-fs-bits></dd><dt>E / M</dt><dd data-fs-fields></dd>
+<dt>I &gt;&gt; 1</dt><dd data-fs-shift></dd><dt>J = 0x5f3759df − (I &gt;&gt; 1)</dt><dd data-fs-seed></dd></dl>
+<div class="fs-scroll" tabindex="0" role="region" aria-label="Bit patterns and iteration"><table><thead><tr><th scope="col">Updates</th><th scope="col">y</th><th scope="col">Error in y</th><th scope="col">x × y</th><th scope="col">Error in x × y</th></tr></thead><tbody data-fs-rows></tbody></table></div></div>
+<noscript><p>The explorer uses JavaScript. The preceding table contains the complete x = 25 results.</p></noscript></section>
+
+<h2 id="en-implementation">4. Implementation and intermediate ranges</h2>
+<p>The following C++20 implementation comes from the accompanying verification program. Its entry points require finite, positive normal inputs, retain the <code>0x5f3759df</code> seed, and allow zero to two refinement steps.</p>
+<figure><pre><code class="language-cpp">static_assert(sizeof(float) == sizeof(std::uint32_t));
+static_assert(std::numeric_limits&lt;float&gt;::is_iec559);
+static_assert(std::numeric_limits&lt;float&gt;::radix == 2);
+static_assert(std::numeric_limits&lt;float&gt;::digits == 24);
+static_assert(std::numeric_limits&lt;float&gt;::min_exponent == -125);
+static_assert(std::numeric_limits&lt;float&gt;::max_exponent == 128);
+static_assert(FLT_EVAL_METHOD == 0,
+              &quot;This experiment requires float expressions evaluated as float.&quot;);
+
+constexpr std::uint32_t magic = 0x5f3759dfu;
+
+bool in_domain(float x) {
+    return x &gt; 0.0f &amp;&amp; std::isnormal(x);
+}
+
+// The seed and refinement expect a positive, finite, normal binary32 input.
+float inverse_sqrt_seed(float x) {
+    const auto bits = std::bit_cast&lt;std::uint32_t&gt;(x);
+    return std::bit_cast&lt;float&gt;(magic - (bits &gt;&gt; 1));
+}
+
+float newton_step(float x, float y) {
+    // Keep x*y near sqrt(x) and the product of the two factors near 1/2.
+    // Preserve this grouping; the build disables contraction and reassociation.
+    return y * (1.5f - (x * y) * (0.5f * y));
+}
+
+float approximate_inverse_sqrt(float x, int steps = 1) {
+    // Zero, negative, subnormal, infinity and NaN need a separate policy.
+    if (!in_domain(x)) throw std::domain_error(&quot;Expected positive normal float&quot;);
+    if (steps &lt; 0 || steps &gt; 2) throw std::invalid_argument(&quot;Use 0, 1 or 2 steps&quot;);
+    float y = inverse_sqrt_seed(x);
+    for (int step = 0; step &lt; steps; ++step) y = newton_step(x, y);
+    return y;
+}
+
+float approximate_sqrt(float x, int steps = 1) {
+    return x * approximate_inverse_sqrt(x, steps);
+}</code></pre><figcaption>verify.cpp · 29–67</figcaption></figure>
+<p><code>std::bit_cast&lt;std::uint32_t&gt;</code> preserves the input bits; integer arithmetic constructs the seed, and <code>std::bit_cast&lt;float&gt;</code> interprets it. An ordinary numeric conversion would turn 25 into the integer 25, which has a different meaning from the encoding \(I\). The historical code accesses the float through <code>long*</code>. Fixed-width integers and <code>bit_cast</code> make the representation conversion explicit in this implementation. <a href="https://github.com/cplusplus/draft/blob/6aea7f6be0895b9dd361c6562bdee2f3809e4fa0/source/numerics.tex#L1324-L1365">Object-representation conversion</a> · <a href="https://github.com/cplusplus/draft/blob/6aea7f6be0895b9dd361c6562bdee2f3809e4fa0/source/expressions.tex#L289-L303">C++ object access rules</a></p>
+<p>Multiplication order affects floating-point behavior too. The implementation first computes <code>x * y</code> and <code>0.5f * y</code>, then multiplies them. Since \(y\approx1/\sqrt{x}\), the first intermediate is approximately \(\sqrt{x}\), and their product is approximately one half. This multiplication order keeps the intermediate values within the normal range for the supported inputs.</p>
+<p>Computing <code>0.5f * x</code> first produces the subnormal intermediate \(2^{-127}\) at the smallest normal input, \(x=2^{-126}\). Gradual underflow represents that value exactly. Flushing subnormals to zero changes it to zero and changes the correction. On x86, the verification program saves the floating-point control register, temporarily changes its mode for this comparison, and restores the original setting afterward.</p>
+<div class="fs-scroll" tabindex="0" role="region" aria-label="x = 2⁻¹²⁶: relative error after one reciprocal-root update"><table><caption>x = 2⁻¹²⁶: relative error after one reciprocal-root update</caption><thead><tr><th scope="col">Mode</th><th scope="col">Bits of 0.5 × x</th><th scope="col">Historical grouping error</th><th scope="col">Reordered error</th></tr></thead><tbody><tr><td>Gradual underflow</td><td>0x00400000</td><td>-0.1692832%</td><td>-0.1692832%</td></tr><tr><td>Flush subnormals to zero</td><td>0x00000000</td><td>+44.9322581%</td><td>-0.1692832%</td></tr></tbody></table></div>
+<p>These functions accept \(2^{-126}\le x\le(2-2^{-23})2^{127}\). An interface that also accepts zero, negative inputs, infinities, and NaNs needs separate handling according to the intended mathematical semantics. Subnormal inputs also need scaling or a dedicated path. The input checks enforce the domain of these functions.</p>
+<p>A fused multiply-add evaluates its product and sum with one rounding, which can change the final bits. This build disables contraction and aggressive floating-point reassociation so the code, browser explorer, and tables follow the same arithmetic steps.</p>
+
+<h2 id="en-measurements">5. Reproducible accuracy measurements</h2>
+<p>The verification program enumerates all <code>16,777,216</code> binary32 inputs in <code>[1, 4)</code>, covering two adjacent exponent fields and every fraction field. The reference values use double-precision <code>std::sqrt</code>. The reported quantities are absolute relative errors:</p>
+<div class="fs-equation">\[e_y=\left|y\sqrt{x}-1\right|,\qquad e_s=\left|\frac{s}{\sqrt{x}}-1\right|.\]</div>
+<div class="fs-scroll" tabindex="0" role="region" aria-label="Maximum absolute relative error over all 16,777,216 inputs in [1, 4)"><table><caption>Maximum absolute relative error over all 16,777,216 inputs in [1, 4)</caption><thead><tr><th scope="col">Updates</th><th scope="col">Maximum reciprocal-root error</th><th scope="col">Maximum square-root product error</th></tr></thead><tbody><tr><td>0</td><td>3.4375773%</td><td>3.4375773%</td></tr><tr><td>1</td><td>0.1752339%</td><td>0.1752322%</td></tr><tr><td>2</td><td>0.0004733%</td><td>0.0004756%</td></tr></tbody></table></div>
+<p>The program also samples fraction fields across all 254 normal exponent fields and checks the smallest and largest normal inputs. The maxima in this table refer to the stated exhaustive set; results for the other exponents are included in the accompanying measurement file.</p>
+<p class="fs-environment">Measurement environment: GCC 13.1.1 20230614 (Red Hat 13.1.1-4) · AMD EPYC-Genoa Processor · x86_64. Round to nearest; gradual underflow in the main sweep.</p>
+<p>Download the <a href="../assets/special-optimization/fast-sqrt/verify.cpp" download>verification program</a> and <a href="../assets/special-optimization/fast-sqrt/results.json">measurement results</a>, then reproduce the run with the same compiler options:</p>
+<pre><code class="language-bash">c++ -O3 -std=c++20 -ffp-contract=off -fno-fast-math \
+    -Wall -Wextra -Wpedantic verify.cpp -o verify
+./verify &gt; measurements.json</code></pre>
+<p>The program measures numerical error and prints the example bits and iteration results. The reported errors apply to the tested inputs. Application timing also depends on the generated instructions, dependencies, vectorization, and workload size.</p>
+
+<h2 id="en-hardware">6. Square-root paths on modern hardware</h2>
+<p>The bit-level seed illustrates a general method: estimate a value from its representation, then refine it using the equation. Modern processors also expose square-root or reciprocal-square-root instructions with numerical contracts that an implementation can use directly.</p>
+<p>In PTX ISA 9.1, archived with CUDA 13.1.1, <code>rsqrt.approx.f32</code> specifies a maximum relative error of \(2^{-22.9}\) for positive finite inputs with default subnormal handling. <code>sqrt.rn.f32</code> specifies square-root rounding to nearest, ties to even. The <code>approx</code> and <code>rn</code> modifiers identify these different contracts. <a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#floating-point-instructions-rsqrt">Reciprocal square root</a> · <a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#floating-point-instructions-sqrt">Square root</a></p>
+<p>The required output guides the choice. Normalization consumes a reciprocal square root directly. A correctly rounded square root requires a library function or instruction with that contract. Approximate fused computations need both an error budget and inspection of the generated machine code. Computing <code>x * rsqrt.approx(x)</code> adds a final multiplication rounding and has its own error path.</p>
+<p>The related article <a href="silu-tanh-exp2-instruction-path.html">SiLU with tanh and exp2</a> examines another algebraic rewrite: the formula provides candidate implementations, while dependencies, rounding, and target hardware determine the trade-offs.</p>
+
+<h2 id="en-references">References</h2>
+<ul class="fs-references"><li><a href="https://github.com/id-Software/Quake-III-Arena/blob/dbe4ddb10315479fc00086f08e25d968b4b43c49/code/game/q_math.c#L548-L572">Quake III Q_rsqrt, q_math.c:548–572</a></li><li><a href="https://github.com/id-Software/Quake-III-Arena/blob/dbe4ddb10315479fc00086f08e25d968b4b43c49/code/game/q_math.c#L185-L198">Quake III VectorNormalizeFast, q_math.c:185–198</a></li><li><a href="https://docs.oracle.com/cd/E19957-01/806-3568/ncg_math.html">Oracle Numerical Computation Guide: IEEE single format</a></li><li><a href="https://github.com/cplusplus/draft/blob/6aea7f6be0895b9dd361c6562bdee2f3809e4fa0/source/numerics.tex#L1324-L1365">C++20 draft N4861: bit_cast</a></li><li><a href="https://github.com/cplusplus/draft/blob/6aea7f6be0895b9dd361c6562bdee2f3809e4fa0/source/expressions.tex#L289-L303">C++20 draft N4861: object access</a></li><li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#floating-point-instructions-rsqrt">CUDA 13.1.1 / PTX ISA 9.1: rsqrt</a></li><li><a href="https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html#floating-point-instructions-sqrt">CUDA 13.1.1 / PTX ISA 9.1: sqrt</a></li></ul>
+</div></main></div></body></html>

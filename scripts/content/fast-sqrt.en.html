@@ -1,0 +1,75 @@
+<h1>Fast square roots and reciprocal square roots</h1>
+<p class="article-lead">Normalizing the vector <code>(3, 4)</code> means multiplying both components by <code>1/√25 = 0.2</code>. Floating-point bits can provide an estimate of this shared factor, and multiplication can refine it. The classic <code>Q_rsqrt</code> implementation in the public Quake III source follows that sequence: one integer shift and subtraction produce the seed, followed by one Newton iteration. [[quake|Q_rsqrt]] · [[normalize|Vector normalization call site]]</p>
+<p>This article follows <code>x = 25</code> through the seed and refinement, then multiplies the reciprocal square root by the input to approximate the square root. The implementation uses IEEE 754 binary32, with a bit-pattern explorer and a runnable accuracy measurement program.</p>
+
+<h2 id="en-target">1. Square roots and normalization</h2>
+<p>A square root and a reciprocal square root serve different computational purposes:</p>
+<div class="fs-equation">\[s=\sqrt{x},\qquad y=\frac{1}{\sqrt{x}},\qquad s=xy\quad(x&gt;0).\]</div>
+<p>For vector normalization, compute the squared length and its reciprocal square root, then reuse that factor for each component. The squared length of <code>(3, 4)</code> is 25. Multiplying by 0.2 gives <code>(0.6, 0.8)</code>. To recover the length itself, compute <code>25 × 0.2 = 5</code>.</p>
+<p>Newton iteration can compute the square root directly. Applying it to \(s^2-x=0\) gives:</p>
+<div class="fs-equation">\[s_{n+1}=\frac12\left(s_n+\frac{x}{s_n}\right).\]</div>
+<p>With <code>x = 25</code> and <code>s₀ = 6</code>, the first two updates produce approximately 5.083333 and 5.000683. Each iteration includes a division. Fast reciprocal square root uses a different equation whose update simplifies to multiplication and addition or subtraction. The bit-level seed is close enough for one or two updates to reduce the error.</p>
+
+<h2 id="en-seed">2. Floating-point encoding and the seed</h2>
+<h3 id="en-format">2.1 Reading the same bits as an integer</h3>
+<p>A binary32 value has one sign bit, eight exponent bits, and 23 fraction bits. For a positive normal number, the sign is zero and:</p>
+<div class="fs-equation">\[x=(1+m)2^{E-127},\qquad m=\frac{M}{2^{23}},\quad 1\le E\le254.\]</div>
+<p>Here \(E\) is the stored, biased exponent field and \(M\) is the integer represented by the fraction field. The actual exponent is \(E-127\), and the leading significand bit is implicit in the normal-number encoding. [[binary32|Binary32 format]]</p>
+{{bits25}}
+<p>The bits of 25 are <code>0x41c80000</code>: <code>E = 131</code> and <code>M = 0x480000</code>. Thus <code>m = 0.5625</code>, giving <code>1.5625 × 2⁴</code>. Interpreting those same bits as an unsigned integer produces \(I\):</p>
+<div class="fs-equation">\[I=2^{23}E+M=2^{23}(E+m).\]</div>
+<p>The integer contains both the exponent and the fraction. Shifting and subtracting it, then interpreting the resulting bits as a float, produces a reciprocal-square-root seed. C++20 provides <code>std::bit_cast</code> to convert between these object representations. [[bitcast|C++20 bit_cast]]</p>
+
+<h3 id="en-log">2.2 A linear transformation in logarithmic space</h3>
+<p>Taking a square root halves a logarithm; taking a reciprocal changes its sign. Floating-point encoding lets us approximate that logarithm and combine the two operations in one integer transformation.</p>
+<div class="fs-equation">\[\log_2x=E-127+\log_2(1+m).\]</div>
+<p>For \(0\le m&lt;1\), approximate \(\log_2(1+m)\) with the line \(m+\sigma\). The offset \(\sigma\) adjusts its position. Writing \(L=2^{23}\) gives:</p>
+<div class="fs-equation">\[\log_2x\approx\frac{I}{L}-127+\sigma.\]</div>
+<p>Let \(J\) be the integer bits of the reciprocal-square-root seed. Applying the same approximation to the input and output, with \(\log_2y=-\tfrac12\log_2x\), yields:</p>
+<div class="fs-equation">\[\frac{J}{L}-127+\sigma\approx-\frac12\left(\frac{I}{L}-127+\sigma\right),\qquad J\approx\frac32L(127-\sigma)-\frac12I.\]</div>
+<p>This explains the form <code>J = R - (I &gt;&gt; 1)</code>. The shift divides the unsigned integer by two, rounding down; \(R\) absorbs the exponent bias and line offset. Setting \(\sigma=0\) gives <code>0x5f400000</code>. The Quake III constant <code>0x5f3759df</code> corresponds to \(\sigma\approx0.0450466\). The linear approximation explains the family of constants; the specific choice also depends on the error objective. [[quake|The chosen constant]]</p>
+<p>For the running example <code>x = 25</code>, the integer operations are:</p>
+<pre><code class="language-text">I       = 0x41c80000
+I &gt;&gt; 1  = 0x20e40000
+R       = 0x5f3759df
+J       = 0x3e5359df</code></pre>
+<p>Interpreting <code>J</code> as a float produces approximately <code>0.2063975</code>, already close to the target 0.2. A Newton iteration refines that estimate.</p>
+
+<h2 id="en-newton">3. Newton iteration and error reduction</h2>
+<p>Choose \(f(y)=y^{-2}-x\), whose positive root is \(1/\sqrt{x}\). Using its derivative \(f'(y)=-2y^{-3}\), the Newton update simplifies to:</p>
+<div class="fs-equation">\[y_{n+1}=y_n-\frac{y_n^{-2}-x}{-2y_n^{-3}}=y_n\left(\frac32-\frac12xy_n^2\right).\]</div>
+<p>When the estimate is too large, \(xy_n^2\) exceeds 1, and the correction factor reduces it. Near the root, the update cancels the first-order error. Substituting \(y_n=(1+\varepsilon_n)/\sqrt{x}\) gives, in real arithmetic:</p>
+<div class="fs-equation">\[\varepsilon_{n+1}=-\frac32\varepsilon_n^2-\frac12\varepsilon_n^3.\]</div>
+<p>The squared term dominates once the error is small. An initial error of roughly 3% can fall to a few parts per thousand after one update and a few parts per million after another. Binary32 arithmetic adds rounding at each operation. The measured results for <code>x = 25</code> are:</p>
+{{example-table}}
+<p>In real arithmetic, \(xy_n\) has the same relative error against \(\sqrt{x}\) as the reciprocal-square-root estimate. The final floating-point multiplication rounds the product once more, so the verification program measures both outputs.</p>
+{{explorer}}
+
+<h2 id="en-implementation">4. Implementation and intermediate ranges</h2>
+<p>The following C++20 implementation comes from the accompanying verification program. Its entry points require finite, positive normal inputs, retain the <code>0x5f3759df</code> seed, and allow zero to two refinement steps.</p>
+{{algorithm}}
+<p><code>std::bit_cast&lt;std::uint32_t&gt;</code> preserves the input bits; integer arithmetic constructs the seed, and <code>std::bit_cast&lt;float&gt;</code> interprets it. An ordinary numeric conversion would turn 25 into the integer 25, which has a different meaning from the encoding \(I\). The historical code accesses the float through <code>long*</code>. Fixed-width integers and <code>bit_cast</code> make the representation conversion explicit in this implementation. [[bitcast|Object-representation conversion]] · [[aliasing|C++ object access rules]]</p>
+<p>Multiplication order affects floating-point behavior too. The implementation first computes <code>x * y</code> and <code>0.5f * y</code>, then multiplies them. Since \(y\approx1/\sqrt{x}\), the first intermediate is approximately \(\sqrt{x}\), and their product is approximately one half. This multiplication order keeps the intermediate values within the normal range for the supported inputs.</p>
+<p>Computing <code>0.5f * x</code> first produces the subnormal intermediate \(2^{-127}\) at the smallest normal input, \(x=2^{-126}\). Gradual underflow represents that value exactly. Flushing subnormals to zero changes it to zero and changes the correction. On x86, the verification program saves the floating-point control register, temporarily changes its mode for this comparison, and restores the original setting afterward.</p>
+{{ftz-table}}
+<p>These functions accept \(2^{-126}\le x\le(2-2^{-23})2^{127}\). An interface that also accepts zero, negative inputs, infinities, and NaNs needs separate handling according to the intended mathematical semantics. Subnormal inputs also need scaling or a dedicated path. The input checks enforce the domain of these functions.</p>
+<p>A fused multiply-add evaluates its product and sum with one rounding, which can change the final bits. This build disables contraction and aggressive floating-point reassociation so the code, browser explorer, and tables follow the same arithmetic steps.</p>
+
+<h2 id="en-measurements">5. Reproducible accuracy measurements</h2>
+<p>The verification program enumerates all <code>16,777,216</code> binary32 inputs in <code>[1, 4)</code>, covering two adjacent exponent fields and every fraction field. The reference values use double-precision <code>std::sqrt</code>. The reported quantities are absolute relative errors:</p>
+<div class="fs-equation">\[e_y=\left|y\sqrt{x}-1\right|,\qquad e_s=\left|\frac{s}{\sqrt{x}}-1\right|.\]</div>
+{{error-table}}
+<p>The program also samples fraction fields across all 254 normal exponent fields and checks the smallest and largest normal inputs. The maxima in this table refer to the stated exhaustive set; results for the other exponents are included in the accompanying measurement file.</p>
+{{environment}}
+<p>Download the <a href="../assets/special-optimization/fast-sqrt/verify.cpp" download>verification program</a> and <a href="../assets/special-optimization/fast-sqrt/results.json">measurement results</a>, then reproduce the run with the same compiler options:</p>
+{{build-command}}
+<p>The program measures numerical error and prints the example bits and iteration results. The reported errors apply to the tested inputs. Application timing also depends on the generated instructions, dependencies, vectorization, and workload size.</p>
+
+<h2 id="en-hardware">6. Square-root paths on modern hardware</h2>
+<p>The bit-level seed illustrates a general method: estimate a value from its representation, then refine it using the equation. Modern processors also expose square-root or reciprocal-square-root instructions with numerical contracts that an implementation can use directly.</p>
+<p>In PTX ISA 9.1, archived with CUDA 13.1.1, <code>rsqrt.approx.f32</code> specifies a maximum relative error of \(2^{-22.9}\) for positive finite inputs with default subnormal handling. <code>sqrt.rn.f32</code> specifies square-root rounding to nearest, ties to even. The <code>approx</code> and <code>rn</code> modifiers identify these different contracts. [[ptx-rsqrt|Reciprocal square root]] · [[ptx-sqrt|Square root]]</p>
+<p>The required output guides the choice. Normalization consumes a reciprocal square root directly. A correctly rounded square root requires a library function or instruction with that contract. Approximate fused computations need both an error budget and inspection of the generated machine code. Computing <code>x * rsqrt.approx(x)</code> adds a final multiplication rounding and has its own error path.</p>
+<p>The related article <a href="silu-tanh-exp2-instruction-path.html">SiLU with tanh and exp2</a> examines another algebraic rewrite: the formula provides candidate implementations, while dependencies, rounding, and target hardware determine the trade-offs.</p>
+
+<h2 id="en-references">References</h2>
+{{references}}
