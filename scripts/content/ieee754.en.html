@@ -1,0 +1,62 @@
+<h1>IEEE 754 floating-point numbers</h1>
+<p class="article-lead">Floating-point numbers represent both very small and very large values with a finite number of bits. The exponent sets the scale, while the fraction field determines the spacing within that scale, so range and precision are separate properties. With eight bits of binary precision, 258 is exactly representable, while 257 requires rounding.</p>
+
+<h2 id="en-encoding">1. Sign, exponent, and fraction fields</h2>
+<p>An IEEE 754 binary floating-point format consists of a sign bit \(s\), a biased exponent field \(E\), and a fraction field \(M\). Let the exponent have \(e\) bits and the fraction have \(m\) bits, with an exponent bias of \(b=2^{e-1}-1\). A normal number has the value:</p>
+<div class="ieee-equation">\[x=(-1)^s\left(1+\frac{M}{2^m}\right)2^{E-b}.\]</div>
+<p>The fraction field stores the \(m\) bits after the binary point. For normal numbers, the encoding supplies an implicit leading 1, giving a precision of \(p=m+1\) bits. In 32-bit single precision, \(e=8\), \(m=23\), and \(b=127\). [[ieee|Single-precision field layout]]</p>
+{{bit-example}}
+<p>The bit pattern for <code>1.5</code> is <code>0x3fc00000</code>. Its sign bit is 0, its exponent field is 127, and its fraction field is <code>0x400000</code>. Thus \(M/2^{23}=0.5\), and the decoded value is \(1.5\times2^0\).</p>
+<p>For encodings that reserve an all-ones exponent field for special values, let \(E_{\max}=2^e-1\). The decoding rules are as follows. [[ieee|Floating-point encoding classes]]</p>
+{{decode-table}}
+<p>Positive and negative zero both have zero exponent and fraction fields, with different sign bits; they compare equal numerically. NaNs use an all-ones exponent and a nonzero fraction, allowing multiple bit patterns.</p>
+
+<h2 id="en-range">2. Representable range and format comparison</h2>
+<h3 id="en-normal-range">2.1 Limits of normal numbers</h3>
+<p>The general range formulas in this section apply to encodings that reserve an all-ones exponent for special values. The smallest positive normal number has \(E=1\) and \(M=0\), so:</p>
+<div class="ieee-equation">\[x_{\min,\mathrm{normal}}=2^{1-b}=2^{\,2-2^{e-1}}.\]</div>
+<p>When the all-ones exponent is reserved, the largest finite exponent field is \(E_{\max}-1\). Setting every fraction bit to 1 gives a significand of \(2-2^{-m}\), hence:</p>
+<div class="ieee-equation">\[x_{\max}=(2-2^{-m})2^{E_{\max}-1-b}=(2-2^{-m})2^b.\]</div>
+<p>For example, 16-bit half precision has a 10-bit fraction field and a bias of 15. Its smallest positive normal number is \(2^{-14}\), and its largest finite value is \((2-2^{-10})2^{15}=65504\).</p>
+
+<h3 id="en-subnormal">2.2 Subnormal numbers and gradual underflow</h3>
+<p>When \(E=0\), the encoding uses an implicit leading 0 and retains the exponent scale \(2^{1-b}\):</p>
+<div class="ieee-equation">\[x_{\mathrm{subnormal}}=(-1)^s\frac{M}{2^m}2^{1-b}.\]</div>
+<p>The smallest positive subnormal has \(M=1\) and a value of \(2^{1-b-m}\). The largest subnormal has \(M=2^m-1\); it is one interval of the same size below the smallest normal number:</p>
+<div class="ieee-equation">\[2^{1-b}-(1-2^{-m})2^{1-b}=2^{1-b-m}.\]</div>
+<p>The same spacing continues across the boundary between subnormal values and the lowest normal interval. In single precision, that spacing is \(2^{-149}\), and the smallest normal number is \(2^{-126}\). As subnormal values approach zero, they retain fewer significant binary digits. [[ieee|Gradual underflow]]</p>
+
+<h3 id="en-formats">2.3 Common formats</h3>
+{{format-bit-layout}}
+<p>The table measures spacing above 1 as the distance between 1 and the next larger representable value. Half and single precision use IEEE binary formats; bfloat16 and FP8 use the specified encodings. The TensorFloat-32 row uses a precision model with 8 exponent bits and 10 fraction bits. The extended finite-value rules for E4M3 appear below the table. [[bf16|bfloat16 numerical range]] · [[fp8|FP8 format definitions]] · [[tf32|TensorFloat-32 format conventions]]</p>
+{{format-table}}
+<p>The NVIDIA E4M3 format in the table (E4M3FN) extends the finite range: an all-ones exponent can still encode finite values, with a maximum of 448. The patterns <code>0x7f</code> and <code>0xff</code> encode NaN, and there is no infinity encoding. Its smallest normal number is \(2^{-6}\), and its smallest subnormal is \(2^{-9}\). E5M2 retains infinity and NaN encodings, so the classification rules in Section 1 apply. [[e4m3|NVIDIA E4M3]] · [[e5m2|NVIDIA E5M2]]</p>
+<p>The PTX specification for TensorFloat-32 requires at least 10 bits of fraction precision and leaves its internal layout implementation-defined. The table calculates ranges and integer boundaries using the 10-bit model. Treatment of subnormal inputs also depends on the matrix-multiply instruction. Encoding range, computational precision, and hardware underflow handling need to be checked separately. [[tf32|PTX alternate floating-point formats]] · [[tf32-mma|Matrix-multiply precision and underflow semantics]]</p>
+
+<h2 id="en-inspect">3. Classifying floating-point values by their bits</h2>
+<p>Examining the exponent and fraction fields of a single-precision value distinguishes finite numbers, infinities, and NaNs. The code below uses C++20 <code>std::bit_cast</code> to read the same 32 bits as an unsigned integer, then extracts the fields with masks. Fixed-width integers and bit operations make the layout explicit while preserving the original bit pattern. [[bitcast|C++20 object representation conversion]]</p>
+<p>The unsigned mask for the sign bit is <code>0x80000000u</code>, or \(2^{31}=2147483648\).</p>
+{{classify-code}}
+<p>After removing the sign bit, <code>0x7f800000</code> is the encoding of infinity. Larger unsigned bit patterns have an all-ones exponent and a nonzero fraction, identifying NaNs. When the exponent is zero, the fraction distinguishes zero from a subnormal number. The accompanying program produces these results.</p>
+{{classification-table}}
+
+<h2 id="en-precision">4. Adjacent spacing and the integer precision boundary</h2>
+<p>Within a normal interval \([2^k,2^{k+1})\), adjacent values are spaced \(2^{k-m}\) apart. The spacing above 1 is therefore \(2^{-m}\), while the spacing above 0.5 is \(2^{-m-1}\). Each power-of-two boundary doubles the spacing as the exponent increases.</p>
+<p>At \(2^{m+1}=2^p\), the spacing reaches 2. These formats have enough exponent range to include that point, so every integer from zero through \(2^p\) is exactly representable, and \(2^p+1\) is the first positive integer that is not.</p>
+<div class="ieee-equation">\[n_{\mathrm{first\ missing}}=2^{m+1}+1.\]</div>
+<p>bfloat16 has 7 fraction bits plus an implicit leading bit, giving 8 bits of precision. Both 256 and 258 are exactly representable, with 257 halfway between them. Round-to-nearest, ties-to-even maps 257 to 256 and 259 to 260. Adding one to the bfloat16 value 256 and rounding the result back to that format also gives 256.</p>
+{{bf16-table}}
+<p>The verification program simulates this rounding step through software quantization. It keeps the upper 16 bits of a single-precision value and uses the lower bits to decide whether to round upward. At a tie, it checks the least significant retained bit so that the result has an even significand. This checks the rounding rule of the format.</p>
+{{bf16-code}}
+<p>Single precision has 24 bits of precision, placing its corresponding boundary at 16,777,216. The single-precision addition <code>16777216.0f + 1.0f</code> in the example produces <code>16777216.0f</code>. This value is still far below overflow; the change is in the spacing between adjacent values.</p>
+<p>The complete <a href="../assets/programmer-essentials/ieee754/verify.cpp" download>verification program</a> checks special values, field decoding, and integer rounding. The <a href="../assets/programmer-essentials/ieee754/results.json">recorded results</a> include the compilation environment and output. To reproduce the results:</p>
+{{build-command}}
+<p>Floating-point encodings can also help construct numerical algorithms. <a href="fast-square-root.html">Fast square-root and inverse-square-root approximations</a> uses the exponent and fraction fields to generate an initial estimate, then refines it with Newton iterations. <a href="fp8-scaling-recipes.html">FP8 scaling and training recipes</a> discusses how quantization scales affect the numerical range in use.</p>
+
+<h2 id="en-special">5. NaN and infinity</h2>
+<p>NaN (Not a Number) represents cases with no valid numerical result. Under IEEE 754 default exception handling, <code>0.0 / 0.0</code> produces NaN, while a positive, nonzero finite number divided by positive zero produces positive infinity. The accompanying C++ program checks the following cases in the default floating-point environment. [[exceptions|IEEE arithmetic and special values]]</p>
+{{special-table}}
+<p>Ordinary arithmetic propagates NaN. Comparisons return Boolean values: <code>NaN == NaN</code> is false, <code>NaN != NaN</code> is true, and ordered comparisons involving NaN are false. C++ provides <code>std::isnan</code> to identify NaNs and <code>std::isinf</code> to identify infinities. Floating-point remainders use <code>std::fmod</code>; the integer <code>%</code> operator has separate semantics.</p>
+
+<h2 id="en-references">References</h2>
+{{references}}
