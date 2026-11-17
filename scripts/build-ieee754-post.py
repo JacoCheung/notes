@@ -66,6 +66,8 @@ def format_bit_layout(lang):
         ('fp16', 'IEEE 754 半精度 FP16' if zh else 'IEEE 754 half precision · FP16', 5, 10, 15),
         ('bf16', 'bfloat16', 8, 7, 127),
         ('tf32', 'TensorFloat-32 · 逻辑精度示意' if zh else 'TensorFloat-32 · logical precision model', 8, 10, 127),
+        ('fp8-e5m2', 'FP8 E5M2', 5, 2, 15),
+        ('fp8-e4m3fn', 'FP8 E4M3FN', 4, 3, 7),
         ('fp24', 'ATI / AMD FP24 · R300 / R400', 7, 16, 63),
     ]
     rows = []
@@ -76,6 +78,12 @@ def format_bit_layout(lang):
         fields = [('sign', '符号' if zh else 'sign', '0'),
                   ('exponent', f'指数（{exponent_width} 位）' if zh else f'exponent ({exponent_width} bits)', f'{exponent:0{exponent_width}b}'),
                   ('fraction', f'小数（{fraction_width} 位）' if zh else f'fraction ({fraction_width} bits)', f'{fraction:0{fraction_width}b}')]
+        if total == 8:
+            # Stack the label and bit count above the narrow FP8 fields.
+            names = ['符号', '指数', '小数'] if zh else ['sign', 'exponent', 'fraction']
+            fields = [(kind, f'{name}<br>{len(bits)} 位' if zh else
+                       f'{name}<br>{len(bits)} {"bit" if len(bits) == 1 else "bits"}', bits)
+                      for (kind, _, bits), name in zip(fields, names)]
         labels = ''.join(f'<span class="ieee-field-label ieee-field-{kind}" style="grid-column:span {len(bits)}">{label}</span>'
                          for kind, label, bits in fields)
         cells = ''.join(f'<span class="ieee-layout-bit ieee-bit-{kind}">{bit}</span>'
@@ -93,7 +101,7 @@ def format_bit_layout(lang):
 </div>''')
     caption = ('各行表示同一个数 0.15625 = 1.01₂ × 2⁻³，所有单元格等宽。TF32 的 18–0 是拼接精度字段的逻辑编号，数据使用 32 位容器，内部布局由实现决定。FP24 为历史 ATI R300 / R400 的着色器计算格式。' if zh else
                'Every row represents 0.15625 = 1.01₂ × 2⁻³ with equal-width bit cells. TF32 positions 18–0 label concatenated precision fields; data uses a 32-bit container with an implementation-defined layout. FP24 is the historical ATI R300 / R400 shader computation format.')
-    caption += ' ' + ' · '.join(f'<a href="{escape(REFS[key]["url"], quote=True)}">{key.upper()}</a>' for key in ('tf32', 'fp24'))
+    caption += ' ' + ' · '.join(f'<a href="{escape(REFS[key]["url"], quote=True)}">{key.upper()}</a>' for key in ('tf32', 'fp8', 'fp24'))
     label = '浮点格式位布局对照，可横向滚动' if zh else 'Floating-point bit layouts; horizontally scrollable'
     return (f'<figure class="ieee-format-figure"><div class="ieee-layout-scroll" tabindex="0" role="region" aria-label="{label}">'
             '<div class="ieee-layout-diagram">' + ''.join(rows) + '</div></div>'
