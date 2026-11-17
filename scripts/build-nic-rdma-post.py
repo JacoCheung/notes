@@ -225,7 +225,7 @@ def expand(lang):
 
 
 def main():
-    meta=dict(title='网卡与 RDMA：从 socket 到 verbs',title_en='NICs and RDMA: from sockets to verbs',slug='nic-rdma-socket-verbs',date='2026-11-10',tags='RDMA, Verbs, mlx5, 网卡驱动',tags_en='RDMA, Verbs, mlx5, NIC Drivers',reading='8 分钟',reading_en='8 min',summary='普通网卡也会通过 DMA 搬运数据，远程内存写进一步让网卡直接访问对端已注册内存。以 4 KiB 传输对照 socket、verbs 与 mlx5 源码，解释描述符、门铃和完成通知。',summary_en='Ordinary NICs already use DMA. A 4 KiB transfer through sockets and RDMA reveals how mlx5 drivers handle descriptors, doorbells, memory registration and completion.',series='networking-basics',series_title='网络入门原理',series_title_en='Networking Fundamentals',series_order='5')
+    meta=dict(title='网卡与 RDMA：从 socket 到 verbs',title_en='NICs and RDMA: from sockets to verbs',slug='nic-rdma-socket-verbs',date='2026-11-10',tags='RDMA, Verbs, mlx5, 网卡驱动',tags_en='RDMA, Verbs, mlx5, NIC Drivers',reading='8 分钟',reading_en='8 min',summary='跨机器传输数据时，远程直接内存访问怎样减少处理器的工作？应用先登记缓冲区和访问权限，再提交请求，让网卡直接读写对端指定内存，并用完成通知确认传输进度。',summary_en='How can transferring data between machines require less processor work? Applications register buffers and permissions, then use remote direct memory access to let network adapters move data and report completion.',series='networking-basics',series_title='网络入门原理',series_title_en='Networking Fundamentals',series_order='5')
     metadata='\n'.join(f'<meta name="post:{key}" content="{escape(value,quote=True)}">' for key,value in meta.items())
     html=f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{meta['title']}</title>

@@ -112,7 +112,7 @@ def expand(lang):
 
 
 def main():
-    meta=dict(title='URL、域名与 DNS',title_en='URLs, domains, and DNS',slug='url-domain-dns',date='2026-11-12',tags='URL, DNS, 域名, HTTP',tags_en='URL, DNS, Domains, HTTP',reading='12 分钟',reading_en='12 min',summary='子域名和路径不同的两个地址，可以打开同一页面。通过域名解析序列图和本地路由示例，解释域名如何找到服务器、请求如何选中页面，以及重定向为何改变地址。',summary_en='Different hostnames and paths can lead to one page. A name resolution diagram and runnable routing example explain how servers select pages and redirect requests.',series='networking-basics',series_title='网络入门原理',series_title_en='Networking Fundamentals',series_order='6')
+    meta=dict(title='URL、域名与 DNS',title_en='URLs, domains, and DNS',slug='url-domain-dns',date='2026-11-12',tags='URL, DNS, 域名, HTTP',tags_en='URL, DNS, Domains, HTTP',reading='12 分钟',reading_en='12 min',summary='两个看起来不同的网址，可能打开同一个页面。域名解析负责找到服务器的网络地址，服务器根据网址中的域名和路径选择内容，重定向则让浏览器改用另一个网址。',summary_en='Different web addresses can display the same page. Name resolution finds server addresses; servers use hostnames and paths to select content, while redirects send browsers to another address.',series='networking-basics',series_title='网络入门原理',series_title_en='Networking Fundamentals',series_order='6')
     metadata='\n'.join(f'<meta name="post:{key}" content="{escape(value,quote=True)}">' for key,value in meta.items())
     html=f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{meta['title']}</title>
