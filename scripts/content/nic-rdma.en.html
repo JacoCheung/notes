@@ -5,7 +5,7 @@
 
 <h2 id="nic-device-en">1. NICs and memory</h2>
 <p>A PCIe NIC interacts with the CPU through two kinds of address. Its BARs (Base Address Registers) describe device address windows. <u>Once the driver maps a register region, CPU loads and stores issue MMIO (Memory-Mapped I/O) accesses to the device.</u> To access host memory, the NIC uses DMA (Direct Memory Access) mappings established through the Linux DMA API. The IOMMU is part of the host I/O subsystem. With address translation enabled, the NIC issues DMA requests using I/O virtual addresses (IOVAs). After a request reaches the host over PCIe, the IOMMU translates its IOVA to a host physical address and checks access permissions. [[dma-api|DMA addresses and mappings]] · [[vtd-arch|Host DMA remapping]]</p>
-<p>The CPU describes where to read data and how many bytes to send, then places that descriptor in a ring in memory. The NIC reads it and executes the transfer. The conventional mlx5 send path has four steps:</p>
+<p>The CPU writes the source data's starting address and byte count into a descriptor, then places it in a ring in memory. The NIC reads it and executes the transfer. The conventional mlx5 send path has four steps:</p>
 <table><thead><tr><th>Step</th><th>Performed by</th><th>Action</th></tr></thead><tbody>
 <tr><td>① Write the descriptor</td><td>CPU</td><td>Write a WQE (Work Queue Element) into the send queue (SQ) ring, recording the operation, buffer address and length.</td></tr>
 <tr><td>② Ring the doorbell</td><td>CPU</td><td>Record the new producer index in the DBR (Doorbell Record) in memory, then write the doorbell register on a UAR (User Access Region) page in the BAR, an MMIO write that reaches the NIC over PCIe.</td></tr>
@@ -13,6 +13,27 @@
 <tr><td>④ Complete</td><td>NIC</td><td>DMA-write CQEs (Completion Queue Entries) into the completion queue (CQ) as configured, then raise an interrupt or wait for software to poll, as configured.</td></tr>
 </tbody></table>
 <p>Software performs ① and ②; the NIC performs ③ and ④. Sockets and RDMA verbs both use this queue mechanism. The socket path in <a href="#socket-en">section 2</a> submits work from the kernel Ethernet driver; the verbs path in <a href="#verbs-en">section 3</a> submits it from the user-space driver <code>libmlx5</code>. The hardware is shared, while request submission runs in different places.</p>
+
+<h3 id="source-layout-en">Source layout</h3>
+<p>The mlx5 software stack spans two repositories: <code>rdma-core</code> supplies user-space libraries, and Linux contains the kernel drivers. <code>libibverbs</code> provides the common verbs API. <code>libmlx5</code> is the mlx5 provider, the device-specific user-space driver implementing those interfaces.</p>
+<pre data-language="text" data-source-tree><code>rdma-core/                                      User space
+├── [[verbs-tree|libibverbs/]]                                 Common verbs API
+│   ├── [[verbs-inline|verbs.h]]                                 Public API and inline dispatch
+│   ├── [[verbs-open|device.c]]                                Device listing and context open
+│   └── cmd*.c                                  Kernel resource commands
+└── [[mlx5-provider-tree|providers/mlx5/]]                             libmlx5: mlx5 provider
+    ├── [[mlx5-send|qp.c]]                                    Encode WQEs; ring doorbells
+    └── [[mlx5-cq|cq.c]]                                    Read CQEs
+
+linux/                                          Kernel space
+└── drivers/
+    ├── [[rdma-kernel-tree|infiniband/core/]]                        Common RDMA stack and uverbs
+    ├── [[mlx5-ib-tree|infiniband/hw/mlx5/]]                     mlx5_ib: resources, memory registration
+    └── [[mlx5-core-tree|net/ethernet/mellanox/mlx5/core/]]         mlx5_core: PCI, firmware, resources
+        ├── [[mlx5e-netdev|en_main.c]]                           mlx5e: Ethernet device operations
+        ├── [[mlx5e-xmit|en_tx.c]]                             mlx5e: Ethernet transmit path
+        └── [[mlx5e-db|en/txrx.h]]                           mlx5e: DBR and doorbell writes</code></pre>
+<p><code>ibv_post_send()</code> in <code>verbs.h</code> dispatches through <code>qp-&gt;context-&gt;ops.post_send</code>. For an mlx5 device, the implementation lives in <code>providers/mlx5/</code>. [[verbs-inline|API dispatch]] In the kernel, <code>mlx5e</code> is built into <code>mlx5_core.ko</code>, while <code>mlx5_ib.ko</code> is a separate RDMA module. [[mlx5-build|Build rules]] · [[mlx5-ib-aux|RDMA driver entry]] <a href="#nic-driver-en">Section 4</a> follows resource setup and user-space mappings.</p>
 
 <h2 id="socket-en">2. The TCP socket path</h2>
 <p>A sends 4 KiB to B over an established IPv4 TCP connection using ordinary copying <code>send()</code> and <code>recv()</code> calls. For this example, each call handles all 4096 bytes. <code>send()</code> is declared in <code>&lt;sys/socket.h&gt;</code>; the application calls a C-library wrapper before entering the kernel. On Linux x86-64 with glibc 2.40, the path is:</p>
@@ -117,6 +138,7 @@ recv(fd, buf, 4096, 0)                     # system call: copy to the user buffe
 <details class="path-reference"><summary>Source and documentation entry points by section</summary>
 <table><thead><tr><th>Question</th><th>Entry points</th></tr></thead><tbody>
 <tr><td>1 Host IOMMU and DMA addresses</td><td>[[dma-api|Linux DMA mapping]]; [[vtd-arch|Intel VT-d architecture]]</td></tr>
+<tr><td>1 User-space libraries and kernel driver sources</td><td>[[verbs-tree|libibverbs]] → [[mlx5-provider-tree|mlx5 provider]]; kernel: [[rdma-kernel-tree|RDMA core]], [[mlx5-ib-tree|mlx5_ib]], [[mlx5-core-tree|mlx5_core / mlx5e]]</td></tr>
 <tr><td>2 The send wrapper and kernel entry</td><td>[[glibc-send|__libc_send]] → [[send-syscall|sendto system call]] → [[socket-send|__sys_sendto]] → [[socket-dispatch|__sock_sendmsg]] → [[inet-send|inet_sendmsg]] → [[tcp-send-entry|tcp_sendmsg]]</td></tr>
 <tr><td>2 Copies and doorbells on the socket path</td><td>[[tcp-copy|tcp_sendmsg_locked]] → [[mlx5-dma|mlx5e_txwqe_build_dsegs]] → [[mlx5e-db|mlx5e_notify_hw]]; receive: [[mlx5e-rx|mlx5e_napi_poll]] → [[tcp-recv|tcp_recvmsg_locked]]; [[msg-zerocopy|MSG_ZEROCOPY]]</td></tr>
 <tr><td>3 Verbs fields, states and connections</td><td>[[verbs-mr|ibv_reg_mr]], [[verbs-modify-qp|ibv_modify_qp]], [[verbs-post-send|ibv_post_send]], [[rdma-cm|rdma_cm]], [[rdma-guide|RDMA programming guide]], [[verbs|libibverbs]]</td></tr>

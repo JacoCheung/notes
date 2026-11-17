@@ -5,14 +5,35 @@
 
 <h2 id="nic-device">1. 网卡与内存</h2>
 <p>以 PCIe 网卡为例，CPU 与网卡通过两类地址交互。网卡的 BAR（Base Address Register）描述设备的地址窗口；<u>驱动映射其中的寄存器区域后，CPU 的 load / store 就能发起 MMIO（Memory-Mapped I/O，内存映射 I/O）访问。</u>网卡访问主机内存则使用 DMA（Direct Memory Access，直接内存访问），由驱动通过 Linux DMA API 建立映射。IOMMU 位于主机的 I/O 子系统中。启用地址翻译时，网卡用 I/O 虚拟地址（IOVA）发起 DMA 请求；请求经 PCIe 到达主机后，IOMMU 将 IOVA 转换为主机物理地址，并检查访问权限。[[dma-api|DMA 地址与映射]] · [[vtd-arch|主机侧 DMA 重映射]]</p>
-<p>CPU 把“从哪里取数据、发多少字节”写成描述符，放进内存中的环形队列；网卡读取描述符后执行传输。在 mlx5 的常规发送路径中，一次请求经过以下四步：</p>
+<p>CPU 把“源数据起始地址和字节数”写到描述符，放进内存中的环形队列；网卡读取描述符后执行传输。在 mlx5 的常规发送路径中，一次请求经过以下四步：</p>
 <table><thead><tr><th>步骤</th><th>执行者</th><th>动作</th></tr></thead><tbody>
 <tr><td>① 写描述符</td><td>CPU</td><td>在发送队列 SQ 的环中写一个 WQE（Work Queue Element），记录操作类型、buffer 地址和长度。</td></tr>
 <tr><td>② 敲 doorbell</td><td>CPU</td><td>先在内存中的 DBR（Doorbell Record）记下新的生产者序号，再写 BAR 中 UAR（User Access Region）页上的 doorbell 寄存器。后者是一次 MMIO 写，经 PCIe 到达网卡。</td></tr>
 <tr><td>③ 执行</td><td>网卡</td><td>DMA 读取 WQE 及其指向的数据，按协议发往网络。</td></tr>
 <tr><td>④ 完成</td><td>网卡</td><td>按完成配置将 CQE（Completion Queue Entry）DMA 写入完成队列 CQ，按配置触发中断，或等待软件轮询。</td></tr>
 </tbody></table>
-<p>软件负责 ①②，网卡负责 ③④。socket 和 RDMA verbs 都使用这类队列机制：<a href="#socket">第 2 节</a>的 socket 路径由内核以太网驱动提交工作，<a href="#verbs">第 3 节</a>的 verbs 路径由用户态驱动 <code>libmlx5</code> 提交。两者共用网卡，却把请求提交放在了不同的执行位置。</p>
+<p>软件负责 ①②，网卡负责 ③④。socket 和 RDMA verbs 都使用这类队列机制：<a href="#socket">第 2 节</a>的 socket 路径由内核以太网驱动提交工作，<a href="#verbs">第 3 节</a>的 verbs 路径由用户态驱动 <code>libmlx5</code> 提交。两者共用网卡，但请求提交放在不同的执行位置。</p>
+
+<h3 id="source-layout">源码布局</h3>
+<p>mlx5 的软件栈分布在两个仓库中：<code>rdma-core</code> 提供用户态库，Linux 源码包含内核驱动。<code>libibverbs</code> 提供通用 verbs 接口；<code>libmlx5</code> 是 mlx5 设备对应的 provider，即实现这些接口的设备专用用户态驱动。</p>
+<pre data-language="text" data-source-tree><code>rdma-core/                                      用户态
+├── [[verbs-tree|libibverbs/]]                                 通用 verbs API
+│   ├── [[verbs-inline|verbs.h]]                                 公开接口与内联分派
+│   ├── [[verbs-open|device.c]]                                设备枚举与 context 打开
+│   └── cmd*.c                                  向内核发送资源管理命令
+└── [[mlx5-provider-tree|providers/mlx5/]]                             libmlx5：mlx5 专用 provider
+    ├── [[mlx5-send|qp.c]]                                    编码 WQE、写 doorbell
+    └── [[mlx5-cq|cq.c]]                                    读取 CQE
+
+linux/                                          内核态
+└── drivers/
+    ├── [[rdma-kernel-tree|infiniband/core/]]                        通用 RDMA 栈与 uverbs 接口
+    ├── [[mlx5-ib-tree|infiniband/hw/mlx5/]]                     mlx5_ib：RDMA 资源与内存注册
+    └── [[mlx5-core-tree|net/ethernet/mellanox/mlx5/core/]]         mlx5_core：PCI、固件与公共资源
+        ├── [[mlx5e-netdev|en_main.c]]                           mlx5e：注册以太网设备操作
+        ├── [[mlx5e-xmit|en_tx.c]]                             mlx5e：以太网发送路径
+        └── [[mlx5e-db|en/txrx.h]]                           mlx5e：更新 DBR、写 doorbell</code></pre>
+<p><code>ibv_post_send()</code> 在 <code>verbs.h</code> 中通过 <code>qp-&gt;context-&gt;ops.post_send</code> 调用 provider；mlx5 设备对应的实现位于 <code>providers/mlx5/</code>。[[verbs-inline|接口分派]] 内核中的 <code>mlx5e</code> 编入 <code>mlx5_core.ko</code>，<code>mlx5_ib.ko</code> 是独立的 RDMA 模块。[[mlx5-build|构建关系]] · [[mlx5-ib-aux|RDMA 驱动入口]] 资源建立与用户态映射的调用过程见<a href="#nic-driver">第 4 节</a>。</p>
 
 <h2 id="socket">2. TCP socket 路径</h2>
 <p>A 通过一条已建立的 IPv4 TCP 连接把 4 KiB 发给 B。这里采用普通的拷贝式 <code>send()</code> / <code>recv()</code>，并取两次调用都完整处理 4096 字节的情况。<code>send()</code> 声明在 <code>&lt;sys/socket.h&gt;</code>，应用先调用 C 库封装，再进入内核。以 Linux x86-64 和 glibc 2.40 为例，发送路径如下：</p>
@@ -117,6 +138,7 @@ recv(fd, buf, 4096, 0)                     # 系统调用：拷贝到用户 buff
 <details class="path-reference"><summary>按节列出的源码与文档入口</summary>
 <table><thead><tr><th>要确认的问题</th><th>入口</th></tr></thead><tbody>
 <tr><td>1 主机侧 IOMMU 与 DMA 地址</td><td>[[dma-api|Linux DMA 映射]]、[[vtd-arch|Intel VT-d 架构]]</td></tr>
+<tr><td>1 用户态库与内核驱动源码树</td><td>[[verbs-tree|libibverbs]] → [[mlx5-provider-tree|mlx5 provider]]；内核：[[rdma-kernel-tree|RDMA core]]、[[mlx5-ib-tree|mlx5_ib]]、[[mlx5-core-tree|mlx5_core / mlx5e]]</td></tr>
 <tr><td>2 send 的用户态封装与内核入口</td><td>[[glibc-send|__libc_send]] → [[send-syscall|sendto 系统调用]] → [[socket-send|__sys_sendto]] → [[socket-dispatch|__sock_sendmsg]] → [[inet-send|inet_sendmsg]] → [[tcp-send-entry|tcp_sendmsg]]</td></tr>
 <tr><td>2 socket 路径的拷贝与 doorbell</td><td>[[tcp-copy|tcp_sendmsg_locked]] → [[mlx5-dma|mlx5e_txwqe_build_dsegs]] → [[mlx5e-db|mlx5e_notify_hw]]；接收：[[mlx5e-rx|mlx5e_napi_poll]] → [[tcp-recv|tcp_recvmsg_locked]]；[[msg-zerocopy|MSG_ZEROCOPY]]</td></tr>
 <tr><td>3 verbs 的字段、状态与连接</td><td>[[verbs-mr|ibv_reg_mr]]、[[verbs-modify-qp|ibv_modify_qp]]、[[verbs-post-send|ibv_post_send]]、[[rdma-cm|rdma_cm]]、[[rdma-guide|RDMA 编程指南]]、[[verbs|libibverbs]]</td></tr>
