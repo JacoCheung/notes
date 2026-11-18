@@ -18,7 +18,16 @@ cudaError_t status = cudaDeviceGetAttribute(
 // status == cudaSuccess 时：
 // direct == 1：支持 CPU 无迁移访问 GPU 驻留的 managed 页面。
 // direct == 0：不支持该能力；CPU 访问这类页面通常需要迁移。</code></pre>
-<p><strong>GPU 访问 CPU 驻留页的条件不同。</strong> 普通 PCIe GPU 就可以直接读写主机内存，物理页继续留在 CPU DRAM。Mapped pinned memory 通过主机页的 GPU 映射完成访问 (zero-copy)；managed memory 在页面已驻留主机且远程映射有效时也支持这种访问，可用 <code>SetPreferredLocation=Host</code> 和面向 GPU 的 <code>SetAccessedBy</code> 引导驻留与映射策略。这些建议不等同于锁页，managed 页仍可能因其他策略或显式预取而迁移。两种方式都需要正确的访问同步，直接访问仍会经 PCIe 传输数据。[[mapped|Mapped pinned memory]] · [[memory-api|Managed 驻留与访问建议]]</p></div>
+<p><strong>GPU 访问 CPU 驻留页的条件不同。</strong> 普通 PCIe GPU 就可以直接读写主机内存，物理页继续留在 CPU DRAM。Mapped pinned memory 通过主机页的 GPU 映射完成访问 (zero-copy)；managed memory 在页面已驻留主机且远程映射有效时也支持这种访问，可用 <code>SetPreferredLocation=Host</code> 和面向 GPU 的 <code>SetAccessedBy</code> 引导驻留与映射策略。这些建议不等同于锁页，managed 页仍可能因其他策略或显式预取而迁移。两种方式都需要正确的访问同步，直接访问仍会经 PCIe 传输数据。[[mapped|Mapped pinned memory]] · [[memory-api|Managed 驻留与访问建议]]</p>
+<table class="uvm-host-access-table">
+<caption>GPU 访问 CPU 驻留内存：平台与分配方式</caption>
+<thead><tr><th scope="col">内存类型</th><th scope="col">x86 + PCIe<br>（无 HMM）</th><th scope="col">x86 + PCIe + HMM</th><th scope="col">GH200 / GB200<br>（NVLink-C2C + ATS）</th></tr></thead>
+<tbody>
+<tr><th scope="row">Pinned 内存<br>（<code>cudaMallocHost</code> / <code>cudaHostRegister</code>）</th><td>✅ 直接访问（zero-copy）</td><td>✅ 直接访问（zero-copy）</td><td>✅ 直接访问（zero-copy）</td></tr>
+<tr><th scope="row">Managed 内存，页在 CPU</th><td>通常按访问迁移；设置 Host 驻留偏好和 GPU 访问建议后可远程访问</td><td>同左</td><td>✅ 支持一致性远程访问；是否迁移仍取决于策略</td></tr>
+<tr><th scope="row">普通 <code>malloc</code> / <code>mmap</code> 内存</th><td>❌ 未注册时不能直接交给 kernel 解引用，会造成非法访问</td><td>可访问；匿名页通常按缺页迁移，可用建议引导远程访问</td><td>✅ 可通过 ATS 直接访问</td></tr>
+</tbody></table>
+<p class="source-scope">本表讨论 Linux 上 GPU 对主机内存的访问。Pinned 行以 GPU 映射已建立、使用 GPU 可访问指针为前提，必要时通过 <code>cudaHostGetDevicePointer()</code> 取得该指针。普通 <code>malloc</code> / <code>mmap</code> 一行以匿名内存为例；文件后备的 <code>mmap</code> 通常不会因 GPU 访问自动迁移。HMM（Heterogeneous Memory Management，异构内存管理）和 ATS（Address Translation Services，地址翻译服务）须在实际系统中启用；支持直接访问不等于 managed 页始终不迁移。[[host-memory-access|平台支持与映射]] · [[um-allocators|分配器与迁移策略]]</p></div>
 <p><strong>页面何时迁移、迁到哪里，由 UVM 结合访问需求、策略和平台能力决定。</strong> 缺页可以通过补充映射或调整权限解决；迁移也可以在没有缺页时发生。</p>
 <table class="uvm-migration-triggers"><thead><tr><th>触发条件</th><th>可能采取的动作</th></tr></thead><tbody>
 <tr><td><strong>缺页：</strong>当前映射不存在或不满足访问要求</td><td>根据策略选择迁移、建立可用的远程映射，或调整访问权限</td></tr>

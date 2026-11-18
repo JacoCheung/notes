@@ -30,6 +30,8 @@ LINKS = {
     'cpu-residency': UVM + 'uvm_va_block.c#L12519-L12551',
     'gpu-residency': UVM + 'uvm_gpu_replayable_faults.c#L1512-L1580',
     'host-direct': 'https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/unified-memory.html#direct-unified-memory-access-from-the-host',
+    'host-memory-access': 'https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html#mapped-memory',
+    'um-allocators': 'https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/unified-memory.html#overview-of-memory-allocators-for-unified-memory',
     'grace-memory': 'https://developer.nvidia.com/blog/nvidia-grace-hopper-superchip-architecture-in-depth/',
     'hardware-coherence': 'https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/unified-memory.html#cpu-and-gpu-page-tables-hardware-coherency-vs-software-coherency',
     'cdmm': 'https://dam-cdn.nvd.orangelogic.com/AssetLink/77dn7clj03ib0kiritw143238xspfu4b.pdf#page=9',
