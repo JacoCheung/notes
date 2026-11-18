@@ -1,0 +1,69 @@
+<h2 id="zh-example">2. 输入与请求标识</h2>
+<p>四个 rank 都持有表 A 和表 B 的一部分行，也各自收到一批查表请求。橙色格子属于 A，蓝色格子属于 B；格子里的 0–3 表示这次请求应交给哪个 owner rank。图中保留请求出现的顺序，用 <code>来源 rank:特征:位置</code> 标识每个格子，其中特征 0 是 A、1 是 B。</p>
+<p>例如，<code>0:0:1</code> 表示 rank 0 的 A 特征中第二次请求。它的格子写着 1，因此要发送给 rank 1。多个请求可以具有相同的 owner；每次请求都保留自己的标识，移动后仍可逐一追踪。</p>
+{{inputs}}
+<p>初始布局按 feature 排列：每个 rank 的一个连续缓冲区先放 A，再放 B。四个 rank 分别有 9、11、10、10 次请求，总计 40 次。</p>
+<p>TorchRec 用 <code>KeyedJaggedTensor</code>（KJT）保存这份输入。图中的一排实心格是 <code>values</code>，一个展平的一维张量；下方的描边小格是 <code>lengths</code>，记录每个样本在每个特征下有几个 key。本例中每个 rank 只带一个样本，所以每个特征占一个 <code>lengths</code> 元素，rank 0 是 <code>[6, 3]</code>。批大小为 B 时，每个特征占 B 个元素。</p>
+
+<h2 id="zh-bucketize">3. 按目标 rank 分桶</h2>
+<p>各 rank 在发送前扫描输入，把每次请求放到对应 owner 的桶中。桶之间按目标 rank 排列；每个桶内部先 A 后 B，同一特征的相对顺序保持不变。发往同一目标的数据由此组成连续分段。</p>
+{{send-rank0}}
+<p>rank 0 的四段 <code>values</code> 长度是 <code>[4, 2, 1, 2]</code>。例如发往 rank 1 的分段包含 <code>A[1]</code> 和 <code>B[1]</code>，它们在输入中相隔较远，分桶后被放在一起。</p>
+<p>分桶同时重写 <code>lengths</code>：每个目标 rank 下每个特征一项，rank 0 得到 <code>[3, 1, 1, 1, 1, 0, 1, 1]</code>。发往 rank 2 的一段是 <code>[1, 0]</code>，即 1 个 A、0 个 B。<code>values</code> 中只有 ID，一段 key 里哪几个属于 A，全靠这两个数记录。把一段的 <code>lengths</code> 相加，就得到这段 <code>values</code> 的长度。</p>
+<p>四个来源 rank 的 <code>values</code> 分段长度组成下面的矩阵。</p>
+{{counts}}
+<p>矩阵的一行是一个发送者的 <code>send_splits</code>，一列是一个接收者的 <code>recv_splits</code>，对应图中 <code>splits</code> 一行左边的方括号。右边的方括号是 <code>lengths</code> 的分段长度：发给每个目标 rank 的 <code>lengths</code> 段含 A、B 各一项，即特征数乘以批大小，本例为 2。它与数据无关，所以总是 <code>[2 2 2 2]</code>。</p>
+
+<h2 id="zh-alltoall">4. AllToAll 交换与接收端重排</h2>
+<p>AllToAll 将每个发送段交给对应目标。用列表表示分段时，这一步满足：</p>
+<pre><code class="language-python">recv[dst][src] = send[src][dst]</code></pre>
+<p>接收端拿到的 <code>values</code> 是一串没有标签的 ID。要查表，它得知道两件事：哪一段来自哪个 rank，段内哪几个属于 A。TorchRec 为此做三次 AllToAll，先交换各段的长度，再分别传 <code>lengths</code> 和 <code>values</code>。</p>
+{{calls}}
+<p>第一次调用里，每个 rank 给每个 peer 发 3 个整数：将要发给它的 <code>lengths</code> 个数、<code>values</code> 个数和自己的批大小。这是固定批大小、无权重时的情形；开启 collective 校验时还会附一个标签。rank 0 读回后得到 <code>values</code> 的接收长度 <code>[4, 2, 1, 3]</code>，也就是矩阵第 0 列，共 10 次请求；另外三个 rank 分别接收 12、8、10 次。接收端按这些长度分配缓冲区，再把它们作为后两次调用的 <code>output_split_sizes</code>。后两次调用在读回这些长度之后相继发起。</p>
+<p>来源 rank 由位置决定。<code>all_to_all_single</code> 按 rank 顺序拼接各来源的段：先是来源 rank 0 的 4 个 key，再是 rank 1 的 2 个，依此类推，所以布局变成 <code>来源 rank → feature</code>。每段的起始偏移由接收端累加段长得到，不随消息传输。</p>
+<p>特征由 <code>lengths</code> 决定。rank 0 收到的 <code>lengths</code> 是 <code>[3, 1, 1, 1, 0, 1, 2, 1]</code>，每个来源两项。来源 rank 3 的一段有 3 个 key，对应 <code>[2, 1]</code>，所以前两个属于 A，最后一个属于 B。</p>
+{{recv-rank0}}
+<p>查表前，接收端再把同一特征的请求集中到一起。Recat 将布局改为 <code>feature → 来源 rank</code>：先取各来源的 A，再取各来源的 B。这一步是本地重排。</p>
+<pre><code class="language-text">接收块：R0-A  R0-B  R1-A  R1-B  R2-A  R2-B  R3-A  R3-B
+块序号：  0     1     2     3     4     5     6     7
+重排后：R0-A  R1-A  R2-A  R3-A  R0-B  R1-B  R2-B  R3-B
+块置换：[0, 2, 4, 6, 1, 3, 5, 7]</code></pre>
+<p>块的边界同样来自 <code>lengths</code>：第 k 块的长度就是它的第 k 项，rank 0 的 <code>R2-A</code> 块长度为 0。按块序展开，得到对接收缓冲区中 10 个元素的置换 <code>[0, 1, 2, 4, 7, 8, 3, 5, 6, 9]</code>，最终是 6 次 A 请求加 4 次 B 请求。<code>lengths</code> 按同一块序重排为 <code>[3, 1, 0, 2, 1, 1, 1, 1]</code>：前四项是来源 rank 0–3 的 A，后四项是它们的 B。重排后的 KJT 把四个来源的样本并成一个批，批大小为 4。批大小大于 1 时每块含多个 <code>lengths</code> 元素，见<a href="torchrec-row-wise-sharding.html#zh-recat-primer">行分片文章中的 recat 说明</a>。</p>
+{{lookup-rank0}}
+<p>请求 <code>0:0:1</code> 先进入 rank 0 的 <code>dst 1</code> 分段，经通信到达 rank 1 的 <code>src 0</code> 分段，重排后位于 rank 1 的 A 区域。沿这条路径，格子的颜色、owner 和请求标识保持一致。</p>
+
+<h2 id="zh-code">5. Python 布局演算</h2>
+<p>下面的纯 Python 代码使用图中的 owner 标签，演算三次布局变化。每次请求用一个 <code>Key</code> 记录来源、特征、位置和 owner。程序验证每个阶段都保留全部请求；指定 SVG 路径后，还会逐项核对图中的 40 个格子、16 条路由计数，以及各处的 <code>lengths</code> 和 <code>splits</code>。</p>
+{{bucketize-code}}
+<p><code>stable_bucketize</code> 先按 owner 和特征分组，返回四个目标段，<code>segment_lengths</code> 再数出每段中各特征的 key 数。接收端按来源拼接 <code>values</code> 和 <code>lengths</code>，然后调用 <code>recat</code>。这个函数只读 <code>lengths</code> 和块序，不查看 <code>Key</code> 里的特征字段，得到的布局与动画终点相同：</p>
+{{pipeline-code}}
+<p>下载<a href="../assets/torchrec/embedding-comm-viz/keyflow_example.py" download>完整演算程序</a>和<a href="../assets/torchrec/embedding-comm-viz/example.json">结果数据</a>。运行 <code>python3.11 keyflow_example.py</code> 可打印输入、各阶段的 <code>lengths</code>、分段长度及 rank 0 的重排结果。程序在本地用列表模拟数据流；动画的 19.2 秒展示时长用于观察步骤。</p>
+<p>本例对应 key 的输入分发。真实 embedding ID 的行号换算、三次调用之间的 CPU 等待，以及查表后向量的返回路径，见<a href="torchrec-row-wise-sharding.html">TorchRec Row-wise Sharding</a>；多批次之间如何重叠通信，见<a href="torchrec-sparse-dist-pipeline.html">TorchRec Sparse Dist Pipeline</a>。</p>
+
+<p>对应的 TorchRec 布局操作可对照固定版本的 <a href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/embedding_sharding.py#L268-L353">bucketize_kjt_before_all2all</a> 与 <a href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L249-L367">_recat</a>。分段长度由 <a href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L3201-L3209">KJT.dist_splits</a> 计算，<a href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L877-L1036">KJTAllToAllSplitsAwaitable</a> 交换它们，<a href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/distributed/dist_data.py#L686-L874">KJTAllToAllTensorsAwaitable</a> 传输 <code>lengths</code> 和 <code>values</code>，<a href="https://github.com/pytorch/torchrec/blob/1d87b8f79b7bb1671cb8be3e646e99e835cce610/torchrec/sparse/jagged_tensor.py#L3243-L3379">KJT.dist_init</a> 按块序重排；<a href="../assets/torchrec/embedding-comm-viz/sources.json">来源记录</a>保存了原图校验值与版本链接。</p>
+
+<h2 id="zh-hier">6. DynamicEmb 的 hierarchical input dist</h2>
+<p>前面各节是 TorchRec 自带的 input dist。NVIDIA recsys-examples 里的 DynamicEmb 在 <a href="https://github.com/NVIDIA/recsys-examples/pull/528">PR 528</a> 中为 row-wise 分片的 <code>EmbeddingCollection</code> 换了一套实现，用 <code>output_dist="hierarchical"</code> 打开。节点内的 GPU 通过 NVLink 直接读写彼此的显存；节点之间由 GPU kernel 自己经 NCCL GIN 发 InfiniBand，中间不经过 CPU。本节用同一份 40 次请求演算它的 input dist。</p>
+<p>例子的设定如下。4 个节点各有 1 张 GPU，所以 rank 就是节点。每个 rank 也是自己节点的 proxy，没有节点内转发这一段，凡是发给别的 rank 的 key 都跨节点。表 A 和表 B 属于同一个 lookup group。key 不带 weights。</p>
+<p>输入已经是 unique 的。这个算子只接收 index dedup 之后的 key，所以图中最左边的 KJT 里，同一张表的同一个 key 在一个 rank 上只出现一次；每个节点只有一张 GPU，node dedup 也就不再合并任何 key。图里 <code>KJT values</code> 等行的实心格沿用前文的画法：格子里的数字标的是这个 key 的 owner rank，不是 key 的取值。同一个 rank 上数字相同的格子是不同的 key，只是 owner 相同。真实的 key 是 64 位的 embedding ID，owner 由它按分片规则算出。</p>
+{{hier-figure}}
+<p>动画分三步播放，图从左到右是一次调用里数据经过的位置，五列对应下面五件事。前两件在第一步里，第三、四件在第二步里，第五件是第三步。</p>
+<ol>
+<li><strong>Bucketize。</strong>按 owner 做稳定的计数排序，只写两个数组：<code>inv</code> 记录分桶后的第 <code>row</code> 行是 KJT 里的第几个 key，<code>bucket_feature_of_row</code> 记录这一行的 owner × 特征数 + 特征。key 留在 KJT 原地不动。TorchRec 在这一步会另外生成一份按目标排好的 <code>values</code> 和 <code>lengths</code>，也就是第 3 节的 Send buffer。</li>
+<li><strong>Push。</strong><code>node_key_push</code> 按 <code>inv</code> 取出 key，直接写进 window 里的 <code>node_keys</code>。自己拥有的 key 进 own part，是一次本地写，图中画成虚线。发往其他节点的 key 进 remote part，经 node dedup 后按 owner 节点切成 <code>key_stage</code> 的三段，本例中每段是一个 16 字节的 chunk 头加若干条 8 字节的 key 记录。chunk 头的方括号里依次是 <code>record_lo, record_hi | start, end</code>：这段记录的范围，以及它们的 embedding 行将来在本 rank <code>proxy_rows</code> 里的位置。</li>
+<li><strong>Count message。</strong><code>rail_exchange</code> 给每个 rail peer 做一次 GIN put，并附带一个 signal。消息的头部对所有 peer 相同，尾部是发给该 peer 的每个特征的 key 数。它承担了 TorchRec 中 splits 和 lengths 两次 AllToAll 的作用：既给出每段的长度，也给出段内每个特征有几个 key。各 rank 读到同一批头部后，各自算出同一份 rail layout，owner 不需要把布局发回来。</li>
+<li><strong>Key put。</strong><code>rail_key_push</code> 对每个 owner 再做一次 GIN put，把 <code>key_stage</code> 中对应的一段写进对方 <code>rail_keys</code> 里 rail layout 给出的位置，即图中的 <code>slice_in</code>，同样附带 signal。owner 在 <code>rail_done</code> 里等齐所有 signal。</li>
+<li><strong>Owner tables。</strong><code>owner_kjt_kernel</code> 填出 owner 的 KJT：每个特征占 4 列，第一列是自己的 own part，其余三列是其他节点，按节点序排列。embedding 行在 <code>lookup_rows</code> 中保持到达顺序：先是 own part，再是各来源节点的记录。两种顺序不同，kernel 因此同时写出 <code>row_map</code>，记录 KJT 第 i 个 key 的行号。之后 lookup 把第 i 个 key 的行直接写到 <code>row_map[i]</code>，这些行已经是 output dist 要发送的顺序。</li>
+</ol>
+<p>与 TorchRec 的流程相比，变化集中在三处。</p>
+{{hier-compare}}
+<p>rank 0 的 <code>row_map</code> 是 <code>[0, 1, 2, 4, 7, 8, 3, 5, 6, 9]</code>，与第 4 节 recat 的元素置换相同，因为 rank 0 自己恰好排在第一列。rank 2 的 KJT 列序是节点 2、0、1、3，TorchRec 的列序是 0、1、2、3，两边的 <code>lengths</code> 和行号就不再一样。</p>
+
+<h3 id="zh-hier-plan">plan 与 row_map</h3>
+<p><code>input_dist()</code> 返回 owner 的 KJT、<code>lookup_rows</code>、<code>row_map</code>，以及交给 output dist 的两份 plan：forward 用的 <code>FwdPlan</code> 和 backward 用的 <code>BwdPlan</code>。plan 里的表来自 rank 的三种身份：requester、proxy 和 owner。下表列出 rank 0 的取值；按容量分配的表只列有效项。</p>
+{{hier-plan}}
+<p><code>src</code> 把分桶后的每一行对应到 forward 读取 embedding 行的位置。前 4 行的 owner 是 rank 0 自己，取值是 <code>lookup_rows</code> 的行号；后 5 行的 owner 在其他节点，取值是 <code>proxy_rows</code> 的行号。<code>fwd_groups</code> 对每个来源节点给出三个数：前两个是该节点的记录中这个 lookup group 的起止，第三个是 shift，第 k 条记录位于 <code>lookup_rows</code> 的第 k + shift 行。proxy 的 <code>bwd_groups</code> 与对端 owner 的 <code>fwd_groups</code> 逐位相同，backward 的 put 因此落在 lookup 写过的位置。</p>
+<p>window 里只存放在途数据和控制字。下表是 rank 0 在这次调用里经手的 window 内容。</p>
+{{hier-window}}
+<p>下载<a href="../assets/torchrec/embedding-comm-viz/hier_input_dist_example.py" download>演算程序</a>，与 <code>keyflow_example.py</code> 放在同一目录后运行 <code>python3.11 hier_input_dist_example.py</code>，可打印四个 rank 的全部表。程序按 PR 的设计文档和单元测试里的参考实现，用 Python 列表推演布局，没有运行真实的算子。ring 的大小、每个 chunk 能容纳的行数等由容量决定的量不影响本例：每个 owner 节点的 key 都落在一个 chunk 里。</p>
+<p>对应的源码固定在合并提交：设计文档的 <a href="https://github.com/NVIDIA/recsys-examples/blob/d53b9c8ca504f239d64078062d020d8e27f52bcf/corelib/dynamicemb/docs/hier_output_dist.md?plain=1#L1270-L1340">input dist 步骤</a>、<a href="https://github.com/NVIDIA/recsys-examples/blob/d53b9c8ca504f239d64078062d020d8e27f52bcf/corelib/dynamicemb/docs/hier_output_dist.md?plain=1#L1669-L1700">跨节点部分</a>和 <a href="https://github.com/NVIDIA/recsys-examples/blob/d53b9c8ca504f239d64078062d020d8e27f52bcf/corelib/dynamicemb/docs/hier_output_dist.md?plain=1#L2184-L2215">lookup 与 row map</a>；<a href="https://github.com/NVIDIA/recsys-examples/blob/d53b9c8ca504f239d64078062d020d8e27f52bcf/corelib/dynamicemb/src/hier_output_dist/input_dist/plan.h#L141-L180">FwdPlan 与 BwdPlan</a>、<a href="https://github.com/NVIDIA/recsys-examples/blob/d53b9c8ca504f239d64078062d020d8e27f52bcf/corelib/dynamicemb/src/hier_output_dist/input_dist/bucketize.cu#L378">owner_scatter_kernel</a>、<a href="https://github.com/NVIDIA/recsys-examples/blob/d53b9c8ca504f239d64078062d020d8e27f52bcf/corelib/dynamicemb/src/hier_output_dist/input_dist/comm_kernels.cu#L277">rail_key_push_kernel</a>、<a href="https://github.com/NVIDIA/recsys-examples/blob/d53b9c8ca504f239d64078062d020d8e27f52bcf/corelib/dynamicemb/src/hier_output_dist/input_dist/rail.cuh#L63">count_messages_of</a>、<a href="https://github.com/NVIDIA/recsys-examples/blob/d53b9c8ca504f239d64078062d020d8e27f52bcf/corelib/dynamicemb/src/hier_output_dist/common/common.h#L201-L213">Chunk 与 OwnerChunk</a>；参考实现见 <a href="https://github.com/NVIDIA/recsys-examples/blob/d53b9c8ca504f239d64078062d020d8e27f52bcf/corelib/dynamicemb/test/unit_tests/test_hier_dedup.py#L1514">proxy_reference</a> 和 <a href="https://github.com/NVIDIA/recsys-examples/blob/d53b9c8ca504f239d64078062d020d8e27f52bcf/corelib/dynamicemb/test/unit_tests/test_hier_dedup.py#L2633">check_owner</a>。</p>
